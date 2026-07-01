@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+legacy/
+
+# frontend
+frontend/node_modules
+
+# backups
+llm-wiki-dist.zip
+zip.py
+.wiki_backups/
