@@ -89,8 +89,31 @@ class SharedGraphRuntime:
                     pass
 
     def update_settings(self, settings: Settings) -> None:
-        """Replace settings at runtime. Caller must handle client rebuilds."""
+        """Replace settings at runtime. Rebuilds the chat client / reranker
+        when their config changed. The embedder is deliberately NOT rebuilt:
+        changing the embed model invalidates every stored vector, and the
+        bootstrap re-embed gate handles that on the next restart."""
+        old = self.settings
         self.settings = settings
+        chat_keys = ("chat_model", "chat_base_url", "chat_api_key", "chat_temperature")
+        if any(getattr(old, k) != getattr(settings, k) for k in chat_keys):
+            self.llm = OpenAiLlmClient(
+                model=settings.chat_model,
+                base_url=settings.chat_base_url,
+                api_key=settings.chat_api_key,
+                system_prompt=GRAPH_SYSTEM_PROMPT,
+                temperature=settings.chat_temperature,
+            )
+        rerank_keys = (
+            "rerank_backend",
+            "rerank_base_url",
+            "rerank_api_key",
+            "rerank_model",
+            "hf_rerank_model",
+            "rerank_device",
+        )
+        if any(getattr(old, k) != getattr(settings, k) for k in rerank_keys):
+            self.reranker = self._build_reranker(settings)
 
 # DB Connection session manager, it opens the connections and closes it when called
 class GraphDbSession:
@@ -1420,6 +1443,33 @@ class GraphWriteSession:
         self._replace_structural_edges(document_name, structural_edges)
         self._db_record_source(document_name, version)
         return actions
+
+    def recon(self, source_file: str | Path) -> dict[str, Any]:
+        """Read-only revision status for a source doc: is it new, changed, or
+        unchanged relative to what was last ingested? Mutates nothing."""
+        out_path = Path(source_file)
+        if not out_path.exists():
+            raise FileNotFoundError(f"source does not exist: {out_path}")
+        nodes, _edges = self._load_md_output(out_path)
+        if not nodes:
+            return {"status": "empty", "document": None, "nodes": 0}
+        document_name = nodes[0].original_document_name or out_path.name
+        version = self._source_version_for_nodes(nodes)
+        recorded = self._db_get_source(document_name)
+        if recorded is None:
+            status = "new"
+        elif recorded[0] == version:
+            status = "unchanged"
+        else:
+            status = "changed"
+        return {
+            "status": status,
+            "document": document_name,
+            "version": version,
+            "recorded_version": recorded[0] if recorded else None,
+            "recorded_at": recorded[1] if recorded else None,
+            "nodes": len(nodes),
+        }
 
     def _ingest_one(self, node: Node) -> list[Edge]:
         existing = self._db_get_node(node.id)
@@ -2876,6 +2926,24 @@ class WriteGraphService:
             job.error = f"{type(exc).__name__}: {exc}"
         finally:
             job.finished_at = datetime.now(timezone.utc)
+            self._prune_jobs()
+
+    # Keep the in-memory job registry bounded on long uptimes; queued/running
+    # jobs are never dropped.
+    MAX_FINISHED_JOBS = 500
+
+    def _prune_jobs(self) -> None:
+        finished = [
+            j
+            for j in self.jobs.values()
+            if j.status in ("done", "failed", "cancelled")
+        ]
+        overflow = len(finished) - self.MAX_FINISHED_JOBS
+        if overflow <= 0:
+            return
+        finished.sort(key=lambda j: j.finished_at or j.created_at)
+        for job in finished[:overflow]:
+            self.jobs.pop(job.id, None)
 
     def _apply_job_sync(self, job: WriteJob) -> Any:
         db = GraphDbSession(self.runtime.settings, readonly=False)
@@ -2963,21 +3031,23 @@ class WriteGraphService:
         return True
 
 
-def bootstrap_database(settings: Settings) -> None:
+def bootstrap_database(
+    settings: Settings, runtime: SharedGraphRuntime | None = None
+) -> None:
     """
     One-time startup: create vector tables, embed existing active nodes,
     set embed model metadata, and run cluster naming.
 
-    Call this in the lifespan before accepting requests.
+    Call this in the lifespan before accepting requests. Pass the runtime the
+    app already built; only build a fresh one when running standalone.
     """
     print(f"[bootstrap] START db={settings.database_path}", flush=True)
     db = GraphDbSession(settings, readonly=False)
     try:
-        print(
-            "[bootstrap] building runtime (NOTE: app.py already built one -- this is a 2nd load)",
-            flush=True,
-        )
-        write_session = GraphWriteSession(SharedGraphRuntime(settings), db)
+        if runtime is None:
+            print("[bootstrap] building standalone runtime", flush=True)
+            runtime = SharedGraphRuntime(settings)
+        write_session = GraphWriteSession(runtime, db)
 
         # Ensure vector tables exist
         write_session._db_ensure_vec_tables(write_session.runtime.embedder.dim)
