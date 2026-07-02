@@ -346,15 +346,6 @@ class LlmClient(Protocol):
     def complete_structured(
         self, system_prompt: str, user_content: str, output_model: type[Any]
     ) -> Any: ...
-    def run_tool_loop(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        tools: list[Any],
-        dispatch: Any,
-        max_steps: int,
-        finish_guard: Any = None,
-    ) -> Any: ...
 
 
 @runtime_checkable
@@ -468,4 +459,3 @@ class EnrichJob:
     node_id: str | None = None
     replacements: dict[str, str] = field(default_factory=dict)
     stale_sources: list[str] = field(default_factory=list)
-

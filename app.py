@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import threading
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -43,6 +45,8 @@ from graph.models import Settings
 runtime: SharedGraphRuntime | None = None
 read_service: ReadGraphService | None = None
 write_service: WriteGraphService | None = None
+agent_runs: dict[str, asyncio.Task] = {}
+agent_stop_events: dict[str, threading.Event] = {}
 
 
 @asynccontextmanager
@@ -308,6 +312,8 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
     loop = asyncio.get_running_loop()
     events: queue.Queue = queue.Queue()
     sentinel = object()
+    run_id = str(uuid.uuid4())
+    stop_event = threading.Event()
 
     async def run_agent():
         def emit(event: dict) -> None:
@@ -315,34 +321,69 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
 
         try:
             answer = await reads().ask(
-                payload.question, on_event=emit, overrides=payload.overrides
+                payload.question,
+                on_event=emit,
+                overrides=payload.overrides,
+                stop_event=stop_event,
             )
             events.put({"type": "answer", **_dump(answer)})
+        except asyncio.CancelledError:
+            stop_event.set()
+            events.put({"type": "cancelled", "run_id": run_id})
+            raise
         except Exception as exc:
             events.put({"type": "error", "message": str(exc)})
         finally:
+            agent_runs.pop(run_id, None)
+            agent_stop_events.pop(run_id, None)
             events.put(sentinel)
 
     task = asyncio.create_task(run_agent())
+    agent_runs[run_id] = task
+    agent_stop_events[run_id] = stop_event
 
     async def stream():
         yield ": connected\n\n"
-        while True:
+        yield f"data: {json.dumps({'type': 'run', 'run_id': run_id}, ensure_ascii=False)}\n\n"
+        try:
+            while True:
+                try:
+                    event = await loop.run_in_executor(
+                        None, lambda: events.get(timeout=15)
+                    )
+                except queue.Empty:
+                    yield ": ping\n\n"
+                    continue
+                if event is sentinel:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             try:
-                event = await loop.run_in_executor(None, lambda: events.get(timeout=15))
-            except queue.Empty:
-                yield ": ping\n\n"
-                continue
-            if event is sentinel:
-                break
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-        await task
+                await task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            if not task.done():
+                stop_event.set()
+                task.cancel()
 
     return StreamingResponse(
         stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/agent-runs/{run_id}/stop")
+async def stop_agent_run(run_id: str) -> dict:
+    task = agent_runs.get(run_id)
+    stop_event = agent_stop_events.get(run_id)
+    if task is None and stop_event is None:
+        raise HTTPException(status_code=404, detail="agent run not found")
+    if stop_event is not None:
+        stop_event.set()
+    if task is not None and not task.done():
+        task.cancel()
+    return {"run_id": run_id, "status": "stopping"}
 
 
 # ============================================================================

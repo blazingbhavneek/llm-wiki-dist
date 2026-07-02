@@ -76,6 +76,8 @@ export const api = {
     req(`/api/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`),
   ask: (question, overrides) =>
     req('/api/ask', { method: 'POST', body: JSON.stringify({ question, overrides }) }),
+  stopAgentRun: (runId) =>
+    req(`/api/agent-runs/${encodeURIComponent(runId)}/stop`, { method: 'POST' }),
 
   // Stream step-level agent progress via SSE. Calls onEvent(ev) per event;
   // resolves when the stream ends. Falls back to throwing on a non-OK response.
