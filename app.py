@@ -30,12 +30,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from graph.graph import (
+    GraphDbSession,
+    GraphWriteSession,
     ReadGraphService,
     SharedGraphRuntime,
     WriteGraphService,
     bootstrap_database,
     job_to_dict,
 )
+from graph.langgraph_agent import AgentStopped
 from graph.models import Settings
 
 # ============================================================================
@@ -56,8 +59,9 @@ async def lifespan(_: FastAPI):
     settings = Settings.from_env()
     runtime = SharedGraphRuntime(settings)
 
-    # Bootstrap DB tables / vectors / clusters (blocking)
-    await asyncio.to_thread(bootstrap_database, settings)
+    # Bootstrap DB tables / vectors / clusters (blocking). Reuses the runtime
+    # built above instead of constructing a second embedder/LLM stack.
+    await asyncio.to_thread(bootstrap_database, settings, runtime)
 
     read_service = ReadGraphService(runtime, max_reads=16, max_agents=16)
     write_service = WriteGraphService(runtime, max_queue_size=100)
@@ -115,6 +119,15 @@ def _dump(obj: Any) -> Any:
 
 def _job_response(job):
     d = job_to_dict(job)
+    # Job payloads can embed whole markdown documents; clients polling job
+    # status only need type/status/result/error. Truncate long strings so
+    # every poll stays cheap.
+    payload = d.get("payload")
+    if isinstance(payload, dict):
+        d["payload"] = {
+            k: (v[:200] + f"… ({len(v)} chars)" if isinstance(v, str) and len(v) > 200 else v)
+            for k, v in payload.items()
+        }
     if job.status == "queued":
         d["position"] = writes().queue_position(job.id)
     return _dump(d)
@@ -214,7 +227,12 @@ async def replace_settings(payload: dict[str, Any]) -> dict:
 async def patch_settings(payload: dict[str, Any]) -> dict:
     try:
         current_dict = _dump(_runtime().settings)
-        current_dict.update(payload)
+        # Ignore blanked-out secrets: clients receive redacted values ("") and
+        # may echo them back; an empty secret must not wipe the real key.
+        clean = {
+            k: v for k, v in payload.items() if not (k in _SECRET_KEYS and not v)
+        }
+        current_dict.update(clean)
         new = Settings(**current_dict)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -267,38 +285,47 @@ async def read_node(node_id: str) -> dict:
 async def node_links(
     node_id: str, direction: str = "both", label: str | None = None
 ) -> list[dict]:
-    pairs = await reads().follow_link(node_id, label=label, direction=direction)
+    try:
+        pairs = await reads().follow_link(node_id, label=label, direction=direction)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return [{"edge": _dump(e), "node": _dump(n)} for e, n in pairs]
 
 
 @app.get("/api/search")
 async def search(q: str, limit: int | None = None) -> list[dict]:
+    if limit is not None:
+        limit = max(1, min(int(limit), 200))
     nodes = await reads().search(q, limit)
     return [_dump(n) for n in nodes]
 
 
 @app.get("/api/query")
 async def query(query_type: str, value: str) -> dict:
-    result = await reads().query(query_type, value)
+    try:
+        result = await reads().query(query_type, value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return _dump(result)
 
 
 @app.post("/api/recon")
 async def recon(payload: RecondBody) -> dict:
-    # recon is read-only (it reports status without mutating)
+    # Read-only revision status: is this source doc new/changed/unchanged
+    # relative to what was last ingested? Uses a write session for its doc
+    # loaders but mutates nothing, so it stays off the write queue.
     def work():
-        db_session = __import__("graph_read_write").GraphDbSession(
-            _runtime().settings, readonly=True
-        )
+        db_session = GraphDbSession(_runtime().settings, readonly=True)
         try:
-            session = __import__("graph_read_write").GraphReadSession(
-                _runtime(), db_session
-            )
+            session = GraphWriteSession(_runtime(), db_session)
             return session.recon(payload.source_file)
         finally:
             db_session.close()
 
-    return await asyncio.to_thread(work)
+    try:
+        return await asyncio.to_thread(work)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.post("/api/ask")
@@ -331,6 +358,11 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
             stop_event.set()
             events.put({"type": "cancelled", "run_id": run_id})
             raise
+        except AgentStopped:
+            # The stop endpoint may land as AgentStopped (raised inside the
+            # worker thread) instead of task cancellation; both are a clean
+            # user-requested stop, not an error.
+            events.put({"type": "cancelled", "run_id": run_id})
         except Exception as exc:
             events.put({"type": "error", "message": str(exc)})
         finally:
