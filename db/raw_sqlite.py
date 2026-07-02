@@ -391,6 +391,10 @@ class RawSqliteDatabase(BaseDatabase):
             _row_to_edge(r) for r in self.connection.execute(sql, params).fetchall()
         ]
 
+    def delete_edge(self, edge_id: str) -> None:
+        self.connection.execute("DELETE FROM edges WHERE id=?", (edge_id,))
+        self.connection.commit()
+
     def delete_edges_by_label_for_nodes(self, label: str, node_ids: set[str]) -> None:
         if not node_ids:
             return
@@ -490,6 +494,18 @@ class RawSqliteDatabase(BaseDatabase):
             f"SELECT 1 FROM {table} WHERE node_id=? LIMIT 1", (node_id,)
         ).fetchone()
         return row is not None
+
+    def get_vector(self, node_id: str, table: str = "vec_body") -> list[float] | None:
+        import struct
+
+        if self._dim is None:
+            return None
+        row = self.connection.execute(
+            f"SELECT embedding FROM {table} WHERE node_id=?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return list(struct.unpack(f"{self._dim}f", row["embedding"]))
 
     def vector_search(
         self, vector: list[float], table: str = "vec_body", limit: int = 20

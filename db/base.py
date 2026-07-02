@@ -71,6 +71,10 @@ class BaseDatabase(ABC):
     def delete_edges_by_label_for_nodes(self, label: str, node_ids: set[str]) -> None:
         raise NotImplementedError
 
+    def delete_edge(self, edge_id: str) -> None:
+        """Hard-delete a single edge row by id."""
+        raise NotImplementedError
+
     @abstractmethod
     def record_source(self, document_name: str, source_hash: str) -> None:
         raise NotImplementedError
@@ -99,6 +103,10 @@ class BaseDatabase(ABC):
 
     @abstractmethod
     def set_vector(self, node_id: str, table: str, vector: list[float]) -> None:
+        raise NotImplementedError
+
+    def get_vector(self, node_id: str, table: str = "vec_body") -> list[float] | None:
+        """Stored embedding for a node, or None when absent."""
         raise NotImplementedError
 
     @abstractmethod

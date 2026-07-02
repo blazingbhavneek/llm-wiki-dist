@@ -97,12 +97,16 @@ class GraphDbSession:
 
     def __init__(self, settings: Settings, readonly: bool = False):
         self.settings = settings
+        # One backend handle for the whole session. Every _db_* helper reuses
+        # it instead of opening a fresh connection (and reloading the vec
+        # extension) per call. Also creates the db file on first run.
+        self.database = Database(settings.database_path)
         self.conn = self._open(settings.database_path, readonly=readonly)
 
     def _open(self, path: str, readonly: bool) -> Any:
         import sqlite3
 
-        mode = "ro" if readonly else "rw"
+        mode = "ro" if readonly else "rwc"
         uri = f"file:{path}?mode={mode}"
         conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -112,7 +116,10 @@ class GraphDbSession:
         return conn
 
     def close(self) -> None:
-        self.conn.close()
+        try:
+            self.database.close()
+        finally:
+            self.conn.close()
 
     def __enter__(self) -> GraphDbSession:
         return self
@@ -156,10 +163,12 @@ class GraphReadSession:
             "subagent_max_steps",
             "subagent_min_reads",
             "subagent_max_reads",
+            "early_exit_candidates",
+            "shallow_answer_max_nodes",
         }
         float_keys = {"chat_temperature"}
         str_keys = {"chat_base_url", "chat_api_key", "chat_model"}
-        bool_keys = {"entity_dedup", "enable_mermaid"}
+        bool_keys = {"entity_dedup", "enable_mermaid", "agent_early_exit"}
         clean: dict[str, Any] = {}
         for key, value in overrides.items():
             if value is None:
@@ -225,11 +234,15 @@ class GraphReadSession:
         pairs: list[tuple[Edge, Node]] = []
         if normalized in {"outgoing", "both"}:
             for edge in self._db_get_outgoing_edges(node_id, label):
+                if edge.invalid_at or edge.expired_at:
+                    continue
                 target = self._db_get_node(edge.target_node_id)
                 if target and target.status == NodeStatus.active:
                     pairs.append((edge, target))
         if normalized in {"incoming", "both"}:
             for edge in self._db_get_incoming_edges(node_id, label):
+                if edge.invalid_at or edge.expired_at:
+                    continue
                 source = self._db_get_node(edge.source_node_id)
                 if source and source.status == NodeStatus.active:
                     pairs.append((edge, source))
@@ -633,7 +646,14 @@ class GraphReadSession:
         emit = on_event or (lambda event: None)
         emit({"type": "start", "question": question})
 
-        answer = self._run_lead(question, emit, stop_event=stop_event)
+        # Early-exit routing: skip deep research when an existing agent note
+        # already answers the question, or when shallow RAG over retrieved
+        # evidence is enough for a narrow query.
+        answer: AgentAnswer | None = None
+        if self.settings.agent_early_exit:
+            answer = self._try_early_exit(question, emit, stop_event=stop_event)
+        if answer is None:
+            answer = self._run_lead(question, emit, stop_event=stop_event)
 
         # if model was asked to generate mermaid, check if it was done right and fix it if any error
         if self.settings.enable_mermaid and answer.answer:
@@ -644,6 +664,138 @@ class GraphReadSession:
 
         emit({"type": "done"})
         return answer
+
+    # Early-exit router. Three outcomes: reuse an existing agent note verbatim,
+    # compose a shallow RAG answer from retrieved evidence, or return None to
+    # fall through to deep multi-subagent research. Any failure falls through.
+    def _try_early_exit(
+        self,
+        question: str,
+        emit: Callable,
+        stop_event: threading.Event | None = None,
+    ) -> AgentAnswer | None:
+        if stop_event is not None and stop_event.is_set():
+            raise AgentStopped("agent run cancelled")
+
+        try:
+            results = self.search_with_evidence(
+                question, limit=self.settings.early_exit_candidates
+            )
+        except Exception as exc:
+            log.info("early-exit retrieval failed; deep path: %s", exc)
+            return None
+        if not results:
+            emit({"type": "route", "mode": "deep", "reason": "no candidates"})
+            return None
+
+        emit(
+            {
+                "type": "candidates",
+                "count": len(results),
+                "nodes": [node_ref(r["node"]) for r in results],
+            }
+        )
+
+        def describe(result: dict[str, Any]) -> dict[str, Any]:
+            node = result["node"]
+            return {
+                "node_id": node.id,
+                "kind": (
+                    "agent_note" if node.type == NodeType.exogenous else "source"
+                ),
+                "title": node.title,
+                "summary": node.summary,
+                "evidence": [
+                    " ".join((ev.get("text") or "").split())[:280]
+                    for ev in result.get("evidence", [])[:3]
+                ],
+            }
+
+        payload = {
+            "question": question,
+            "candidates": [describe(r) for r in results],
+        }
+        try:
+            raw = self.llm.complete_structured(
+                ROUTER_PROMPT, json.dumps(payload, ensure_ascii=False), RouteDecision
+            )
+            decision = (
+                raw if isinstance(raw, RouteDecision) else RouteDecision.model_validate(raw)
+            )
+        except Exception as exc:
+            log.info("early-exit router failed; deep path: %s", exc)
+            return None
+
+        mode = (decision.mode or "deep").strip().lower()
+        emit(
+            {
+                "type": "route",
+                "mode": mode,
+                "reason": decision.reason,
+                "node_id": decision.node_id,
+            }
+        )
+        if stop_event is not None and stop_event.is_set():
+            raise AgentStopped("agent run cancelled")
+
+        if mode == "reuse" and decision.node_id:
+            node = self._db_get_node(clean_node_ref(decision.node_id))
+            if node and node.status == NodeStatus.active and node.body.strip():
+                emit({"type": "read", "agent": 0, "node": node_ref(node)})
+                # Cite the note plus the sources it was derived from so the UI
+                # highlights the whole provenance path.
+                cited = [node.id] + [
+                    e.target_node_id
+                    for e in self._db_get_outgoing_edges(node.id, "reference")
+                ]
+                return AgentAnswer(
+                    question=question,
+                    answer=node.body,
+                    cited_node_ids=dedupe(cited),
+                    steps=1,
+                    exogenous_node_id=(
+                        node.id if node.type == NodeType.exogenous else None
+                    ),
+                )
+            # Router pointed at a bad node; the evidence is still usable.
+            mode = "shallow"
+
+        if mode == "shallow":
+            top = results[: self.settings.shallow_answer_max_nodes]
+            context = {
+                "question": question,
+                "notes": [
+                    {
+                        "node_id": r["node"].id,
+                        "title": r["node"].title,
+                        "summary": r["node"].summary,
+                        "evidence": [
+                            " ".join((ev.get("text") or "").split())
+                            for ev in r.get("evidence", [])
+                        ],
+                        "body": r["node"].body[:2500],
+                    }
+                    for r in top
+                ],
+            }
+            emit({"type": "compiling"})
+            try:
+                text = self.llm.complete(
+                    SHALLOW_ANSWER_PROMPT, json.dumps(context, ensure_ascii=False)
+                ).strip()
+            except Exception as exc:
+                log.info("shallow answer failed; deep path: %s", exc)
+                return None
+            if not text:
+                return None
+            return AgentAnswer(
+                question=question,
+                answer=text,
+                cited_node_ids=[r["node"].id for r in top],
+                steps=1,
+            )
+
+        return None
 
     def _run_lead(
         self,
@@ -845,6 +997,8 @@ class GraphReadSession:
             next_frontier: list[str] = []
             for node_id in frontier:
                 for edge in self._db_get_edges_for_node(node_id):
+                    if edge.invalid_at or edge.expired_at:
+                        continue
                     seen_edges[edge.id] = edge
                     other_id = (
                         edge.target_node_id
@@ -860,53 +1014,43 @@ class GraphReadSession:
             frontier = next_frontier
         return list(seen_nodes.values()), list(seen_edges.values())
 
-    # DB Ops
+    # DB Ops (all routed through the session's shared backend handle)
 
     def db_get_all_nodes(self) -> list[Node]:
-        
-        return Database(self.settings.database_path).get_all_nodes()
+        return self.db.database.get_all_nodes()
 
     def db_get_all_edges(self) -> list[Edge]:
-        
-        return Database(self.settings.database_path).get_all_edges()
+        return self.db.database.get_all_edges()
 
     def _db_get_node(self, node_id: str) -> Node | None:
-        
-        return Database(self.settings.database_path).get_node(node_id)
+        return self.db.database.get_node(node_id)
 
     def _keyword_search(self, text: str, limit: int) -> list[Node]:
-        
-        return Database(self.settings.database_path).keyword_search(text, limit)
+        return self.db.database.keyword_search(text, limit)
 
     def _vector_search(
         self, vector: list[float], table: str, k: int
     ) -> list[tuple[str, float]]:
-        
-        return Database(self.settings.database_path).vector_search(vector, table, k)
+        return self.db.database.vector_search(vector, table, k)
 
     def _search_items_fts(self, text: str, limit: int) -> list[dict]:
-        
-        return Database(self.settings.database_path).search_items_fts_query(text, limit)
+        return self.db.database.search_items_fts_query(text, limit)
 
     def _get_search_items(self, ids: list[str]) -> dict[str, dict]:
-        
-        return Database(self.settings.database_path).get_search_items(ids)
+        return self.db.database.get_search_items(ids)
 
     def _db_get_edges_for_node(self, node_id: str) -> list[Edge]:
-        
-        return Database(self.settings.database_path).get_edges_for_node(node_id)
+        return self.db.database.get_edges_for_node(node_id)
 
     def _db_get_outgoing_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-        
-        return Database(self.settings.database_path).get_outgoing_edges(node_id, label)
+        return self.db.database.get_outgoing_edges(node_id, label)
 
     def _db_get_incoming_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-        
-        return Database(self.settings.database_path).get_incoming_edges(node_id, label)
+        return self.db.database.get_incoming_edges(node_id, label)
 
 
 class GraphWriteSession:
@@ -926,13 +1070,19 @@ class GraphWriteSession:
         if not old:
             raise KeyError(f"node not found: {node_id}")
 
+        new_id = (
+            make_exogenous_node_id(body)
+            if old.type == NodeType.exogenous
+            else make_node_id(body, old.original_document_name)
+        )
         replacement = Node(
-            id=make_node_id(body, old.original_document_name),
+            id=new_id,
             body=body,
             type=old.type,
-            title=old.title,
+            title=self._title_from_markdown(body) or old.title,
             original_document_name=old.original_document_name,
             source_path=old.source_path,
+            source_ranges=old.source_ranges,
             source_version=source_hash(body),
             cluster=old.cluster,
         )
@@ -945,9 +1095,31 @@ class GraphWriteSession:
 
         self._persist_node(replacement)
         self._supersede(old, replacement)
+        # Keep the document chain (`follows`) and note provenance
+        # (`reference`/`supports`) attached to the live node, not the
+        # superseded one.
+        self._remap_edges(old.id, replacement.id)
+        # A hand edit is new information: agent notes supported by this node
+        # must regenerate against the replacement or go stale.
+        if self.runtime.enrich is not None:
+            self.runtime.enrich.enqueue_cascade({old.id: replacement.id}, [])
+        else:
+            actions: list[str] = []
+            self._cascade_dependents({old.id: replacement.id}, set(), actions)
         return replacement
 
     def delete_node(self, node_id: str) -> None:
+        node = self._db_get_node(node_id)
+        if node is not None:
+            # Take the node out of retrieval first, then let dependents react
+            # while its `supports` edges still exist: notes regenerate from
+            # their remaining sources or go stale.
+            self._db_set_node_status(node_id, NodeStatus.deleted)
+            actions: list[str] = []
+            try:
+                self._cascade_dependents({}, {node_id}, actions)
+            except Exception as exc:
+                log.info("delete cascade failed for %s: %s", node_id, exc)
         self._db_delete_node(node_id)
 
     def create_exogenous_node(
@@ -976,6 +1148,9 @@ class GraphWriteSession:
         node.cluster = self._cluster_for_references(node.id, source_node_ids, body_vec)
         self._db_upsert_node(node)
         self._link_references(node, source_node_ids)
+        # `supports` edges (source -> note) are the path _cascade_dependents
+        # walks; without them a source revision could never refresh this note.
+        self._link_supports(node, dedupe([sid for sid in source_node_ids if sid]))
         if self.runtime.enrich is not None:
             self.runtime.enrich.enqueue_summary(node.id)
         return node
@@ -1094,30 +1269,38 @@ class GraphWriteSession:
         document_name = nodes[0].original_document_name or out_path.name
         version = self._source_version_for_nodes(nodes)
 
-        edge_count = 0
-        for index, node in enumerate(nodes, start=1):
-            node.source_version = version
-            edges = self._ingest_one(node)
-            edge_count += len(edges)
-            log.info(
-                "ingest %d/%d | edges so far %d | %s",
-                index,
-                len(nodes),
-                edge_count,
-                node.id,
+        if document_name and self._db_get_source(document_name):
+            # Re-ingest of a known document: run the revision flow so changed
+            # pages supersede their old versions (and dependents cascade)
+            # instead of piling up duplicates next to stale active nodes.
+            actions = self._revise_document(
+                nodes, structural_edges, document_name, version
             )
+            log.info("re-ingest via revision flow: %s", "; ".join(actions) or "no-op")
+        else:
+            edge_count = 0
+            for index, node in enumerate(nodes, start=1):
+                node.source_version = version
+                edges = self._ingest_one(node)
+                edge_count += len(edges)
+                log.info(
+                    "ingest %d/%d | edges so far %d | %s",
+                    index,
+                    len(nodes),
+                    edge_count,
+                    node.id,
+                )
 
-        if nodes:
             self._replace_structural_edges(document_name, structural_edges)
             if document_name:
                 self._db_record_source(document_name, version)
 
-        log.info(
-            "ingest done: %d nodes, %d semantic/dedup edges, %d structural",
-            len(nodes),
-            edge_count,
-            len(structural_edges),
-        )
+            log.info(
+                "ingest done: %d nodes, %d semantic/dedup edges, %d structural",
+                len(nodes),
+                edge_count,
+                len(structural_edges),
+            )
 
         try:
             mapping = self.recluster()
@@ -1139,7 +1322,26 @@ class GraphWriteSession:
 
         document_name = nodes[0].original_document_name or out_path.name
         version = self._source_version_for_nodes(nodes)
+        actions = self._revise_document(nodes, structural_edges, document_name, version)
 
+        try:
+            self.recluster()
+            self.ensure_japanese_clusters()
+        except Exception as exc:
+            log.info("recluster skipped: %s", exc)
+
+        return actions
+
+    def _revise_document(
+        self,
+        nodes: list[Node],
+        structural_edges: list[Edge],
+        document_name: str,
+        version: str,
+    ) -> list[str]:
+        """Revision matching for one document: unchanged pages keep their node,
+        changed pages supersede the old one, removed pages go stale, and
+        dependents cascade. Shared by cascading_update and re-ingest."""
         # Cheap pass: stamp version + body hash
         for node in nodes:
             node.source_version = version
@@ -1217,13 +1419,6 @@ class GraphWriteSession:
         self._cascade_dependents(replacements, stale_sources, actions)
         self._replace_structural_edges(document_name, structural_edges)
         self._db_record_source(document_name, version)
-
-        try:
-            self.recluster()
-            self.ensure_japanese_clusters()
-        except Exception as exc:
-            log.info("recluster skipped: %s", exc)
-
         return actions
 
     def _ingest_one(self, node: Node) -> list[Edge]:
@@ -1253,116 +1448,90 @@ class GraphWriteSession:
         return self.db.conn
 
     def _db_get_node(self, node_id: str) -> Node | None:
-        
-        return Database(self.settings.database_path).get_node(node_id)
+        return self.db.database.get_node(node_id)
 
     def _db_upsert_node(self, node: Node) -> None:
-        
-        Database(self.settings.database_path).upsert_node(node)
+        self.db.database.upsert_node(node)
 
     def _db_delete_node(self, node_id: str) -> None:
-        
-        Database(self.settings.database_path).delete_node(node_id)
+        self.db.database.delete_node(node_id)
 
     def _db_set_node_status(self, node_id: str, status: NodeStatus) -> None:
-        
-        Database(self.settings.database_path).set_node_status(node_id, status)
+        self.db.database.set_node_status(node_id, status)
 
     def _db_get_nodes_by_document(
         self, doc_name: str, active_only: bool = False
     ) -> list[Node]:
-        
-        return Database(self.settings.database_path).get_nodes_by_document(
-            doc_name, active_only
-        )
+        return self.db.database.get_nodes_by_document(doc_name, active_only)
 
     def _db_upsert_edge(self, edge: Edge) -> None:
-        
-        Database(self.settings.database_path).upsert_edge(edge)
+        self.db.database.upsert_edge(edge)
+
+    def _db_delete_edge(self, edge_id: str) -> None:
+        self.db.database.delete_edge(edge_id)
 
     def _db_delete_edges_by_label_for_nodes(
         self, label: str, node_ids: set[str]
     ) -> None:
-        
-        Database(self.settings.database_path).delete_edges_by_label_for_nodes(
-            label, node_ids
-        )
+        self.db.database.delete_edges_by_label_for_nodes(label, node_ids)
 
     def _db_record_source(self, doc_name: str, version: str) -> None:
-        
-        Database(self.settings.database_path).record_source(doc_name, version)
+        self.db.database.record_source(doc_name, version)
 
     def _db_get_source(self, doc_name: str) -> tuple[str, str] | None:
-        
-        return Database(self.settings.database_path).get_source(doc_name)
+        return self.db.database.get_source(doc_name)
 
     def _db_ensure_vec_tables(self, dim: int) -> None:
-        
-        Database(self.settings.database_path).ensure_vec_tables(dim)
+        self.db.database.ensure_vec_tables(dim)
 
     def _db_reset_vec_tables(self) -> None:
-        
-        Database(self.settings.database_path).reset_vec_tables()
+        self.db.database.reset_vec_tables()
 
     def _db_has_vector(self, node_id: str) -> bool:
-        
-        return Database(self.settings.database_path).has_vector(node_id)
+        return self.db.database.has_vector(node_id)
 
     def _db_count_vectors(self, table: str) -> int:
-        
-        return Database(self.settings.database_path).count_vectors(table)
+        return self.db.database.count_vectors(table)
 
     def _db_set_vector(self, node_id: str, table: str, vector: list[float]) -> None:
-        
-        Database(self.settings.database_path).set_vector(node_id, table, vector)
+        self.db.database.set_vector(node_id, table, vector)
 
     def _db_replace_search_items(self, node_id: str, items: list[dict]) -> None:
-        
-        Database(self.settings.database_path).replace_search_items(node_id, items)
+        self.db.database.replace_search_items(node_id, items)
 
     def _db_delete_search_items(self, node_id: str) -> None:
-        
-        Database(self.settings.database_path).delete_search_items(node_id)
+        self.db.database.delete_search_items(node_id)
 
     def _db_set_search_item_vector(self, item_id: str, vector: list[float]) -> None:
-        
-        Database(self.settings.database_path).set_search_item_vector(item_id, vector)
+        self.db.database.set_search_item_vector(item_id, vector)
 
     def _db_get_vector(self, node_id: str, table: str) -> list[float] | None:
-        
-        return Database(self.settings.database_path).get_vector(node_id, table)
+        return self.db.database.get_vector(node_id, table)
 
     def _db_get_meta(self, key: str) -> str | None:
-        
-        return Database(self.settings.database_path).get_meta(key)
+        return self.db.database.get_meta(key)
 
     def _db_set_meta(self, key: str, value: str) -> None:
-        
-        Database(self.settings.database_path).set_meta(key, value)
+        self.db.database.set_meta(key, value)
 
     def _db_get_all_nodes(self) -> list[Node]:
-        
-        return Database(self.settings.database_path).get_all_nodes()
+        return self.db.database.get_all_nodes()
 
     def _db_get_all_edges(self) -> list[Edge]:
-        
-        return Database(self.settings.database_path).get_all_edges()
+        return self.db.database.get_all_edges()
 
     def _db_get_edges_for_node(self, node_id: str) -> list[Edge]:
-        
-        return Database(self.settings.database_path).get_edges_for_node(node_id)
+        return self.db.database.get_edges_for_node(node_id)
 
     def _db_get_outgoing_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-        
-        return Database(self.settings.database_path).get_outgoing_edges(node_id, label)
+        return self.db.database.get_outgoing_edges(node_id, label)
 
     def _db_get_incoming_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-
-        return Database(self.settings.database_path).get_incoming_edges(node_id, label)
+        return self.db.database.get_incoming_edges(node_id, label)
 
     # -- Embedding helpers ------------------------------------------------
 
@@ -1465,9 +1634,9 @@ class GraphWriteSession:
             [("vec_summary", summary_vec)] if summary_vec else []
         )
         for table, vector in probes:
-            for candidate_id, _distance in Database(
-                self.settings.database_path
-            ).vector_search(vector, table, k + 1):
+            for candidate_id, _distance in self.db.database.vector_search(
+                vector, table, k + 1
+            ):
                 if candidate_id != node_id and candidate_id not in ranked:
                     ranked.append(candidate_id)
         candidates = [
@@ -1717,6 +1886,35 @@ class GraphWriteSession:
         except Exception as exc:
             log.info("clear search items on supersede failed %s: %s", old.id, exc)
 
+    def _remap_edges(
+        self,
+        old_id: str,
+        new_id: str,
+        labels: tuple[str, ...] = ("follows", "reference", "supports"),
+    ) -> None:
+        """Re-point structural/provenance edges from a superseded node to its
+        replacement so the document chain and note provenance stay live."""
+        wanted = set(labels)
+        for edge in self._db_get_edges_for_node(old_id):
+            if edge.label not in wanted:
+                continue
+            src = new_id if edge.source_node_id == old_id else edge.source_node_id
+            dst = new_id if edge.target_node_id == old_id else edge.target_node_id
+            if src == dst:
+                continue
+            self._db_upsert_edge(
+                Edge(
+                    id=make_edge_id(src, dst, edge.label),
+                    source_node_id=src,
+                    target_node_id=dst,
+                    label=edge.label,
+                    summary=edge.summary,
+                    valid_at=edge.valid_at,
+                    source_episode_ids=edge.source_episode_ids,
+                )
+            )
+            self._db_delete_edge(edge.id)
+
     def _link_supports(self, node: Node, source_node_ids: list[str]) -> None:
         for source_id in source_node_ids:
             if not self._db_get_node(source_id):
@@ -1795,9 +1993,7 @@ class GraphWriteSession:
     def _nearest_cluster(
         self, node_id: str, body_vec: list[float], allowed: set[str] | None = None
     ) -> str | None:
-        for cid, _dist in Database(self.settings.database_path).vector_search(
-            body_vec, "vec_body", 50
-        ):
+        for cid, _dist in self.db.database.vector_search(body_vec, "vec_body", 50):
             if cid == node_id:
                 continue
             nn = self._db_get_node(cid)
@@ -1920,8 +2116,14 @@ class GraphWriteSession:
                 actions.append("cascade-skipped:disabled")
             return
 
+        # Seed from both sides of each replacement: after a hand edit the
+        # `supports` edges have been remapped onto the new node, while the
+        # revision flow leaves them on the old one.
         frontier: deque[tuple[str, int]] = deque(
-            (nid, 0) for nid in sorted(set(replacements) | set(stale_sources))
+            (nid, 0)
+            for nid in sorted(
+                set(replacements) | set(replacements.values()) | set(stale_sources)
+            )
         )
         visited: set[str] = set()
         processed = 0
@@ -2032,7 +2234,9 @@ class GraphWriteSession:
         if replacement.id == old.id:
             return old
         self._persist_node(replacement)
-        self._link_supports(replacement, [n.id for n in support_nodes])
+        self._link_supports(replacement, support_ids)
+        # Keep UI provenance: notes render their sources via `reference` edges.
+        self._link_references(replacement, support_ids)
         self._supersede(old, replacement)
         return replacement
 
