@@ -13,6 +13,7 @@ import {
   Plus,
   Send,
   Sparkles,
+  Square,
 } from 'lucide-react'
 import { useT } from '../i18n.jsx'
 
@@ -25,6 +26,8 @@ const STR = {
     topics: '件のトピック',
     askPlaceholder: '追加で質問を入力してください…',
     ask: '質問',
+    stop: '停止',
+    stopping: '停止中…',
     thinking: '考えています…',
     working: '作業中…',
     answerDone: '回答が完了しました',
@@ -56,6 +59,8 @@ const STR = {
     topics: 'topics',
     askPlaceholder: 'Ask a follow-up question...',
     ask: 'Ask',
+    stop: 'Stop',
+    stopping: 'Stopping…',
     thinking: 'Thinking…',
     working: 'Working…',
     answerDone: 'Answer ready',
@@ -92,6 +97,10 @@ export default function ChatPanel({
   savedIds,
   addingIds,
   writeStatuses,
+  agentRunning,
+  agentCanStop,
+  agentStopping,
+  onStopAgent,
 }) {
   const t = useT(STR)
   const [question, setQuestion] = useState('')
@@ -103,7 +112,7 @@ export default function ChatPanel({
 
   const submit = () => {
     const clean = question.trim()
-    if (!clean) return
+    if (!clean || agentRunning) return
 
     onAsk(clean)
     setQuestion('')
@@ -157,19 +166,36 @@ export default function ChatPanel({
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) submit()
+              if (e.key === 'Enter' && !e.shiftKey && !agentRunning) submit()
             }}
             placeholder={t.askPlaceholder}
           />
 
-          <button
-            className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-blue-600 text-white shadow-sm transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={submit}
-            disabled={!question.trim()}
-            title={t.ask}
-          >
-            <Send size={18} />
-          </button>
+          {agentRunning ? (
+            <button
+              className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-red-600 text-white shadow-sm transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={onStopAgent}
+              disabled={!agentCanStop || agentStopping}
+              title={agentStopping ? t.stopping : agentCanStop ? t.stop : t.working}
+              aria-label={agentStopping ? t.stopping : agentCanStop ? t.stop : t.working}
+            >
+              {agentStopping || !agentCanStop ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : (
+                <Square size={16} fill="currentColor" />
+              )}
+            </button>
+          ) : (
+            <button
+              className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-blue-600 text-white shadow-sm transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={submit}
+              disabled={!question.trim()}
+              title={t.ask}
+              aria-label={t.ask}
+            >
+              <Send size={18} />
+            </button>
+          )}
         </div>
 
         <p className="mt-2 text-center text-[11px] font-medium text-slate-400">

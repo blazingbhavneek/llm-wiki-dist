@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  ArrowLeft,
   BookMarked,
   BookOpen,
   Bookmark,
@@ -20,9 +21,9 @@ import {
   Search,
   Settings,
   Sparkles,
-  Tags,
   Upload,
   UserCircle,
+  X,
 } from 'lucide-react'
 
 import ChatPanel from './components/ChatPanel'
@@ -63,6 +64,7 @@ const STR = {
       graph: 'グラフ',
       upload: 'アップロード',
       glossary: '用語集',
+      explorer: 'エクスプローラー',
       topics: 'トピック',
       settings: '設定',
       newChat: '新しいチャット',
@@ -112,12 +114,22 @@ const STR = {
       documentsSubtitle: '元ドキュメントのナビゲーション',
       topicsTitle: 'トピック',
       topicsSubtitle: 'トピック別に整理',
+      explorerTab: 'エクスプローラー',
+      sourcesTab: 'ソース',
+      sourcesTitle: '回答のソース',
+      sourcesSubtitle: (n) => `${n} 件のソースノード`,
+      viewAnswer: '回答を開く',
+      usedSource: '使用済みソース',
+      missingSource: 'ソースノードが見つかりません。',
+      noSources: 'この回答にソースノードはありません。',
     },
 
     markdownFrame: {
       fallbackTitle: 'ドキュメント',
       hint: 'ドキュメント領域をダブルクリックすると編集できます。折りたたむとこの表示を閉じます。',
       working: '処理中…',
+      back: '戻る',
+      backTitle: '前の画面に戻る',
       collapse: '折りたたむ',
       collapseTitle: 'ドキュメントを折りたたむ',
     },
@@ -188,6 +200,9 @@ const STR = {
 
     working: '作業中…',
     answerReady: (steps) => `${steps} ステップで回答ができました。`,
+    agentStopped: 'エージェントを停止しました',
+    agentStoppedText: 'エージェントの実行は停止されました。',
+    stopAgentFailed: (m) => `停止に失敗しました: ${m}`,
     openedReview: 'ワークスペースで開きました →。確認してから wiki に追加してください。',
     foundNoBody: 'ソースは見つかりましたが、回答本文がありません。',
     foundNoBodyText: (c, steps) =>
@@ -229,6 +244,7 @@ const STR = {
       graph: 'Graph',
       upload: 'Upload',
       glossary: 'Glossary',
+      explorer: 'Explorer',
       topics: 'Topics',
       settings: 'Settings',
       newChat: 'New chat',
@@ -278,12 +294,22 @@ const STR = {
       documentsSubtitle: 'Original document navigation',
       topicsTitle: 'Topics',
       topicsSubtitle: 'Arranged by topic',
+      explorerTab: 'Explorer',
+      sourcesTab: 'Sources',
+      sourcesTitle: 'Answer sources',
+      sourcesSubtitle: (n) => `${n} source node${n === 1 ? '' : 's'}`,
+      viewAnswer: 'View answer',
+      usedSource: 'Used source',
+      missingSource: 'Source node not found.',
+      noSources: 'This answer has no source nodes.',
     },
 
     markdownFrame: {
       fallbackTitle: 'Document',
       hint: 'Double-click the document area to edit. Collapse closes this view.',
       working: 'Working…',
+      back: 'Back',
+      backTitle: 'Back to previous screen',
       collapse: 'Collapse',
       collapseTitle: 'Collapse document',
     },
@@ -354,6 +380,9 @@ const STR = {
 
     working: 'Working…',
     answerReady: (steps) => `Answer ready in ${steps} steps.`,
+    agentStopped: 'Agent stopped',
+    agentStoppedText: 'The agent run was stopped.',
+    stopAgentFailed: (m) => `Stop failed: ${m}`,
     openedReview: 'Opened in the workspace →. Review it, then add it to the wiki.',
     foundNoBody: 'Found sources, but no answer body.',
     foundNoBodyText: (c, steps) =>
@@ -383,7 +412,8 @@ const STR = {
 function LeftSidebar({
   collapsed,
   activeView,
-  rightMode,
+  activeRightTabId,
+  rightOpen,
   recentQuestions,
   onToggle,
   onNavigate,
@@ -417,10 +447,10 @@ function LeftSidebar({
       view: 'glossary',
     },
     {
-      id: 'topics',
-      label: t.shell.topics,
-      icon: Tags,
-      view: 'topics',
+      id: 'explorer',
+      label: t.shell.explorer,
+      icon: FolderTree,
+      view: 'explorer',
     },
   ]
 
@@ -469,8 +499,8 @@ function LeftSidebar({
           {items.map((item) => {
             const Icon = item.icon
             const active =
-              item.view === 'topics'
-                ? rightMode === 'topics'
+              item.view === 'explorer'
+                ? rightOpen && activeRightTabId === 'explorer'
                 : activeView === item.view
 
             return (
@@ -672,21 +702,257 @@ function RightDocumentRail({
   mode,
   library,
   workspace,
+  tabs,
+  activeTabId,
+  onActivateTab,
+  onCloseTab,
   onModeChange,
   onOpenNode,
   onOpenFullDoc,
+  rawById,
+  onViewAnswer,
 }) {
+  const t = useT(STR)
+
+  const allTabs = [
+    {
+      id: 'explorer',
+      kind: 'explorer',
+      title: t.rightRail.explorerTab,
+    },
+    ...(Array.isArray(tabs) ? tabs : []),
+  ]
+
+  const activeTab =
+    allTabs.find((tab) => tab.id === activeTabId) ||
+    allTabs[0]
+
   return (
-    <aside className="h-full min-h-0 w-[360px] shrink-0 border-l border-line bg-[#f8fafc]">
-      <DocSidebar
-        mode={mode}
-        library={library}
-        activeTabId={workspace?.id}
-        onModeChange={onModeChange}
-        onOpenNode={onOpenNode}
-        onOpenFullDoc={onOpenFullDoc}
-      />
+    <aside className="flex h-full min-h-0 w-[380px] shrink-0 flex-col border-l border-line bg-[#f8fafc]">
+      <div className="flex h-[46px] shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-white px-2">
+        {allTabs.map((tab) => {
+          const active = tab.id === activeTab.id
+          const closable = tab.kind !== 'explorer'
+
+          return (
+            <div
+              key={tab.id}
+              className={`group flex h-8 min-w-0 shrink-0 items-center rounded-lg border text-[12px] font-extrabold transition ${
+                active
+                  ? 'border-blue-200 bg-blue-50 text-blue-700'
+                  : 'border-transparent bg-white text-slate-500 hover:bg-slate-50 hover:text-slate-900'
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() => onActivateTab?.(tab.id)}
+                className="flex h-full min-w-0 items-center gap-1.5 px-2"
+                title={tab.title}
+              >
+                {tab.kind === 'explorer' ? (
+                  <FolderTree size={14} />
+                ) : (
+                  <FileText size={14} />
+                )}
+                <span className="max-w-[120px] truncate">
+                  {tab.kind === 'explorer' ? tab.title : tab.title || t.rightRail.sourcesTab}
+                </span>
+              </button>
+
+              {closable && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onCloseTab?.(tab.id)
+                  }}
+                  className="mr-1 grid h-6 w-6 place-items-center rounded-md text-slate-400 hover:bg-white hover:text-slate-700"
+                  title={t.closeTab}
+                  aria-label={t.closeTab}
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      <div className="min-h-0 flex-1">
+        {activeTab.kind === 'sources' ? (
+          <AnswerSourcesSidebar
+            answer={activeTab.answer}
+            rawById={rawById}
+            activeNodeId={workspace?.kind === 'doc' ? workspace.nodeId : null}
+            onOpenNode={onOpenNode}
+            onViewAnswer={onViewAnswer}
+          />
+        ) : (
+          <DocSidebar
+            mode={mode}
+            library={library}
+            activeTabId={workspace?.id}
+            onModeChange={onModeChange}
+            onOpenNode={onOpenNode}
+            onOpenFullDoc={onOpenFullDoc}
+          />
+        )}
+      </div>
     </aside>
+  )
+}
+
+function AnswerSourcesSidebar({
+  answer,
+  rawById,
+  activeNodeId,
+  onOpenNode,
+  onViewAnswer,
+}) {
+  const t = useT(STR)
+
+  const refs = Array.isArray(answer?.refs) ? answer.refs : []
+  const refById = new Map(refs.map((ref) => [ref.id, ref]))
+  const citedIds = Array.from(
+    new Set([
+      ...(Array.isArray(answer?.citedIds) ? answer.citedIds : []),
+      ...refs.map((ref) => ref.id).filter(Boolean),
+    ]),
+  )
+
+  const rows = citedIds.map((id) => {
+    const node = rawById?.get?.(id)
+    const ref = refById.get(id)
+    const title =
+      node?.title ||
+      node?.entity ||
+      node?.name ||
+      ref?.label ||
+      id
+    const summary =
+      node?.summary ||
+      node?.abstract ||
+      node?.text ||
+      node?.body ||
+      ref?.note ||
+      ''
+    const sourceName =
+      node?.original_document_name ||
+      node?.documentName ||
+      node?.sourceName ||
+      node?.source_path ||
+      node?.source ||
+      ''
+    const typeLabel =
+      node?.type === 'exogenous'
+        ? t.searchResults.agentNote
+        : t.searchResults.sourceNote
+
+    return {
+      id,
+      node,
+      title,
+      summary,
+      sourceName,
+      typeLabel,
+    }
+  })
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-[#f8fafc] px-[12px] py-[14px]">
+      <div className="mb-3 border-b border-line pb-3">
+        <div className="flex items-start gap-2">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-emerald-100 text-emerald-700">
+            <FileText size={17} />
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-extrabold text-slate-900">
+              {t.rightRail.sourcesTitle}
+            </div>
+            <div className="mt-0.5 line-clamp-2 text-[12px] font-semibold leading-5 text-slate-500">
+              {answer?.title || answer?.question || t.answer}
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-extrabold text-emerald-700">
+            {t.rightRail.sourcesSubtitle(rows.length)}
+          </span>
+
+          {answer?.markdown && (
+            <button
+              type="button"
+              onClick={() => onViewAnswer?.(answer)}
+              className="rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-[11px] font-extrabold text-blue-700 hover:bg-blue-100"
+            >
+              {t.rightRail.viewAnswer}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto pb-5">
+        {rows.length === 0 && (
+          <p className="py-[20px] text-[12.5px] text-muted">
+            {t.rightRail.noSources}
+          </p>
+        )}
+
+        <div className="space-y-2">
+          {rows.map((row) => {
+            const active = row.id === activeNodeId
+            const disabled = !row.node
+
+            return (
+              <button
+                key={row.id}
+                type="button"
+                disabled={disabled}
+                onClick={() => row.node && onOpenNode?.(row.node)}
+                className={`w-full rounded-xl border p-3 text-left shadow-sm transition ${
+                  active
+                    ? 'border-blue-300 bg-blue-50'
+                    : 'border-emerald-200 bg-white hover:border-emerald-300 hover:bg-emerald-50/40'
+                } ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}
+              >
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-emerald-700">
+                    {t.rightRail.usedSource}
+                  </span>
+                  <span className="shrink-0 text-[10.5px] font-bold text-slate-400">
+                    {row.typeLabel}
+                  </span>
+                </div>
+
+                <div className="text-[13px] font-extrabold leading-5 text-slate-900">
+                  {row.title}
+                </div>
+
+                {row.sourceName && (
+                  <div className="mt-1 line-clamp-1 text-[11px] font-semibold text-slate-400">
+                    {row.sourceName}
+                  </div>
+                )}
+
+                {row.summary ? (
+                  <p className="mt-2 line-clamp-3 text-[12px] leading-5 text-slate-600">
+                    {row.summary}
+                  </p>
+                ) : (
+                  disabled && (
+                    <p className="mt-2 text-[12px] leading-5 text-slate-500">
+                      {t.rightRail.missingSource}
+                    </p>
+                  )
+                )}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -866,12 +1132,31 @@ function SettingsCenter({ children }) {
   )
 }
 
-function MarkdownWorkspaceFrame({ item, children, onClose, onDoubleClick }) {
+function MarkdownWorkspaceFrame({
+  item,
+  children,
+  canGoBack,
+  onBack,
+  onClose,
+  onDoubleClick,
+}) {
   const t = useT(STR)
 
   return (
     <div className="flex h-full flex-col bg-white">
       <div className="flex h-[54px] shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4">
+        {canGoBack && (
+          <button
+            onClick={onBack}
+            className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-[12px] font-bold text-slate-600 hover:bg-slate-50 hover:text-slate-950"
+            title={t.markdownFrame.backTitle}
+            aria-label={t.markdownFrame.backTitle}
+          >
+            <ArrowLeft size={16} />
+            <span>{t.markdownFrame.back}</span>
+          </button>
+        )}
+
         <div className="grid h-9 w-9 place-items-center rounded-xl bg-blue-50 text-blue-700">
           <FileText size={18} />
         </div>
@@ -1015,6 +1300,8 @@ export default function App() {
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightOpen, setRightOpen] = useState(true)
   const [rightMode, setRightMode] = useState('documents') // documents | topics
+  const [rightTabs, setRightTabs] = useState([])
+  const [activeRightTabId, setActiveRightTabId] = useState('explorer')
   const [centerView, setCenterView] = useState('chat') // chat | graph | upload | glossary | settings | markdown | search
 
   /**
@@ -1035,6 +1322,7 @@ export default function App() {
    * MarkdownView.
    */
   const [workspace, setWorkspace] = useState(null)
+  const [centerHistory, setCenterHistory] = useState([])
 
   const draftSeq = useRef(0)
 
@@ -1044,6 +1332,9 @@ export default function App() {
   const [savedIds, setSavedIds] = useState(() => new Set())
   const [addingIds, setAddingIds] = useState(() => new Set())
   const [answerWriteStatuses, setAnswerWriteStatuses] = useState(() => new Map())
+  const [agentRunning, setAgentRunning] = useState(false)
+  const [agentRunId, setAgentRunId] = useState(null)
+  const [agentStopping, setAgentStopping] = useState(false)
   const answerSeq = useRef(0)
 
   const [focusIds, setFocusIds] = useState(null)
@@ -1076,13 +1367,21 @@ export default function App() {
     return new Set()
   }, [workspace])
 
-  const answerIds = useMemo(() => {
+  const activeRightTab = useMemo(() => {
+    return rightTabs.find((tab) => tab.id === activeRightTabId) || null
+  }, [rightTabs, activeRightTabId])
+
+  const activeSourceIds = useMemo(() => {
+    if (activeRightTab?.kind === 'sources') {
+      return new Set(activeRightTab.answer?.citedIds || [])
+    }
+
     if (workspace?.kind === 'answer') {
       return new Set(workspace.answer?.citedIds || [])
     }
 
     return new Set()
-  }, [workspace])
+  }, [activeRightTab, workspace])
 
   const graph = useMemo(() => layoutGraph(raw.nodes, raw.edges), [raw])
 
@@ -1224,6 +1523,34 @@ export default function App() {
   // Workspace helpers
   // ---------------------------------------------------------------------------
 
+  const pushCenterHistory = () => {
+    if (!centerView) return
+    if (centerView === 'markdown' && !workspace) return
+
+    const entry =
+      centerView === 'markdown'
+        ? {
+            centerView,
+            workspace,
+          }
+        : {
+            centerView,
+          }
+
+    setCenterHistory((prev) => {
+      const last = prev[prev.length - 1]
+
+      if (
+        last?.centerView === entry.centerView &&
+        last?.workspace?.id === entry.workspace?.id
+      ) {
+        return prev
+      }
+
+      return [...prev, entry].slice(-20)
+    })
+  }
+
   const updateWorkspace = (id, patch) => {
     setWorkspace((prev) => {
       if (!prev || prev.id !== id) return prev
@@ -1237,12 +1564,38 @@ export default function App() {
 
   const closeWorkspace = () => {
     setWorkspace(null)
+    setCenterHistory([])
     setCenterView('chat')
   }
 
-  const openWorkspace = (next) => {
+  const openWorkspace = (next, options = {}) => {
+    const shouldPush =
+      options.pushHistory !== false &&
+      (centerView !== 'markdown' || workspace?.id !== next?.id)
+
+    if (shouldPush) {
+      pushCenterHistory()
+    }
+
     setWorkspace(next)
     setCenterView('markdown')
+  }
+
+  const goBackFromWorkspace = () => {
+    const target = centerHistory[centerHistory.length - 1]
+
+    if (!target) return
+
+    setCenterHistory((prev) => prev.slice(0, -1))
+
+    if (target.centerView === 'markdown' && target.workspace) {
+      setWorkspace(target.workspace)
+      setCenterView('markdown')
+      return
+    }
+
+    setWorkspace(null)
+    setCenterView(target.centerView || 'chat')
   }
 
   const openNode = (n) => {
@@ -1400,16 +1753,74 @@ export default function App() {
       refs: answer.refs || [],
     }
 
-    setWorkspace(next)
     setActiveAnswerId(answer.id)
     setFocusIds(new Set(answer.citedIds || []))
 
     if (expand) {
-      setCenterView('markdown')
+      openWorkspace(next)
+    } else {
+      setWorkspace(next)
     }
   }
 
   const startEdit = (id) => updateWorkspace(id, { editing: true })
+
+  const cancelEdit = (id) => {
+    setWorkspace((prev) => {
+      if (!prev || prev.id !== id) return prev
+
+      return {
+        ...prev,
+        editing: false,
+        draft: {
+          title: prev.doc?.title || prev.draft?.title || '',
+          markdown: prev.doc?.markdown ?? prev.draft?.markdown ?? '',
+        },
+      }
+    })
+  }
+
+  const openAnswerSourcesTab = (answer) => {
+    const citedIds = Array.isArray(answer?.citedIds) ? answer.citedIds : []
+    const refs = Array.isArray(answer?.refs) ? answer.refs : []
+
+    if (!answer || (citedIds.length === 0 && refs.length === 0)) return false
+
+    const id = `sources:${answer.id}`
+    const title = answer.title || answer.question || t.answer
+
+    setRightTabs((prev) => {
+      const nextTab = {
+        id,
+        kind: 'sources',
+        title: title.slice(0, 26),
+        answer,
+      }
+      const existing = prev.findIndex((tab) => tab.id === id)
+
+      if (existing === -1) {
+        return [...prev, nextTab]
+      }
+
+      const next = prev.slice()
+      next[existing] = nextTab
+      return next
+    })
+
+    setActiveRightTabId(id)
+    setRightOpen(true)
+    setActiveAnswerId(answer.id)
+    setFocusIds(new Set(citedIds))
+
+    return true
+  }
+
+  const closeRightTab = (id) => {
+    if (id === 'explorer') return
+
+    setRightTabs((prev) => prev.filter((tab) => tab.id !== id))
+    setActiveRightTabId((current) => (current === id ? 'explorer' : current))
+  }
 
   const changeTitle = (id, title) => {
     setWorkspace((prev) => {
@@ -1724,7 +2135,24 @@ export default function App() {
 
       // Store as workspace data, but do not force full markdown view.
       openAnswerTab(answer, false)
+      openAnswerSourcesTab(answer)
     } else {
+      if (cited.length) {
+        answerSeq.current += 1
+      }
+
+      const sourceOnlyAnswer = cited.length
+        ? {
+            id: answerSeq.current,
+            question: q,
+            title: q,
+            markdown: '',
+            refs,
+            steps: ans.steps,
+            citedIds: cited,
+          }
+        : null
+
       patchLast(() => ({
         role: 'assistant',
         title: t.foundNoBody,
@@ -1733,7 +2161,9 @@ export default function App() {
         activity,
       }))
 
-      if (cited[0]) {
+      if (sourceOnlyAnswer) {
+        openAnswerSourcesTab(sourceOnlyAnswer)
+      } else if (cited[0]) {
         openNodeById(cited[0])
       }
     }
@@ -1742,9 +2172,12 @@ export default function App() {
   const ask = async (q) => {
     const clean = q.trim()
 
-    if (!clean) return
+    if (!clean || agentRunning) return
 
     setCenterView('chat')
+    setAgentRunning(true)
+    setAgentRunId(null)
+    setAgentStopping(false)
 
     setMessages((prev) => [
       ...prev,
@@ -1761,9 +2194,27 @@ export default function App() {
     ])
 
     const activity = []
+    let sawCancelled = false
 
     try {
       await api.askStream(clean, overrides, (ev) => {
+        if (ev.type === 'run') {
+          setAgentRunId(ev.run_id || null)
+          return
+        }
+
+        if (ev.type === 'cancelled') {
+          sawCancelled = true
+
+          return patchLast((m) => ({
+            ...m,
+            streaming: false,
+            title: t.agentStopped,
+            text: t.agentStoppedText,
+            activity: activity.length ? [...activity] : m.activity || [],
+          }))
+        }
+
         if (ev.type === 'answer') {
           return finalizeAnswer(ev, activity, clean)
         }
@@ -1807,11 +2258,30 @@ export default function App() {
         }))
       })
     } catch (e) {
+      if (sawCancelled) return
+
       patchLast(() => ({
         role: 'assistant',
         title: t.requestFailed,
         text: e.message,
       }))
+    } finally {
+      setAgentRunning(false)
+      setAgentRunId(null)
+      setAgentStopping(false)
+    }
+  }
+
+  const stopAgent = async () => {
+    if (!agentRunId || agentStopping) return
+
+    setAgentStopping(true)
+
+    try {
+      await api.stopAgentRun(agentRunId)
+    } catch (e) {
+      setAgentStopping(false)
+      fireToast(t.stopAgentFailed(e.message))
     }
   }
 
@@ -1944,14 +2414,22 @@ export default function App() {
   // ---------------------------------------------------------------------------
 
   const handleNav = (view) => {
-    if (view === 'topics') {
-      setRightMode('topics')
+    if (view === 'explorer') {
+      setActiveRightTabId('explorer')
       setRightOpen(true)
       return
     }
 
     if (view === 'documents') {
+      setActiveRightTabId('explorer')
       setRightMode('documents')
+      setRightOpen(true)
+      return
+    }
+
+    if (view === 'topics') {
+      setActiveRightTabId('explorer')
+      setRightMode('topics')
       setRightOpen(true)
       return
     }
@@ -1960,9 +2438,19 @@ export default function App() {
   }
 
   const handleNewChat = () => {
+    if (agentRunId) {
+      api.stopAgentRun(agentRunId).catch(() => {})
+    }
+
     setMessages([])
     setWorkspace(null)
     setActiveAnswerId(null)
+    setRightTabs([])
+    setActiveRightTabId('explorer')
+    setCenterHistory([])
+    setAgentRunning(false)
+    setAgentRunId(null)
+    setAgentStopping(false)
     setCenterView('chat')
   }
 
@@ -1999,7 +2487,7 @@ export default function App() {
             worldW={graph.worldW}
             worldH={graph.worldH}
             openIds={openIds}
-            answerIds={answerIds}
+            answerIds={activeSourceIds}
             showConflict={false}
             showStale={false}
             onOpenNode={openNode}
@@ -2053,6 +2541,8 @@ export default function App() {
       return (
         <MarkdownWorkspaceFrame
           item={workspace}
+          canGoBack={centerHistory.length > 0}
+          onBack={goBackFromWorkspace}
           onClose={closeWorkspace}
           onDoubleClick={() => {
             if (workspace.kind !== 'fulldoc') {
@@ -2077,6 +2567,7 @@ export default function App() {
             busyMessage={workspace.busyMessage}
             refs={workspace.refs}
             onStartEdit={() => startEdit(workspace.id)}
+            onCancelEdit={() => cancelEdit(workspace.id)}
             onConfirm={() => {
               if (workspace.kind === 'doc') {
                 saveNode(workspace)
@@ -2115,6 +2606,10 @@ export default function App() {
               savedIds={savedIds}
               addingIds={addingIds}
               writeStatuses={answerWriteStatuses}
+              agentRunning={agentRunning}
+              agentCanStop={!!agentRunId}
+              agentStopping={agentStopping}
+              onStopAgent={stopAgent}
             />
           </div>
         </div>
@@ -2127,7 +2622,8 @@ export default function App() {
       <LeftSidebar
         collapsed={leftCollapsed}
         activeView={centerView}
-        rightMode={rightMode}
+        activeRightTabId={activeRightTabId}
+        rightOpen={rightOpen}
         recentQuestions={recentQuestions}
         onToggle={() => setLeftCollapsed((v) => !v)}
         onNavigate={handleNav}
@@ -2175,9 +2671,15 @@ export default function App() {
               mode={rightMode}
               library={docLibrary}
               workspace={workspace}
+              tabs={rightTabs}
+              activeTabId={activeRightTabId}
+              onActivateTab={setActiveRightTabId}
+              onCloseTab={closeRightTab}
               onModeChange={setRightMode}
               onOpenNode={openNode}
               onOpenFullDoc={openFullDoc}
+              rawById={rawById}
+              onViewAnswer={(answer) => openAnswerTab(answer, true)}
               onClose={() => setRightOpen(false)}
             />
           )}
@@ -2188,4 +2690,3 @@ export default function App() {
     </div>
   )
 }
-

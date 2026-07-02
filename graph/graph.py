@@ -18,9 +18,10 @@ from typing import Any, Callable, Literal
 
 from db import Database
 from embeddings import Embedder, Reranker
-from llm.agent import AgentClient
+from llm.llm import LlmClient as OpenAiLlmClient
 
 from .enrich import *
+from .langgraph_agent import AgentStopped, run_lead_agent, run_subagent
 from .models import *
 from .utils import *
 
@@ -64,7 +65,7 @@ class SharedGraphRuntime:
         self.embedder = Embedder(settings)
         self.reranker = self._build_reranker(settings)
         print("[runtime] SharedGraphRuntime ready", flush=True)
-        self.llm = AgentClient(
+        self.llm = OpenAiLlmClient(
             model=settings.chat_model,
             base_url=settings.chat_base_url,
             api_key=settings.chat_api_key,
@@ -180,7 +181,7 @@ class GraphReadSession:
             return
         self.settings = replace(self.settings, **clean)
         if any(k in clean for k in str_keys) or "chat_temperature" in clean:
-            self.llm = AgentClient(
+            self.llm = OpenAiLlmClient(
                 model=self.settings.chat_model,
                 base_url=self.settings.chat_base_url,
                 api_key=self.settings.chat_api_key,
@@ -624,6 +625,7 @@ class GraphReadSession:
         question: str,
         persist: bool = False,
         on_event: Callable[[dict[str, Any]], None] | None = None, # callback for event emission
+        stop_event: threading.Event | None = None,
     ) -> AgentAnswer:
         if persist:
             raise ValueError("ReadSession.ask() must use persist=False")
@@ -631,7 +633,7 @@ class GraphReadSession:
         emit = on_event or (lambda event: None)
         emit({"type": "start", "question": question})
 
-        answer = self._run_lead(question, emit)
+        answer = self._run_lead(question, emit, stop_event=stop_event)
 
         # if model was asked to generate mermaid, check if it was done right and fix it if any error
         if self.settings.enable_mermaid and answer.answer:
@@ -643,66 +645,13 @@ class GraphReadSession:
         emit({"type": "done"})
         return answer
 
-    def _run_lead(self, question: str, emit: Callable) -> AgentAnswer:
-        evidence: list[str] = []
-
-        # custom tool call executor, since we have to manage a runtime, easier to execute tools here rather than making tools that need 
-        # to take in many many parameters just so they can run in isolation, and way too many variables involved to setup tools seperately for each agent
-        def dispatch(name: str, args: dict[str, Any]) -> str:
-            if name == "search":
-                query = str(args.get("text", ""))
-                emit({"type": "search", "phase": "main", "query": query})
-                try:
-                    results = self.search_with_evidence(
-                        query, limit=self.settings.rerank_top_k
-                    )
-                except Exception as exc:
-                    log.info("lead evidence search failed; node-only: %s", exc)
-                    results = [
-                        {"node": n, "why": [], "evidence": []}
-                        for n in self.search(query, limit=self.settings.rerank_top_k)
-                    ]
-                candidate_nodes = [r["node"] for r in results]
-                emit(
-                    {
-                        "type": "candidates",
-                        "count": len(candidate_nodes),
-                        "nodes": [node_ref(n) for n in candidate_nodes],
-                    }
-                )
-                if not candidate_nodes:
-                    return "no nodes found"
-                return "\n".join(format_lead_candidate(r) for r in results)
-            if name == "explore":
-                return self._run_subagents(
-                    args.get("node_ids", []), question, evidence, emit
-                )
-            return f"unknown tool: {name}"
-
-        system_prompt = MAIN_AGENT_SYSTEM_PROMPT
-        if self.settings.enable_mermaid:
-            system_prompt += MERMAID_INSTRUCTION
-
-        # simple React style agent, runs until model keeps emitting tools
-        result = self.llm.run_tool_loop(
-            system_prompt, question, LEAD_TOOLS, dispatch, self.settings.agent_max_steps
-        )
-        emit({"type": "compiling"})
-
-        if result.finished_args is not None:
-            answer_text = str(result.finished_args.get("answer", "")).strip()
-            cited = [
-                nid for nid in result.finished_args.get("cited_node_ids", []) if nid
-            ]
-        else:
-            answer_text, cited = result.content, []
-
-        return AgentAnswer(
-            question=question,
-            answer=answer_text,
-            cited_node_ids=cited or dedupe(evidence),
-            steps=result.steps,
-        )
+    def _run_lead(
+        self,
+        question: str,
+        emit: Callable,
+        stop_event: threading.Event | None = None,
+    ) -> AgentAnswer:
+        return run_lead_agent(self, question, emit, stop_event=stop_event)
 
     # Run a subagent to explor multiple topics to avoid missing a path that might have been a better answer
     def _run_subagents(
@@ -711,6 +660,7 @@ class GraphReadSession:
         question: str,
         evidence: list[str],
         emit: Callable,
+        stop_event: threading.Event | None = None,
     ) -> str:
         starts = self._resolve_distinct_starts(raw_node_ids)
         if not starts:
@@ -735,9 +685,11 @@ class GraphReadSession:
 
                 # the subagent is started given the same question but a different starting point to explore multiple possible paths
                 report = self._run_single_subagent(
-                    start, siblings, question, index, emit
+                    start, siblings, question, index, emit, stop_event=stop_event
                 )
                 reports.append(report)
+            except AgentStopped:
+                raise
             except Exception as exc:
                 reports.append(
                     {
@@ -783,6 +735,7 @@ class GraphReadSession:
         question: str,
         index: int,
         emit: Callable,
+        stop_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         run = Subrun(start_id=start_id, index=index)
 
@@ -791,17 +744,6 @@ class GraphReadSession:
             emit(
                 {"type": "subagent_start", "agent": index, "node": node_ref(start_node)}
             )
-
-        def dispatch(name: str, args: dict[str, Any]) -> str:
-            return self._dispatch_subagent(name, args, run, emit)
-
-        def finish_guard(_args: dict[str, Any]) -> str | None:
-            if len(run.read_ids) < self.settings.subagent_min_reads:
-                return (
-                    f"You have read only {len(run.read_ids)} node(s); read at least "
-                    f"{self.settings.subagent_min_reads} before finishing. Read another now."
-                )
-            return None
 
         siblings_str = ", ".join(sibling_ids) if sibling_ids else "(none)"
         user_prompt = (
@@ -812,31 +754,9 @@ class GraphReadSession:
             "この領域がその質問について何を述べているかを報告してください。"
         )
 
-        result = self.llm.run_tool_loop(
-            SUBAGENT_SYSTEM_PROMPT,
-            user_prompt,
-            SUBAGENT_TOOLS,
-            dispatch,
-            self.settings.subagent_max_steps,
-            finish_guard=finish_guard,
+        return run_subagent(
+            self, run, question, user_prompt, emit, stop_event=stop_event
         )
-
-        if result.finished_args is not None:
-            answer = str(result.finished_args.get("answer", "")).strip()
-            cited = [
-                nid for nid in result.finished_args.get("cited_node_ids", []) if nid
-            ]
-        else:
-            answer, cited = result.content, []
-
-        cited = cited or dedupe(run.visited)
-        emit({"type": "subagent_done", "agent": index, "cited": cited})
-
-        return {
-            "start": start_id,
-            "answer": answer or "(no findings)",
-            "cited": cited,
-        }
 
     # A bit misworded, its not a agent dispatched, its a tool call for a subagent + its emitted message which can be read by UI
     def _dispatch_subagent(
@@ -2611,13 +2531,19 @@ class ReadGraphService:
         question: str,
         on_event: Callable[[dict], None] | None = None,
         overrides: dict[str, Any] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> AgentAnswer:
         def work():
             db = GraphDbSession(self.runtime.settings, readonly=True)
             try:
                 session = GraphReadSession(self.runtime, db)
                 session.apply_overrides(overrides)
-                return session.ask(question, persist=False, on_event=on_event)
+                return session.ask(
+                    question,
+                    persist=False,
+                    on_event=on_event,
+                    stop_event=stop_event,
+                )
             finally:
                 db.close()
 
@@ -3006,4 +2932,3 @@ def bootstrap_database(settings: Settings) -> None:
     finally:
         print("[bootstrap] DONE", flush=True)
         db.close()
-
