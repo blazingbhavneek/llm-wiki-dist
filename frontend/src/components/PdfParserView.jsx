@@ -54,9 +54,9 @@ export default function PdfParserView({
   const fileRef = useRef(null)
 
   const [file, setFile] = useState(null)
-  const [baseUrl, setBaseUrl] = useState('https://integrate.api.nvidia.com/v1/chat/completions')
+  const [baseUrl, setBaseUrl] = useState('http://10.160.144.101:51021/v1')
   const [apiKey, setApiKey] = useState('<API_KEY>')
-  const [model, setModel] = useState('google/gemma-4-31b-it')
+  const [model, setModel] = useState('openai/gpt-oss-120b')
 
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('')
@@ -229,7 +229,7 @@ export default function PdfParserView({
                 label="NVIDIA Invoke URL"
                 value={baseUrl}
                 onChange={setBaseUrl}
-                placeholder="https://integrate.api.nvidia.com/v1/chat/completions"
+                placeholder="http://10.160.144.101:51021/v1"
                 disabled={busy}
               />
 
@@ -237,7 +237,7 @@ export default function PdfParserView({
                 label="Model"
                 value={model}
                 onChange={setModel}
-                placeholder="google/gemma-4-31b-it"
+                placeholder="openai/gpt-oss-120b"
                 disabled={busy}
               />
             </div>

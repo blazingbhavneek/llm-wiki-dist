@@ -17,3 +17,15 @@ frontend/node_modules
 llm-wiki-dist.zip
 zip.py
 .wiki_backups/
+
+# db
+.wiki/
+
+# helpers
+sample.py
+translate.py
+translation_judge_log.jsonl
+
+
+# misc
+.DS_Store

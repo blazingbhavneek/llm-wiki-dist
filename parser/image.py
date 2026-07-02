@@ -28,11 +28,11 @@ OUTPUT_FILE = None
 # If OUTPUT_FILE is None, output will be:
 # input_filename.described.md
 
-OPENAI_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+OPENAI_BASE_URL = "http://10.160.144.101:51021/v1"
 OPENAI_API_KEY = (
     "<API_KEY>"
 )
-OPENAI_MODEL = "google/gemma-4-31b-it"
+OPENAI_MODEL = "openai/gpt-oss-120b"
 
 CONCURRENCY = 5
 TEMPERATURE = 0.3

@@ -55,7 +55,7 @@ async def lifespan(_: FastAPI):
     # Bootstrap DB tables / vectors / clusters (blocking)
     await asyncio.to_thread(bootstrap_database, settings)
 
-    read_service = ReadGraphService(runtime, max_reads=8, max_agents=2)
+    read_service = ReadGraphService(runtime, max_reads=16, max_agents=16)
     write_service = WriteGraphService(runtime, max_queue_size=100)
     await write_service.start()
 

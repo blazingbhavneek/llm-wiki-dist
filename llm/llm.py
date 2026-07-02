@@ -11,14 +11,14 @@ import requests
 from pydantic import ValidationError
 
 from .base import BaseLlmClient
+from .utils import strip_image_media
 
-NVIDIA_INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-NVIDIA_API_KEY = (
+INVOKE_URL = "http://10.160.144.101:51021/v1"
+API_KEY = (
     "<API_KEY>"
 )
-NVIDIA_MODEL = "google/gemma-4-31b-it"
-NVIDIA_MAX_TOKENS = 16384
-NVIDIA_TOP_P = 0.95
+MODEL = "openai/gpt-oss-120b"
+
 
 
 class LlmClient(BaseLlmClient):
@@ -36,22 +36,22 @@ class LlmClient(BaseLlmClient):
         retry_attempts: int = 3,
         retry_delay_seconds: float = 1.0,
     ) -> None:
-        self.model = model or NVIDIA_MODEL
-        self.base_url = self._normalize_invoke_url(base_url or NVIDIA_INVOKE_URL)
-        self.api_key = api_key or NVIDIA_API_KEY
-        self.system_prompt = system_prompt
+        self.model = model or MODEL
+        self.base_url = self._normalize_invoke_url(base_url or INVOKE_URL)
+        self.api_key = api_key or API_KEY
+        self.system_prompt = strip_image_media(system_prompt)
         self.temperature = temperature
         self.timeout = timeout
         self.retry_attempts = max(0, retry_attempts)
         self.retry_delay_seconds = max(0.0, retry_delay_seconds)
         self.message_history: list[dict[str, Any]] = []
-        if system_prompt.strip():
+        if self.system_prompt.strip():
             self.message_history.append(
-                {"role": "system", "content": system_prompt.strip()}
+                {"role": "system", "content": self.system_prompt.strip()}
             )
 
     def invoke(self, prompt: str) -> str:
-        prompt = prompt.strip()
+        prompt = strip_image_media(prompt).strip()
         if not prompt:
             raise ValueError("prompt must not be empty")
 
@@ -63,7 +63,7 @@ class LlmClient(BaseLlmClient):
         return reply
 
     def invoke_structured(self, prompt: str, output_model: type[Any]) -> Any:
-        prompt = prompt.strip()
+        prompt = strip_image_media(prompt).strip()
         if not prompt:
             raise ValueError("prompt must not be empty")
 
@@ -138,9 +138,7 @@ class LlmClient(BaseLlmClient):
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": NVIDIA_MAX_TOKENS,
             "temperature": self.temperature if temperature is None else temperature,
-            "top_p": NVIDIA_TOP_P,
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
@@ -165,7 +163,10 @@ class LlmClient(BaseLlmClient):
         normalized: list[dict[str, Any]] = []
         for message in messages:
             if isinstance(message, dict):
-                normalized.append(dict(message))
+                entry = dict(message)
+                if isinstance(entry.get("content"), str):
+                    entry["content"] = strip_image_media(entry["content"])
+                normalized.append(entry)
                 continue
 
             role = getattr(message, "type", None) or getattr(message, "role", None)
@@ -177,6 +178,9 @@ class LlmClient(BaseLlmClient):
 
             if not role or content is None:
                 raise TypeError(f"Unsupported message type: {type(message)!r}")
+
+            if isinstance(content, str):
+                content = strip_image_media(content)
 
             entry: dict[str, Any] = {"role": role, "content": content}
             tool_call_id = getattr(message, "tool_call_id", None)
@@ -243,7 +247,7 @@ class LlmClient(BaseLlmClient):
         }
 
     def _normalize_invoke_url(self, value: str) -> str:
-        base = (value or NVIDIA_INVOKE_URL).rstrip("/")
+        base = (value or INVOKE_URL).rstrip("/")
         if base.endswith("/chat/completions"):
             return base
         if base.endswith("/v1"):

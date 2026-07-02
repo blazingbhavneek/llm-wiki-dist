@@ -28,11 +28,11 @@ TEMP_DIR.mkdir(exist_ok=True)
 MINERU_VENV_BIN = Path("/home/seigyo/llm-wiki/.venv/bin")
 
 GPU_MEMORY_UTILIZATION = "0.05"
-NVIDIA_INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_INVOKE_URL = "http://10.160.144.101:51021/v1"
 NVIDIA_API_KEY = (
     "<API_KEY>"
 )
-NVIDIA_MODEL = "google/gemma-4-31b-it"
+NVIDIA_MODEL = "openai/gpt-oss-120b"
 
 IMAGE_EXTENSIONS = {
     ".png",

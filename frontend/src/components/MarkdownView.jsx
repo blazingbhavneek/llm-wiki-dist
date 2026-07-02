@@ -22,6 +22,7 @@ const STR = {
     agentNote: 'エージェントノート',
     sourceNote: 'ソースノート',
     edit: '編集',
+    cancel: 'キャンセル',
     adding: '追加中...',
     addToWiki: 'wiki に追加',
     addToGraph: 'グラフに追加',
@@ -46,6 +47,7 @@ const STR = {
     agentNote: 'Agent note',
     sourceNote: 'Source note',
     edit: 'Edit',
+    cancel: 'Cancel',
     adding: 'Adding...',
     addToWiki: 'Add to wiki',
     addToGraph: 'Add to graph',
@@ -63,7 +65,6 @@ const markdownSchema = {
   tagNames: [
     ...(defaultSchema.tagNames || []),
 
-    // 一般的な HTML タグ
     'div',
     'span',
     'p',
@@ -79,12 +80,10 @@ const markdownSchema = {
     'sub',
     'sup',
 
-    // リスト
     'ul',
     'ol',
     'li',
 
-    // 見出し
     'h1',
     'h2',
     'h3',
@@ -92,11 +91,9 @@ const markdownSchema = {
     'h5',
     'h6',
 
-    // リンクとメディア
     'a',
     'img',
 
-    // HTML テーブル対応
     'table',
     'thead',
     'tbody',
@@ -204,7 +201,6 @@ function normalizeImageSrc(src) {
 
   const trimmed = src.trim()
 
-  // data URL に改行やスペースが含まれている場合は削除します。
   if (/^data:image\//i.test(trimmed)) {
     return trimmed.replace(/\s+/g, '')
   }
@@ -413,6 +409,7 @@ const markdownComponents = {
     if (!inline && className.includes('language-mermaid')) {
       return <MermaidDiagram code={String(children).replace(/\n$/, '')} />
     }
+
     if (inline) {
       return (
         <code
@@ -432,12 +429,12 @@ const markdownComponents = {
   },
 
   pre: ({ children, ...props }) => {
-    // Let a mermaid code child render itself (MermaidDiagram) instead of
-    // wrapping it in a raw <pre> code block.
     const child = Array.isArray(children) ? children[0] : children
+
     if ((child?.props?.className || '').includes('language-mermaid')) {
       return <>{children}</>
     }
+
     return (
       <pre
         className="my-4 overflow-x-auto rounded-lg border border-line bg-[#0f172a] p-4 text-sm text-white"
@@ -511,12 +508,13 @@ export default function MarkdownView({
   draft,
   isEditing,
   dirty,
-  mode = 'node', // 'node' | 'draft' | 'fulldoc' | 'answer'
+  mode = 'node',
   positions,
   busy,
   busyMessage,
   refs,
   onStartEdit,
+  onCancelEdit,
   onConfirm,
   onDelete,
   onAddToGraph,
@@ -532,7 +530,12 @@ export default function MarkdownView({
   const isDraft = mode === 'draft' || isAnswer
   const canEdit = !readOnly
 
-  const isAgent = doc.badge === 'agent' || doc.badge === 'Agent note'
+  const badgeText = String(doc.badge || '').toLowerCase()
+  const isAgent =
+    badgeText === 'agent' ||
+    badgeText === 'agent note' ||
+    badgeText === 'エージェントノート'
+
   const badgeClass = isAgent
     ? 'bg-orange/15 text-[#925d00] border-orange/25'
     : 'bg-green/10 text-[#08785a] border-green/20'
@@ -550,9 +553,13 @@ export default function MarkdownView({
             : dirty
               ? t.dirtyStatus
               : t.doubleClickEdit
+  
+  const handleCancelEdit = () => {
+    onCancelEdit?.()
+  }
 
   return (
-    <div className="grid h-full grid-rows-[auto_minmax(0,1fr)] bg-white">
+    <div className="grid h-full w-full grid-rows-[auto_minmax(0,1fr)] bg-white">
       <div className="border-b border-line bg-white px-[26px] pb-[14px] pt-[18px]">
         <div className="mb-[8px] flex flex-wrap items-center gap-2 text-[12px] text-muted">
           <span
@@ -560,7 +567,15 @@ export default function MarkdownView({
               isEditing ? 'border-blue/20 bg-blue/10 text-[#244a9d]' : badgeClass
             }`}
           >
-            {isEditing ? t.editing : isAnswer ? t.answerDraft : isDraft ? t.draft : isAgent ? t.agentNote : t.sourceNote}
+            {isEditing
+              ? t.editing
+              : isAnswer
+                ? t.answerDraft
+                : isDraft
+                  ? t.draft
+                  : isAgent
+                    ? t.agentNote
+                    : t.sourceNote}
           </span>
           <span className="inline-flex items-center gap-2">
             {busy && <InlineSpinner />}
@@ -587,6 +602,12 @@ export default function MarkdownView({
               {isEditing ? t.editing : t.edit}
             </SmallBtn>
 
+            {isEditing && (
+              <SmallBtn onClick={handleCancelEdit} disabled={busy}>
+                {t.cancel}
+              </SmallBtn>
+            )}
+
             {isDraft ? (
               <SmallBtn onClick={onAddToGraph} disabled={busy} confirm>
                 {busy ? t.adding : isAnswer ? t.addToWiki : t.addToGraph}
@@ -607,15 +628,16 @@ export default function MarkdownView({
 
       <div className="min-h-0 overflow-auto bg-gradient-to-b from-white to-[#fbfdff]">
         {isEditing ? (
-          <div className="grid h-full grid-cols-2 gap-0">
+          <div className="grid h-full w-full grid-cols-2 gap-0">
             <textarea
               className="h-full w-full resize-none border-r border-line bg-soft p-[26px] font-mono text-[13px] leading-[1.6] text-ink outline-none"
               value={draft.markdown}
               onChange={(e) => onChangeBody(e.target.value)}
               spellCheck={false}
             />
+
             <div className="h-full overflow-auto p-[36px]">
-              <article className="md mx-auto max-w-[760px]">
+              <article className="md w-full max-w-none">
                 <MarkdownRenderer markdown={draft.markdown} />
                 <References refs={refs} onOpenNode={onOpenNode} />
               </article>
@@ -623,11 +645,11 @@ export default function MarkdownView({
           </div>
         ) : (
           <div
-            className="h-full"
+            className="h-full w-full"
             onDoubleClick={canEdit && !isEditing ? onStartEdit : undefined}
           >
             {readOnly && positions?.length > 0 && (
-              <div className="mx-auto max-w-[860px] px-[36px] pt-[24px]">
+              <div className="w-full px-[36px] pt-[24px]">
                 <div className="border border-line bg-soft px-[14px] py-[10px] text-[12px] text-muted">
                   <span className="font-bold text-ink">{positions.length}</span> {t.pagesChain}
                   <span className="ml-[6px]">
@@ -640,7 +662,8 @@ export default function MarkdownView({
                 </div>
               </div>
             )}
-            <article className="md mx-auto max-w-[860px] px-[36px] pb-[90px] pt-[36px]">
+
+            <article className="md w-full max-w-none px-[36px] pb-[90px] pt-[36px]">
               <MarkdownRenderer markdown={draft.markdown} />
               <References refs={refs} onOpenNode={onOpenNode} />
             </article>

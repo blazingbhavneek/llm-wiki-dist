@@ -1,5 +1,3 @@
-"""Command line interface: `python -m graph.cli ...`. Thin — calls Graph."""
-
 from __future__ import annotations
 
 import argparse
@@ -10,11 +8,11 @@ from pathlib import Path
 from .graph import Graph
 from .models import Settings
 
-
+# print a random json object
 def _print(value: object) -> None:
     print(json.dumps(value, indent=2, ensure_ascii=False, default=str))
 
-
+# initiate a graph
 def _graph(args: argparse.Namespace) -> Graph:
     settings = Settings.from_env()
     if args.database:

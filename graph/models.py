@@ -1,6 +1,4 @@
-"""Data only: domain models, LLM-exchange DTOs, settings. No internal imports —
-this is the leaf every other module (including `db`) is allowed to depend on."""
-
+# delayed type evaluation, helps with circular imports etc, or refering to a class before its definition is complete
 from __future__ import annotations
 
 import os
@@ -9,32 +7,40 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from pydantic import BaseModel, Field
+from typing import Callable, ContextManager, Protocol, runtime_checkable
+from dataclasses import dataclass, field
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# --- settings -----------------------------------------------------------------
+#  settings 
 @dataclass
 class Settings:
-    """All tunables for one Graph instance."""
 
-    chat_base_url: str = "https://integrate.api.nvidia.com/v1/chat/completions"
+    # For Chat UI
+    chat_base_url: str = "http://10.160.144.101:51021/v1"
     chat_api_key: str = (
         "<API_KEY>"
     )
-    chat_model: str = "google/gemma-4-31b-it"
+    chat_model: str = "openai/gpt-oss-120b"
     chat_temperature: float = 0.4
+    agent_max_steps: int = 40
+    agent_patience: int = 20
 
+    # Compile time/ingest time 
+
+    # embeddings
     embed_backend: str = "server"
     embed_base_url: str = "http://localhost:8081/v1"
     embed_api_key: str = "local"
     embed_model: str = "cl-nagoya/ruri-v3-310m"
     hf_embed_model: str = "cl-nagoya/ruri-v3-310m"
-    hf_device: str = "cuda:0"
+    hf_device: str = "cuda:0" # fallback device id if server fails
     embed_dim: int = 768
 
+    # reranker
     rerank_backend: str = "server"
     rerank_base_url: str = "http://localhost:8082/v1"
     rerank_api_key: str = "local"
@@ -42,34 +48,37 @@ class Settings:
     hf_rerank_model: str = "cl-nagoya/ruri-v3-reranker-310m"
     rerank_device: str = "cuda:0"
 
-    database_path: str = ".wiki/moove_wiki2.sqlite"
+    # db
+    database_path: str = ".wiki/moove_wiki.sqlite"
 
+    # edge 
     edge_candidate_k: int = 50
     vector_query_k: int = 50
-    cascade_max_hops: int = 2
-    cascade_max_nodes: int = 50
-    agent_max_steps: int = 40
-    agent_patience: int = 20
+    
+    # on endogenenous node change
+    cascade_max_hops: int = 3
+    cascade_max_nodes: int = 100
+    
+    # search parameters
     search_rrf_k: int = 60
-    entity_dedup: bool = True
-
     search_candidate_pool: int = 50
     rerank_top_k: int = 20
+    entity_dedup: bool = True
 
-    # --- evidence-first search: chunking (chars) -------------------------------
+    #  evidence-first search: chunking (chars) 
     search_big_chunk_size: int = 3000
     search_big_chunk_overlap: int = 300
     search_small_chunk_size: int = 512
     search_small_chunk_overlap: int = 80
 
-    # --- evidence-first search: retrieval pools --------------------------------
+    #  evidence-first search: retrieval pools -
     pool_node_bm25: int = 50
     pool_vec_body: int = 50
     pool_vec_summary: int = 50
     pool_item_bm25: int = 150
     pool_vec_item: int = 300
 
-    # --- evidence-first search: weighted RRF field weights ---------------------
+    #  evidence-first search: weighted RRF field weights 
     weight_item_bm25: float = 1.35
     weight_title_vec: float = 1.30
     weight_claim_vec: float = 1.25
@@ -79,7 +88,7 @@ class Settings:
     weight_node_bm25: float = 0.90
     weight_body_vec: float = 0.75
 
-    # --- evidence-first search: caps + rerank/MMR ------------------------------
+    #  evidence-first search: caps + rerank/MMR 
     evidence_max_per_node: int = 3
     evidence_max_per_field: int = 2
     evidence_dedup_char_window: int = 200
@@ -210,12 +219,12 @@ class Settings:
         )
 
 
-# --- enums --------------------------------------------------------------------
+#  whether a node was created from source file or made by AI Agent
 class NodeType(str, Enum):
     endogenous = "endogenous"
     exogenous = "exogenous"
 
-
+# whether a node is overruled by newer version, with updated version
 class NodeStatus(str, Enum):
     active = "active"
     stale = "stale"
@@ -223,7 +232,7 @@ class NodeStatus(str, Enum):
     deleted = "deleted"
 
 
-# --- core graph models --------------------------------------------------------
+# Contains the actual information
 class Node(BaseModel):
     id: str
     body: str
@@ -243,13 +252,15 @@ class Node(BaseModel):
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
 
-
+# Connecting nodes so agent knows what to read next
 class Edge(BaseModel):
     id: str
     source_node_id: str
     target_node_id: str
     label: str
     summary: str = ""
+
+    # In case new information comes existing relation is invalidated
     created_at: str = Field(default_factory=now_iso)
     valid_at: str | None = None
     invalid_at: str | None = None
@@ -257,39 +268,41 @@ class Edge(BaseModel):
     source_episode_ids: list[str] = Field(default_factory=list)
 
 
-# --- LLM-exchange DTOs --------------------------------------------------------
+#  LLM Structured outputs
+
+# singular edge
 class EdgeSuggestion(BaseModel):
     target_node_id: str
     label: str = "related"
     summary: str = ""
 
-
+# list of above edge model
 class EdgeSuggestions(BaseModel):
     edges: list[EdgeSuggestion] = Field(default_factory=list)
 
-
+# For metadata filtering
 class Keywords(BaseModel):
     keywords: list[str] = Field(default_factory=list)
 
-
+# Factual grounds extracted from a node
 class ClaimExtraction(BaseModel):
     entity: str = ""
     claims: list[str] = Field(default_factory=list)
 
-
+# Whether two entities are same or not
 class EntityMatch(BaseModel):
     is_same: bool = False
     target_node_id: str | None = None
 
 
-# --- query / metrics ----------------------------------------------------------
+#  Query response from the graph
 class QueryResult(BaseModel):
     query_type: str
     value: str
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
 
-
+# Final agent answer
 class AgentAnswer(BaseModel):
     question: str
     answer: str = ""
@@ -311,7 +324,7 @@ class GraphStats(BaseModel):
     clusters: dict[str, int] = Field(default_factory=dict)
     target_node_id: str | None = None
 
-
+# In case model emits english name for cluster, had this problem earlier
 class ClusterRename(BaseModel):
     original_name: str
     new_name: str
@@ -319,3 +332,140 @@ class ClusterRename(BaseModel):
 
 class ClusterRenamePlan(BaseModel):
     renames: list[ClusterRename] = []
+
+
+
+# Interface describing the methods an LLM client must implement, independent of
+# the underlying provider. @runtime_checkable allows isinstance(..., LlmClient) checks.
+# Protocol defining the interface expected of an LLM client. Protocols are for
+# structural type checking (what methods an object has), not shared implementation
+# or inheritance, making them ideal when multiple unrelated classes should be interchangeable.
+@runtime_checkable
+class LlmClient(Protocol):
+    def complete(self, system_prompt: str, user_content: str) -> str: ...
+    def complete_structured(
+        self, system_prompt: str, user_content: str, output_model: type[Any]
+    ) -> Any: ...
+    def run_tool_loop(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[Any],
+        dispatch: Any,
+        max_steps: int,
+        finish_guard: Any = None,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class EmbedderPort(Protocol):
+    dim: int
+    model_name: str
+
+    def embed_document(self, text: str) -> list[float]: ...
+    def embed_query(self, text: str) -> list[float]: ...
+
+
+@runtime_checkable
+class RerankerPort(Protocol):
+    def top_k(
+        self, query: str, items: list[tuple[str, Any]], k: int
+    ) -> list[tuple[Any, float]]: ...
+
+
+# Tools Schemas
+class search(BaseModel):
+    """Search the wiki for nodes matching a text query."""
+
+    text: str = Field(description="keywords to search for")
+
+
+class read(BaseModel):
+    """Read a node's full body and metadata by id."""
+
+    node_id: str = Field(description="id of the node to read")
+
+
+class follow_link(BaseModel):
+    """Follow edges from a node to its neighboring nodes."""
+
+    node_id: str = Field(description="id of the node to expand")
+    direction: str = Field(
+        default="both", description="'incoming', 'outgoing', or 'both'"
+    )
+
+
+class explore(BaseModel):
+    """Hand distinct starting node ids to a team of exploration subagents."""
+
+    node_ids: list[str] = Field(
+        default_factory=list, description="distinct starting node ids"
+    )
+
+
+class finish(BaseModel):
+    """Provide the final answer and the node ids used as evidence."""
+
+    answer: str = Field(description="the final answer, grounded in node content")
+    cited_node_ids: list[str] = Field(
+        default_factory=list, description="ids that support the answer"
+    )
+
+
+LEAD_TOOLS = [search, explore, finish]
+SUBAGENT_TOOLS = [search, read, follow_link, finish]
+
+
+
+@dataclass
+class Subrun:
+    """Per-subagent run state. Created once, captured by the dispatch closure —
+    never threaded through call signatures."""
+
+    start_id: str
+    index: int
+    visited: list[str] = field(default_factory=list)
+    read_ids: set[str] = field(default_factory=set)
+    empty_streak: int = 0
+
+
+@dataclass
+class EvidenceHit:
+    """One retrieval hit, normalized across every pool (node + search_item)."""
+
+    node_id: str
+    field: str
+    item_id: str | None
+    text: str
+    rank: int
+    weight: float
+    start_char: int | None = None
+
+    def contribution(self, rrf_k: int) -> float:
+        return self.weight / (rrf_k + self.rank)
+
+
+@runtime_checkable
+class EnrichmentWorker(Protocol):
+    """The subset of GraphWriteSession the queue needs. Kept tiny so the two
+    modules stay decoupled and this file never imports graph.graph."""
+
+    def enrich_summary(self, node_id: str) -> None: ...
+    def enrich_entity_dedup(self, node_id: str) -> None: ...
+    def enrich_cascade(
+        self, replacements: dict[str, str], stale_sources: list[str]
+    ) -> None: ...
+    def refresh_clusters(self) -> None: ...
+
+    # meta accessors (already on GraphWriteSession as _db_get_meta/_db_set_meta;
+    # a thin public alias will be added when wiring)
+    def get_meta(self, key: str) -> str | None: ...
+    def set_meta(self, key: str, value: str) -> None: ...
+
+@dataclass(frozen=True)
+class EnrichJob:
+    kind: str  # "summary" | "entity_dedup" | "cascade" | "maybe_recluster"
+    node_id: str | None = None
+    replacements: dict[str, str] = field(default_factory=dict)
+    stale_sources: list[str] = field(default_factory=list)
+
