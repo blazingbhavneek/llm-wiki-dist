@@ -13,6 +13,7 @@ from typing import Any, Callable
 from pydantic import BaseModel
 
 from .llm import LlmClient
+from .utils import strip_image_media
 
 
 class ToolLoopResult(BaseModel):
@@ -56,8 +57,8 @@ class AgentClient(LlmClient):
         as a tool observation, and the loop continues (still bounded by max_steps).
         """
         messages: list[Any] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": strip_image_media(system_prompt)},
+            {"role": "user", "content": strip_image_media(user_prompt)},
         ]
         steps = 0
         for _ in range(max(1, max_steps)):

@@ -1,31 +1,3 @@
-"""
-Background "assimilation" queue.
-
-A freshly-added node is made usable immediately by the write path (body +
-vectors + FTS + cheap derived fields + reference/semantic edges committed
-synchronously). The *expensive, graph-wide* bookkeeping is drained here slowly
-in the background so the UI never blocks on it:
-
-  - summary          : 1 LLM call, improves summary-vector ranking
-  - entity_dedup     : 1 LLM call, collapses duplicate entities (same-as merge)
-  - cascade          : regenerate exogenous notes whose sources changed
-  - maybe_recluster  : Louvain + per-cluster LLM naming, only every N endo adds
-
-Design notes
-------------
-* Decoupled from `graph.graph` on purpose: this module imports nothing from the
-  write session. The worker is handed a `session_factory` that yields a
-  context-managed object implementing `EnrichmentWorker` (GraphWriteSession
-  satisfies it). Keeps the heavy graph module free of a queue dependency and
-  lets this be unit-tested with a fake worker.
-* Single daemon thread, FIFO queue, a small sleep ("drip") between jobs so the
-  background work stays low-priority and never starves foreground reads/writes.
-* Each job opens its own short-lived write session (its own sqlite connection),
-  matching the one-connection-per-operation pattern the rest of the code uses.
-* The recluster counter lives in the DB `meta` table (key
-  ``endo_since_recluster``) so it survives restarts; the worker owns it.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -34,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, ContextManager, Protocol, runtime_checkable
+from .models import *
 
 log = logging.getLogger("graph_enrich")
 
@@ -42,36 +15,8 @@ log = logging.getLogger("graph_enrich")
 RECLUSTER_COUNTER_KEY = "endo_since_recluster"
 
 
-# --- worker interface the queue drives --------------------------------------
-@runtime_checkable
-class EnrichmentWorker(Protocol):
-    """The subset of GraphWriteSession the queue needs. Kept tiny so the two
-    modules stay decoupled and this file never imports graph.graph."""
-
-    def enrich_summary(self, node_id: str) -> None: ...
-    def enrich_entity_dedup(self, node_id: str) -> None: ...
-    def enrich_cascade(
-        self, replacements: dict[str, str], stale_sources: list[str]
-    ) -> None: ...
-    def refresh_clusters(self) -> None: ...
-
-    # meta accessors (already on GraphWriteSession as _db_get_meta/_db_set_meta;
-    # a thin public alias will be added when wiring)
-    def get_meta(self, key: str) -> str | None: ...
-    def set_meta(self, key: str, value: str) -> None: ...
-
-
 # `session_factory()` must return a context manager yielding an EnrichmentWorker.
 SessionFactory = Callable[[], ContextManager[EnrichmentWorker]]
-
-
-# --- jobs -------------------------------------------------------------------
-@dataclass(frozen=True)
-class EnrichJob:
-    kind: str  # "summary" | "entity_dedup" | "cascade" | "maybe_recluster"
-    node_id: str | None = None
-    replacements: dict[str, str] = field(default_factory=dict)
-    stale_sources: list[str] = field(default_factory=list)
 
 
 # --- queue ------------------------------------------------------------------

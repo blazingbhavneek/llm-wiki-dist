@@ -1,9 +1,4 @@
-"""
-Clean-slate implementation of the split read/write architecture.
-
-No wrapping of the existing Graph monolith.
-Each session class owns its own logic, db connection, and state.
-"""
+# region Imports
 
 from __future__ import annotations
 
@@ -25,35 +20,15 @@ from db import Database
 from embeddings import Embedder, Reranker
 from llm.agent import AgentClient
 
-from .core import *
-from .enrich import EnrichmentQueue
-from .models import (
-    AgentAnswer,
-    ClaimExtraction,
-    ClusterRenamePlan,
-    Edge,
-    EdgeSuggestions,
-    EntityMatch,
-    GraphStats,
-    Keywords,
-    Node,
-    NodeStatus,
-    NodeType,
-    QueryResult,
-    Settings,
-    now_iso,
-)
+from .enrich import *
+from .models import *
 from .utils import *
-from .utils import (
-    Subrun,
-    clean_node_ref,
-    dedupe,
-    format_node_full,
-    node_ref,
-    repair_answer_mermaid,
-)
 
 log = logging.getLogger("graph_rw")
+
+# endregion Imports
+
+# region Global vars
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 _NUMBERED_DOC_RE = re.compile(r"^\d+-(.+\.md)$")
@@ -63,106 +38,15 @@ _CASCADE_MATCH_THRESHOLD = 0.45
 SEARCH_INDEX_VERSION = "chunk512-80-v1"
 
 
-@dataclass
-class EvidenceHit:
-    """One retrieval hit, normalized across every pool (node + search_item)."""
-
-    node_id: str
-    field: str
-    item_id: str | None
-    text: str
-    rank: int
-    weight: float
-    start_char: int | None = None
-
-    def contribution(self, rrf_k: int) -> float:
-        return self.weight / (rrf_k + self.rank)
+WriteStatus = Literal["queued", "running", "done", "failed", "cancelled"]
 
 
-def _item_vec_weight(settings: Settings, field: str) -> float:
-    return {
-        "title": settings.weight_title_vec,
-        "claim": settings.weight_claim_vec,
-        "small_chunk": settings.weight_small_chunk_vec,
-        "summary": settings.weight_summary_vec,
-        "big_chunk": settings.weight_big_chunk_vec,
-    }.get(field, settings.weight_small_chunk_vec)
+
+# endregion Global vars
 
 
-def _normalize_scores(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    low, high = min(values), max(values)
-    if high - low < 1e-9:
-        return [1.0 for _ in values]
-    return [(v - low) / (high - low) for v in values]
-
-
-def _mmr_order(texts: list[str], rel: list[float], lam: float) -> list[int]:
-    """Greedy MMR ordering: lam*rel - (1-lam)*max_sim_to_selected (token overlap)."""
-    remaining = set(range(len(texts)))
-    order: list[int] = []
-    while remaining:
-        best_idx, best_score = None, float("-inf")
-        for i in remaining:
-            sim = max((token_jaccard(texts[i], texts[j]) for j in order), default=0.0)
-            score = lam * rel[i] - (1.0 - lam) * sim
-            if score > best_score:
-                best_score, best_idx = score, i
-        order.append(best_idx)
-        remaining.discard(best_idx)
-    return order
-
-
-def _node_snippet(node: Node) -> str:
-    return (node.summary or node.title or "").strip()
-
-
-def _evidence_why(node_hits: list[EvidenceHit]) -> list[dict[str, Any]]:
-    """Best (lowest) rank per field that matched this node, rank-ascending."""
-    best: dict[str, int] = {}
-    for hit in node_hits:
-        if hit.field not in best or hit.rank < best[hit.field]:
-            best[hit.field] = hit.rank
-    return [
-        {"field": field, "rank": rank}
-        for field, rank in sorted(best.items(), key=lambda kv: kv[1])
-    ]
-
-
-def _format_lead_candidate(result: dict[str, Any]) -> str:
-    node = result["node"]
-    why = result.get("why", [])
-    why_str = ", ".join(f"{w['field']}#{w['rank']}" for w in why[:4]) or "n/a"
-    lines = (
-        f"- node_id: `{node.id}`\n"
-        f"  title: {node.title}\n"
-        f"  summary: {node.summary}\n"
-        f"  why_matched: {why_str}"
-    )
-    for ev in result.get("evidence", [])[:3]:
-        snippet = " ".join((ev.get("text") or "").split())
-        if len(snippet) > 240:
-            snippet = snippet[:240] + "…"
-        if snippet:
-            lines += f"\n  evidence[{ev['field']}]: {snippet}"
-    lines += (
-        "\n  next_action: pass this id to explore(node_ids=[...]) if promising "
-        "and distinct"
-    )
-    return lines
-
-
-# ============================================================================
-# 1. Shared Runtime
-# ============================================================================
-
-
+# Runtime that initiates Globally usable Embedding client, LLM client and global default config that will be used by other components
 class SharedGraphRuntime:
-    """
-    Heavy resources loaded once, shared across all sessions.
-    No per-request mutable state.
-    """
 
     def __init__(self, settings: Settings):
         print(
@@ -170,7 +54,8 @@ class SharedGraphRuntime:
             flush=True,
         )
         self.settings = settings
-        # Background assimilation queue; installed by WriteGraphService.
+        # Background assimilation queue; installed by WriteGraphService. 
+        # For write tasks, since two nodes should not be assimilated parallely
         self.enrich: Any = None
         print(
             f"[runtime] embed_backend={settings.embed_backend} rerank_backend={settings.rerank_backend}",
@@ -206,17 +91,8 @@ class SharedGraphRuntime:
         """Replace settings at runtime. Caller must handle client rebuilds."""
         self.settings = settings
 
-
-# ============================================================================
-# 2. Db Session
-# ============================================================================
-
-
+# DB Connection session manager, it opens the connections and closes it when called
 class GraphDbSession:
-    """
-    One database connection per operation.
-    Opens in WAL-friendly mode, commits on success, rolls back on error.
-    """
 
     def __init__(self, settings: Settings, readonly: bool = False):
         self.settings = settings
@@ -247,17 +123,8 @@ class GraphDbSession:
             self.conn.commit()
         self.close()
 
-
-# ============================================================================
-# 3. Read Session - All read logic lives here
-# ============================================================================
-
-
+# Graph reader, no mutation so thread safe, allows to override global config on client request
 class GraphReadSession:
-    """
-    Pure read operations. No mutation of the database.
-    Each method receives emit explicitly, never stored on self.
-    """
 
     def __init__(self, runtime: SharedGraphRuntime, db: GraphDbSession):
         self.runtime = runtime
@@ -321,13 +188,15 @@ class GraphReadSession:
                 temperature=self.settings.chat_temperature,
             )
 
-    # -- Basic CRUD reads -------------------------------------------------
+    # CRUD (Except only the R part lmao)
 
+    # Get all nodes and edges for viewing the graph
     def get(self) -> tuple[list[Node], list[Edge]]:
         nodes = self.db_get_all_nodes()
         edges = self.db_get_all_edges()
         return nodes, edges
 
+    # Read a particular node to get its content
     def read_node(self, node_id: str) -> Node | None:
         node = self._db_get_node(node_id)
         if node:
@@ -340,6 +209,7 @@ class GraphReadSession:
         matches = self._keyword_search(node_id, 5)
         return matches[0] if matches else None
 
+    # If asked to get a list of outgoing or incoming edges and their nodes
     def follow_link(
         self,
         node_id: str,
@@ -364,6 +234,7 @@ class GraphReadSession:
                     pairs.append((edge, source))
         return pairs[:limit] if limit is not None else pairs
 
+    # Calculate graph stats for health, not too dense, not too sparse ideally
     def health(self, node_id: str | None = None) -> GraphStats:
         nodes = self.db_get_all_nodes()
         edges = self.db_get_all_edges()
@@ -419,7 +290,11 @@ class GraphReadSession:
             target_node_id=node_id,
         )
 
-    def query(self, query_type: str, value: str) -> QueryResult:
+    # Query the graph
+    # id: get by node id, and its edges
+    # keyword:  search through LLM extracted keywords + title + summary and body of each node 
+    # vector: Embedding based search for similarity search (searches titles, main body, summaries, claims etc)
+    def  query(self, query_type: str, value: str) -> QueryResult:
         normalized = query_type.lower().strip()
         if normalized == "id":
             node = self.read_node(value)
@@ -450,11 +325,13 @@ class GraphReadSession:
                 query_type="vector", value=value, nodes=nodes, edges=edges_list
             )
         raise ValueError("query_type must be 'keyword', 'vector', or 'id'")
-
+    
+    # Calls the function that does all 3 Query modes then rank them, if that fails fallbacks to normal keyword search
     def search(self, text: str, limit: int | None = None) -> list[Node]:
-        """Backward-compatible node search. Delegates to the evidence-first
-        pipeline and returns just the ranked ``Node`` list."""
+
+        # server default limit or user defined limit
         limit = limit or self.settings.vector_query_k
+        
         try:
             results = self.search_with_evidence(text, limit)
         except Exception as exc:
@@ -466,36 +343,44 @@ class GraphReadSession:
                 return []
             return nodes[:limit]
         return [r["node"] for r in results][:limit]
-
+    
+    # Evidence-first retrieval. Returns ``{node, score, why, evidence}`` dicts ranked by cross-encoder relevance (falling back to weighted RRF).
+    # Combines BM25 keyword search, vector search, item search, reranking, deduping, and returns nodes with evidence snippets.
     def search_with_evidence(
         self, text: str, limit: int | None = None
     ) -> list[dict[str, Any]]:
-        """Evidence-first retrieval. Returns ``{node, score, why, evidence}`` dicts
-        ranked by cross-encoder relevance (falling back to weighted RRF)."""
+
         limit = limit or self.settings.vector_query_k
         s = self.settings
+
+        # Rank normalizer, it flattens the contributions of ranks, as this parameter is increased, the ranked are 
+        # more flattened and more chance of lower ranks to be included
         rrf_k = s.search_rrf_k
+        
+        # It also makes evidences, not just plain ranks so LLM can choose based on context not just quantitative numbers
         hits: list[EvidenceHit] = []
 
-        # --- node BM25 --------------------------------------------------------
+        # node BM25 
         node_bm25: list[Node] = []
         try:
             node_bm25 = self._keyword_search(text, s.pool_node_bm25)
         except Exception as exc:
             log.info("node bm25 failed: %s", exc)
+
+        # Convert node keyword hits into evidence hits
         for rank, node in enumerate(node_bm25, start=1):
             hits.append(
                 EvidenceHit(
                     node.id,
                     "node_bm25",
                     None,
-                    _node_snippet(node),
+                    node_snippet(node),
                     rank,
                     s.weight_node_bm25,
                 )
             )
 
-        # --- vector pools -----------------------------------------------------
+        # vector pools 
         query_vec: list[float] | None = None
         try:
             query_vec = self.runtime.embedder.embed_query(text)
@@ -503,6 +388,7 @@ class GraphReadSession:
             log.info("query embed failed; BM25-only: %s", exc)
 
         if query_vec is not None:
+            # Search node-level embeddings like body and summary
             for table, field, weight, pool in (
                 ("vec_body", "body_vec", s.weight_body_vec, s.pool_vec_body),
                 (
@@ -517,9 +403,12 @@ class GraphReadSession:
                 except Exception as exc:
                     log.info("%s search failed: %s", table, exc)
                     continue
+
+                # These hits know the node, text gets filled later
                 for rank, (node_id, _dist) in enumerate(vhits, start=1):
                     hits.append(EvidenceHit(node_id, field, None, "", rank, weight))
 
+            # Search smaller indexed items/chunks with vector similarity
             try:
                 item_hits = self._vector_search(
                     query_vec, "vec_search_item", s.pool_vec_item
@@ -527,7 +416,10 @@ class GraphReadSession:
             except Exception as exc:
                 log.info("vec_search_item search failed: %s", exc)
                 item_hits = []
+
+            # Load item rows so we can attach actual text as evidence
             rows = self._get_search_items([iid for iid, _ in item_hits])
+
             for rank, (item_id, _dist) in enumerate(item_hits, start=1):
                 row = rows.get(item_id)
                 if not row:
@@ -539,17 +431,22 @@ class GraphReadSession:
                         item_id,
                         row["text"] or "",
                         rank,
-                        _item_vec_weight(s, row["field"]),
+                        item_vec_weight(s, row["field"]), # TODO: Make this inline
                         row.get("start_char"),
                     )
                 )
 
-        # --- item BM25 --------------------------------------------------------
+        # item BM25 searches smaller indexed chunks/items inside nodes, not the whole node text
+        # Different from node BM25, which finds broadly matching nodes using title/summary/body/keywords
+        # This is mainly for finding exact evidence snippets that matched the query
+        # So node BM25 finds candidate nodes, item BM25 explains why with precise text
         try:
             item_bm25 = self._search_items_fts(text, s.pool_item_bm25)
         except Exception as exc:
             log.info("item bm25 failed: %s", exc)
             item_bm25 = []
+
+        # Add keyword matches from smaller items/chunks
         for rank, row in enumerate(item_bm25, start=1):
             hits.append(
                 EvidenceHit(
@@ -563,37 +460,51 @@ class GraphReadSession:
                 )
             )
 
+        # Nothing matched anywhere
         if not hits:
             return []
 
-        # --- weighted RRF per node + load active nodes ------------------------
+        # weighted RRF per node + load active nodes 
         node_scores: dict[str, float] = defaultdict(float)
+
+        # Same node can get points from multiple search methods
         for hit in hits:
             node_scores[hit.node_id] += hit.contribution(rrf_k)
 
         nodes: dict[str, Node] = {}
+
+        # Load nodes and ignore inactive ones
         for node_id in node_scores:
             node = self._db_get_node(node_id)
             if node and node.status == NodeStatus.active:
                 nodes[node_id] = node
 
         by_node: dict[str, list[EvidenceHit]] = defaultdict(list)
+
+        # Group evidence under its node
         for hit in hits:
             if hit.node_id not in nodes:
                 continue
             if not hit.text.strip():
-                hit.text = _node_snippet(nodes[hit.node_id])
+                hit.text = node_snippet(nodes[hit.node_id])
             by_node[hit.node_id].append(hit)
 
         # --- per-node evidence selection with caps ----------------------------
         pool: list[EvidenceHit] = []
+
+        # Pick limited good evidence from each node
         for node_id, node_hits in by_node.items():
             pool.extend(self._select_node_evidence(node_hits))
+
         pool.sort(key=lambda h: h.contribution(rrf_k), reverse=True)
+
+        # Keep only non-empty snippets and cap rerank pool
         pool = [h for h in pool if h.text.strip()][: s.evidence_rerank_pool]
 
         # --- cross-encoder rerank of snippets (guarded) -----------------------
         rel: list[float] | None = None
+
+        # Reranker scores actual query-snippet relevance if available
         if self.runtime.reranker and pool:
             try:
                 ranked = self.runtime.reranker.top_k(
@@ -604,27 +515,37 @@ class GraphReadSession:
             except Exception as exc:
                 log.info("snippet rerank failed; RRF order: %s", exc)
                 rel = None
+
+        # If reranker fails, just use RRF score
         if rel is None:
             rel = [pool[i].contribution(rrf_k) for i in range(len(pool))]
-        rel = _normalize_scores(rel)
+
+        rel = normalize_scores(rel)
 
         # --- MMR dedup over the snippet pool ----------------------------------
-        order = _mmr_order([h.text for h in pool], rel, s.evidence_mmr_lambda)
+        order = mmr_order([h.text for h in pool], rel, s.evidence_mmr_lambda)
         rank_of = {idx: pos for pos, idx in enumerate(order)}
 
         node_pool_idx: dict[str, list[int]] = defaultdict(list)
+
+        # Remember which snippets belong to which node
         for i, hit in enumerate(pool):
             node_pool_idx[hit.node_id].append(i)
 
         # --- aggregate evidence back to nodes ---------------------------------
         results: list[dict[str, Any]] = []
+
         for node_id, node in nodes.items():
             snippet_idxs = node_pool_idx.get(node_id, [])
+
             if snippet_idxs:
                 best_rel = max(rel[i] for i in snippet_idxs)
+
+                # Choose best non-duplicate evidence snippets for this node
                 chosen = sorted(snippet_idxs, key=lambda i: rank_of[i])[
                     : s.evidence_max_per_node
                 ]
+
                 evidence = [
                     {
                         "field": pool[i].field,
@@ -636,14 +557,16 @@ class GraphReadSession:
                 ]
             else:
                 best_rel, evidence = 0.0, []
+
             results.append(
                 {
                     "node": node,
                     "score": best_rel + node_scores[node_id],
-                    "why": _evidence_why(by_node[node_id]),
+                    "why": evidence_why(by_node[node_id]),
                     "evidence": evidence,
                 }
             )
+
         results.sort(key=lambda d: d["score"], reverse=True)
         return results[:limit]
 
@@ -651,23 +574,36 @@ class GraphReadSession:
         """Caps per node: <=max_per_node snippets, <=max_per_field per field,
         <=1 per overlapping small/big-chunk region (start_char proximity)."""
         s = self.settings
+
+        # Sort best evidence first using same RRF contribution logic
         ordered = sorted(
             node_hits, key=lambda h: h.contribution(s.search_rrf_k), reverse=True
         )
+
         selected: list[EvidenceHit] = []
         per_field: Counter = Counter()
         regions: list[int] = []
         seen: set[str] = set()
+
         for hit in ordered:
+            # Stop once this node already has enough evidence
             if len(selected) >= s.evidence_max_per_node:
                 break
+
+            # Skip empty evidence
             if not hit.text.strip():
                 continue
+
+            # Dedup same item, or same-looking text if item_id is missing
             key = hit.item_id or hit.text[:80]
             if key in seen:
                 continue
+
+            # Avoid taking too many snippets from same field
             if per_field[hit.field] >= s.evidence_max_per_field:
                 continue
+
+            # Dedup nearby chunk regions so small/big chunks don't repeat same area
             if hit.field in ("small_chunk", "big_chunk") and hit.start_char is not None:
                 if any(
                     abs(hit.start_char - r) < s.evidence_dedup_char_window
@@ -675,18 +611,19 @@ class GraphReadSession:
                 ):
                     continue
                 regions.append(hit.start_char)
+
             selected.append(hit)
             per_field[hit.field] += 1
             seen.add(key)
+
         return selected
 
-    # -- Agent / Ask ------------------------------------------------------
-
+    # Query agent, with live streaming events
     def ask(
         self,
         question: str,
         persist: bool = False,
-        on_event: Callable[[dict[str, Any]], None] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None, # callback for event emission
     ) -> AgentAnswer:
         if persist:
             raise ValueError("ReadSession.ask() must use persist=False")
@@ -696,6 +633,7 @@ class GraphReadSession:
 
         answer = self._run_lead(question, emit)
 
+        # if model was asked to generate mermaid, check if it was done right and fix it if any error
         if self.settings.enable_mermaid and answer.answer:
             # repair_answer_mermaid expects the llm as second arg
             answer.answer = repair_answer_mermaid(
@@ -708,6 +646,8 @@ class GraphReadSession:
     def _run_lead(self, question: str, emit: Callable) -> AgentAnswer:
         evidence: list[str] = []
 
+        # custom tool call executor, since we have to manage a runtime, easier to execute tools here rather than making tools that need 
+        # to take in many many parameters just so they can run in isolation, and way too many variables involved to setup tools seperately for each agent
         def dispatch(name: str, args: dict[str, Any]) -> str:
             if name == "search":
                 query = str(args.get("text", ""))
@@ -732,7 +672,7 @@ class GraphReadSession:
                 )
                 if not candidate_nodes:
                     return "no nodes found"
-                return "\n".join(_format_lead_candidate(r) for r in results)
+                return "\n".join(format_lead_candidate(r) for r in results)
             if name == "explore":
                 return self._run_subagents(
                     args.get("node_ids", []), question, evidence, emit
@@ -743,6 +683,7 @@ class GraphReadSession:
         if self.settings.enable_mermaid:
             system_prompt += MERMAID_INSTRUCTION
 
+        # simple React style agent, runs until model keeps emitting tools
         result = self.llm.run_tool_loop(
             system_prompt, question, LEAD_TOOLS, dispatch, self.settings.agent_max_steps
         )
@@ -763,6 +704,7 @@ class GraphReadSession:
             steps=result.steps,
         )
 
+    # Run a subagent to explor multiple topics to avoid missing a path that might have been a better answer
     def _run_subagents(
         self,
         raw_node_ids: list[Any],
@@ -790,6 +732,8 @@ class GraphReadSession:
 
         for index, (start, siblings) in enumerate(assignments, start=1):
             try:
+
+                # the subagent is started given the same question but a different starting point to explore multiple possible paths
                 report = self._run_single_subagent(
                     start, siblings, question, index, emit
                 )
@@ -803,6 +747,7 @@ class GraphReadSession:
                     }
                 )
 
+        # Aggregate results in a seperate report
         for report in reports:
             evidence.extend(report.get("cited", []))
 
@@ -815,6 +760,7 @@ class GraphReadSession:
             )
         return "\n".join(blocks)
 
+    # Dedup already seen nodes
     def _resolve_distinct_starts(self, raw_node_ids: list[Any]) -> list[str]:
         resolved: list[str] = []
         seen: set[str] = set()
@@ -827,6 +773,9 @@ class GraphReadSession:
                 break
         return resolved
 
+    # Run the subagent with same pattern, with explicit instructions to keep its exploration to its own region and report its finding
+    # Explictly told to not read other nodes in case it ends up there somehow
+    # TODO: Add exogenous node exploration case too, in case the exo nodes is enough, just verify the important facts from its source and report it as good 
     def _run_single_subagent(
         self,
         start_id: str,
@@ -856,11 +805,11 @@ class GraphReadSession:
 
         siblings_str = ", ".join(sibling_ids) if sibling_ids else "(none)"
         user_prompt = (
-            f"Question: {question}\n\n"
-            f"Your assigned starting node: {start_id}\n"
-            f"Sibling agents are covering (do NOT explore these): {siblings_str}\n\n"
-            "Read your starting node first, then follow links / search within your "
-            "region. Report what this region says about the question."
+            f"質問: {question}\n\n"
+            f"あなたに割り当てられた開始ノード: {start_id}\n"
+            f"他のエージェントが担当している領域（探索しないこと）: {siblings_str}\n\n"
+            "まず開始ノードを読み、その後リンクをたどるか、あなたの担当領域内で検索してください。"
+            "この領域がその質問について何を述べているかを報告してください。"
         )
 
         result = self.llm.run_tool_loop(
@@ -889,6 +838,7 @@ class GraphReadSession:
             "cited": cited,
         }
 
+    # A bit misworded, its not a agent dispatched, its a tool call for a subagent + its emitted message which can be read by UI
     def _dispatch_subagent(
         self,
         name: str,
@@ -963,8 +913,8 @@ class GraphReadSession:
 
         return f"unknown tool: {name}"
 
-    # -- Neighbourhood expansion ------------------------------------------
-
+    # Expands from the seed nodes through connected edges for the given number of hops
+    # Collects active neighboring nodes and all edges seen on the way, while avoiding duplicates
     def _expand_neighborhood(
         self, seeds: list[Node], hops: int = 2
     ) -> tuple[list[Node], list[Edge]]:
@@ -990,68 +940,53 @@ class GraphReadSession:
             frontier = next_frontier
         return list(seen_nodes.values()), list(seen_edges.values())
 
-    # -- DB helpers -------------------------------------------------------
+    # DB Ops
 
     def db_get_all_nodes(self) -> list[Node]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_all_nodes()
 
     def db_get_all_edges(self) -> list[Edge]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_all_edges()
 
     def _db_get_node(self, node_id: str) -> Node | None:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_node(node_id)
 
     def _keyword_search(self, text: str, limit: int) -> list[Node]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).keyword_search(text, limit)
 
     def _vector_search(
         self, vector: list[float], table: str, k: int
     ) -> list[tuple[str, float]]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).vector_search(vector, table, k)
 
     def _search_items_fts(self, text: str, limit: int) -> list[dict]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).search_items_fts_query(text, limit)
 
     def _get_search_items(self, ids: list[str]) -> dict[str, dict]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_search_items(ids)
 
     def _db_get_edges_for_node(self, node_id: str) -> list[Edge]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_edges_for_node(node_id)
 
     def _db_get_outgoing_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_outgoing_edges(node_id, label)
 
     def _db_get_incoming_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_incoming_edges(node_id, label)
-
-
-# ============================================================================
-# 4. Write Session - All write logic lives here
-# ============================================================================
 
 
 class GraphWriteSession:
@@ -1064,7 +999,7 @@ class GraphWriteSession:
         self.db = db
         self.settings = runtime.settings
 
-    # -- Node operations --------------------------------------------------
+    # -- Node operations 
 
     def update_node(self, node_id: str, body: str) -> Node:
         old = self._db_get_node(node_id)
@@ -1398,139 +1333,114 @@ class GraphWriteSession:
         return self.db.conn
 
     def _db_get_node(self, node_id: str) -> Node | None:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_node(node_id)
 
     def _db_upsert_node(self, node: Node) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).upsert_node(node)
 
     def _db_delete_node(self, node_id: str) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).delete_node(node_id)
 
     def _db_set_node_status(self, node_id: str, status: NodeStatus) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).set_node_status(node_id, status)
 
     def _db_get_nodes_by_document(
         self, doc_name: str, active_only: bool = False
     ) -> list[Node]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_nodes_by_document(
             doc_name, active_only
         )
 
     def _db_upsert_edge(self, edge: Edge) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).upsert_edge(edge)
 
     def _db_delete_edges_by_label_for_nodes(
         self, label: str, node_ids: set[str]
     ) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).delete_edges_by_label_for_nodes(
             label, node_ids
         )
 
     def _db_record_source(self, doc_name: str, version: str) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).record_source(doc_name, version)
 
     def _db_get_source(self, doc_name: str) -> tuple[str, str] | None:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_source(doc_name)
 
     def _db_ensure_vec_tables(self, dim: int) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).ensure_vec_tables(dim)
 
     def _db_reset_vec_tables(self) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).reset_vec_tables()
 
     def _db_has_vector(self, node_id: str) -> bool:
-        from db import Database
-
+        
         return Database(self.settings.database_path).has_vector(node_id)
 
     def _db_count_vectors(self, table: str) -> int:
-        from db import Database
-
+        
         return Database(self.settings.database_path).count_vectors(table)
 
     def _db_set_vector(self, node_id: str, table: str, vector: list[float]) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).set_vector(node_id, table, vector)
 
     def _db_replace_search_items(self, node_id: str, items: list[dict]) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).replace_search_items(node_id, items)
 
     def _db_delete_search_items(self, node_id: str) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).delete_search_items(node_id)
 
     def _db_set_search_item_vector(self, item_id: str, vector: list[float]) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).set_search_item_vector(item_id, vector)
 
     def _db_get_vector(self, node_id: str, table: str) -> list[float] | None:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_vector(node_id, table)
 
     def _db_get_meta(self, key: str) -> str | None:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_meta(key)
 
     def _db_set_meta(self, key: str, value: str) -> None:
-        from db import Database
-
+        
         Database(self.settings.database_path).set_meta(key, value)
 
     def _db_get_all_nodes(self) -> list[Node]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_all_nodes()
 
     def _db_get_all_edges(self) -> list[Edge]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_all_edges()
 
     def _db_get_edges_for_node(self, node_id: str) -> list[Edge]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_edges_for_node(node_id)
 
     def _db_get_outgoing_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-        from db import Database
-
+        
         return Database(self.settings.database_path).get_outgoing_edges(node_id, label)
 
     def _db_get_incoming_edges(
         self, node_id: str, label: str | None = None
     ) -> list[Edge]:
-        from db import Database
 
         return Database(self.settings.database_path).get_incoming_edges(node_id, label)
 
@@ -2644,11 +2554,6 @@ class GraphWriteSession:
         ]
 
 
-# ============================================================================
-# 5. ReadGraphService
-# ============================================================================
-
-
 class ReadGraphService:
     """
     Concurrent read access with bounded concurrency.
@@ -2720,13 +2625,6 @@ class ReadGraphService:
             return await asyncio.to_thread(work)
 
 
-# ============================================================================
-# 6. WriteJob
-# ============================================================================
-
-WriteStatus = Literal["queued", "running", "done", "failed", "cancelled"]
-
-
 @dataclass
 class WriteJob:
     id: str
@@ -2754,11 +2652,6 @@ def job_to_dict(job: WriteJob) -> dict[str, Any]:
         "result": job.result,
         "error": job.error,
     }
-
-
-# ============================================================================
-# 7. WriteGraphService
-# ============================================================================
 
 
 ASSIMILATING_MESSAGE = (
@@ -2940,11 +2833,6 @@ class WriteGraphService:
         return True
 
 
-# ============================================================================
-# 8. Bootstrap
-# ============================================================================
-
-
 def bootstrap_database(settings: Settings) -> None:
     """
     One-time startup: create vector tables, embed existing active nodes,
@@ -3118,3 +3006,4 @@ def bootstrap_database(settings: Settings) -> None:
     finally:
         print("[bootstrap] DONE", flush=True)
         db.close()
+
