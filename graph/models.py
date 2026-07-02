@@ -29,6 +29,12 @@ class Settings:
     agent_max_steps: int = 40
     agent_patience: int = 20
 
+    # ask() early-exit routing: reuse an existing agent note or answer with
+    # shallow RAG when the graph already covers the question; else deep research
+    agent_early_exit: bool = True
+    early_exit_candidates: int = 8
+    shallow_answer_max_nodes: int = 6
+
     # Compile time/ingest time 
 
     # embeddings
@@ -138,6 +144,16 @@ class Settings:
             cascade_max_nodes=int(env("WIKI_CASCADE_MAX_NODES", cls.cascade_max_nodes)),
             agent_max_steps=int(env("WIKI_AGENT_MAX_STEPS", cls.agent_max_steps)),
             agent_patience=int(env("WIKI_AGENT_PATIENCE", cls.agent_patience)),
+            agent_early_exit=env(
+                "WIKI_AGENT_EARLY_EXIT", "1" if cls.agent_early_exit else "0"
+            )
+            not in {"0", "false", "False", ""},
+            early_exit_candidates=int(
+                env("WIKI_EARLY_EXIT_CANDIDATES", cls.early_exit_candidates)
+            ),
+            shallow_answer_max_nodes=int(
+                env("WIKI_SHALLOW_MAX_NODES", cls.shallow_answer_max_nodes)
+            ),
             search_rrf_k=int(env("WIKI_SEARCH_RRF_K", cls.search_rrf_k)),
             entity_dedup=env("WIKI_ENTITY_DEDUP", "1" if cls.entity_dedup else "0")
             not in {"0", "false", "False", ""},
@@ -293,6 +309,14 @@ class ClaimExtraction(BaseModel):
 class EntityMatch(BaseModel):
     is_same: bool = False
     target_node_id: str | None = None
+
+
+# Early-exit routing decision for ask(): reuse an existing agent note verbatim,
+# answer shallowly from retrieved evidence, or run the deep research agent.
+class RouteDecision(BaseModel):
+    mode: str = "deep"  # "reuse" | "shallow" | "deep"
+    node_id: str | None = None
+    reason: str = ""
 
 
 #  Query response from the graph

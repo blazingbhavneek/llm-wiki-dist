@@ -194,6 +194,9 @@ const STR = {
     following: (who, n, ne) => `${who} · ${n} からリンクをたどり中 (${ne})`,
     subDone: (who, c) => `${who} · 完了 (${c} ソース)`,
     compiling: '回答をコンパイル中…',
+    routeReuse: '既存のノートを再利用して回答します',
+    routeShallow: '浅い検索で回答します（証拠が十分）',
+    routeDeep: '深い調査を開始します',
     diagramBuilding: '図を作成中…',
     diagramReady: '図の準備完了',
     diagramFailed: '図を描画できませんでした',
@@ -374,6 +377,9 @@ const STR = {
     following: (who, n, ne) => `${who} · following links from ${n} (${ne})`,
     subDone: (who, c) => `${who} · done (${c} sources)`,
     compiling: 'compiling answer…',
+    routeReuse: 'reusing an existing note',
+    routeShallow: 'answering from a shallow lookup',
+    routeDeep: 'starting deep research',
     diagramBuilding: 'building diagram…',
     diagramReady: 'diagram ready',
     diagramFailed: 'could not render diagram',
@@ -2080,6 +2086,12 @@ export default function App() {
         return t.searching(who, ev.query)
       case 'candidates':
         return t.pagesFound(ev.count)
+      case 'route':
+        return ev.mode === 'reuse'
+          ? t.routeReuse
+          : ev.mode === 'shallow'
+            ? t.routeShallow
+            : t.routeDeep
       case 'subagents_spawned':
         return t.spawned(ev.starts?.length || 0)
       case 'subagent_start':
