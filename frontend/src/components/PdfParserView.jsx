@@ -54,7 +54,7 @@ export default function PdfParserView({
   const fileRef = useRef(null)
 
   const [file, setFile] = useState(null)
-  const [baseUrl, setBaseUrl] = useState('http://10.160.144.101:51021/v1')
+  const [baseUrl, setBaseUrl] = useState('http://10.160.144.101:51026/v1')
   const [apiKey, setApiKey] = useState('<API_KEY>')
   const [model, setModel] = useState('openai/gpt-oss-120b')
 
@@ -229,7 +229,7 @@ export default function PdfParserView({
                 label="NVIDIA Invoke URL"
                 value={baseUrl}
                 onChange={setBaseUrl}
-                placeholder="http://10.160.144.101:51021/v1"
+                placeholder="http://10.160.144.101:51026/v1"
                 disabled={busy}
               />
 

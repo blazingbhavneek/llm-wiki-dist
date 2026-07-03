@@ -28,7 +28,7 @@ OUTPUT_FILE = None
 # If OUTPUT_FILE is None, output will be:
 # input_filename.described.md
 
-OPENAI_BASE_URL = "http://10.160.144.101:51021/v1"
+OPENAI_BASE_URL = "http://10.160.144.101:51026/v1"
 OPENAI_API_KEY = (
     "<API_KEY>"
 )

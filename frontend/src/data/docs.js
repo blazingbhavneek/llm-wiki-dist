@@ -4,7 +4,7 @@
 // document are chain-linked with `follows` edges (source = prev, target = next).
 // So we reconstruct documents and their page order entirely client-side.
 
-const AGENT_DOC = 'Agent Notes'
+const AGENT_DOC = 'エージェントメモ'
 
 function rangeStart(n) {
   const r = n.source_ranges
