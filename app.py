@@ -10,7 +10,7 @@ Features:
 
 Run:
     pip install fastapi "uvicorn[standard]"
-    WIKI_DB=.wiki/test.sqlite uvicorn app:app --reload --port 8787
+    WIKI_DB=.wiki3/test.sqlite uvicorn app:app --port 51023
 """
 
 from __future__ import annotations
