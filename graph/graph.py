@@ -27,6 +27,17 @@ from .utils import *
 
 log = logging.getLogger("graph_rw")
 
+
+import json
+import traceback
+from datetime import datetime
+from typing import Any, Callable
+from threading import Event
+
+from pydantic import BaseModel, Field
+from langchain_core.tools import StructuredTool
+
+
 # endregion Imports
 
 # region Global vars
@@ -123,7 +134,7 @@ class GraphDbSession:
         # One backend handle for the whole session. Every _db_* helper reuses
         # it instead of opening a fresh connection (and reloading the vec
         # extension) per call. Also creates the db file on first run.
-        self.database = Database(settings.database_path)
+        self.database = Database(settings.database_path, readonly=readonly)
         self.conn = self._open(settings.database_path, readonly=readonly)
 
     def _open(self, path: str, readonly: bool) -> Any:
@@ -153,6 +164,54 @@ class GraphDbSession:
         else:
             self.conn.commit()
         self.close()
+
+def debug_print(label: str, data: Any = None) -> None:
+    """
+    Simple stdout debug logger.
+
+    Uses print(..., flush=True) so logs appear immediately in Docker/server logs.
+    """
+    try:
+        timestamp = datetime.now().isoformat()
+
+        if data is None:
+            print(f"[GRAPH_AGENT_DEBUG] {timestamp} | {label}", flush=True)
+            return
+
+        text = json.dumps(data, ensure_ascii=False, default=str, indent=2)
+        print(
+            f"[GRAPH_AGENT_DEBUG] {timestamp} | {label}\n{text[:12000]}",
+            flush=True,
+        )
+    except Exception:
+        print(
+            f"[GRAPH_AGENT_DEBUG] {datetime.now().isoformat()} | {label} | <debug serialization failed>",
+            flush=True,
+        )
+
+
+def format_lead_candidate(result: dict[str, Any]) -> str:
+    """
+    Formats one early-exit retrieval candidate so the LangGraph lead agent can reuse it.
+    """
+    node = result["node"]
+
+    evidence_lines: list[str] = []
+    for ev in result.get("evidence", [])[:5]:
+        text = " ".join((ev.get("text") or "").split())
+        if text:
+            evidence_lines.append(f"  - {text[:700]}")
+
+    evidence_text = "\n".join(evidence_lines) if evidence_lines else "  - no evidence snippets"
+
+    return (
+        f"- node_id: `{node.id}`\n"
+        f"  title: {node.title}\n"
+        f"  summary: {node.summary}\n"
+        f"  evidence:\n{evidence_text}\n"
+        f"  next_action: if relevant, call explore(node_ids=['{node.id}']) or include this id with other candidates"
+    )
+
 
 # Graph reader, no mutation so thread safe, allows to override global config on client request
 class GraphReadSession:
@@ -697,18 +756,62 @@ class GraphReadSession:
         emit: Callable,
         stop_event: threading.Event | None = None,
     ) -> AgentAnswer | None:
+        """
+        Early-exit router.
+
+        Outcomes:
+        1. reuse existing agent note verbatim
+        2. compose shallow RAG answer from retrieved evidence
+        3. return None to fall through to deep LangGraph research
+
+        Important change:
+        - If router chooses deep, we preserve the retrieved candidates in:
+            self._lead_seed_context
+            self._lead_seed_node_ids
+        so LangGraph does not start blind.
+        """
+
+        debug_print("early_exit.start", {"question": question})
+
+        # Clear stale seed context from any previous call on the same session object.
+        self._lead_seed_context = ""
+        self._lead_seed_node_ids = []
+
         if stop_event is not None and stop_event.is_set():
             raise AgentStopped("agent run cancelled")
 
         try:
             results = self.search_with_evidence(
-                question, limit=self.settings.early_exit_candidates
+                question,
+                limit=self.settings.early_exit_candidates,
             )
+
+            debug_print(
+                "early_exit.search_with_evidence.results",
+                {
+                    "count": len(results),
+                    "nodes": [
+                        {
+                            "id": r["node"].id,
+                            "title": r["node"].title,
+                            "summary": r["node"].summary,
+                            "score": r.get("score"),
+                            "evidence_count": len(r.get("evidence", [])),
+                        }
+                        for r in results
+                    ],
+                },
+            )
+
         except Exception as exc:
+            debug_print("early_exit.retrieval_failed", {"error": repr(exc)})
+            traceback.print_exc()
             log.info("early-exit retrieval failed; deep path: %s", exc)
             return None
+
         if not results:
             emit({"type": "route", "mode": "deep", "reason": "no candidates"})
+            debug_print("early_exit.no_candidates.deep_path")
             return None
 
         emit(
@@ -738,18 +841,39 @@ class GraphReadSession:
             "question": question,
             "candidates": [describe(r) for r in results],
         }
+
         try:
             raw = self.llm.complete_structured(
-                ROUTER_PROMPT, json.dumps(payload, ensure_ascii=False), RouteDecision
+                ROUTER_PROMPT,
+                json.dumps(payload, ensure_ascii=False),
+                RouteDecision,
             )
+
+            debug_print("early_exit.router.raw", raw)
+
             decision = (
-                raw if isinstance(raw, RouteDecision) else RouteDecision.model_validate(raw)
+                raw
+                if isinstance(raw, RouteDecision)
+                else RouteDecision.model_validate(raw)
             )
+
+            debug_print(
+                "early_exit.router.decision",
+                {
+                    "mode": decision.mode,
+                    "reason": decision.reason,
+                    "node_id": decision.node_id,
+                },
+            )
+
         except Exception as exc:
+            debug_print("early_exit.router_failed", {"error": repr(exc)})
+            traceback.print_exc()
             log.info("early-exit router failed; deep path: %s", exc)
             return None
 
         mode = (decision.mode or "deep").strip().lower()
+
         emit(
             {
                 "type": "route",
@@ -758,20 +882,55 @@ class GraphReadSession:
                 "node_id": decision.node_id,
             }
         )
+
         if stop_event is not None and stop_event.is_set():
             raise AgentStopped("agent run cancelled")
 
+        # ---------------------------------------------------------------------
+        # Critical new behavior:
+        # If router chooses deep, preserve the 8 candidates instead of discarding.
+        # ---------------------------------------------------------------------
+        if mode == "deep":
+            self._lead_seed_context = "\n\n".join(
+                format_lead_candidate(r) for r in results
+            )
+            self._lead_seed_node_ids = [r["node"].id for r in results]
+
+            debug_print(
+                "early_exit.deep_seed_saved",
+                {
+                    "seed_node_ids": self._lead_seed_node_ids,
+                    "seed_context_preview": self._lead_seed_context[:3000],
+                },
+            )
+
+            return None
+
         if mode == "reuse" and decision.node_id:
             node = self._db_get_node(clean_node_ref(decision.node_id))
+
+            debug_print(
+                "early_exit.reuse.attempt",
+                {
+                    "requested_node_id": decision.node_id,
+                    "cleaned_node_id": clean_node_ref(decision.node_id),
+                    "found": node is not None,
+                    "status": getattr(node, "status", None) if node else None,
+                    "has_body": bool(node and node.body and node.body.strip()),
+                },
+            )
+
             if node and node.status == NodeStatus.active and node.body.strip():
                 emit({"type": "read", "agent": 0, "node": node_ref(node)})
+
                 # Cite the note plus the sources it was derived from so the UI
                 # highlights the whole provenance path.
                 cited = [node.id] + [
                     e.target_node_id
                     for e in self._db_get_outgoing_edges(node.id, "reference")
                 ]
-                return AgentAnswer(
+
+                answer = AgentAnswer(
                     question=question,
                     answer=node.body,
                     cited_node_ids=dedupe(cited),
@@ -780,11 +939,24 @@ class GraphReadSession:
                         node.id if node.type == NodeType.exogenous else None
                     ),
                 )
+
+                debug_print(
+                    "early_exit.reuse.success",
+                    {
+                        "node_id": node.id,
+                        "cited_node_ids": answer.cited_node_ids,
+                    },
+                )
+
+                return answer
+
             # Router pointed at a bad node; the evidence is still usable.
+            debug_print("early_exit.reuse.bad_node_falling_back_to_shallow")
             mode = "shallow"
 
         if mode == "shallow":
             top = results[: self.settings.shallow_answer_max_nodes]
+
             context = {
                 "question": question,
                 "notes": [
@@ -801,22 +973,64 @@ class GraphReadSession:
                     for r in top
                 ],
             }
+
             emit({"type": "compiling"})
+
+            debug_print(
+                "early_exit.shallow.start",
+                {
+                    "node_ids": [r["node"].id for r in top],
+                    "note_count": len(top),
+                },
+            )
+
             try:
                 text = self.llm.complete(
-                    SHALLOW_ANSWER_PROMPT, json.dumps(context, ensure_ascii=False)
+                    SHALLOW_ANSWER_PROMPT,
+                    json.dumps(context, ensure_ascii=False),
                 ).strip()
+
+                debug_print(
+                    "early_exit.shallow.llm_result",
+                    {
+                        "answer_len": len(text),
+                        "answer_preview": text[:1000],
+                    },
+                )
+
             except Exception as exc:
+                debug_print("early_exit.shallow_failed", {"error": repr(exc)})
+                traceback.print_exc()
                 log.info("shallow answer failed; deep path: %s", exc)
                 return None
+
             if not text:
+                debug_print("early_exit.shallow.empty_answer.deep_path")
                 return None
-            return AgentAnswer(
+
+            answer = AgentAnswer(
                 question=question,
                 answer=text,
                 cited_node_ids=[r["node"].id for r in top],
                 steps=1,
             )
+
+            debug_print(
+                "early_exit.shallow.success",
+                {
+                    "cited_node_ids": answer.cited_node_ids,
+                },
+            )
+
+            return answer
+
+        debug_print(
+            "early_exit.unknown_mode.deep_path",
+            {
+                "mode": mode,
+                "reason": decision.reason,
+            },
+        )
 
         return None
 
@@ -826,7 +1040,73 @@ class GraphReadSession:
         emit: Callable,
         stop_event: threading.Event | None = None,
     ) -> AgentAnswer:
-        return run_lead_agent(self, question, emit, stop_event=stop_event)
+        """
+        Run the LangGraph lead agent with its own DB session.
+
+        This prevents LangGraph worker/tool threads from touching the request-thread
+        DB handle stored on self.db.
+        """
+        import copy
+        import threading
+        import traceback
+
+        seed_context = getattr(self, "_lead_seed_context", "")
+        seed_node_ids = getattr(self, "_lead_seed_node_ids", [])
+
+        print(
+            f"[GRAPH_AGENT_DEBUG] _run_lead.start thread={threading.get_ident()} "
+            f"has_seed_context={bool(seed_context.strip())} seed_node_ids={seed_node_ids}",
+            flush=True,
+        )
+
+        langgraph_db = None
+
+        try:
+            # Create a DB session specifically for this LangGraph run.
+            # readonly=True is safer for research/read-only agent work.
+            langgraph_db = GraphDbSession(self.settings, readonly=True)
+
+            print(
+                f"[GRAPH_AGENT_DEBUG] langgraph_db.created thread={threading.get_ident()}",
+                flush=True,
+            )
+
+            # Shallow-copy the session object so methods like search_with_evidence(),
+            # read_node(), _db_get_node(), etc. still exist, but self.db points to
+            # the LangGraph-specific DB session.
+            langgraph_session = copy.copy(self)
+            langgraph_session.db = langgraph_db
+
+            return run_lead_agent(
+                langgraph_session,
+                question,
+                emit,
+                stop_event=stop_event,
+                seed_context=seed_context,
+                seed_node_ids=seed_node_ids,
+            )
+
+        except Exception as exc:
+            print(
+                f"[GRAPH_AGENT_DEBUG] _run_lead.failed thread={threading.get_ident()} error={repr(exc)}",
+                flush=True,
+            )
+            traceback.print_exc()
+            raise
+
+        finally:
+            if langgraph_db is not None:
+                try:
+                    print(
+                        f"[GRAPH_AGENT_DEBUG] langgraph_db.close thread={threading.get_ident()}",
+                        flush=True,
+                    )
+                    langgraph_db.close()
+                except Exception as exc:
+                    print(
+                        f"[GRAPH_AGENT_DEBUG] langgraph_db.close.failed error={repr(exc)}",
+                        flush=True,
+                    )
 
     # Run a subagent to explor multiple topics to avoid missing a path that might have been a better answer
     def _run_subagents(
@@ -1145,37 +1425,81 @@ class GraphWriteSession:
                 log.info("delete cascade failed for %s: %s", node_id, exc)
         self._db_delete_node(node_id)
 
+    def _clean_optional_text(self, value: str | None, max_len: int | None = None) -> str | None:
+        if not value:
+            return None
+
+        text = " ".join(value.strip().split())
+
+        if not text:
+            return None
+
+        if max_len is not None and len(text) > max_len:
+            return text[: max_len - 1].rstrip() + "…"
+
+        return text
+
+
+    def _exo_title_for_note(
+        self,
+        body: str,
+        origin: str | None,
+        question: str | None,
+    ) -> str:
+        clean_question = self._clean_optional_text(question)
+
+        # For saved agent answers, prefer the original question as title.
+        # This makes future identical/similar queries much easier to retrieve.
+        if clean_question:
+            return clean_question
+
+        return self._title_from_markdown(body) or self._exo_fallback_title(origin, body)
+
     def create_exogenous_node(
-        self, body: str, source_node_ids: list[str], origin: str | None = None
+        self,
+        body: str,
+        source_node_ids: list[str],
+        origin: str | None = None,
+        question: str | None = None,
     ) -> Node:
-        # Fast path for agent-authored notes: keep the markdown verbatim (mermaid
-        # and all), fill only the cheap derived fields, link cited sources as
-        # `reference` edges, and defer summary generation to the background. No
-        # recluster -- the node lands in a fixed "Agent Notes" cluster and is
-        # searchable (FTS title/body/keywords + body vector) the moment we return.
+        clean_question = self._clean_optional_text(question)
+
+        # Important:
+        # Do not hash only origin/question, otherwise different answers to the same
+        # question can collide. Include body too.
+        identity_material = "\n\n".join(
+            part
+            for part in [
+                origin or "",
+                clean_question or "",
+                body,
+            ]
+            if part
+        )
+
         node = Node(
-            id=make_exogenous_node_id(origin or body),
+            id=make_exogenous_node_id(identity_material),
             body=body,
             type=NodeType.exogenous,
-            title=self._title_from_markdown(body) or self._exo_fallback_title(origin, body),
-            # Leave the document name unset so every agent note groups under the
-            # single "Agent Notes" library entry instead of spawning its own
-            # top-level document per save.
+            title=self._exo_title_for_note(body, origin, clean_question),
             original_document_name=None,
             cluster="Agent Notes",
         )
+
         self._fill_cheap_fields(node)
         self._db_upsert_node(node)
+
         body_vec, _ = self._store_vectors(node)
-        # Place the note in a real topic cluster instead of a static bucket.
+
         node.cluster = self._cluster_for_references(node.id, source_node_ids, body_vec)
         self._db_upsert_node(node)
+
         self._link_references(node, source_node_ids)
-        # `supports` edges (source -> note) are the path _cascade_dependents
-        # walks; without them a source revision could never refresh this note.
         self._link_supports(node, dedupe([sid for sid in source_node_ids if sid]))
+
         if self.runtime.enrich is not None:
             self.runtime.enrich.enqueue_summary(node.id)
+
         return node
 
     def create_document_node(
@@ -2835,8 +3159,7 @@ def job_to_dict(job: WriteJob) -> dict[str, Any]:
 
 
 ASSIMILATING_MESSAGE = (
-    "Added to the graph and searchable now. Ranking is still assimilating in "
-    "the background — results improve shortly."
+    "グラフへの追加が完了し、検索できるようになりました。ランキングは現在バックグラウンドで反映中です。しばらくすると検索結果の精度が向上します。"
 )
 
 
@@ -2962,6 +3285,7 @@ class WriteGraphService:
                     body=job.payload["body"],
                     source_node_ids=job.payload.get("source_node_ids", []),
                     origin=job.payload.get("origin"),
+                    question=job.payload.get("question"),
                 )
                 return _assimilating_result(node)
 

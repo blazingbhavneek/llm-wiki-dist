@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from .base import BaseLlmClient
 from .utils import strip_image_media
 
-INVOKE_URL = "http://10.160.144.101:51021/v1"
+INVOKE_URL = "http://10.160.144.101:51026/v1"
 API_KEY = (
     "<API_KEY>"
 )

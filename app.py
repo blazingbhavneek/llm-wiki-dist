@@ -23,7 +23,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any
-
+from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -161,9 +161,11 @@ class UpdateBody(BaseModel):
 
 class ExogenousBody(BaseModel):
     body: str
-    source_node_ids: list[str] = []
+    source_node_ids: list[str] = Field(default_factory=list)
     origin: str | None = None
 
+    # New: original user query this note answers.
+    question: str | None = None
 
 class DocumentBody(BaseModel):
     body: str
@@ -449,6 +451,7 @@ async def create_exogenous(payload: ExogenousBody) -> dict:
             "body": payload.body,
             "source_node_ids": payload.source_node_ids,
             "origin": payload.origin,
+            "question": payload.question,
         },
     )
 

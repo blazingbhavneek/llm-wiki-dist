@@ -20,11 +20,11 @@ def now_iso() -> str:
 class Settings:
 
     # For Chat UI
-    chat_base_url: str = "http://10.160.144.101:51021/v1"
+    chat_base_url: str = "http://10.160.144.101:51029/v1"
     chat_api_key: str = (
         "<API_KEY>"
     )
-    chat_model: str = "openai/gpt-oss-120b"
+    chat_model: str = "gemma-4-31B"
     chat_temperature: float = 0.4
     agent_max_steps: int = 40
     agent_patience: int = 20
@@ -32,7 +32,7 @@ class Settings:
     # ask() early-exit routing: reuse an existing agent note or answer with
     # shallow RAG when the graph already covers the question; else deep research
     agent_early_exit: bool = True
-    early_exit_candidates: int = 8
+    early_exit_candidates: int = 20
     shallow_answer_max_nodes: int = 6
 
     # Compile time/ingest time 
@@ -313,11 +313,60 @@ class EntityMatch(BaseModel):
 
 # Early-exit routing decision for ask(): reuse an existing agent note verbatim,
 # answer shallowly from retrieved evidence, or run the deep research agent.
-class RouteDecision(BaseModel):
-    mode: str = "deep"  # "reuse" | "shallow" | "deep"
-    node_id: str | None = None
-    reason: str = ""
+from enum import Enum
+from pydantic import BaseModel, Field
 
+
+class RouteMode(str, Enum):
+    """
+    Strategy selected by the early-exit router.
+    """
+
+    reuse = "reuse"
+    shallow = "shallow"
+    deep = "deep"
+
+
+class RouteDecision(BaseModel):
+    """
+    Routing decision for ask() early-exit behavior.
+
+    The router chooses the cheapest strategy that can still answer accurately:
+    - reuse: return an existing agent-created answer note verbatim
+    - shallow: answer directly from retrieved evidence snippets
+    - deep: run the full research agent
+    """
+
+    mode: RouteMode = Field(
+        default=RouteMode.deep,
+        description=(
+            "The routing strategy to use. "
+            "'reuse' means an existing agent_note already answers the question almost completely, "
+            "so return that note verbatim. "
+            "'shallow' means the question is narrow and can be answered accurately from the retrieved evidence snippets. "
+            "'deep' means the question is broad, multi-topic, uncertain, or the retrieved evidence is insufficient, "
+            "so the full research agent should run."
+        ),
+    )
+
+    node_id: str | None = Field(
+        default=None,
+        description=(
+            "The exact candidate node id to reuse when mode is 'reuse'. "
+            "This must be copied exactly from one of the provided candidate node IDs. "
+            "Required for mode='reuse'. "
+            "Should be null for mode='shallow' or mode='deep'."
+        ),
+    )
+
+    reason: str = Field(
+        default="",
+        description=(
+            "A short one-sentence explanation for the routing decision. "
+            "Explain why the selected mode is sufficient or why deeper research is needed. "
+            "Do not leave this empty."
+        ),
+    )
 
 #  Query response from the graph
 class QueryResult(BaseModel):

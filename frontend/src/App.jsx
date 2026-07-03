@@ -83,7 +83,7 @@ const STR = {
       switchToTopics: 'トピック',
       terms: '利用規約',
       privacy: 'プライバシーポリシー',
-      footerCopyright: (year) => `© ${year} LLM Wiki Project`,
+      footerCopyright: (year) => `${year} MESW LLM Wiki`,
     },
 
     topbar: {
@@ -266,7 +266,7 @@ const STR = {
       switchToTopics: 'Topics',
       terms: 'Terms',
       privacy: 'Privacy Policy',
-      footerCopyright: (year) => `© ${year} LLM Wiki Project`,
+      footerCopyright: (year) => `${year} MESW LLM Wiki`,
     },
 
     topbar: {
@@ -452,12 +452,12 @@ function LeftSidebar({
       icon: BookMarked,
       view: 'glossary',
     },
-    {
-      id: 'explorer',
-      label: t.shell.explorer,
-      icon: FolderTree,
-      view: 'explorer',
-    },
+    // {
+    //   id: 'explorer',
+    //   label: t.shell.explorer,
+    //   icon: FolderTree,
+    //   view: 'explorer',
+    // },
   ]
 
   return (
@@ -1262,7 +1262,7 @@ function AppFooter() {
 
   return (
     <footer className="flex h-[42px] shrink-0 items-center justify-between border-t border-slate-200 bg-white px-5 text-[12px] font-medium text-slate-400">
-      <span>{t.shell.footerCopyright('2024')}</span>
+      <span>{t.shell.footerCopyright('2026')}</span>
 
       <div className="flex items-center gap-5">
         <button className="hover:text-slate-700">
@@ -1277,7 +1277,7 @@ function AppFooter() {
 }
 
 
-const pdfApiBase = 'http://localhost:51025'
+const pdfApiBase = 'http://10.160.144.101:51025'
 
 function describeWriteJob(job, doneText, t) {
   if (!job?.status) return t.startingWrite
@@ -1331,6 +1331,97 @@ export default function App() {
   const [centerHistory, setCenterHistory] = useState([])
 
   const draftSeq = useRef(0)
+
+  // Assimilation refs
+  const assimilationTimerRef = useRef(null)
+  const assimilationStopAtRef = useRef(0)
+  const assimilationIdleHitsRef = useRef(0)
+
+  const stopAssimilationPolling = useCallback(() => {
+    if (assimilationTimerRef.current) {
+      clearTimeout(assimilationTimerRef.current)
+      assimilationTimerRef.current = null
+    }
+
+    assimilationStopAtRef.current = 0
+    assimilationIdleHitsRef.current = 0
+  }, [])
+
+  const startAssimilationPolling = useCallback((options = {}) => {
+    const {
+      intervalMs = 4000,
+      minDurationMs = 10000,
+      maxDurationMs = 120000,
+      idleHitsToStop = 2,
+    } = options
+
+    const startedAt = Date.now()
+    const minStopAt = startedAt + minDurationMs
+
+    assimilationStopAtRef.current = Math.max(
+      assimilationStopAtRef.current,
+      startedAt + maxDurationMs,
+    )
+
+    if (assimilationTimerRef.current) {
+      return
+    }
+
+    const tick = async () => {
+      try {
+        const res = await api.assimilation()
+        const pending = Number(res?.pending ?? 0)
+
+        setAssimPending(Number.isFinite(pending) ? pending : 0)
+
+        if (pending > 0) {
+          assimilationIdleHitsRef.current = 0
+        } else {
+          assimilationIdleHitsRef.current += 1
+        }
+
+        const now = Date.now()
+
+        const shouldContinue =
+          now < assimilationStopAtRef.current &&
+          (
+            pending > 0 ||
+            now < minStopAt ||
+            assimilationIdleHitsRef.current < idleHitsToStop
+          )
+
+        if (shouldContinue) {
+          assimilationTimerRef.current = setTimeout(tick, intervalMs)
+        } else {
+          assimilationTimerRef.current = null
+          assimilationStopAtRef.current = 0
+          assimilationIdleHitsRef.current = 0
+
+          if (pending <= 0) {
+            setAssimPending(0)
+          }
+        }
+      } catch {
+        const now = Date.now()
+
+        if (now < assimilationStopAtRef.current) {
+          assimilationTimerRef.current = setTimeout(tick, intervalMs)
+        } else {
+          assimilationTimerRef.current = null
+          assimilationStopAtRef.current = 0
+          assimilationIdleHitsRef.current = 0
+        }
+      }
+    }
+
+    tick()
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      stopAssimilationPolling()
+    }
+  }, [stopAssimilationPolling])
 
   // chat
   const [messages, setMessages] = useState([])
@@ -1483,31 +1574,6 @@ export default function App() {
       .finally(() => setLoading(false))
   }, [reload])
 
-  // Poll background-assimilation backlog.
-  useEffect(() => {
-    let alive = true
-
-    const poll = async () => {
-      try {
-        const res = await api.assimilation()
-
-        if (alive) {
-          setAssimPending(res?.pending ?? 0)
-        }
-      } catch {
-        // endpoint optional
-      }
-    }
-
-    poll()
-
-    const timer = setInterval(poll, 4000)
-
-    return () => {
-      alive = false
-      clearInterval(timer)
-    }
-  }, [])
 
   const setAnswerWriteStatus = (answerId, text) => {
     if (!answerId) return
@@ -1861,6 +1927,8 @@ export default function App() {
   // ---------------------------------------------------------------------------
 
   const saveNode = async (item) => {
+    startAssimilationPolling()
+
     updateWorkspace(item.id, {
       busy: true,
       busyMessage: t.startingUpdate,
@@ -1941,6 +2009,8 @@ export default function App() {
 
   const uploadMarkdown = async ({ filename, markdown }, onStatus) => {
     try {
+      startAssimilationPolling()
+
       onStatus?.(t.startingWriteGraph)
 
       const node = await api.createDocument(
@@ -1951,7 +2021,10 @@ export default function App() {
         },
         {
           onProgress: (job) => onStatus?.(describeWriteJob(job, t.mdAdded, t)),
-          onAssimilating: (msg) => fireToast(msg),
+          onAssimilating: (msg) => {
+            startAssimilationPolling()
+            fireToast(msg)
+          },
         },
       )
 
@@ -1969,6 +2042,7 @@ export default function App() {
   }
 
   const addDraftToGraph = async (item) => {
+    startAssimilationPolling()
     updateWorkspace(item.id, {
       busy: true,
       busyMessage: t.startingWriteGraph,
@@ -1980,12 +2054,21 @@ export default function App() {
     }
 
     try {
+      const exogenousQuestion =
+        item.answer?.question ||
+        item.question ||
+        item.draft?.question ||
+        item.draft?.title ||
+        ''
+
+      const exogenousOriginPrefix = item.kind === 'answer' ? 'agent' : 'human'
+
       const node =
         item.sourceType === 'exogenous'
           ? await api.createExogenous(
               item.draft.markdown,
               item.sourceIds || [],
-              `${item.kind === 'answer' ? 'agent' : 'human'}:${item.draft.title.slice(0, 60)}`,
+              `${exogenousOriginPrefix}:${exogenousQuestion.slice(0, 60)}`,
               {
                 onProgress: (job) => {
                   const text = describeWriteJob(job, t.addedToGraph, t)
@@ -1998,7 +2081,13 @@ export default function App() {
                     setAnswerWriteStatus(item.answer.id, text)
                   }
                 },
-                onAssimilating: (msg) => fireToast(msg),
+                onAssimilating: (msg) => {
+                  startAssimilationPolling()
+                  fireToast(msg)
+                },
+              },
+              {
+                question: exogenousQuestion || null,
               },
             )
           : await api.createDocument(
@@ -2015,7 +2104,10 @@ export default function App() {
                     busyMessage: describeWriteJob(job, t.addedToGraph, t),
                   })
                 },
-                onAssimilating: (msg) => fireToast(msg),
+                onAssimilating: (msg) => {
+                  startAssimilationPolling()
+                  fireToast(msg)
+                },
               },
             )
 
@@ -2300,6 +2392,8 @@ export default function App() {
   const addWiki = async (answer) => {
     if (!answer || savedIds.has(answer.id) || addingIds.has(answer.id)) return
 
+    startAssimilationPolling()
+
     const answerWorkspace =
       workspace?.kind === 'answer' && workspace.answer?.id === answer.id
         ? workspace
@@ -2312,6 +2406,11 @@ export default function App() {
       answer.title ??
       answer.question ??
       t.answer
+
+    const answerQuestion =
+      answer.question ||
+      title ||
+      ''
 
     const citedIds = answerWorkspace?.sourceIds || answer.citedIds || []
 
@@ -2329,7 +2428,7 @@ export default function App() {
       const node = await api.createExogenous(
         markdown,
         citedIds,
-        `agent:${title.slice(0, 60)}`,
+        `agent:${answerQuestion.slice(0, 60)}`,
         {
           onProgress: (job) => {
             const text = describeWriteJob(job, t.savedToGraph, t)
@@ -2342,7 +2441,13 @@ export default function App() {
               })
             }
           },
-          onAssimilating: (msg) => fireToast(msg),
+          onAssimilating: (msg) => {
+            startAssimilationPolling()
+            fireToast(msg)
+          },
+        },
+        {
+          question: answerQuestion || null,
         },
       )
 
@@ -2556,11 +2661,6 @@ export default function App() {
           canGoBack={centerHistory.length > 0}
           onBack={goBackFromWorkspace}
           onClose={closeWorkspace}
-          onDoubleClick={() => {
-            if (workspace.kind !== 'fulldoc') {
-              startEdit(workspace.id)
-            }
-          }}
         >
           <MarkdownView
             doc={workspace.doc}

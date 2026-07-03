@@ -1,7 +1,7 @@
 // Thin client over the FastAPI backend (app.py).
 // Base URL configurable via VITE_API_URL; defaults to the dev server port.
 
-const BASE = import.meta.env.VITE_API_URL || 'http://localhost:51026'
+const BASE = import.meta.env.VITE_API_URL || 'http://10.160.144.101:51023'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function req(path, opts) {
@@ -122,10 +122,21 @@ export const api = {
       }
     }
   },
-  createExogenous: async (body, sourceNodeIds, origin, jobOpts) =>
+  createExogenous: async (
+    body,
+    sourceNodeIds,
+    origin,
+    jobOpts,
+    metadata = {},
+  ) =>
     unwrapAdd(await writeReq('/api/exogenous', {
       method: 'POST',
-      body: JSON.stringify({ body, source_node_ids: sourceNodeIds, origin }),
+      body: JSON.stringify({
+        body,
+        source_node_ids: sourceNodeIds,
+        origin,
+        question: metadata.question || null,
+      }),
     }, jobOpts), jobOpts),
   createDocument: async ({ body, title, documentName, sourcePath, sourceRanges }, jobOpts) =>
     unwrapAdd(await writeReq('/api/document', {
