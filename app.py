@@ -122,19 +122,19 @@ async def lifespan(_: FastAPI):
 
 def _gateway() -> ModelGateway:
     if gateway is None:
-        raise HTTPException(status_code=503, detail="gateway not ready")
+        raise HTTPException(status_code=503, detail="ゲートウェイが準備できていません")
     return gateway
 
 
 def reads() -> Researcher:
     if researcher is None:
-        raise HTTPException(status_code=503, detail="researcher not ready")
+        raise HTTPException(status_code=503, detail="リサーチャーが準備できていません")
     return researcher
 
 
 def writes() -> Librarian:
     if librarian is None:
-        raise HTTPException(status_code=503, detail="librarian not ready")
+        raise HTTPException(status_code=503, detail="ライブラリアンが準備できていません")
     return librarian
 
 
@@ -209,6 +209,11 @@ class ExogenousBody(BaseModel):
 
     # New: original user query this note answers.
     question: str | None = None
+
+
+class IngestRawBody(BaseModel):
+    text: str
+    origin: str | None = None
 
 
 class DocumentBody(BaseModel):
@@ -323,7 +328,7 @@ async def get_health(node_id: str | None = None) -> dict:
 async def read_node(node_id: str) -> dict:
     node = await reads().read_node(node_id)
     if node is None:
-        raise HTTPException(status_code=404, detail="node not found")
+        raise HTTPException(status_code=404, detail="ノードが見つかりません")
     return _dump(node)
 
 
@@ -444,7 +449,7 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
 @app.post("/api/agent-runs/{run_id}/stop")
 async def stop_agent_run(run_id: str) -> dict:
     if not agent_runs.stop(run_id):
-        raise HTTPException(status_code=404, detail="agent run not found")
+        raise HTTPException(status_code=404, detail="エージェント実行が見つかりません")
     return {"run_id": run_id, "status": "stopping"}
 
 
@@ -481,6 +486,13 @@ async def create_exogenous(payload: ExogenousBody) -> dict:
             "origin": payload.origin,
             "question": payload.question,
         },
+    )
+
+
+@app.post("/api/ingest-raw")
+async def ingest_raw(payload: IngestRawBody) -> dict:
+    return await _enqueue(
+        "ingest_raw", {"text": payload.text, "origin": payload.origin}
     )
 
 
@@ -535,7 +547,7 @@ async def list_write_jobs(status: str | None = None, limit: int = 100) -> list[d
 async def get_write_job(job_id: str) -> dict:
     job = writes().get_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
+        raise HTTPException(status_code=404, detail="ジョブが見つかりません")
     return _job_response(job)
 
 
@@ -543,5 +555,5 @@ async def get_write_job(job_id: str) -> dict:
 async def cancel_write_job(job_id: str) -> dict:
     cancelled = writes().cancel_job(job_id)
     if not cancelled:
-        raise HTTPException(status_code=409, detail="job not cancellable")
+        raise HTTPException(status_code=409, detail="このジョブはキャンセルできません")
     return {"job_id": job_id, "status": "cancelled"}

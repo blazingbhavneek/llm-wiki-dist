@@ -319,6 +319,14 @@ class ClaimExtraction(BaseModel):
     entity: str = ""
     claims: list[str] = Field(default_factory=list)
 
+# Durable discoveries extracted from raw transcripts
+class ExtractedDiscovery(BaseModel):
+    title: str
+    body: str
+
+class DiscoveryExtraction(BaseModel):
+    discoveries: list[ExtractedDiscovery] = Field(default_factory=list)
+
 # Whether two entities are same or not
 class EntityMatch(BaseModel):
     is_same: bool = False
@@ -453,40 +461,40 @@ class RerankerPort(Protocol):
 
 # Tools Schemas
 class search(BaseModel):
-    """Search the wiki for nodes matching a text query."""
+    """テキストクエリに一致するノードをWikiから検索します。"""
 
-    text: str = Field(description="keywords to search for")
+    text: str = Field(description="検索するキーワード")
 
 
 class read(BaseModel):
-    """Read a node's full body and metadata by id."""
+    """IDを指定してノードの本文全体とメタデータを読みます。"""
 
-    node_id: str = Field(description="id of the node to read")
+    node_id: str = Field(description="読むノードのID")
 
 
 class follow_link(BaseModel):
-    """Follow edges from a node to its neighboring nodes."""
+    """ノードからエッジをたどり、隣接ノードへ移動します。"""
 
-    node_id: str = Field(description="id of the node to expand")
+    node_id: str = Field(description="展開するノードのID")
     direction: str = Field(
-        default="both", description="'incoming', 'outgoing', or 'both'"
+        default="both", description="'incoming'、'outgoing'、または 'both'"
     )
 
 
 class explore(BaseModel):
-    """Hand distinct starting node ids to a team of exploration subagents."""
+    """重複しない開始ノードIDを探索サブエージェントのチームに渡します。"""
 
     node_ids: list[str] = Field(
-        default_factory=list, description="distinct starting node ids"
+        default_factory=list, description="重複しない開始ノードID"
     )
 
 
 class finish(BaseModel):
-    """Provide the final answer and the node ids used as evidence."""
+    """最終回答と、根拠として使用したノードIDを提出します。"""
 
-    answer: str = Field(description="the final answer, grounded in node content")
+    answer: str = Field(description="ノード本文に根拠を持つ最終回答")
     cited_node_ids: list[str] = Field(
-        default_factory=list, description="ids that support the answer"
+        default_factory=list, description="回答を裏付けるノードID"
     )
 
 
@@ -584,6 +592,17 @@ CLAIM_PROMPT = (
     "数値、対象範囲を含む場合は、対象、条件、行動、結果、例外、日付、値、役割の関係を"
     "優先して抽出してください。"
     "本文に存在しない事実を推論したり追加したりしないでください。"
+)
+
+DISCOVERY_PROMPT = (
+    "あなたは開発者のコーディングエージェントが残した生の作業記録（トランスクリプト）を読みます。"
+    "恒久的で再利用可能な発見のみを抽出してください：根本原因、不変条件、落とし穴、"
+    "理由を伴う自明でない意思決定。\n"
+    "ルール：\n"
+    "- ほとんどのトランスクリプトには恒久的な内容は何も含まれていません。その場合は空のリストを返してください。\n"
+    "- 経過の説明、計画、TODOのような雑談、コードを読めば明らかな事実は決して抽出しないでください。\n"
+    "- 各発見は単体で理解できなければなりません（タイトルと、関係するファイル・シンボル・コミットを"
+    "本文中に明記した本文）。"
 )
 
 ROUTER_PROMPT = (
@@ -799,19 +818,19 @@ MERMAID_FIX_SYSTEM = (
 )
 
 LEAD_AGENT_PROMPT = """
-You are the lead research agent.
+あなたは主任研究エージェントです。
 
-You can use these tools:
-- search(text): search for candidate nodes
-- explore(node_ids): dispatch subagents to inspect specific nodes
-- finish(answer, cited_node_ids): provide final answer
+使用できるツール：
+- search(text)：候補ノードを検索します
+- explore(node_ids)：指定したノードを調査するサブエージェントを派遣します
+- finish(answer, cited_node_ids)：最終回答を提出します
 
-Rules:
-- Prefer exact node IDs from search results.
-- If candidate nodes are already provided in the user message, inspect them first.
-- Use explore(...) when you have relevant node IDs.
-- Do not endlessly search with tiny keyword variations.
-- Finish with a concise answer and cite supporting node IDs.
+ルール：
+- 検索結果に含まれる正確なノードIDを優先して使用してください。
+- ユーザーメッセージに候補ノードがすでに提示されている場合は、まずそれらを調査してください。
+- 関連するノードIDがある場合は explore(...) を使用してください。
+- キーワードをわずかに変えただけの検索を延々と繰り返さないでください。
+- 簡潔な回答で finish し、根拠となるノードIDを引用してください。
 """.strip()
 
 
@@ -984,7 +1003,7 @@ def clean_node_ref(value: str) -> str:
 
 def format_node_full(node: Node | None, requested_id: str, cleaned_id: str) -> str:
     if not node:
-        return f"node not found\nrequested_id: {requested_id}\ncleaned_id: {cleaned_id}"
+        return f"ノードが見つかりません\nrequested_id: {requested_id}\ncleaned_id: {cleaned_id}"
     note = ""
     if requested_id.strip() != cleaned_id:
         note = f"requested_id: {requested_id}\ncleaned_id: {cleaned_id}\n"
@@ -1145,12 +1164,12 @@ def format_lead_candidate(result: dict[str, Any]) -> str:
         if snippet:
             evidence_lines.append(f"  - [{ev['field']}] {snippet[:700]}")
     evidence_text = (
-        "\n".join(evidence_lines) if evidence_lines else "  - no evidence snippets"
+        "\n".join(evidence_lines) if evidence_lines else "  - 証拠抜粋なし"
     )
     lines += (
         f"\n  evidence:\n{evidence_text}\n"
-        f"  next_action: if relevant, call explore(node_ids=['{node.id}']) "
-        "or include this id with other candidates"
+        f"  next_action: 関連する場合は explore(node_ids=['{node.id}']) を呼び出すか、"
+        "他の候補と一緒にこのIDを含めてください"
     )
     return lines
 

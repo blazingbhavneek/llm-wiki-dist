@@ -197,7 +197,7 @@ def _safe_dedupe(ids: list[str]) -> list[str]:
 
 def _format_search_results(results: list[dict[str, Any]]) -> str:
     if not results:
-        return "no nodes found"
+        return "ノードは見つかりませんでした"
 
     blocks: list[str] = []
     for r in results:
@@ -207,13 +207,13 @@ def _format_search_results(results: list[dict[str, Any]]) -> str:
             text = _sanitize_string_for_llm(" ".join((ev.get("text") or "").split()))
             if text:
                 ev_lines.append(f"    - {text[:500]}")
-        evidence_text = "\n".join(ev_lines) if ev_lines else "    - no evidence snippets"
+        evidence_text = "\n".join(ev_lines) if ev_lines else "    - 証拠抜粋なし"
         blocks.append(
             f"- node_id: `{node.id}`\n"
             f"  title: {_sanitize_string_for_llm(str(node.title))}\n"
             f"  summary: {_sanitize_string_for_llm(str(node.summary))}\n"
             f"  evidence:\n{evidence_text}\n"
-            f"  next_action: if relevant, call explore(node_ids=['{node.id}'])"
+            f"  next_action: 関連する場合は explore(node_ids=['{node.id}']) を呼び出してください"
         )
 
     return _sanitize_tool_output("\n".join(blocks))
@@ -225,27 +225,27 @@ def _format_search_results(results: list[dict[str, Any]]) -> str:
 
 
 class LeadSearchArgs(BaseModel):
-    """Search the knowledge graph for relevant nodes."""
+    """ナレッジグラフから関連ノードを検索します。"""
 
-    text: str = Field(..., description="Search query text")
+    text: str = Field(..., description="検索クエリのテキスト")
 
 
 class LeadExploreArgs(BaseModel):
-    """Dispatch subagents to deeply explore specific node IDs."""
+    """指定したノードIDを深く探索するサブエージェントを派遣します。"""
 
     node_ids: list[str] = Field(
         ...,
-        description="Exact node IDs to explore. Use node IDs returned by search.",
+        description="探索する正確なノードID。search が返したノードIDを使用してください。",
     )
 
 
 class LeadFinishArgs(BaseModel):
-    """Finish with the final answer and cited node IDs."""
+    """最終回答と引用ノードIDを提出して終了します。"""
 
-    answer: str = Field(..., description="Final answer to the user")
+    answer: str = Field(..., description="ユーザーへの最終回答")
     cited_node_ids: list[str] | None = Field(
         default=None,
-        description="Node IDs supporting the final answer",
+        description="最終回答を裏付けるノードID",
     )
 
 
@@ -300,7 +300,7 @@ def _lead_explore(ctx: LeadContext, node_ids: list[str]) -> str:
     _check_stop(ctx.stop_event)
     cleaned = _clean_ids(node_ids)
     if not cleaned:
-        return "no valid node_ids supplied. Search first, then call explore with exact node IDs."
+        return "有効な node_ids が指定されていません。まず search し、その結果の正確なノードIDで explore を呼び出してください。"
 
     result = ctx.session._run_subagents(
         cleaned, ctx.question, ctx.evidence, ctx.emit, stop_event=ctx.stop_event
@@ -337,20 +337,20 @@ def _lead_tools(ctx: LeadContext) -> list[StructuredTool]:
         StructuredTool.from_function(
             search_tool,
             name="search",
-            description=LeadSearchArgs.__doc__ or "Search for relevant nodes.",
+            description=LeadSearchArgs.__doc__ or "関連ノードを検索します。",
             args_schema=LeadSearchArgs,
         ),
         StructuredTool.from_function(
             explore_tool,
             name="explore",
             description=LeadExploreArgs.__doc__
-            or "Explore selected node IDs using subagents.",
+            or "選択したノードIDをサブエージェントで探索します。",
             args_schema=LeadExploreArgs,
         ),
         StructuredTool.from_function(
             finish_tool,
             name="finish",
-            description=LeadFinishArgs.__doc__ or "Finish with the final answer.",
+            description=LeadFinishArgs.__doc__ or "最終回答を提出して終了します。",
             args_schema=LeadFinishArgs,
             return_direct=True,
         ),
@@ -364,12 +364,12 @@ def _seeded_user_content(
         return question
     return (
         f"{question}\n\n"
-        "Important: initial retrieval already found candidate nodes for this question.\n"
-        "Do not discard these candidates.\n"
-        "If they appear relevant, call explore(node_ids=[...]) using the exact node IDs below.\n\n"
-        "Initial candidate nodes:\n"
+        "重要：初期検索で、この質問に対する候補ノードがすでに見つかっています。\n"
+        "これらの候補を無視しないでください。\n"
+        "関連しそうな場合は、以下の正確なノードIDを使って explore(node_ids=[...]) を呼び出してください。\n\n"
+        "初期候補ノード：\n"
         f"{seed_context}\n\n"
-        f"Candidate node IDs: {', '.join(seed_node_ids)}\n"
+        f"候補ノードID: {', '.join(seed_node_ids)}\n"
     )
 
 
@@ -500,7 +500,7 @@ def _sub_search(ctx: SubagentContext, text: str) -> str:
                 f"- node_id: `{n.id}`\n"
                 f"  title: {_sanitize_string_for_llm(str(n.title))}\n"
                 f"  summary: {_sanitize_string_for_llm(str(n.summary))}\n"
-                f"  next_action: read this node with read(node_id='{n.id}') if relevant"
+                f"  next_action: 関連する場合は read(node_id='{n.id}') でこのノードを読んでください"
                 for n in nodes
             )
         )
@@ -508,10 +508,10 @@ def _sub_search(ctx: SubagentContext, text: str) -> str:
     run.empty_streak += 1
     if run.empty_streak >= session.settings.agent_patience:
         return (
-            f"no nodes found ({run.empty_streak} consecutive empty searches). Stop "
-            "searching now: call finish with the best answer supported by nodes you read."
+            f"ノードは見つかりませんでした（{run.empty_streak}回連続で検索結果が空です）。"
+            "これ以上検索せず、これまでに読んだノードに裏付けられた最善の回答で finish を呼び出してください。"
         )
-    return "no nodes found"
+    return "ノードは見つかりませんでした"
 
 
 def _sub_read(ctx: SubagentContext, node_id: str) -> str:
@@ -524,12 +524,12 @@ def _sub_read(ctx: SubagentContext, node_id: str) -> str:
     if node:
         if node.id in run.read_ids:
             return _sanitize_tool_output(
-                f"already read {node.id} ({node.title}). Pick a DIFFERENT node, follow a link, or finish."
+                f"{node.id}（{node.title}）はすでに読みました。別のノードを選ぶか、リンクをたどるか、finish してください。"
             )
         if len(run.read_ids) >= session.settings.subagent_max_reads:
             return _sanitize_tool_output(
-                f"read budget reached ({len(run.read_ids)}/{session.settings.subagent_max_reads} "
-                "nodes). Call finish now with what you have gathered."
+                f"読み取り上限に達しました（{len(run.read_ids)}/{session.settings.subagent_max_reads} ノード）。"
+                "これまでに集めた内容で今すぐ finish を呼び出してください。"
             )
         run.empty_streak = 0
         run.read_ids.add(node.id)
@@ -561,7 +561,7 @@ def _sub_follow_link(ctx: SubagentContext, node_id: str, direction: str = "both"
     )
 
     if not pairs:
-        return "no neighbors"
+        return "隣接ノードはありません"
     return _sanitize_tool_output(
         "\n".join(
             f"- [{_sanitize_string_for_llm(str(e.label))}] "
@@ -581,13 +581,13 @@ def _sub_finish(
     min_reads = ctx.session.settings.subagent_min_reads
     if len(run.read_ids) < min_reads:
         return (
-            f"You have read only {len(run.read_ids)} node(s); read at least "
-            f"{min_reads} before finishing. Read another now."
+            f"まだ{len(run.read_ids)}個のノードしか読んでいません。finish する前に"
+            f"少なくとも{min_reads}個読んでください。今すぐ別のノードを読んでください。"
         )
 
     ctx.finished["answer"] = _sanitize_string_for_llm(str(answer or "")).strip()
     ctx.finished["cited_node_ids"] = _clean_ids(cited_node_ids)
-    return "finished; do not call more tools"
+    return "完了しました。これ以上ツールを呼び出さないでください"
 
 
 def _sub_tools(ctx: SubagentContext) -> list[StructuredTool]:
@@ -681,12 +681,12 @@ def run_subagent(
         "subagent.return agent=%s start=%s answer_len=%s cited=%s",
         run.index,
         run.start_id,
-        len(answer or "(no findings)"),
+        len(answer or "（発見なし）"),
         cited,
     )
     return {
         "start": run.start_id,
-        "answer": answer or "(no findings)",
+        "answer": answer or "（発見なし）",
         "cited": cited,
     }
 
@@ -814,7 +814,7 @@ class ResearchSession:
     ) -> list[tuple[Edge, Node]]:
         normalized = direction.lower().strip()
         if normalized not in {"incoming", "outgoing", "both"}:
-            raise ValueError("direction must be 'incoming', 'outgoing', or 'both'")
+            raise ValueError("direction は 'incoming'、'outgoing'、'both' のいずれかでなければなりません")
 
         pairs: list[tuple[Edge, Node]] = []
         if normalized in {"outgoing", "both"}:
@@ -1352,6 +1352,10 @@ class ResearchSession:
         if not (node and node.status == NodeStatus.active and node.body.strip()):
             return None
 
+        # Pilot metric: grep-able reuse-hit counter (a cached note answered a
+        # question instead of deep research). No schema; just a log line.
+        log.info("reuse_hit node=%s", node.id)
+
         emit({"type": "read", "agent": 0, "node": node_ref(node)})
         # Cite the note plus the sources it was derived from so the UI
         # highlights the whole provenance path.
@@ -1438,8 +1442,8 @@ class ResearchSession:
         starts = self._resolve_distinct_starts(raw_node_ids)
         if not starts:
             return (
-                "no valid starting nodes resolved from those ids. Search again and pass "
-                "exact node ids from the search results to explore."
+                "指定されたIDから有効な開始ノードを解決できませんでした。再度 search し、"
+                "その検索結果の正確なノードIDを explore に渡してください。"
             )
         emit(
             {
@@ -1467,7 +1471,7 @@ class ResearchSession:
                 reports.append(
                     {
                         "start": "?",
-                        "answer": f"(subagent failed: {exc})",
+                        "answer": f"（サブエージェント失敗: {exc}）",
                         "cited": [],
                     }
                 )
@@ -1476,12 +1480,12 @@ class ResearchSession:
         for report in reports:
             evidence.extend(report.get("cited", []))
 
-        blocks = ["Subagent reports (each explored a different region):"]
+        blocks = ["サブエージェントの報告（それぞれ異なる領域を探索）："]
         for index, report in enumerate(reports, start=1):
-            cited_str = ", ".join(report.get("cited", [])) or "(none)"
+            cited_str = ", ".join(report.get("cited", [])) or "（なし）"
             blocks.append(
-                f"\n### Subagent {index} — start node: {report.get('start')}\n"
-                f"{report.get('answer', '').strip()}\nEvidence node ids: {cited_str}"
+                f"\n### サブエージェント{index} — 開始ノード: {report.get('start')}\n"
+                f"{report.get('answer', '').strip()}\n根拠ノードID: {cited_str}"
             )
         return "\n".join(blocks)
 

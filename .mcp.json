@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "team-memory": {
+      "command": "node",
+      "args": ["bridge/dist/main.js"],
+      "env": {
+        "BRIDGE_PROJECT_ROOT": "."
+      }
+    }
+  }
+}

@@ -33,6 +33,8 @@ from .core import (
     CLUSTER_NAMER_SYSTEM,
     ClaimExtraction,
     ClusterRenamePlan,
+    DISCOVERY_PROMPT,
+    DiscoveryExtraction,
     EDGE_PROMPT,
     ENTITY_DEDUP_PROMPT,
     Edge,
@@ -261,6 +263,10 @@ class Librarian:
                 question=job.payload.get("question"),
             )
             return _assimilating_result(node)
+
+        if job.type == "ingest_raw":
+            nodes = self.ingest_raw(job.payload["text"], job.payload.get("origin"))
+            return {"extracted": len(nodes)}
 
         if job.type == "create_document":
             node = self.create_document_node(
@@ -691,6 +697,27 @@ class Librarian:
             self.enqueue_summary(node.id)
 
         return node
+
+    def ingest_raw(self, text: str, origin: str | None) -> list[Node]:
+        result = self.gateway.llm.complete_structured(
+            DISCOVERY_PROMPT, text[-60000:], DiscoveryExtraction
+        )
+        parsed = (
+            result
+            if isinstance(result, DiscoveryExtraction)
+            else DiscoveryExtraction.model_validate(result)
+        )
+        nodes: list[Node] = []
+        for discovery in parsed.discoveries:
+            title = discovery.title.strip()
+            body = discovery.body.strip()
+            if not title or not body:
+                continue
+            node = self.create_exogenous_node(
+                body=body, source_node_ids=[], origin=origin, question=title
+            )
+            nodes.append(node)
+        return nodes
 
     def create_document_node(
         self,
@@ -2144,5 +2171,4 @@ class Librarian:
             )
             for prev_id, next_id in zip(node_ids, node_ids[1:])
         ]
-
 
