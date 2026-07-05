@@ -28,11 +28,9 @@ TEMP_DIR.mkdir(exist_ok=True)
 MINERU_VENV_BIN = Path("/home/seigyo/llm-wiki/.venv/bin")
 
 GPU_MEMORY_UTILIZATION = "0.05"
-NVIDIA_INVOKE_URL = "http://10.160.144.101:51026/v1"
-NVIDIA_API_KEY = (
-    "<API_KEY>"
-)
-NVIDIA_MODEL = "openai/gpt-oss-120b"
+NVIDIA_INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1")
+NVIDIA_API_KEY = os.environ.get("OPENAI_API_KEY", "local")
+NVIDIA_MODEL = os.environ.get("WIKI_MODEL", "openai/gpt-oss-120b")
 
 IMAGE_EXTENSIONS = {
     ".png",

@@ -303,6 +303,7 @@ function AssistantMessage({
   const [stepsOpen, setStepsOpen] = useState(false)
 
   const streaming = !!m.streaming
+  const errored = !!m.error
   const activity = m.activity || []
   const hasSteps = !streaming && activity.length > 0
 
@@ -323,7 +324,7 @@ function AssistantMessage({
           <span className="grid h-6 w-6 place-items-center rounded-full bg-violet-50 text-violet-700">
             <Sparkles size={14} />
           </span>
-          <span>{streaming ? t.working : t.answerDone}</span>
+          <span>{streaming ? t.working : errored ? t.requestFailed : t.answerDone}</span>
         </div>
 
         <article className="w-full overflow-hidden rounded-2xl rounded-tl-md border border-slate-200 bg-white shadow-sm">

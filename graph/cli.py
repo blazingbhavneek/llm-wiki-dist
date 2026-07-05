@@ -6,14 +6,11 @@ import logging
 from contextlib import contextmanager
 from pathlib import Path
 
-from .graph import (
-    GraphDbSession,
-    GraphReadSession,
-    GraphWriteSession,
-    SharedGraphRuntime,
-    bootstrap_database,
-)
-from .models import Settings
+from .core import Settings
+from .gateway import ModelGateway
+from .librarian import Librarian
+from .researcher import ResearchSession
+from .store import GraphStore
 
 
 # print a random json object
@@ -31,32 +28,33 @@ def _settings(args: argparse.Namespace) -> Settings:
 @contextmanager
 def _read_session(args: argparse.Namespace):
     settings = _settings(args)
-    runtime = SharedGraphRuntime(settings)
-    db = GraphDbSession(settings, readonly=True)
+    gateway = ModelGateway(settings)
+    store = GraphStore(settings.database_path, readonly=True)
     try:
-        yield GraphReadSession(runtime, db)
+        yield ResearchSession(gateway, store)
     finally:
-        db.close()
-        runtime.close()
+        store.close()
+        gateway.close()
 
 
 @contextmanager
 def _write_session(args: argparse.Namespace):
-    # No enrichment queue in the CLI: cascades and reclustering run inline.
+    # background=False: no queues in the CLI — cascades and reclustering
+    # run inline on the calling thread.
     settings = _settings(args)
-    runtime = SharedGraphRuntime(settings)
-    db = GraphDbSession(settings, readonly=False)
+    gateway = ModelGateway(settings)
+    store = GraphStore(settings.database_path)
     try:
-        yield GraphWriteSession(runtime, db)
+        yield Librarian(gateway, store, background=False)
     finally:
-        db.close()
-        runtime.close()
+        store.close()
+        gateway.close()
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    settings = _settings(args)
-    bootstrap_database(settings)
-    print(f"database ready: {settings.database_path}")
+    with _write_session(args) as librarian:
+        librarian.bootstrap()
+        print(f"database ready: {librarian.settings.database_path}")
 
 
 def cmd_add(args: argparse.Namespace) -> None:

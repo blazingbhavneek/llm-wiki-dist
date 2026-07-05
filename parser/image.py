@@ -12,9 +12,12 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =========================
-# HARDCODED CONFIG VALUES
+# CONFIG VALUES (env-overridable, see .env)
 # =========================
 
 MARKDOWN_FOLDER = "/home/seigyo/llm-wiki/mineru/"
@@ -28,11 +31,9 @@ OUTPUT_FILE = None
 # If OUTPUT_FILE is None, output will be:
 # input_filename.described.md
 
-OPENAI_BASE_URL = "http://10.160.144.101:51026/v1"
-OPENAI_API_KEY = (
-    "<API_KEY>"
-)
-OPENAI_MODEL = "openai/gpt-oss-120b"
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "local")
+OPENAI_MODEL = os.environ.get("WIKI_MODEL", "openai/gpt-oss-120b")
 
 CONCURRENCY = 5
 TEMPERATURE = 0.3

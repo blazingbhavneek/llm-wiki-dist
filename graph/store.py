@@ -1,19 +1,25 @@
-"""Current raw SQLite backend used by the graph package."""
+"""GraphStore — the persistence actor.
+
+One SQLite file: nodes + edges + FTS5 keyword indexes + sqlite-vec vector
+tables, WAL mode. Thread safety is owned HERE: every thread lazily gets its
+own connection (self.connection), so callers never manage connections or
+sessions. Create one read-only instance for the Researcher and one writable
+instance for the Librarian; both live for the whole process."""
 
 from __future__ import annotations
 
 import re
 import sqlite3
 import threading
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from graph.models import Edge, Node, NodeStatus, now_iso
-
-from .base import BaseDatabase
+from .core import Edge, Node, NodeStatus, now_iso
 
 _FTS_SPECIAL = re.compile(r'["()*:^]')
+log = logging.getLogger("raw_sqlite")
 
 
 def _fts_query(text: str) -> str:
@@ -21,7 +27,7 @@ def _fts_query(text: str) -> str:
     return " OR ".join(f'"{t}"' for t in terms)
 
 
-class RawSqliteDatabase(BaseDatabase):
+class GraphStore:
     def __init__(
         self,
         path: str | Path = ".wiki/wiki.sqlite",
@@ -47,12 +53,11 @@ class RawSqliteDatabase(BaseDatabase):
 
         self._dim: int | None = None
 
-        print(
-            f"[DB_DEBUG] RawSqliteDatabase object created "
-            f"thread={threading.get_ident()} "
-            f"path={self.path} "
-            f"readonly={self.readonly}",
-            flush=True,
+        log.debug(
+            "database.created thread=%s path=%s readonly=%s",
+            threading.get_ident(),
+            self.path,
+            self.readonly,
         )
 
         # Initialize DB schema from the creating thread's own connection.
@@ -86,12 +91,11 @@ class RawSqliteDatabase(BaseDatabase):
             with self._connections_lock:
                 self._connections.append(conn)
 
-            print(
-                f"[DB_DEBUG] SQLite connection opened "
-                f"thread={threading.get_ident()} "
-                f"path={self.path} "
-                f"readonly={self.readonly}",
-                flush=True,
+            log.debug(
+                "connection.opened thread=%s path=%s readonly=%s",
+                threading.get_ident(),
+                self.path,
+                self.readonly,
             )
 
         return conn
@@ -227,7 +231,7 @@ class RawSqliteDatabase(BaseDatabase):
         )
         self._ensure_node_columns()
         self._ensure_edge_columns()
-        self.connection.commit()
+        self._commit()
 
     def _ensure_node_columns(self) -> None:
         existing = {
@@ -308,7 +312,7 @@ class RawSqliteDatabase(BaseDatabase):
             )
             self._dim = dim
 
-        self.connection.commit()
+        self._commit()
 
     def reset_vec_tables(self) -> None:
         """Drop the vector tables and forget the stored dim.
@@ -323,7 +327,7 @@ class RawSqliteDatabase(BaseDatabase):
         self.connection.execute("DROP TABLE IF EXISTS vec_summary")
         self.connection.execute("DROP TABLE IF EXISTS vec_search_item")
         self.connection.execute("DELETE FROM meta WHERE key = 'embed_dim'")
-        self.connection.commit()
+        self._commit()
         self._dim = None
 
     def get_meta(self, key: str) -> str | None:
@@ -344,20 +348,38 @@ class RawSqliteDatabase(BaseDatabase):
                 (key, value),
             )
 
+    def _commit(self) -> None:
+        """Commit unless a transaction() is open on this thread — then the
+        outermost transaction() owns the commit, keeping multi-statement jobs
+        atomic."""
+        if getattr(self._local, "in_transaction", False):
+            return
+        self.connection.commit()
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         conn = self.connection
 
+        # Nested call: the outermost transaction() on this thread owns
+        # commit/rollback, so a failure anywhere rolls back the whole batch
+        # instead of leaving earlier statements committed.
+        if getattr(self._local, "in_transaction", False):
+            yield conn
+            return
+
+        self._local.in_transaction = True
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            self._local.in_transaction = False
 
     def close(self) -> None:
         """
-        Close every SQLite connection opened by this RawSqliteDatabase object.
+        Close every SQLite connection opened by this GraphStore.
 
         Because connections are opened lazily per thread, there may be more
         than 1 connection.
@@ -446,7 +468,7 @@ class RawSqliteDatabase(BaseDatabase):
         )
 
         self._reindex_fts(node)
-        self.connection.commit()
+        self._commit()
 
     def get_node(self, node_id: str) -> Node | None:
         row = self.connection.execute(
@@ -464,7 +486,7 @@ class RawSqliteDatabase(BaseDatabase):
             "UPDATE nodes SET status=?, updated_at=? WHERE id=?",
             (status.value, now_iso(), node_id),
         )
-        self.connection.commit()
+        self._commit()
 
     def delete_node(self, node_id: str) -> None:
         if self.readonly:
@@ -592,7 +614,7 @@ class RawSqliteDatabase(BaseDatabase):
             ),
         )
 
-        self.connection.commit()
+        self._commit()
 
     def get_all_edges(self) -> list[Edge]:
         rows = self.connection.execute(
@@ -660,7 +682,7 @@ class RawSqliteDatabase(BaseDatabase):
             "DELETE FROM edges WHERE id=?",
             (edge_id,),
         )
-        self.connection.commit()
+        self._commit()
 
     def delete_edges_by_label_for_nodes(
         self,
@@ -686,7 +708,7 @@ class RawSqliteDatabase(BaseDatabase):
             params,
         )
 
-        self.connection.commit()
+        self._commit()
 
     def record_source(self, document_name: str, source_hash: str) -> None:
         if self.readonly:
@@ -799,7 +821,7 @@ class RawSqliteDatabase(BaseDatabase):
             (node_id, blob),
         )
 
-        self.connection.commit()
+        self._commit()
 
     def count_vectors(self, table: str = "vec_body") -> int:
         """Number of stored vectors in a table.
@@ -1038,7 +1060,7 @@ class RawSqliteDatabase(BaseDatabase):
             (item_id, blob),
         )
 
-        self.connection.commit()
+        self._commit()
 
     def search_items_fts_query(
         self,
@@ -1149,5 +1171,3 @@ def _row_to_edge(row: sqlite3.Row) -> Edge:
         source_episode_ids=json.loads(episodes_raw or "[]"),
     )
 
-
-Database = RawSqliteDatabase
