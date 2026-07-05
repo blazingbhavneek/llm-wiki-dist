@@ -1,98 +1,141 @@
 """
-FastAPI backend with split read/write architecture.
+FastAPI backend over four actors:
 
-Features:
-  - Async bounded-concurrency reads via ReadGraphService
-  - Serialized write queue via WriteGraphService
-  - Runtime-editable settings via PATCH /api/settings
-  - Streaming agent endpoint
-  - Full job status visibility
+  - ModelGateway  — chat LLM + embedder + reranker + settings
+  - GraphStore    — SQLite persistence (one writable, one read-only instance)
+  - Librarian     — all writes: job queue + enrichment drip + bootstrap
+  - Researcher    — all reads: search + ask() agent, bounded concurrency
+
+This file is transport only: HTTP/SSE in, actor methods out.
 
 Run:
     pip install fastapi "uvicorn[standard]"
-    WIKI_DB=.wiki3/test.sqlite uvicorn app:app --port 51023
+    WIKI_DB=.wiki/wiki3.sqlite uvicorn app:app --port 51023
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any
-from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from graph.graph import (
-    GraphDbSession,
-    GraphWriteSession,
-    ReadGraphService,
-    SharedGraphRuntime,
-    WriteGraphService,
-    bootstrap_database,
-    job_to_dict,
-)
-from graph.langgraph_agent import AgentStopped
-from graph.models import Settings
+from graph.core import Settings
+from graph.gateway import ModelGateway
+from graph.librarian import Librarian, job_to_dict
+from graph.researcher import AgentStopped, Researcher
+from graph.store import GraphStore
+
+log = logging.getLogger("app")
 
 # ============================================================================
 # lifecycle
 # ============================================================================
 
-runtime: SharedGraphRuntime | None = None
-read_service: ReadGraphService | None = None
-write_service: WriteGraphService | None = None
-agent_runs: dict[str, asyncio.Task] = {}
-agent_stop_events: dict[str, threading.Event] = {}
+class AgentRunRegistry:
+    """Tracks in-flight streaming agent runs so /stop can cancel them."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._stop_events: dict[str, threading.Event] = {}
+
+    def register(self, run_id: str, task: asyncio.Task, stop: threading.Event) -> None:
+        self._tasks[run_id] = task
+        self._stop_events[run_id] = stop
+
+    def remove(self, run_id: str) -> None:
+        self._tasks.pop(run_id, None)
+        self._stop_events.pop(run_id, None)
+
+    def stop(self, run_id: str) -> bool:
+        """Signal + cancel a run. False when the run id is unknown."""
+        task = self._tasks.get(run_id)
+        stop_event = self._stop_events.get(run_id)
+        if task is None and stop_event is None:
+            return False
+        if stop_event is not None:
+            stop_event.set()
+        if task is not None and not task.done():
+            task.cancel()
+        return True
+
+
+gateway: ModelGateway | None = None
+researcher: Researcher | None = None
+librarian: Librarian | None = None
+agent_runs = AgentRunRegistry()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global runtime, read_service, write_service
+    global gateway, researcher, librarian
 
+    # Surface graph.* INFO logs (bootstrap / reclustering / cluster naming) that
+    # otherwise stay hidden behind the root logger's WARNING default.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    logging.getLogger("graph_librarian").setLevel(logging.INFO)
+
+    log.info("startup: initializing gateway")
     settings = Settings.from_env()
-    runtime = SharedGraphRuntime(settings)
+    gateway = ModelGateway(settings)
 
-    # Bootstrap DB tables / vectors / clusters (blocking). Reuses the runtime
-    # built above instead of constructing a second embedder/LLM stack.
-    await asyncio.to_thread(bootstrap_database, settings, runtime)
+    # One writable store for the Librarian, one read-only for the Researcher.
+    # Each hands every thread its own SQLite connection.
+    log.info("startup: opening store db=%s", settings.database_path)
+    write_store = GraphStore(settings.database_path)
+    librarian = Librarian(gateway, write_store, max_queue_size=100)
 
-    read_service = ReadGraphService(runtime, max_reads=16, max_agents=16)
-    write_service = WriteGraphService(runtime, max_queue_size=100)
-    await write_service.start()
+    # Bootstrap vectors / search items / clusters (blocking) before serving.
+    log.info("startup: running bootstrap (embed/search/cluster catch-up)")
+    await asyncio.to_thread(librarian.bootstrap)
+
+    log.info("startup: bootstrap done, starting researcher + librarian")
+    read_store = GraphStore(settings.database_path, readonly=True)
+    researcher = Researcher(gateway, read_store)
+    await librarian.start()
+    log.info("startup: ready, serving requests")
 
     try:
         yield
     finally:
-        await write_service.stop()
-        runtime.close()
-        runtime = None
-        read_service = None
-        write_service = None
+        await librarian.stop()
+        write_store.close()
+        read_store.close()
+        gateway.close()
+        gateway = None
+        researcher = None
+        librarian = None
 
 
-def _runtime() -> SharedGraphRuntime:
-    if runtime is None:
-        raise HTTPException(status_code=503, detail="runtime not ready")
-    return runtime
+def _gateway() -> ModelGateway:
+    if gateway is None:
+        raise HTTPException(status_code=503, detail="gateway not ready")
+    return gateway
 
 
-def reads() -> ReadGraphService:
-    if read_service is None:
-        raise HTTPException(status_code=503, detail="read service not ready")
-    return read_service
+def reads() -> Researcher:
+    if researcher is None:
+        raise HTTPException(status_code=503, detail="researcher not ready")
+    return researcher
 
 
-def writes() -> WriteGraphService:
-    if write_service is None:
-        raise HTTPException(status_code=503, detail="write service not ready")
-    return write_service
+def writes() -> Librarian:
+    if librarian is None:
+        raise HTTPException(status_code=503, detail="librarian not ready")
+    return librarian
 
 
 # ============================================================================
@@ -167,6 +210,7 @@ class ExogenousBody(BaseModel):
     # New: original user query this note answers.
     question: str | None = None
 
+
 class DocumentBody(BaseModel):
     body: str
     title: str | None = None
@@ -203,7 +247,7 @@ def _redact(data: dict) -> dict:
 
 @app.get("/api/settings")
 async def get_settings() -> dict:
-    return _redact(_dump(_runtime().settings))
+    return _redact(_dump(_gateway().settings))
 
 
 @app.get("/api/settings/schema")
@@ -221,14 +265,14 @@ async def replace_settings(payload: dict[str, Any]) -> dict:
         new = Settings(**payload)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    _runtime().update_settings(new)
+    _gateway().update_settings(new)
     return _redact(_dump(new))
 
 
 @app.patch("/api/settings")
 async def patch_settings(payload: dict[str, Any]) -> dict:
     try:
-        current_dict = _dump(_runtime().settings)
+        current_dict = _dump(_gateway().settings)
         # Ignore blanked-out secrets: clients receive redacted values ("") and
         # may echo them back; an empty secret must not wipe the real key.
         clean = {
@@ -238,14 +282,14 @@ async def patch_settings(payload: dict[str, Any]) -> dict:
         new = Settings(**current_dict)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    _runtime().update_settings(new)
+    _gateway().update_settings(new)
     return _redact(_dump(new))
 
 
 @app.post("/api/settings/reset")
 async def reset_settings() -> dict:
     new = Settings.from_env()
-    _runtime().update_settings(new)
+    _gateway().update_settings(new)
     return _redact(_dump(new))
 
 
@@ -314,18 +358,10 @@ async def query(query_type: str, value: str) -> dict:
 @app.post("/api/recon")
 async def recon(payload: RecondBody) -> dict:
     # Read-only revision status: is this source doc new/changed/unchanged
-    # relative to what was last ingested? Uses a write session for its doc
+    # relative to what was last ingested? Uses the Librarian for its doc
     # loaders but mutates nothing, so it stays off the write queue.
-    def work():
-        db_session = GraphDbSession(_runtime().settings, readonly=True)
-        try:
-            session = GraphWriteSession(_runtime(), db_session)
-            return session.recon(payload.source_file)
-        finally:
-            db_session.close()
-
     try:
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(writes().recon, payload.source_file)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -368,13 +404,11 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
         except Exception as exc:
             events.put({"type": "error", "message": str(exc)})
         finally:
-            agent_runs.pop(run_id, None)
-            agent_stop_events.pop(run_id, None)
+            agent_runs.remove(run_id)
             events.put(sentinel)
 
     task = asyncio.create_task(run_agent())
-    agent_runs[run_id] = task
-    agent_stop_events[run_id] = stop_event
+    agent_runs.register(run_id, task, stop_event)
 
     async def stream():
         yield ": connected\n\n"
@@ -409,14 +443,8 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
 
 @app.post("/api/agent-runs/{run_id}/stop")
 async def stop_agent_run(run_id: str) -> dict:
-    task = agent_runs.get(run_id)
-    stop_event = agent_stop_events.get(run_id)
-    if task is None and stop_event is None:
+    if not agent_runs.stop(run_id):
         raise HTTPException(status_code=404, detail="agent run not found")
-    if stop_event is not None:
-        stop_event.set()
-    if task is not None and not task.done():
-        task.cancel()
     return {"run_id": run_id, "status": "stopping"}
 
 
@@ -474,7 +502,7 @@ async def create_document(payload: DocumentBody) -> dict:
 async def assimilation_status() -> dict:
     """Background enrichment backlog still pending (summary/dedup/cascade/
     recluster). UI can show a 'graph assimilating (N)' badge."""
-    return {"pending": writes().enrich.pending()}
+    return {"pending": writes().enrich_pending()}
 
 
 @app.post("/api/recluster")

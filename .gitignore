@@ -27,5 +27,13 @@ translate.py
 translation_judge_log.jsonl
 
 
+# env
+.env
+
 # misc
 .DS_Store
+.wiki3/
+.codegraph/
+vendor/
+
+**.md
