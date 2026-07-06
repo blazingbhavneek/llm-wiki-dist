@@ -1,16 +1,4 @@
-"""Researcher — the actor that answers questions. Read-only.
-
-Owns retrieval (hybrid BM25 + vector + rerank evidence search), the ask()
-early-exit router (reuse an agent note / shallow RAG / deep research), and
-the LangGraph lead+subagent stack (streaming events, stop, budgets).
-
-Concurrency: bounded by two semaphores (plain reads / agent runs). Each
-request gets a throwaway ResearchSession so per-request setting/LLM overrides
-and seed state never leak across requests. All persistence goes through one
-shared read-only GraphStore; it hands each thread its own connection.
-
-Never writes. Never imported by Librarian.
-"""
+# region Imports
 
 from __future__ import annotations
 
@@ -31,27 +19,29 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 
 from .core import (
+    GRAPH_SYSTEM_PROMPT,
+    LEAD_AGENT_PROMPT,
+    ROUTER_PROMPT,
+    SHALLOW_ANSWER_PROMPT,
+    SUBAGENT_SYSTEM_PROMPT,
     AgentAnswer,
     Edge,
     EvidenceHit,
-    GRAPH_SYSTEM_PROMPT,
     GraphStats,
-    LEAD_AGENT_PROMPT,
     Node,
     NodeStatus,
     NodeType,
     QueryResult,
-    ROUTER_PROMPT,
     RouteDecision,
-    SHALLOW_ANSWER_PROMPT,
-    SUBAGENT_SYSTEM_PROMPT,
     Settings,
     Subrun,
     clean_node_ref,
     dedupe,
     evidence_why,
-    finish as FinishArgs,
-    follow_link as FollowLinkArgs,
+)
+from .core import finish as FinishArgs
+from .core import follow_link as FollowLinkArgs
+from .core import (
     format_lead_candidate,
     format_node_full,
     item_vec_weight,
@@ -59,40 +49,40 @@ from .core import (
     node_ref,
     node_snippet,
     normalize_scores,
-    read as ReadArgs,
-    repair_answer_mermaid,
-    sanitize_messages as _sanitize_messages_for_llm,
-    sanitize_text as _sanitize_string_for_llm,
-    sanitize_tool_output as _sanitize_tool_output,
-    search as SearchArgs,
 )
+from .core import read as ReadArgs
+from .core import repair_answer_mermaid
+from .core import sanitize_messages as _sanitize_messages_for_llm
+from .core import sanitize_text as _sanitize_string_for_llm
+from .core import sanitize_tool_output as _sanitize_tool_output
+from .core import search as SearchArgs
 from .gateway import LlmClient as OpenAiLlmClient
 
 if TYPE_CHECKING:
     from .gateway import ModelGateway
     from .store import GraphStore
 
+# endregion Imports
+
+# region Global vars/Helpers
+
 log = logging.getLogger("graph_researcher")
-
-
-# =============================================================================
-# LangGraph agent (lead + subagents)
-# =============================================================================
-
-# =============================================================================
-# Agent support utilities
-# =============================================================================
 
 
 class AgentStopped(Exception):
     """Raised when a client cancels an in-flight LangGraph run."""
 
 
+# region stop checkers, Agent compilers, Sanitizer, message processors
+
+
+# stop event checker, if user says stop, then it would raise error and stop langgraph execution
 def _check_stop(stop_event: Event | None) -> None:
     if stop_event is not None and stop_event.is_set():
         raise AgentStopped("agent run cancelled")
 
 
+# strip base url of /chat/completions if user accidently enters it
 def _base_url(value: str) -> str:
     base = (value or "").rstrip("/")
     if base.endswith("/chat/completions"):
@@ -100,6 +90,7 @@ def _base_url(value: str) -> str:
     return base
 
 
+# makes a simple llm client given setting object
 def _model(settings: Settings) -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.chat_model,
@@ -118,34 +109,41 @@ def _compile_agent(
     prompt: str,
     stop_event: Event | None,
 ):
-    """
-    Compile a LangGraph ReAct agent with mandatory pre-model sanitization.
+    """Compile a LangGraph ReAct agent with message sanitization before each LLM call."""
 
-    This is the main protection point:
-    LangGraph can build up messages from user inputs, assistant outputs,
-    and tool observations. Before every LLM call, state["messages"] is cleaned.
-    """
+    # Clean the prompt once before giving it to the agent.
     safe_prompt = _sanitize_string_for_llm(prompt or "")
 
     def before_model(state: dict[str, Any]) -> dict[str, Any]:
+        # Stop the graph if the user/client cancelled the run.
         _check_stop(stop_event)
+
+        # LangGraph stores conversation history in state["messages"].
         messages = state.get("messages", [])
         if not isinstance(messages, list):
             messages = []
+
+        # "llm_input_messages" is what the model sees for this call.
+        # This keeps the graph state intact, but sends sanitized messages to the LLM.
         return {"llm_input_messages": _sanitize_messages_for_llm(messages)}
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
+
         return create_react_agent(
+            # ChatOpenAI model configured from app settings.
             _model(settings),
             tools=tools,
             prompt=safe_prompt,
+            # Runs before every model call.
             pre_model_hook=before_model,
+            # Use LangGraph's newer ReAct agent version.
             version="v2",
         )
 
 
 def _last_message_text(state: dict[str, Any]) -> str:
+    # Walk backward to find the most recent non-empty message text.
     for message in reversed(state.get("messages", [])):
         content = getattr(message, "content", "")
 
@@ -155,59 +153,84 @@ def _last_message_text(state: dict[str, Any]) -> str:
                 return text
 
         if isinstance(content, list):
+            # Extract text from mixed content parts.
             parts: list[str] = []
             for item in content:
                 if isinstance(item, str):
                     parts.append(_sanitize_string_for_llm(item))
                 elif isinstance(item, dict) and isinstance(item.get("text"), str):
                     parts.append(_sanitize_string_for_llm(item["text"]))
+
             text = "\n".join(parts).strip()
             if text:
                 return text
 
+    # No usable message text found.
     return ""
 
 
 def _count_steps(state: Any) -> int:
+    # Count messages as a simple proxy for how many conversation steps happened.
     messages = state.get("messages", []) if isinstance(state, dict) else []
+
+    # Always return at least 1 so downstream logic never gets a zero step count.
     return max(1, len(messages))
 
 
 def _clean_ids(ids: list[Any] | None) -> list[str]:
-    """Sanitize + normalize a model-supplied list of node ids."""
+    """Sanitize and normalize a model-supplied list of node IDs."""
+
     return [
         clean_node_ref(_sanitize_string_for_llm(str(nid)))
         for nid in (ids or [])
+        # Ignore empty, None, or whitespace-only IDs.
         if str(nid or "").strip()
     ]
 
 
 def _safe_dedupe(ids: list[str]) -> list[str]:
+    # Prefer the shared dedupe helper when it works.
     try:
         return dedupe(ids)
+
+    # Fall back to a simple stable dedupe if the helper fails for any reason.
     except Exception:
         seen: set[str] = set()
         out: list[str] = []
+
         for item in ids:
+            # Keep the first occurrence and skip empty or repeated IDs.
             if item and item not in seen:
                 seen.add(item)
                 out.append(item)
+
         return out
 
 
 def _format_search_results(results: list[dict[str, Any]]) -> str:
+    # Return a clear message when search found nothing.
     if not results:
         return "no nodes found"
 
     blocks: list[str] = []
+
     for r in results:
         node = r["node"]
         ev_lines: list[str] = []
+
+        # Include only the first few evidence snippets to keep output compact.
         for ev in r.get("evidence", [])[:4]:
             text = _sanitize_string_for_llm(" ".join((ev.get("text") or "").split()))
+
             if text:
+                # Trim long evidence snippets so tool output stays manageable.
                 ev_lines.append(f"    - {text[:500]}")
-        evidence_text = "\n".join(ev_lines) if ev_lines else "    - no evidence snippets"
+
+        evidence_text = (
+            "\n".join(ev_lines) if ev_lines else "    - no evidence snippets"
+        )
+
+        # Format each node in a model-readable structure with a suggested action.
         blocks.append(
             f"- node_id: `{node.id}`\n"
             f"  title: {_sanitize_string_for_llm(str(node.title))}\n"
@@ -216,20 +239,28 @@ def _format_search_results(results: list[dict[str, Any]]) -> str:
             f"  next_action: if relevant, call explore(node_ids=['{node.id}'])"
         )
 
+    # Sanitize the final combined output before returning it to the LLM/tool layer.
     return _sanitize_tool_output("\n".join(blocks))
 
 
-# =============================================================================
-# Lead agent
-# =============================================================================
+# endregion stop checkers, Agent compilers, Sanitizer, message processors
+
+# The main Agent, after initial reading of contents present, spawns smaller agents to explore particular leads
+# A query may have multiple occurence by name in various documents,
+# so rather than forcing model to choose one, spawn smaller agent to read up on differnt paths
+# For this we need to create leads first, rather than instructing agent to do it on its own and not get lost, for the first stage we will have it generate
+# leads, all the different possible paths where our answer could be
+# region Lead Explorer
 
 
+# args for what we are searching the leads for
 class LeadSearchArgs(BaseModel):
     """Search the knowledge graph for relevant nodes."""
 
     text: str = Field(..., description="Search query text")
 
 
+# starting point for the subagents, which node to start looking as seed
 class LeadExploreArgs(BaseModel):
     """Dispatch subagents to deeply explore specific node IDs."""
 
@@ -239,6 +270,7 @@ class LeadExploreArgs(BaseModel):
     )
 
 
+# Once a lead exploration is finished, report final answer
 class LeadFinishArgs(BaseModel):
     """Finish with the final answer and cited node IDs."""
 
@@ -264,6 +296,11 @@ class LeadContext:
     )
 
 
+# Tool for the Main agent to search with evidence
+# Its supposed to be atomic? (the word i mean is independant of global variable/context)
+# in my earlier design the tools given to llm used globally defined variables etc, so for sake of langchain, i need a tool maker function which can
+# be independant of the global vars, so, this is the atomic version of it which takes all the context too, this will be wrapped by a tool maker which will
+# give it the set context, and then it would only need the query, so it would work with llm
 def _lead_search(ctx: LeadContext, text: str) -> str:
     _check_stop(ctx.stop_event)
     session = ctx.session
@@ -271,6 +308,7 @@ def _lead_search(ctx: LeadContext, text: str) -> str:
     ctx.emit({"type": "search", "phase": "main", "query": query})
 
     try:
+        # do an initial evidence based search for query
         results = session.search_with_evidence(
             query, limit=session.settings.rerank_top_k
         )
@@ -290,12 +328,11 @@ def _lead_search(ctx: LeadContext, text: str) -> str:
         except Exception as exc:
             log.info("lead full-question retry failed: %s", exc)
 
-    log.debug(
-        "lead.search query=%s results=%s", query, [r["node"].id for r in results]
-    )
+    log.debug("lead.search query=%s results=%s", query, [r["node"].id for r in results])
     return _format_search_results(results)
 
 
+# same as above, atomic version of the tool which would be wrapped later with pre-determined context
 def _lead_explore(ctx: LeadContext, node_ids: list[str]) -> str:
     _check_stop(ctx.stop_event)
     cleaned = _clean_ids(node_ids)
@@ -309,6 +346,7 @@ def _lead_explore(ctx: LeadContext, node_ids: list[str]) -> str:
     return _sanitize_tool_output(result)
 
 
+# same as above, atomic version of the tool which would be wrapped later with pre-determined context
 def _lead_finish(
     ctx: LeadContext, answer: str, cited_node_ids: list[str] | None = None
 ) -> str:
@@ -323,6 +361,7 @@ def _lead_finish(
     return _sanitize_tool_output(json.dumps(ctx.finished, ensure_ascii=False))
 
 
+# this is the wrapper that wraps the above tools with pre-determined context so they can be called by langgraph with just queries
 def _lead_tools(ctx: LeadContext) -> list[StructuredTool]:
     def search_tool(text: str) -> str:
         return _lead_search(ctx, text)
@@ -357,22 +396,48 @@ def _lead_tools(ctx: LeadContext) -> list[StructuredTool]:
     ]
 
 
+# this is the user prompt for when we start the "deep" mode of main agent
+# an agent can have two modes, a shallow mode (answer directly exists) in a node (either exo or endo) in that case it quickly returns an answer
+# if not, then it will start a deep agent, which will do actual exploration, so for that we would give it initial seed nodes to start looking into
+# this is the prompt for that
 def _seeded_user_content(
     question: str, seed_context: str, seed_node_ids: list[str]
 ) -> str:
     if not seed_context.strip():
         return question
+
     return (
         f"{question}\n\n"
-        "Important: initial retrieval already found candidate nodes for this question.\n"
-        "Do not discard these candidates.\n"
-        "If they appear relevant, call explore(node_ids=[...]) using the exact node IDs below.\n\n"
-        "Initial candidate nodes:\n"
+        "重要: この質問に対して、初期検索ですでに候補ノードが見つかっています。\n"
+        "これらのノードは有用な出発点として扱ってください。ただし、これらだけで十分だとは決めつけないでください。\n\n"
+        "利用可能な進め方:\n"
+        "- search(text=...) は、グラフ内から追加の関連ノードを探すために使います。\n"
+        "- explore(node_ids=[...]) は、選択したノードIDについてサブエージェントによる詳しい調査を開始するために使います。\n"
+        "- finish(answer=..., cited_node_ids=[...]) は、十分な調査と根拠確認が終わった後に最終回答を出すために使います。\n\n"
+        "初期候補ノードを注意深く確認してください:\n"
+        "- それらが関連性があり、質問全体に答えるために十分だと思われる場合は、"
+        "下記の正確なノードIDを使って explore(node_ids=[...]) を呼び出してください。\n"
+        "- それらが関連性はあるが不十分だと思われる場合は、explore を呼び出してサブエージェントを開始する前に、"
+        "まず search(text=...) を使って追加の関連ノードを探してください。"
+        "その後、関連する初期候補ノードIDと、新しく見つかった関連ノードIDの両方を使って "
+        "explore(node_ids=[...]) を呼び出してください。\n"
+        "- 候補ノードが関連していないように見える場合は、無理に使わないでください。"
+        "explore を呼び出す前に、search(text=...) でより適切なノードを探してください。\n\n"
+        "explore を呼び出す前に、候補ノードがユーザーの質問に完全に答えるために必要な"
+        "重要なエンティティ、概念、制約、比較対象、期間、条件、例外、またはサブ質問をすべてカバーしているか確認してください。"
+        "重要な情報が不足しているように見える場合は、必ず search(text=...) で追加検索してください。\n\n"
+        "search を使う場合は、質問全体をそのまま検索するだけでなく、足りないと思われる観点ごとに検索してください。"
+        "たとえば、不足している人物名、組織名、技術名、条件、時期、比較対象、原因、結果などを個別に検索してください。\n\n"
+        "初期候補を確認せずに捨てないでください。"
+        "初期候補を使う場合は、正確なノードIDを使用してください。"
+        "ただし、初期候補だけで不十分な場合は、必ず追加検索してから explore を呼び出してください。\n\n"
+        "初期候補ノード:\n"
         f"{seed_context}\n\n"
-        f"Candidate node IDs: {', '.join(seed_node_ids)}\n"
+        f"候補ノードID: {', '.join(seed_node_ids)}\n"
     )
 
 
+# the "deep" agent runner, it expects that previous "shallow" check is already done and now we need to start exploration from given seed nodes
 def run_lead_agent(
     session: Any,
     question: str,
@@ -381,28 +446,25 @@ def run_lead_agent(
     seed_context: str = "",
     seed_node_ids: list[str] | None = None,
 ) -> AgentAnswer:
-    """
-    LangGraph lead agent.
-
-    Important behavior:
-    1. Sanitizes all input before LLM calls.
-    2. Sanitizes all tool output before returning it to LangGraph.
-    3. Sanitizes LangGraph message history in pre_model_hook.
-    4. Supports seed_context and seed_node_ids from early retrieval.
-    """
+    # Normalize user input and seed data before sending anything to the agent.
     question = _sanitize_string_for_llm(str(question or "")).strip()
     seed_context = _sanitize_string_for_llm(str(seed_context or "")).strip()
     seed_node_ids = seed_node_ids or []
 
+    # Shared runtime context used by lead tools like search, explore, and finish.
     ctx = LeadContext(
         session=session, question=question, emit=emit, stop_event=stop_event
     )
+
+    # Compile the lead agent with its tools and system prompt.
     agent = _compile_agent(
         session.settings,
         tools=_lead_tools(ctx),
         prompt=LEAD_AGENT_PROMPT,
         stop_event=stop_event,
     )
+
+    # Add seed retrieval context to the user message when available.
     user_content = _sanitize_string_for_llm(
         _seeded_user_content(question, seed_context, seed_node_ids)
     )
@@ -413,14 +475,16 @@ def run_lead_agent(
         session.settings.agent_max_steps,
         question,
     )
+
+    # Notify callers/UI that the deep lead-agent route has started.
     emit({"type": "route", "mode": "deep", "reason": "lead agent started"})
 
     try:
         state = agent.invoke(
             {"messages": [{"role": "user", "content": user_content}]},
             config={
-                "recursion_limit": max(8, session.settings.agent_max_steps * 2 + 4),
-                # Optional but useful with SQLite/tool thread issues.
+                "recursion_limit": max(50, session.settings.agent_max_steps * 2 + 4),
+                # Keep tool execution serial to avoid SQLite/threading issues.
                 "max_concurrency": 1,
             },
         )
@@ -430,8 +494,7 @@ def run_lead_agent(
 
     finished = ctx.finished
 
-    # If finish_tool was return_direct=True, sometimes the final message is
-    # the JSON returned by finish_tool. Parse it as a fallback.
+    # If finish returned JSON directly, parse it as a fallback source of truth.
     if not finished["answer"] and isinstance(state, dict):
         try:
             parsed = json.loads(_last_message_text(state).strip())
@@ -439,6 +502,7 @@ def run_lead_agent(
                 maybe_answer = _sanitize_string_for_llm(
                     str(parsed.get("answer") or "")
                 ).strip()
+
                 if maybe_answer:
                     finished["answer"] = maybe_answer
                     finished["cited_node_ids"] = _clean_ids(
@@ -447,10 +511,11 @@ def run_lead_agent(
         except Exception:
             pass
 
-    # Last fallback: return the last model message as answer.
+    # Final fallback: use the last visible model message as the answer.
     if not finished["answer"] and isinstance(state, dict):
         finished["answer"] = _sanitize_string_for_llm(_last_message_text(state).strip())
 
+    # Build the normalized final answer object.
     answer = AgentAnswer(
         question=question,
         answer=_sanitize_string_for_llm(finished["answer"]),
@@ -459,18 +524,20 @@ def run_lead_agent(
         ),
         steps=_count_steps(state),
     )
+
     log.debug(
         "lead.return answer_len=%s cited=%s steps=%s",
         len(answer.answer),
         answer.cited_node_ids,
         answer.steps,
     )
+
     return answer
 
 
-# =============================================================================
-# Subagent
-# =============================================================================
+# endregion Lead Explorer
+
+# region Subagent
 
 
 @dataclass
@@ -478,23 +545,38 @@ class SubagentContext:
     """Shared state for one subagent run."""
 
     session: Any
-    run: Subrun
+    run: Subrun  #     start_id, index, visited, read_ids, empty_streak
     emit: Callable[[dict[str, Any]], None]
     stop_event: Event | None = None
+
+    # Stores the subagent's final answer once finish() is called.
     finished: dict[str, Any] = field(default_factory=dict)
 
 
+# same as above, atomic version of the tool which would be wrapped later with pre-determined context
 def _sub_search(ctx: SubagentContext, text: str) -> str:
+    # Stop early if cancellation was requested.
     _check_stop(ctx.stop_event)
+
     session, run = ctx.session, ctx.run
+
+    # Clean the model-provided query before using it for graph search.
     query = _sanitize_string_for_llm(str(text or "")).strip()
+
+    # Emit search event for logs/UI/debugging.
     ctx.emit({"type": "search", "phase": "sub", "agent": run.index, "query": query})
 
+    # Search the graph for relevant nodes.
     nodes = session.search(query, limit=session.settings.rerank_top_k)
+
+    # Track visited node IDs so the run has a memory of what it has seen.
     run.visited.extend(n.id for n in nodes)
 
     if nodes:
+        # Reset empty-search counter once useful results are found.
         run.empty_streak = 0
+
+        # Return compact node previews with clear next action guidance.
         return _sanitize_tool_output(
             "\n".join(
                 f"- node_id: `{n.id}`\n"
@@ -505,63 +587,102 @@ def _sub_search(ctx: SubagentContext, text: str) -> str:
             )
         )
 
+    # Count consecutive failed searches to prevent endless searching.
     run.empty_streak += 1
+
     if run.empty_streak >= session.settings.agent_patience:
         return (
             f"no nodes found ({run.empty_streak} consecutive empty searches). Stop "
             "searching now: call finish with the best answer supported by nodes you read."
         )
+
     return "no nodes found"
 
 
+# same as above, atomic version of the tool which would be wrapped later with pre-determined context
 def _sub_read(ctx: SubagentContext, node_id: str) -> str:
+    # Stop early if cancellation was requested.
     _check_stop(ctx.stop_event)
+
     session, run = ctx.session, ctx.run
+
+    # Preserve requested_id for error messages, but use cleaned_id for lookup.
     requested_id = _sanitize_string_for_llm(str(node_id or ""))
     cleaned_id = clean_node_ref(requested_id)
+
+    # Load the full node content from the graph store.
     node = session.read_node(cleaned_id)
 
     if node:
+        # Avoid wasting read budget on the same node twice.
         if node.id in run.read_ids:
             return _sanitize_tool_output(
                 f"already read {node.id} ({node.title}). Pick a DIFFERENT node, follow a link, or finish."
             )
+
+        # Enforce subagent read budget.
         if len(run.read_ids) >= session.settings.subagent_max_reads:
             return _sanitize_tool_output(
                 f"read budget reached ({len(run.read_ids)}/{session.settings.subagent_max_reads} "
                 "nodes). Call finish now with what you have gathered."
             )
+
+        # Successful read resets the empty-search streak.
         run.empty_streak = 0
+
+        # Track this node as read and visited.
         run.read_ids.add(node.id)
         run.visited.append(node.id)
+
+        # Emit read event for logs/UI/debugging.
         ctx.emit({"type": "read", "agent": run.index, "node": node_ref(node)})
 
+    # Format full node details, including helpful info if node was missing.
     return _sanitize_tool_output(format_node_full(node, requested_id, cleaned_id))
 
 
-def _sub_follow_link(ctx: SubagentContext, node_id: str, direction: str = "both") -> str:
+# same as above, atomic version of the tool which would be wrapped later with pre-determined context
+def _sub_follow_link(
+    ctx: SubagentContext, node_id: str, direction: str = "both"
+) -> str:
+    # Stop early if cancellation was requested.
     _check_stop(ctx.stop_event)
+
     session, run = ctx.session, ctx.run
+
+    # Clean model-provided node ID and direction before graph traversal.
     cleaned_id = clean_node_ref(_sanitize_string_for_llm(str(node_id or "")))
     safe_direction = _sanitize_string_for_llm(str(direction or "both"))
 
+    # Fetch neighboring nodes connected by graph edges.
     pairs = session.follow_link(cleaned_id, direction=safe_direction)
+
     if pairs:
+        # Finding neighbors means the agent made progress.
         run.empty_streak = 0
+
+    # Track all neighbor nodes as visited.
     run.visited.extend(n.id for _edge, n in pairs)
 
+    # Read anchor node only for nicer event metadata.
     anchor = session.read_node(cleaned_id)
+
+    # Emit traversal event for logs/UI/debugging.
     ctx.emit(
         {
             "type": "follow_link",
             "agent": run.index,
-            "node": node_ref(anchor) if anchor else {"id": cleaned_id, "title": cleaned_id},
+            "node": (
+                node_ref(anchor) if anchor else {"id": cleaned_id, "title": cleaned_id}
+            ),
             "neighbors": len(pairs),
         }
     )
 
     if not pairs:
         return "no neighbors"
+
+    # Return compact neighbor list with edge label, node ID, title, and summary.
     return _sanitize_tool_output(
         "\n".join(
             f"- [{_sanitize_string_for_llm(str(e.label))}] "
@@ -573,24 +694,33 @@ def _sub_follow_link(ctx: SubagentContext, node_id: str, direction: str = "both"
     )
 
 
+# same as above, atomic version of the tool which would be wrapped later with pre-determined context
 def _sub_finish(
     ctx: SubagentContext, answer: str, cited_node_ids: list[str] | None = None
 ) -> str:
+    # Stop early if cancellation was requested.
     _check_stop(ctx.stop_event)
+
     run = ctx.run
     min_reads = ctx.session.settings.subagent_min_reads
+
+    # Require enough node reads before allowing the subagent to finish.
     if len(run.read_ids) < min_reads:
         return (
             f"You have read only {len(run.read_ids)} node(s); read at least "
             f"{min_reads} before finishing. Read another now."
         )
 
+    # Store final answer and cleaned citations in shared context.
     ctx.finished["answer"] = _sanitize_string_for_llm(str(answer or "")).strip()
     ctx.finished["cited_node_ids"] = _clean_ids(cited_node_ids)
+
     return "finished; do not call more tools"
 
 
+# this is the wrapper that wraps the above tools with pre-determined context so they can be called by langgraph with just queries
 def _sub_tools(ctx: SubagentContext) -> list[StructuredTool]:
+    # Bind ctx into each tool so LangGraph only has to pass tool arguments.
     def search_tool(text: str) -> str:
         return _sub_search(ctx, text)
 
@@ -603,6 +733,7 @@ def _sub_tools(ctx: SubagentContext) -> list[StructuredTool]:
     def finish_tool(answer: str, cited_node_ids: list[str] | None = None) -> str:
         return _sub_finish(ctx, answer, cited_node_ids)
 
+    # Convert plain Python functions into LangChain StructuredTool objects.
     return [
         StructuredTool.from_function(
             search_tool,
@@ -639,16 +770,15 @@ def run_subagent(
     emit: Callable[[dict[str, Any]], None],
     stop_event: Event | None = None,
 ) -> dict[str, Any]:
-    """
-    LangGraph subagent.
 
-    Also uses the same pre_model_hook through _compile_agent, and all tool
-    outputs are sanitized before returning to LangGraph.
-    """
+    # Normalize inputs before passing them into the agent.
     question = _sanitize_string_for_llm(str(question or "")).strip()
     user_prompt = _sanitize_string_for_llm(str(user_prompt or "")).strip()
 
+    # Shared runtime context used by subagent tools.
     ctx = SubagentContext(session=session, run=run, emit=emit, stop_event=stop_event)
+
+    # Compile the subagent with its tools and system prompt.
     agent = _compile_agent(
         session.settings, _sub_tools(ctx), SUBAGENT_SYSTEM_PROMPT, stop_event
     )
@@ -660,21 +790,25 @@ def run_subagent(
         len(user_prompt),
     )
 
+    # Run the subagent with a bounded recursion limit and serial tool execution.
     state = agent.invoke(
         {"messages": [{"role": "user", "content": user_prompt}]},
         config={
-            "recursion_limit": max(8, session.settings.subagent_max_steps * 2 + 6),
+            "recursion_limit": max(20, session.settings.subagent_max_steps * 2 + 6),
             # Optional but useful with SQLite/tool thread issues.
             "max_concurrency": 1,
         },
     )
 
-    answer = (
-        _sanitize_string_for_llm(str(ctx.finished.get("answer") or "")).strip()
-        or _last_message_text(state)
-    )
+    # Prefer the explicit finish() answer, otherwise fall back to the last message.
+    answer = _sanitize_string_for_llm(
+        str(ctx.finished.get("answer") or "")
+    ).strip() or _last_message_text(state)
+
+    # Prefer cited IDs from finish(); otherwise cite visited nodes as a fallback.
     cited = _clean_ids(ctx.finished.get("cited_node_ids", [])) or dedupe(run.visited)
 
+    # Notify caller/UI that this subagent completed.
     emit({"type": "subagent_done", "agent": run.index, "cited": cited})
 
     log.debug(
@@ -684,6 +818,8 @@ def run_subagent(
         len(answer or "(no findings)"),
         cited,
     )
+
+    # Return compact result for the lead agent to merge with other subagent results.
     return {
         "start": run.start_id,
         "answer": answer or "(no findings)",
@@ -691,18 +827,17 @@ def run_subagent(
     }
 
 
-# =============================================================================
-# Per-request read context
-# =============================================================================
-
 # Compact router-facing view of one search_with_evidence result.
 def _describe_candidate(result: dict[str, Any]) -> dict[str, Any]:
     node = result["node"]
+
+    # Return only the fields needed for routing/preview, not the full node.
     return {
         "node_id": node.id,
         "kind": "agent_note" if node.type == NodeType.exogenous else "source",
         "title": node.title,
         "summary": node.summary,
+        # Keep evidence snippets short and whitespace-normalized.
         "evidence": [
             " ".join((ev.get("text") or "").split())[:280]
             for ev in result.get("evidence", [])[:3]
@@ -710,18 +845,18 @@ def _describe_candidate(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# One research session, seperate context, seperate parameters (set by user or default) for each session, so multiple users can do their own research variations
 class ResearchSession:
-    """One request's read context: settings/LLM (possibly overridden per
-    request) plus early-exit seed state. Cheap to build, never shared across
-    requests. All SQL goes through the shared read-only GraphStore."""
 
     def __init__(self, gateway: ModelGateway, store: GraphStore):
-        self.gateway = gateway
-        self.store = store
+        self.gateway = gateway  # GPU Related stuff: Model, Embedder, Reranker
+        self.store = store  # DB connection
+
         # Defaults to the shared clients; apply_overrides may swap in
         # per-request replacements without touching the gateway.
         self.settings = gateway.settings
         self.llm = gateway.llm
+
         # Early-exit deep route preserves its candidates here so the lead
         # agent does not start blind.
         self._lead_seed_context = ""
@@ -891,7 +1026,7 @@ class ResearchSession:
 
     # Query the graph
     # id: get by node id, and its edges
-    # keyword:  search through LLM extracted keywords + title + summary and body of each node 
+    # keyword:  search through LLM extracted keywords + title + summary and body of each node
     # vector: Embedding based search for similarity search (searches titles, main body, summaries, claims etc)
     def query(self, query_type: str, value: str) -> QueryResult:
         normalized = query_type.lower().strip()
@@ -917,20 +1052,22 @@ class ResearchSession:
             )
         if normalized == "vector":
             vector = self.gateway.embedder.embed_query(value)
-            hits = self.store.vector_search(vector, "vec_body", self.settings.vector_query_k)
+            hits = self.store.vector_search(
+                vector, "vec_body", self.settings.vector_query_k
+            )
             seeds = [n for n in (self.store.get_node(nid) for nid, _ in hits) if n]
             nodes, edges_list = self._expand_neighborhood(seeds, hops=2)
             return QueryResult(
                 query_type="vector", value=value, nodes=nodes, edges=edges_list
             )
         raise ValueError("query_type must be 'keyword', 'vector', or 'id'")
-    
+
     # Calls the function that does all 3 Query modes then rank them, if that fails fallbacks to normal keyword search
     def search(self, text: str, limit: int | None = None) -> list[Node]:
 
         # server default limit or user defined limit
         limit = limit or self.settings.vector_query_k
-        
+
         try:
             results = self.search_with_evidence(text, limit)
         except Exception as exc:
@@ -942,7 +1079,7 @@ class ResearchSession:
                 return []
             return nodes[:limit]
         return [r["node"] for r in results][:limit]
-    
+
     # Evidence-first retrieval. Returns ``{node, score, why, evidence}`` dicts ranked by cross-encoder relevance (falling back to weighted RRF).
     # Combines BM25 keyword search, vector search, item search, reranking, deduping, and returns nodes with evidence snippets.
     def search_with_evidence(
@@ -952,14 +1089,14 @@ class ResearchSession:
         limit = limit or self.settings.vector_query_k
         s = self.settings
 
-        # Rank normalizer, it flattens the contributions of ranks, as this parameter is increased, the ranked are 
+        # Rank normalizer, it flattens the contributions of ranks, as this parameter is increased, the ranked are
         # more flattened and more chance of lower ranks to be included
         rrf_k = s.search_rrf_k
-        
+
         # It also makes evidences, not just plain ranks so LLM can choose based on context not just quantitative numbers
         hits: list[EvidenceHit] = []
 
-        # node BM25 
+        # node BM25
         node_bm25: list[Node] = []
         try:
             node_bm25 = self.store.keyword_search(text, s.pool_node_bm25)
@@ -979,7 +1116,7 @@ class ResearchSession:
                 )
             )
 
-        # vector pools 
+        # vector pools
         query_vec: list[float] | None = None
         try:
             query_vec = self.gateway.embedder.embed_query(text)
@@ -1030,7 +1167,7 @@ class ResearchSession:
                         item_id,
                         row["text"] or "",
                         rank,
-                        item_vec_weight(s, row["field"]), # TODO: Make this inline
+                        item_vec_weight(s, row["field"]),  # TODO: Make this inline
                         row.get("start_char"),
                     )
                 )
@@ -1063,7 +1200,7 @@ class ResearchSession:
         if not hits:
             return []
 
-        # weighted RRF per node + load active nodes 
+        # weighted RRF per node + load active nodes
         node_scores: dict[str, float] = defaultdict(float)
 
         # Same node can get points from multiple search methods
@@ -1121,7 +1258,7 @@ class ResearchSession:
 
         rel = normalize_scores(rel)
 
-        # --- MMR dedup over the snippet pool ----------------------------------
+        # MMR dedup over the snippet pool
         order = mmr_order([h.text for h in pool], rel, s.evidence_mmr_lambda)
         rank_of = {idx: pos for pos, idx in enumerate(order)}
 
@@ -1131,7 +1268,7 @@ class ResearchSession:
         for i, hit in enumerate(pool):
             node_pool_idx[hit.node_id].append(i)
 
-        # --- aggregate evidence back to nodes ---------------------------------
+        # aggregate evidence back to nodes
         results: list[dict[str, Any]] = []
 
         for node_id, node in nodes.items():
@@ -1222,7 +1359,9 @@ class ResearchSession:
         self,
         question: str,
         persist: bool = False,
-        on_event: Callable[[dict[str, Any]], None] | None = None, # callback for event emission
+        on_event: (
+            Callable[[dict[str, Any]], None] | None
+        ) = None,  # callback for event emission
         stop_event: threading.Event | None = None,
     ) -> AgentAnswer:
         if persist:
@@ -1500,7 +1639,7 @@ class ResearchSession:
 
     # Run the subagent with same pattern, with explicit instructions to keep its exploration to its own region and report its finding
     # Explictly told to not read other nodes in case it ends up there somehow
-    # TODO: Add exogenous node exploration case too, in case the exo nodes is enough, just verify the important facts from its source and report it as good 
+    # TODO: Add exogenous node exploration case too, in case the exo nodes is enough, just verify the important facts from its source and report it as good
     def _run_single_subagent(
         self,
         start_id: str,
@@ -1561,11 +1700,8 @@ class ResearchSession:
         return list(seen_nodes.values()), list(seen_edges.values())
 
 
-# =============================================================================
-# Public actor
-# =============================================================================
-
-
+# API for fastapi server, this will be created by an endpoint, and then it will invoke an independant research session in a new thread
+# So the server's job is to create this object and make it run in another thread then wait for the results
 class Researcher:
     """Concurrent, read-only question answering over the graph.
 

@@ -24,6 +24,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -40,6 +41,7 @@ log = logging.getLogger("app")
 # ============================================================================
 # lifecycle
 # ============================================================================
+
 
 class AgentRunRegistry:
     """Tracks in-flight streaming agent runs so /stop can cancel them."""
@@ -168,7 +170,11 @@ def _job_response(job):
     payload = d.get("payload")
     if isinstance(payload, dict):
         d["payload"] = {
-            k: (v[:200] + f"… ({len(v)} chars)" if isinstance(v, str) and len(v) > 200 else v)
+            k: (
+                v[:200] + f"… ({len(v)} chars)"
+                if isinstance(v, str) and len(v) > 200
+                else v
+            )
             for k, v in payload.items()
         }
     if job.status == "queued":
@@ -275,9 +281,7 @@ async def patch_settings(payload: dict[str, Any]) -> dict:
         current_dict = _dump(_gateway().settings)
         # Ignore blanked-out secrets: clients receive redacted values ("") and
         # may echo them back; an empty secret must not wipe the real key.
-        clean = {
-            k: v for k, v in payload.items() if not (k in _SECRET_KEYS and not v)
-        }
+        clean = {k: v for k, v in payload.items() if not (k in _SECRET_KEYS and not v)}
         current_dict.update(clean)
         new = Settings(**current_dict)
     except Exception as exc:

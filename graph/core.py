@@ -1,15 +1,19 @@
-"""Core shelf for the graph package: data models, settings, prompt constants,
-and pure helper functions. Imports nothing from the other graph modules —
-every actor (store / gateway / librarian / researcher) builds on this."""
+# region Imports
 
 from __future__ import annotations
 
-
+import copy
+import hashlib
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -21,7 +25,13 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-#  settings 
+# endregion Imports
+
+
+# region Models
+
+
+#  settings
 @dataclass
 class Settings:
 
@@ -39,7 +49,7 @@ class Settings:
     early_exit_candidates: int = 20
     shallow_answer_max_nodes: int = 6
 
-    # Compile time/ingest time 
+    # Compile time/ingest time
 
     # embeddings
     embed_backend: str = "server"
@@ -47,7 +57,7 @@ class Settings:
     embed_api_key: str = "local"
     embed_model: str = "cl-nagoya/ruri-v3-310m"
     hf_embed_model: str = "cl-nagoya/ruri-v3-310m"
-    hf_device: str = "cuda:0" # fallback device id if server fails
+    hf_device: str = "cuda:0"  # fallback device id if server fails
     embed_dim: int = 768
 
     # reranker
@@ -61,21 +71,21 @@ class Settings:
     # db
     database_path: str = ".wiki/moove_wiki.sqlite"
 
-    # edge 
+    # edge
     edge_candidate_k: int = 50
     vector_query_k: int = 50
-    
+
     # on endogenenous node change
     cascade_max_hops: int = 3
     cascade_max_nodes: int = 100
-    
+
     # search parameters
     search_rrf_k: int = 60
     search_candidate_pool: int = 50
     rerank_top_k: int = 20
     entity_dedup: bool = True
 
-    #  evidence-first search: chunking (chars) 
+    #  evidence-first search: chunking (chars)
     search_big_chunk_size: int = 3000
     search_big_chunk_overlap: int = 300
     search_small_chunk_size: int = 512
@@ -88,7 +98,7 @@ class Settings:
     pool_item_bm25: int = 150
     pool_vec_item: int = 300
 
-    #  evidence-first search: weighted RRF field weights 
+    #  evidence-first search: weighted RRF field weights
     weight_item_bm25: float = 1.35
     weight_title_vec: float = 1.30
     weight_claim_vec: float = 1.25
@@ -98,7 +108,7 @@ class Settings:
     weight_node_bm25: float = 0.90
     weight_body_vec: float = 0.75
 
-    #  evidence-first search: caps + rerank/MMR 
+    #  evidence-first search: caps + rerank/MMR
     evidence_max_per_node: int = 3
     evidence_max_per_field: int = 2
     evidence_dedup_char_window: int = 200
@@ -226,9 +236,7 @@ class Settings:
             subagent_max_reads=int(
                 env("WIKI_SUBAGENT_MAX_READS", cls.subagent_max_reads)
             ),
-            service_max_reads=int(
-                env("WIKI_SERVICE_MAX_READS", cls.service_max_reads)
-            ),
+            service_max_reads=int(env("WIKI_SERVICE_MAX_READS", cls.service_max_reads)),
             service_max_agents=int(
                 env("WIKI_SERVICE_MAX_AGENTS", cls.service_max_agents)
             ),
@@ -253,6 +261,7 @@ class Settings:
 class NodeType(str, Enum):
     endogenous = "endogenous"
     exogenous = "exogenous"
+
 
 # whether a node is overruled by newer version, with updated version
 class NodeStatus(str, Enum):
@@ -282,6 +291,7 @@ class Node(BaseModel):
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
 
+
 # Connecting nodes so agent knows what to read next
 class Edge(BaseModel):
     id: str
@@ -300,24 +310,29 @@ class Edge(BaseModel):
 
 #  LLM Structured outputs
 
+
 # singular edge
 class EdgeSuggestion(BaseModel):
     target_node_id: str
     label: str = "related"
     summary: str = ""
 
+
 # list of above edge model
 class EdgeSuggestions(BaseModel):
     edges: list[EdgeSuggestion] = Field(default_factory=list)
+
 
 # For metadata filtering
 class Keywords(BaseModel):
     keywords: list[str] = Field(default_factory=list)
 
+
 # Factual grounds extracted from a node
 class ClaimExtraction(BaseModel):
     entity: str = ""
     claims: list[str] = Field(default_factory=list)
+
 
 # Whether two entities are same or not
 class EntityMatch(BaseModel):
@@ -327,8 +342,6 @@ class EntityMatch(BaseModel):
 
 # Early-exit routing decision for ask(): reuse an existing agent note verbatim,
 # answer shallowly from retrieved evidence, or run the deep research agent.
-from enum import Enum
-from pydantic import BaseModel, Field
 
 
 class RouteMode(str, Enum):
@@ -382,12 +395,14 @@ class RouteDecision(BaseModel):
         ),
     )
 
+
 #  Query response from the graph
 class QueryResult(BaseModel):
     query_type: str
     value: str
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
+
 
 # Final agent answer
 class AgentAnswer(BaseModel):
@@ -411,6 +426,7 @@ class GraphStats(BaseModel):
     clusters: dict[str, int] = Field(default_factory=dict)
     target_node_id: str | None = None
 
+
 # In case model emits english name for cluster, had this problem earlier
 class ClusterRename(BaseModel):
     original_name: str
@@ -419,7 +435,6 @@ class ClusterRename(BaseModel):
 
 class ClusterRenamePlan(BaseModel):
     renames: list[ClusterRename] = []
-
 
 
 # Interface describing the methods an LLM client must implement, independent of
@@ -494,7 +509,6 @@ LEAD_TOOLS = [search, explore, finish]
 SUBAGENT_TOOLS = [search, read, follow_link, finish]
 
 
-
 @dataclass
 class Subrun:
     """Per-subagent run state. Created once, captured by the dispatch closure —
@@ -540,6 +554,7 @@ class EnrichmentWorker(Protocol):
     def get_meta(self, key: str) -> str | None: ...
     def set_meta(self, key: str, value: str) -> None: ...
 
+
 @dataclass(frozen=True)
 class EnrichJob:
     kind: str  # "summary" | "entity_dedup" | "cascade" | "maybe_recluster"
@@ -548,11 +563,10 @@ class EnrichJob:
     stale_sources: list[str] = field(default_factory=list)
 
 
-# =============================================================================
-# Prompt constants
-# =============================================================================
+# endregion Models
 
-"""Prompt constants used by graph services and agents."""
+
+# region Prompts
 
 GRAPH_SYSTEM_PROMPT = "あなたは、簡潔で事実に基づくナレッジグラフWikiを維持します。"
 
@@ -590,7 +604,6 @@ ROUTER_PROMPT = (
     "あなたはナレッジグラフWikiの質問ルーターです。質問と、検索で見つかった候補ノード"
     "（kind='agent_note' は過去にエージェントが作成した回答ノート、kind='source' は元資料）"
     "が与えられます。最も安価で十分な戦略を1つ選んでください。\n\n"
-
     "選択肢：\n"
     "- reuse: 候補内の agent_note が、質問と同じ範囲をカバーし、質問が求める具体性まで"
     "ほぼ完全に回答している場合。その候補の node_id を正確に返してください。"
@@ -600,7 +613,6 @@ ROUTER_PROMPT = (
     "- deep: 質問が広い、複数箇所の文書確認が必要、候補同士が矛盾する、"
     "解釈・手順・変更・判断・原因・条件整理が必要、または証拠が不十分な場合。"
     "node_id は null にしてください。\n\n"
-
     "重要ルール：\n"
     "- 質問の短さだけで shallow を選んではいけません。短い質問でも、"
     "変更方法、対応方針、原因、理由、手順、例外条件、判断基準、複数条件の整理、"
@@ -631,11 +643,9 @@ SHALLOW_ANSWER_PROMPT = (
     "- 回答はMarkdown形式で書いてください。\n"
     "- 根拠に使ったノードのidを、本文中でバッククォート付きで引用してください（例：`node:...`）。\n"
     "- 抜粋だけでは回答できない場合は、その旨を明確に述べてください。\n\n"
-
     "shallow 回答に適したケース：\n"
     "- 質問が単一の事実を尋ねており、抜粋内に直接答えがある場合。"
     "例：期限、日付、担当者、金額、数値、名称、定義、単一条件、単一の記載事実。\n\n"
-
     "注意が必要なケース：\n"
     "- ユーザーが「何を変更」「どこを変更」「どうすれば」「なぜ」「どの手順」"
     "「どの条件」「何が必要」「何を確認」「どう対応」「どれを選ぶ」"
@@ -706,7 +716,6 @@ MAIN_AGENT_SYSTEM_PROMPT = (
     "各サブエージェントは1つの開始ノードからグラフを読み進め、調査結果を報告します。"
     "有望な手がかりを調査するために使用してください。\n"
     "- finish(answer, cited_node_ids)：最終的にまとめた回答を提出します。\n\n"
-
     "作業手順：\n"
     "1. まず主質問を検索し、その後、質問内の重要語、固有名詞、文書名、制度名、対象名、"
     "条件、役割、日付、数値、手順名、判断基準らしき語を検索してください。"
@@ -719,7 +728,6 @@ MAIN_AGENT_SYSTEM_PROMPT = (
     "再度検索して explore をもう1回実行してもかまいません。そうでなければ回答をまとめてください。\n"
     "5. サブエージェントが報告した内容のみに基づいた十分な回答を、"
     "証拠として使用したノードIDを引用しながら finish で提出してください。\n\n"
-
     "深く調べるべき質問の方針：\n"
     "- ユーザーが行動、変更、対応、判断、原因、理由、手順、条件、例外、影響、比較、"
     "複数文書の整合性を尋ねている場合、概念的な答えだけで finish してはいけません。\n"
@@ -734,7 +742,6 @@ MAIN_AGENT_SYSTEM_PROMPT = (
     "追加検索や追加 explore を検討してください。\n"
     "- それでも具体的な情報が見つからない場合は、見つかった事実と不足している情報を明確に分けて回答してください。"
     "根拠がない文書名、項目名、条件、値、手順を推測してはいけません。\n\n"
-
     "ルール：\n"
     "- あなたはノード本文を直接読むことはできません。サブエージェントの報告に依存してください。\n"
     "- 'node:' プレフィックスを含め、ノードIDは表示されたとおり正確にコピーしてください。\n"
@@ -748,14 +755,12 @@ SUBAGENT_SYSTEM_PROMPT = (
     "あなたは、ナレッジグラフWikiの1つの領域を探索する研究サブエージェントです。"
     "主任研究者から開始ノードを与えられています。それを徹底的に調査し、"
     "具体的で根拠のある発見を報告してください。\n\n"
-
     "ツール：\n"
     "- read(node_id)：ノードの完全な本文を読みます。割り当てられたノードを読むことから開始してください。\n"
     "- follow_link(node_id, direction)：参照、例、前提条件、関連概念をたどるために、"
     "ノードの近傍へ移動します。\n"
     "- search(text)：自分の領域で必要な場合、キーワードで追加のノードを検索します。\n"
     "- finish(answer, cited_node_ids)：調査結果と読んだノードIDを報告します。\n\n"
-
     "ルール：\n"
     "1. 割り当てられた開始ノードを最初に読んでください。\n"
     "2. リンクをたどり、自分の領域内で2〜5個のノードを読んで、実際の証拠を集めてください。"
@@ -768,7 +773,6 @@ SUBAGENT_SYSTEM_PROMPT = (
     "5. 'node:' プレフィックスを含め、ノードIDは正確にコピーしてください。\n"
     "6. 完了したら、この領域が質問について何を示しているかを焦点を絞って要約し、"
     "使用したノードIDを引用して finish を呼び出してください。\n\n"
-
     "調査時の観点：\n"
     "- 質問が単一の事実を尋ねている場合は、その事実と根拠を正確に報告してください。"
     "例：期限、日付、担当者、金額、数値、名称、定義、単一条件。\n"
@@ -814,21 +818,10 @@ Rules:
 - Finish with a concise answer and cite supporting node IDs.
 """.strip()
 
-
-# =============================================================================
-# Pure helpers (formatters, hashing, matching, mermaid repair)
-# =============================================================================
+# endregion Prompts
 
 
-import re
-import shutil
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import Any, Callable
-
-import hashlib
-
+# region Helpers/Utils
 
 
 # Single shared tokenizer. A module constant on purpose: compiling a regex is
@@ -845,13 +838,16 @@ TOKEN_RE = re.compile(r"[a-z0-9_./:-]+")
 # Matches separators/punctuation like " ", "_", ".", or "!!!" for slugification.
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+
 # identifiers / hashing
 def short_hash(text: str, length: int = 12) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:length]
 
+
 # Identity of a whole source document, for recon dedup
 def source_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 
 # remove all special symbols and whitespace and repalce with hyphen
 def slug(text: str, max_length: int = 40) -> str:
@@ -896,7 +892,7 @@ def chunk_text(text: str, size: int, overlap: int) -> list[tuple[int, int, str]]
     return chunks
 
 
-# text matching / scoring 
+# text matching / scoring
 def normalize_token(token: str) -> str:
     return token.strip().lower()
 
@@ -956,7 +952,7 @@ def claims_equivalent(old: Node, new: Node, unchanged_threshold: float = 0.9) ->
     return token_jaccard(old.body, new.body) >= 0.95
 
 
-# pure formatters 
+# pure formatters
 def node_ref(node: Node) -> dict[str, str]:
     return {"id": node.id, "title": node.title or node.entity or node.id}
 
@@ -991,7 +987,7 @@ def format_node_full(node: Node | None, requested_id: str, cleaned_id: str) -> s
     return f"{note}id: {node.id}\ntitle: {node.title}\nsummary: {node.summary}\nbody:\n{node.body}"
 
 
-# mermaid validate / repair (a real subsystem; not inlined) 
+# mermaid validate / repair (a real subsystem; not inlined)
 def validate_mermaid(code: str, settings: Settings) -> tuple[bool, str]:
     """Render the code to SVG with mmdc; True if it parses + renders."""
     mmdc = shutil.which(settings.mermaid_cli_bin)
@@ -1069,6 +1065,7 @@ def repair_answer_mermaid(
     )
     return new_answer
 
+
 # TODO: Make this inline
 def item_vec_weight(settings: Settings, field: str) -> float:
     return {
@@ -1079,6 +1076,7 @@ def item_vec_weight(settings: Settings, field: str) -> float:
         "big_chunk": settings.weight_big_chunk_vec,
     }.get(field, settings.weight_small_chunk_vec)
 
+
 # For ranking purposes
 def normalize_scores(values: list[float]) -> list[float]:
     if not values:
@@ -1087,6 +1085,7 @@ def normalize_scores(values: list[float]) -> list[float]:
     if high - low < 1e-9:
         return [1.0 for _ in values]
     return [(v - low) / (high - low) for v in values]
+
 
 # Greedy Maximal Marginal Relevance (MMR) ordering.
 # At each step, selects the next item that best balances:
@@ -1113,6 +1112,7 @@ def mmr_order(texts: list[str], rel: list[float], lam: float) -> list[int]:
 def node_snippet(node: Node) -> str:
     return (node.summary or node.title or "").strip()
 
+
 # Aggregates evidence hits per field and keeps only the best (lowest) rank for each field.
 # Returns a rank-ordered list showing which fields matched the node most strongly (earlier rank = stronger match).
 def evidence_why(node_hits: list[EvidenceHit]) -> list[dict[str, Any]]:
@@ -1125,6 +1125,7 @@ def evidence_why(node_hits: list[EvidenceHit]) -> list[dict[str, Any]]:
         {"field": field, "rank": rank}
         for field, rank in sorted(best.items(), key=lambda kv: kv[1])
     ]
+
 
 # Formats a candidate node result into a compact, llm-readable summary string
 # for inspection/debugging. Includes node metadata, top match reasons ("why"),
@@ -1153,16 +1154,6 @@ def format_lead_candidate(result: dict[str, Any]) -> str:
         "or include this id with other candidates"
     )
     return lines
-
-
-# =============================================================================
-# LLM input sanitizers (image/base64 stripping for model-bound text)
-# =============================================================================
-
-
-import copy
-import re
-from typing import Any
 
 
 _IMAGE_UNIT_RE = re.compile(
@@ -1305,3 +1296,6 @@ def _sanitize_message(message: Any) -> Any:
         return cloned
     except Exception:
         return message
+
+
+# endregion Helpers/Utils
