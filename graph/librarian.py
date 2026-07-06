@@ -89,6 +89,9 @@ class WriteJob:
     finished_at: datetime | None = None
     result: Any = None
     error: str | None = None
+    # Live progress for long-running jobs (chunk_and_ingest): updated in-place
+    # by the worker thread, read by the /api/write-jobs pollers.
+    progress: dict[str, Any] | None = None
 
 
 # flatten a job object to a dict
@@ -104,6 +107,7 @@ def job_to_dict(job: WriteJob) -> dict[str, Any]:
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "result": job.result,
         "error": job.error,
+        "progress": job.progress,
     }
 
 
@@ -378,6 +382,9 @@ class Librarian:
         if job.type == "ingest_md_output":
             nodes = self.ingest_md_output(job.payload["path"])
             return {"ingested": len(nodes)}
+
+        if job.type == "chunk_and_ingest":
+            return self.chunk_and_ingest(job)
 
         if job.type == "ensure_japanese_clusters":
             mapping = self.ensure_japanese_clusters()
@@ -1107,6 +1114,64 @@ class Librarian:
             log.info("recluster skipped: %s", exc)
 
         return nodes
+
+    def chunk_and_ingest(self, job: WriteJob) -> dict[str, Any]:
+        # Big-document path: chunk an uploaded markdown body with the external
+        # chunker package, then ingest the rendered pages through the normal
+        # ingest_md_output path. This whole job intentionally owns the write
+        # queue end-to-end (one big job); reads stay on their own connection.
+        from chunker import ChunkConfig, run_chunk_pipeline
+
+        body = job.payload["body"]
+        document_name = self._document_name(
+            job.payload.get("document_name")
+            or job.payload.get("title")
+            or f"uploaded-{short_hash(body)}.md"
+        )
+        config = ChunkConfig.from_env().apply_overrides(job.payload.get("options"))
+
+        out_dir = (
+            Path(self.settings.database_path).parent
+            / "chunked"
+            / f"{Path(document_name).stem}-{short_hash(body)}"
+        )
+
+        def on_progress(update: dict[str, Any]) -> None:
+            job.progress = update
+
+        result = run_chunk_pipeline(
+            source_text=body,
+            document_name=document_name,
+            out_dir=out_dir,
+            config=config,
+            llm=self.gateway.llm,
+            on_progress=on_progress,
+        )
+
+        job.progress = {"stage": "ingesting", "total": result.file_count}
+        nodes = self.ingest_md_output(out_dir)
+
+        # Inline enrichment: the job already holds the write queue, so new
+        # nodes leave here fully enriched (summary + entity dedup) instead of
+        # dripping through the background enrichment thread.
+        for index, node in enumerate(nodes, start=1):
+            job.progress = {
+                "stage": "enriching",
+                "current": index,
+                "total": len(nodes),
+            }
+            self.enrich_summary(node.id)
+            self.enrich_entity_dedup(node.id)
+
+        job.progress = {"stage": "done", "total": len(nodes)}
+        return {
+            "chunked": True,
+            "ingested": len(nodes),
+            "files": result.file_count,
+            "document_name": document_name,
+            "out_dir": str(out_dir),
+            "chunker_llm_calls": result.llm_calls,
+        }
 
     def cascading_update(self, source_file: str | Path) -> list[str]:
         # Update an already-ingested source file and cascade changes to dependents.

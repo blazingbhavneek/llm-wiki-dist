@@ -8,12 +8,30 @@ export function describeWriteJob(job, doneText, t) {
   if (job.status === 'queued') {
     return job.position ? t.queuedPos(job.position) : t.queued
   }
-  if (job.status === 'running') return t.writing
+  if (job.status === 'running') {
+    // Long jobs (chunk_and_ingest) report live stage progress.
+    const p = job.progress
+    if (p?.stage) {
+      const counter =
+        p.current != null && p.total != null ? ` ${p.current}/${p.total}` : ''
+      return t.chunkProgress(`${p.stage}${counter}`)
+    }
+    return t.writing
+  }
   if (job.status === 'done') return doneText ?? t.writeFinished
   if (job.status === 'failed') return job.error || t.writeFailed
   if (job.status === 'cancelled') return t.writeCancelled
   return t.statusOf(job.status)
 }
+
+// chunk_and_ingest returns {chunked: true, ingested: N} instead of a node.
+export function isChunkedResult(result) {
+  return !!(result && typeof result === 'object' && result.chunked)
+}
+
+// Big documents chunk + ingest + enrich in one job; the default 10-minute
+// poll timeout is far too short for them.
+const BIG_JOB_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
 /**
  * All write-queue operations (node update/delete, markdown upload, saving
@@ -140,6 +158,7 @@ export function useGraphWrites({
           documentName: filename,
         },
         {
+          timeoutMs: BIG_JOB_TIMEOUT_MS,
           onProgress: (job) => onStatus?.(describeWriteJob(job, t.mdAdded, t)),
           onAssimilating: (msg) => {
             startAssimilationPolling()
@@ -149,6 +168,14 @@ export function useGraphWrites({
       )
 
       await reload()
+
+      if (isChunkedResult(node)) {
+        // Big-document path: many nodes were created; nothing to open.
+        onStatus?.(t.chunkedAdded(node.ingested))
+        fireToast(t.chunkedAdded(node.ingested))
+        return node
+      }
+
       openNode(node)
 
       onStatus?.(t.mdAddedOpened)
@@ -217,6 +244,7 @@ export function useGraphWrites({
                 sourceRanges: item.sourceRanges,
               },
               {
+                timeoutMs: BIG_JOB_TIMEOUT_MS,
                 onProgress: (job) => {
                   updateWorkspace(item.id, {
                     busyMessage: describeWriteJob(job, t.addedToGraph, t),
@@ -234,6 +262,14 @@ export function useGraphWrites({
       if (item.answer?.id) {
         setSavedIds((prev) => new Set(prev).add(item.answer.id))
         setAnswerWriteStatus(item.answer.id, t.savedOpened)
+      }
+
+      if (isChunkedResult(node)) {
+        // Big-document path: the draft became many nodes; close the draft
+        // instead of trying to open a single node.
+        closeWorkspace()
+        fireToast(t.chunkedAdded(node.ingested))
+        return
       }
 
       openNode(node)

@@ -5,6 +5,7 @@ import ChatPanel from './components/ChatPanel'
 import GraphCanvas from './components/GraphCanvas'
 import MarkdownView from './components/MarkdownView'
 import ErrorBoundary from './components/ErrorBoundary'
+import QueueView from './components/QueueView'
 import SettingsView from './components/SettingsView'
 import UploadView from './components/UploadView'
 import { AppFooter } from './components/layout/AppFooter'
@@ -390,6 +391,10 @@ export default function App() {
           />
         </UploadCenter>
       )
+    }
+
+    if (centerView === 'queue') {
+      return <QueueView />
     }
 
     if (centerView === 'glossary') {

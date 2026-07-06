@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import threading
 import uuid
@@ -223,6 +224,14 @@ class DocumentBody(BaseModel):
     document_name: str | None = None
     source_path: str | None = None
     source_ranges: list[tuple[int, int]] | None = None
+    # Optional ChunkConfig overrides for the chunk-and-ingest path
+    # (ablation/speed switches; unknown keys are ignored server-side).
+    chunk_options: dict[str, Any] | None = None
+
+
+# Documents longer than this many lines (~3 pages) always take the
+# chunk-and-ingest path: split into concept pages before node creation.
+CHUNK_LINE_THRESHOLD = int(os.environ.get("WIKI_CHUNK_THRESHOLD_LINES", "300"))
 
 
 class RecondBody(BaseModel):
@@ -490,6 +499,19 @@ async def create_exogenous(payload: ExogenousBody) -> dict:
 
 @app.post("/api/document")
 async def create_document(payload: DocumentBody) -> dict:
+    # Not user-selectable: big documents are always chunked into concept
+    # pages first, then ingested page-by-page (nodes + edges + enrichment).
+    if len(payload.body.splitlines()) > CHUNK_LINE_THRESHOLD:
+        return await _enqueue(
+            "chunk_and_ingest",
+            {
+                "body": payload.body,
+                "title": payload.title,
+                "document_name": payload.document_name,
+                "source_path": payload.source_path,
+                "options": payload.chunk_options or {},
+            },
+        )
     return await _enqueue(
         "create_document",
         {
