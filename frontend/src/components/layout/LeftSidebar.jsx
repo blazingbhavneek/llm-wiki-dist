@@ -1,6 +1,7 @@
 import {
   BookMarked,
   BookOpen,
+  ListTodo,
   MessageCircle,
   Network,
   PanelLeftClose,
@@ -43,6 +44,12 @@ export function LeftSidebar({
       label: t.shell.upload,
       icon: Upload,
       view: 'upload',
+    },
+    {
+      id: 'queue',
+      label: t.shell.queue,
+      icon: ListTodo,
+      view: 'queue',
     },
     {
       id: 'glossary',
