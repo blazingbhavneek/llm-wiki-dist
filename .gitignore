@@ -37,3 +37,7 @@ translation_judge_log.jsonl
 vendor/
 
 **.md
+
+# parser cache
+parser/cache
+parser/temp

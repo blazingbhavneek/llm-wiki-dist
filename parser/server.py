@@ -1,12 +1,19 @@
+# start this server using
+# uvicorn server:app --host 0.0.0.0 --port 8888
+
+import atexit
 import hashlib
 import multiprocessing as mp
 import os
 import queue as queue_module
 import shutil
 import signal
+import sys
+import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from html import escape as html_escape
 from pathlib import Path
@@ -28,9 +35,9 @@ TEMP_DIR.mkdir(exist_ok=True)
 MINERU_VENV_BIN = Path("/home/seigyo/llm-wiki/.venv/bin")
 
 GPU_MEMORY_UTILIZATION = "0.05"
-NVIDIA_INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1")
-NVIDIA_API_KEY = os.environ.get("OPENAI_API_KEY", "local")
-NVIDIA_MODEL = os.environ.get("WIKI_MODEL", "openai/gpt-oss-120b")
+INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
+API_KEY = os.environ.get("OPENAI_API_KEY", "local")
+MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")
 
 IMAGE_EXTENSIONS = {
     ".png",
@@ -43,18 +50,31 @@ IMAGE_EXTENSIONS = {
     ".tiff",
 }
 
+DONE_RETENTION_SECONDS = 72 * 60 * 60
+
 MP_CONTEXT = mp.get_context("fork" if os.name == "posix" else "spawn")
 
 tasks: dict[str, dict[str, Any]] = {}
 
+task_queue: deque[str] = deque()
+current_task_id: Optional[str] = None
+state_lock = threading.RLock()
+scheduler_stop = threading.Event()
+scheduler_thread: Optional[threading.Thread] = None
+shutdown_started = False
+
 
 class APIConfig(BaseModel):
-    base_url: str = NVIDIA_INVOKE_URL
-    api_key: str = NVIDIA_API_KEY
-    model: str = NVIDIA_MODEL
+    base_url: str = INVOKE_URL
+    api_key: str = API_KEY
+    model: str = MODEL
     puppeteer_config_path: Optional[str] = (
         "/home/seigyo/llm-wiki-dist/puppeteer-config.json"
     )
+
+
+def now_ts() -> float:
+    return time.time()
 
 
 def cleanup_stale_processing_dirs():
@@ -70,7 +90,7 @@ def cleanup_stale_processing_dirs():
 
 
 def kill_process_forcefully(process: mp.Process, timeout: float = 5.0):
-    if process.pid is None:
+    if process is None or process.pid is None:
         return
 
     pid = process.pid
@@ -85,11 +105,20 @@ def kill_process_forcefully(process: mp.Process, timeout: float = 5.0):
         if os.name == "posix":
             try:
                 pgid = os.getpgid(pid)
-                os.killpg(pgid, signal.SIGTERM)
+
+                # Safety: if the child has not called os.setsid() yet,
+                # its pgid may still be the same as the parent server.
+                # In that case, do NOT kill the whole process group.
+                if pgid != os.getpgrp():
+                    os.killpg(pgid, signal.SIGTERM)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+
             except ProcessLookupError:
                 return
         else:
             process.terminate()
+
     except Exception as e:
         print(f"[WARN] SIGTERM failed for PID={pid}: {e}")
 
@@ -108,36 +137,129 @@ def kill_process_forcefully(process: mp.Process, timeout: float = 5.0):
             if os.name == "posix":
                 try:
                     pgid = os.getpgid(pid)
-                    os.killpg(pgid, signal.SIGKILL)
+
+                    if pgid != os.getpgrp():
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+
                 except ProcessLookupError:
                     pass
             else:
                 process.kill()
+
         except Exception as e:
             print(f"[WARN] SIGKILL failed for PID={pid}: {e}")
 
     process.join(timeout=1.0)
 
 
-def shutdown_all_tasks():
+def remove_from_queue(task_id: str):
+    remaining = deque(x for x in task_queue if x != task_id)
+    task_queue.clear()
+    task_queue.extend(remaining)
+
+
+def prune_old_done_tasks():
+    cutoff = now_ts() - DONE_RETENTION_SECONDS
+
     for task_id, meta in list(tasks.items()):
-        process: mp.Process = meta["process"]
-        cache_path = Path(meta["cache_path"])
-        task_dir = Path(meta["task_dir"])
+        status = meta.get("status")
 
-        if process.is_alive():
-            kill_process_forcefully(process)
+        if status not in {"completed", "failed"}:
+            continue
 
-        print(f"[SHUTDOWN] Removing partial output for task {task_id}")
-        shutil.rmtree(cache_path, ignore_errors=True)
-        shutil.rmtree(task_dir, ignore_errors=True)
+        done_at = (
+            meta.get("finished_at") or meta.get("done_at") or meta.get("created_at")
+        )
+
+        if done_at and done_at < cutoff:
+            tasks.pop(task_id, None)
+
+
+def shutdown_all_tasks():
+    global current_task_id
+    global shutdown_started
+
+    with state_lock:
+        if shutdown_started:
+            return
+
+        shutdown_started = True
+        scheduler_stop.set()
+
+        for task_id, meta in list(tasks.items()):
+            status = meta.get("status")
+
+            if status not in {"queued", "processing"}:
+                continue
+
+            process: Optional[mp.Process] = meta.get("process")
+            cache_path = Path(meta["cache_path"])
+            task_dir = Path(meta["task_dir"])
+
+            if process and process.is_alive():
+                kill_process_forcefully(process)
+
+            print(f"[SHUTDOWN] Removing partial output for task {task_id}")
+            shutil.rmtree(cache_path, ignore_errors=True)
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+            meta["status"] = "failed"
+            meta["error"] = "Server stopped while task was not complete"
+            meta["finished_at"] = now_ts()
+            meta["done_at"] = now_ts()
+
+        task_queue.clear()
+        current_task_id = None
+
+
+def install_signal_handlers():
+    def handle_signal(signum, frame):
+        print(f"\n[SIGNAL] Received {signal.Signals(signum).name}")
+        shutdown_all_tasks()
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    except Exception as e:
+        print(f"[WARN] Failed to install signal handlers: {e}")
+
+
+def scheduler_loop():
+    while not scheduler_stop.is_set():
+        with state_lock:
+            if current_task_id:
+                refresh_task_status(current_task_id)
+
+            start_next_task_if_possible()
+            prune_old_done_tasks()
+
+        time.sleep(0.5)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global scheduler_thread
+
+    install_signal_handlers()
     cleanup_stale_processing_dirs()
-    yield
-    shutdown_all_tasks()
+
+    scheduler_stop.clear()
+    scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
+    scheduler_thread.start()
+
+    try:
+        yield
+    finally:
+        shutdown_all_tasks()
+
+        if scheduler_thread:
+            scheduler_thread.join(timeout=2.0)
+
+
+atexit.register(shutdown_all_tasks)
 
 
 app = FastAPI(
@@ -309,11 +431,38 @@ def fallback_embed_images(markdown_file: Path, final_md_path: Path):
         f.writelines(output_lines)
 
 
+def redirect_worker_output(cache_dir: str, task_id: str):
+    """
+    Prevent worker/subprocess logs from continuing to print into the terminal.
+    Logs go to: cache/{task_id}/worker.log
+    """
+    try:
+        log_path = Path(cache_dir) / "worker.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+
+        os.dup2(log_file.fileno(), sys.stdout.fileno())
+        os.dup2(log_file.fileno(), sys.stderr.fileno())
+
+        print(f"[WORKER] Logging redirected for task {task_id}", flush=True)
+    except Exception:
+        pass
+
+
 def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str):
     import asyncio
 
     if os.name == "posix":
         os.setsid()
+
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    except Exception:
+        pass
+
+    redirect_worker_output(cache_dir, task_id)
 
     if MINERU_VENV_BIN.exists():
         os.environ["PATH"] = (
@@ -361,6 +510,9 @@ def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str
 
         vision_ok = vision_smoke_test(api_config, smallest_image)
 
+        # TODO: Remove this after test is done, currently disabling vision for speed purpose
+        vision_ok = False
+
         if vision_ok:
             try:
                 image.MARKDOWN_FOLDER = str(mineru_dir)
@@ -372,7 +524,7 @@ def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str
                     "/home/seigyo/llm-wiki/puppeteer-config.json",
                 )
 
-                image.CONCURRENCY = 2
+                image.CONCURRENCY = 1
                 image.FILE_CONCURRENCY = 1
 
                 asyncio.run(image.process_markdown_folder())
@@ -426,60 +578,178 @@ def worker_entry(
 
         shutil.rmtree(cache_path, ignore_errors=True)
 
-        result_queue.put(
-            {
-                "ok": False,
-                "error": str(e),
-                "traceback": traceback.format_exc(),
-            }
-        )
+        try:
+            result_queue.put(
+                {
+                    "ok": False,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+        except Exception:
+            pass
+
+
+def get_queue_position(task_id: str) -> Optional[int]:
+    for i, queued_task_id in enumerate(task_queue):
+        if queued_task_id == task_id:
+            return i + 1
+
+    return None
+
+
+def public_task(task_id: str, meta: dict[str, Any], position: Optional[int] = None):
+    status = meta.get("status")
+
+    item = {
+        "task_id": task_id,
+        "filename": meta.get("filename"),
+        "status": status,
+        "queue_position": (
+            position if position is not None else get_queue_position(task_id)
+        ),
+        "position": position,
+        "created_at": meta.get("created_at"),
+        "started_at": meta.get("started_at"),
+        "finished_at": meta.get("finished_at"),
+    }
+
+    process = meta.get("process")
+
+    if process is not None:
+        item["pid"] = process.pid
+
+    if meta.get("error"):
+        item["error"] = meta["error"]
+
+    if status == "completed":
+        item["result_url"] = f"/result/{task_id}"
+
+    return item
+
+
+def start_next_task_if_possible():
+    global current_task_id
+
+    if current_task_id is not None:
+        current_meta = tasks.get(current_task_id)
+
+        if current_meta and current_meta.get("status") == "processing":
+            return
+
+        current_task_id = None
+
+    while task_queue:
+        next_task_id = task_queue.popleft()
+        meta = tasks.get(next_task_id)
+
+        if not meta:
+            continue
+
+        if meta.get("status") != "queued":
+            continue
+
+        process: mp.Process = meta["process"]
+
+        try:
+            process.start()
+            meta["status"] = "processing"
+            meta["started_at"] = now_ts()
+            current_task_id = next_task_id
+
+            print(
+                f"[QUEUE] Started task {next_task_id}: "
+                f"{meta.get('filename')} PID={process.pid}"
+            )
+
+        except Exception as e:
+            meta["status"] = "failed"
+            meta["error"] = f"Failed to start worker: {e}"
+            meta["finished_at"] = now_ts()
+            meta["done_at"] = now_ts()
+            current_task_id = None
+            print(f"[ERROR] Failed to start task {next_task_id}: {e}")
+
+        return
 
 
 def refresh_task_status(task_id: str):
-    if task_id not in tasks:
-        return None
+    global current_task_id
 
-    meta = tasks[task_id]
-    process: mp.Process = meta["process"]
-    result_queue = meta["queue"]
-    final_md_path = Path(meta["cache_path"]) / "final.md"
+    with state_lock:
+        if task_id not in tasks:
+            return None
 
-    while True:
-        try:
-            msg = result_queue.get_nowait()
-        except queue_module.Empty:
-            break
+        meta = tasks[task_id]
+        process: Optional[mp.Process] = meta.get("process")
+        result_queue = meta.get("queue")
+        final_md_path = Path(meta["cache_path"]) / "final.md"
 
-        meta["last_message"] = msg
+        if meta.get("status") == "queued":
+            return meta
 
-        if msg.get("ok"):
-            meta["status"] = "completed"
-        else:
+        if result_queue is not None:
+            while True:
+                try:
+                    msg = result_queue.get_nowait()
+                except queue_module.Empty:
+                    break
+
+                meta["last_message"] = msg
+
+                if msg.get("ok"):
+                    meta["status"] = "completed"
+                    meta["finished_at"] = now_ts()
+                    meta["done_at"] = now_ts()
+                else:
+                    meta["status"] = "failed"
+                    meta["error"] = msg.get("error", "Unknown error")
+                    meta["finished_at"] = now_ts()
+                    meta["done_at"] = now_ts()
+
+        if final_md_path.exists():
+            if meta.get("status") != "completed":
+                meta["status"] = "completed"
+                meta["finished_at"] = now_ts()
+                meta["done_at"] = now_ts()
+
+        elif process and process.is_alive():
+            meta["status"] = "processing"
+            return meta
+
+        elif process and process.exitcode is not None:
+            if meta.get("status") not in {"completed", "failed"}:
+                meta["status"] = "failed"
+                meta["error"] = f"Worker exited with code {process.exitcode}"
+                meta["finished_at"] = now_ts()
+                meta["done_at"] = now_ts()
+
+        elif process is None and meta.get("status") not in {"completed", "failed"}:
             meta["status"] = "failed"
-            meta["error"] = msg.get("error", "Unknown error")
+            meta["error"] = "Task has no worker process"
+            meta["finished_at"] = now_ts()
+            meta["done_at"] = now_ts()
 
-    if final_md_path.exists():
-        meta["status"] = "completed"
+        if meta.get("status") in {"completed", "failed"}:
+            if process:
+                try:
+                    process.join(timeout=0.2)
+                except Exception:
+                    pass
+
+            if current_task_id == task_id:
+                current_task_id = None
+                start_next_task_if_possible()
+
         return meta
-
-    if process.is_alive():
-        meta["status"] = "processing"
-        return meta
-
-    if process.exitcode is not None:
-        if meta.get("status") not in {"completed", "failed"}:
-            meta["status"] = "failed"
-            meta["error"] = f"Worker exited with code {process.exitcode}"
-
-    return meta
 
 
 @app.post("/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
-    base_url: str = Form(NVIDIA_INVOKE_URL),
-    api_key: str = Form(NVIDIA_API_KEY),
-    model: str = Form(NVIDIA_MODEL),
+    base_url: str = Form(INVOKE_URL),
+    api_key: str = Form(API_KEY),
+    model: str = Form(MODEL),
     puppeteer_config_path: Optional[str] = Form(
         "/home/seigyo/llm-wiki/puppeteer-config.json"
     ),
@@ -508,100 +778,270 @@ async def upload_pdf(
     if final_md_path.exists():
         pending_pdf_path.unlink(missing_ok=True)
 
+        with state_lock:
+            ts = now_ts()
+
+            tasks[pdf_hash] = {
+                "process": None,
+                "queue": None,
+                "status": "completed",
+                "filename": safe_filename,
+                "cache_path": str(cache_path),
+                "task_dir": str(TEMP_DIR / pdf_hash),
+                "error": None,
+                "created_at": ts,
+                "started_at": None,
+                "finished_at": ts,
+                "done_at": ts,
+            }
+
+            prune_old_done_tasks()
+
         return {
             "task_id": pdf_hash,
+            "filename": safe_filename,
             "status": "completed",
             "message": "Returned from cache",
             "result_url": f"/result/{pdf_hash}",
+            "queue_position": None,
         }
 
-    if pdf_hash in tasks:
-        meta = refresh_task_status(pdf_hash)
+    with state_lock:
+        prune_old_done_tasks()
 
-        if meta and meta.get("status") in {"queued", "processing"}:
-            pending_pdf_path.unlink(missing_ok=True)
+        if pdf_hash in tasks:
+            meta = refresh_task_status(pdf_hash)
 
-            return {
-                "task_id": pdf_hash,
-                "status": meta["status"],
-                "message": "Task already running",
-            }
+            if meta and meta.get("status") in {"queued", "processing"}:
+                pending_pdf_path.unlink(missing_ok=True)
 
-    task_dir = TEMP_DIR / pdf_hash
-    task_dir.mkdir(parents=True, exist_ok=True)
+                return {
+                    "task_id": pdf_hash,
+                    "filename": meta.get("filename"),
+                    "status": meta["status"],
+                    "message": "Task already running",
+                    "queue_position": get_queue_position(pdf_hash),
+                }
 
-    final_temp_pdf = task_dir / safe_filename
-    shutil.move(str(pending_pdf_path), str(final_temp_pdf))
+            if meta and meta.get("status") == "completed":
+                pending_pdf_path.unlink(missing_ok=True)
 
-    cache_path.mkdir(parents=True, exist_ok=True)
+                return {
+                    "task_id": pdf_hash,
+                    "filename": meta.get("filename") or safe_filename,
+                    "status": "completed",
+                    "message": "Task already completed",
+                    "result_url": f"/result/{pdf_hash}",
+                    "queue_position": None,
+                }
 
-    api_config = {
-        "base_url": base_url,
-        "api_key": api_key,
-        "model": model,
-        "puppeteer_config_path": puppeteer_config_path,
-    }
+            # Failed or stale task with same hash. Replace it.
+            old_meta = tasks.pop(pdf_hash, None)
+            remove_from_queue(pdf_hash)
 
-    result_queue = MP_CONTEXT.Queue()
+            if old_meta:
+                shutil.rmtree(old_meta.get("task_dir", ""), ignore_errors=True)
 
-    process = MP_CONTEXT.Process(
-        target=worker_entry,
-        args=(
-            pdf_hash,
-            str(final_temp_pdf),
-            api_config,
-            str(cache_path),
-            result_queue,
-        ),
-        daemon=False,
-    )
+        task_dir = TEMP_DIR / pdf_hash
+        task_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks[pdf_hash] = {
-        "process": process,
-        "queue": result_queue,
-        "status": "queued",
-        "cache_path": str(cache_path),
-        "task_dir": str(task_dir),
-        "error": None,
-    }
+        final_temp_pdf = task_dir / safe_filename
+        shutil.move(str(pending_pdf_path), str(final_temp_pdf))
 
-    process.start()
+        cache_path.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "task_id": pdf_hash,
-        "status": "queued",
-        "message": "Task submitted",
-    }
+        api_config = {
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "puppeteer_config_path": puppeteer_config_path,
+        }
+
+        result_queue = MP_CONTEXT.Queue()
+
+        process = MP_CONTEXT.Process(
+            target=worker_entry,
+            args=(
+                pdf_hash,
+                str(final_temp_pdf),
+                api_config,
+                str(cache_path),
+                result_queue,
+            ),
+            daemon=False,
+        )
+
+        tasks[pdf_hash] = {
+            "process": process,
+            "queue": result_queue,
+            "status": "queued",
+            "filename": safe_filename,
+            "cache_path": str(cache_path),
+            "task_dir": str(task_dir),
+            "error": None,
+            "created_at": now_ts(),
+            "started_at": None,
+            "finished_at": None,
+            "done_at": None,
+        }
+
+        task_queue.append(pdf_hash)
+
+        start_next_task_if_possible()
+
+        meta = tasks[pdf_hash]
+
+        return {
+            "task_id": pdf_hash,
+            "filename": safe_filename,
+            "status": meta["status"],
+            "message": (
+                "Task submitted and started"
+                if meta["status"] == "processing"
+                else "Task submitted to queue"
+            ),
+            "queue_position": get_queue_position(pdf_hash),
+        }
 
 
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
     final_md_path = CACHE_DIR / task_id / "final.md"
 
-    if task_id not in tasks:
-        if final_md_path.exists():
+    with state_lock:
+        prune_old_done_tasks()
+
+        if task_id not in tasks:
+            if final_md_path.exists():
+                return {
+                    "task_id": task_id,
+                    "filename": None,
+                    "status": "completed",
+                    "message": "Available in cache",
+                    "result_url": f"/result/{task_id}",
+                    "queue_position": None,
+                }
+
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        meta = refresh_task_status(task_id)
+
+        response = public_task(task_id, meta)
+
+        if meta["status"] == "completed":
+            response["result_url"] = f"/result/{task_id}"
+
+        return response
+
+
+@app.get("/queue")
+async def get_queue():
+    with state_lock:
+        if current_task_id:
+            refresh_task_status(current_task_id)
+
+        prune_old_done_tasks()
+
+        processing = None
+
+        if current_task_id and current_task_id in tasks:
+            meta = tasks[current_task_id]
+
+            if meta.get("status") == "processing":
+                processing = public_task(current_task_id, meta)
+
+        queued = []
+
+        for i, task_id in enumerate(task_queue):
+            meta = tasks.get(task_id)
+
+            if not meta:
+                continue
+
+            if meta.get("status") != "queued":
+                continue
+
+            queued.append(public_task(task_id, meta, position=i + 1))
+
+        completed = []
+        failed = []
+
+        for task_id, meta in tasks.items():
+            status = meta.get("status")
+
+            if status == "completed":
+                completed.append(public_task(task_id, meta))
+            elif status == "failed":
+                failed.append(public_task(task_id, meta))
+
+        completed.sort(key=lambda x: x.get("finished_at") or 0, reverse=True)
+        failed.sort(key=lambda x: x.get("finished_at") or 0, reverse=True)
+
+        return {
+            "retention_hours": 72,
+            "processing": processing,
+            "queued_count": len(queued),
+            "queued": queued,
+            "completed_count": len(completed),
+            "completed": completed,
+            "failed_count": len(failed),
+            "failed": failed,
+        }
+
+
+@app.delete("/queue/{task_id}")
+async def delete_queue_item(task_id: str):
+    global current_task_id
+
+    with state_lock:
+        meta = tasks.get(task_id)
+
+        if not meta:
+            remove_from_queue(task_id)
+
             return {
                 "task_id": task_id,
-                "status": "completed",
-                "message": "Available in cache",
+                "deleted": True,
+                "message": "Task was not in queue history",
             }
 
-        raise HTTPException(status_code=404, detail="Task not found")
+        status = meta.get("status")
+        process: Optional[mp.Process] = meta.get("process")
 
-    meta = refresh_task_status(task_id)
+        remove_from_queue(task_id)
 
-    response = {
-        "task_id": task_id,
-        "status": meta["status"],
-    }
+        if status == "processing":
+            if process and process.is_alive():
+                kill_process_forcefully(process)
 
-    if meta.get("error"):
-        response["error"] = meta["error"]
+            if current_task_id == task_id:
+                current_task_id = None
 
-    if meta["status"] == "completed":
-        response["result_url"] = f"/result/{task_id}"
+            shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
+            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
 
-    return response
+        elif status == "queued":
+            shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
+            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
+
+        elif status == "failed":
+            shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
+            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
+
+        elif status == "completed":
+            # Delete from queue/history only.
+            # Keep cache/{task_id}/final.md so /result/{task_id} can still work.
+            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
+
+        tasks.pop(task_id, None)
+
+        start_next_task_if_possible()
+
+        return {
+            "task_id": task_id,
+            "deleted": True,
+            "status": status,
+        }
 
 
 @app.get("/result/{task_id}")
@@ -609,14 +1049,15 @@ async def get_result(task_id: str):
     final_md_path = CACHE_DIR / task_id / "final.md"
 
     if not final_md_path.exists():
-        if task_id in tasks:
-            meta = refresh_task_status(task_id)
+        with state_lock:
+            if task_id in tasks:
+                meta = refresh_task_status(task_id)
 
-            if meta.get("status") == "failed":
-                raise HTTPException(
-                    status_code=500,
-                    detail=meta.get("error", "Task failed"),
-                )
+                if meta.get("status") == "failed":
+                    raise HTTPException(
+                        status_code=500,
+                        detail=meta.get("error", "Task failed"),
+                    )
 
         raise HTTPException(status_code=404, detail="Result not ready or not found")
 

@@ -499,8 +499,6 @@ async def create_exogenous(payload: ExogenousBody) -> dict:
 
 @app.post("/api/document")
 async def create_document(payload: DocumentBody) -> dict:
-    # Not user-selectable: big documents are always chunked into concept
-    # pages first, then ingested page-by-page (nodes + edges + enrichment).
     if len(payload.body.splitlines()) > CHUNK_LINE_THRESHOLD:
         return await _enqueue(
             "chunk_and_ingest",
@@ -509,9 +507,9 @@ async def create_document(payload: DocumentBody) -> dict:
                 "title": payload.title,
                 "document_name": payload.document_name,
                 "source_path": payload.source_path,
-                "options": payload.chunk_options or {},
             },
         )
+
     return await _enqueue(
         "create_document",
         {
