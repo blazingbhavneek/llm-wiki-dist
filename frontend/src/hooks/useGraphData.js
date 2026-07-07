@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { api } from '../api'
 import { layoutGraph } from '../data/layout'
@@ -67,12 +67,15 @@ export function useGraphData() {
   const [errorRetryable, setErrorRetryable] = useState(false)
   const [readyState, setReadyState] = useState(null)
 
+  // Guards against setState after unmount (delayed fetch resolves post-unmount).
+  const mountedRef = useRef(true)
+
   const reload = useCallback(async () => {
     setError(null)
     setErrorRetryable(false)
 
     const ready = await api.ready()
-    setReadyState(ready)
+    if (mountedRef.current) setReadyState(ready)
 
     if (!ready.ready) {
       const detail = ready.error || `Backend is starting (${ready.stage})`
@@ -84,16 +87,21 @@ export function useGraphData() {
 
     const [g, h] = await Promise.all([api.graph(), api.health()])
 
-    setRaw({ nodes: g.nodes, edges: g.edges })
-    setHealth(h)
+    if (mountedRef.current) {
+      setRaw({ nodes: g.nodes, edges: g.edges })
+      setHealth(h)
+    }
 
     return g
   }, [])
 
   useEffect(() => {
+    mountedRef.current = true
     let cancelled = false
+    let retryTimer = null
 
     const tick = async () => {
+      if (cancelled) return
       try {
         await reload()
         if (!cancelled) setLoading(false)
@@ -103,7 +111,7 @@ export function useGraphData() {
         setErrorRetryable(Boolean(e.retryable))
         setLoading(false)
         if (e.code === 'not_ready') {
-          setTimeout(tick, 1500)
+          retryTimer = setTimeout(tick, 1500)
         }
       }
     }
@@ -112,6 +120,8 @@ export function useGraphData() {
 
     return () => {
       cancelled = true
+      mountedRef.current = false
+      if (retryTimer) clearTimeout(retryTimer)
     }
   }, [reload])
 

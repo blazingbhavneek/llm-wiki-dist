@@ -383,7 +383,16 @@ class Librarian:
         for job in finished[:overflow]:
             self.jobs.pop(job.id, None)
 
+    # Long ingest jobs interleave minutes of LLM calls with DB writes. Wrapping
+    # them in one transaction would hold a SQLite write-transaction open the
+    # whole time (blocking WAL checkpointing). Instead they snapshot the DB up
+    # front, commit incrementally, and revert from the snapshot on any failure.
+    _SNAPSHOT_JOB_TYPES = {"ingest_md_output", "chunk_and_ingest"}
+
     def _apply_job(self, job: WriteJob) -> Any:
+        if job.type in self._SNAPSHOT_JOB_TYPES:
+            return self._apply_job_snapshotted(job)
+
         # One job = one transaction: a failure rolls back every statement the
         # job made, so a crashed job can never leave half-written graph state.
         #
@@ -391,6 +400,57 @@ class Librarian:
         # store.transaction() ensures DB changes commit/rollback as one unit. see store.py
         with self._write_lock, self.store.transaction():
             return self._dispatch_job(job)
+
+    def _apply_job_snapshotted(self, job: WriteJob) -> Any:
+        """Whole-job atomicity for long ingests without a long-held transaction:
+        snapshot the DB, run the job with incremental commits, and revert the
+        snapshot if it fails or is cancelled partway through."""
+        with self._write_lock:
+            snapshot = self._snapshot_db()
+            try:
+                result = self._dispatch_job(job)
+            except BaseException:
+                if snapshot is not None:
+                    self._restore_db(snapshot)
+                raise
+            self._discard_snapshot(snapshot)
+            return result
+
+    def _snapshot_db(self) -> Path | None:
+        """Take a pre-ingest revert point. Returns None (and logs) if snapshot
+        fails, so ingest still proceeds — just without the revert guarantee."""
+        try:
+            snapshot = self.store.path.with_name(self.store.path.name + ".ingest-bak")
+            self.store.snapshot_to(snapshot)
+            log.info("ingest: db snapshot created at %s", snapshot)
+            return snapshot
+        except Exception as exc:
+            log.warning(
+                "ingest: failed to snapshot db; proceeding without revert: %s", exc
+            )
+            return None
+
+    def _restore_db(self, snapshot: Path) -> None:
+        try:
+            self.store.restore_from(snapshot)
+            log.info("ingest: failed/cancelled; reverted db from %s", snapshot)
+        except Exception as exc:
+            log.error(
+                "ingest: CRITICAL — failed to restore db from snapshot %s: %s",
+                snapshot,
+                exc,
+            )
+        finally:
+            self._discard_snapshot(snapshot)
+
+    def _discard_snapshot(self, snapshot: Path | None) -> None:
+        if snapshot is None:
+            return
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(snapshot) + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # Router for type of jobs, call different helper function based on what "type" of job was queued
     def _dispatch_job(self, job: WriteJob) -> Any:
@@ -582,12 +642,14 @@ class Librarian:
                 time.sleep(self._drip_seconds)
 
     def _enrich_handle(self, job: EnrichJob) -> None:
-        # Same discipline as write jobs: one enrichment job = one transaction,
-        # rolled back wholesale if it fails partway.
-        #
-        # _write_lock prevents enrichment writes from overlapping with normal writes.
-        # store.transaction() ensures partial enrichment changes are rolled back on error.
-        with self._write_lock, self.store.transaction():
+        # Enrichment is best-effort and roughly idempotent. We keep _write_lock
+        # so enrichment writes never interleave with user writes, but we do NOT
+        # wrap the whole job in one transaction: recluster and cluster-bridge
+        # make many LLM calls, and holding a single SQLite write-transaction
+        # open across them blocks WAL checkpointing. Individual store writes
+        # commit incrementally instead; a partial failure self-heals on the next
+        # bootstrap/coverage pass.
+        with self._write_lock:
             if job.kind == "summary" and job.node_id:
                 # Generate/update summary fields for this node.
                 self.enrich_summary(job.node_id)

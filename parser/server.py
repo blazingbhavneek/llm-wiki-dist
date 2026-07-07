@@ -6,6 +6,7 @@ import hashlib
 import multiprocessing as mp
 import os
 import queue as queue_module
+import re
 import shutil
 import signal
 import sys
@@ -75,6 +76,20 @@ shutdown_started = False
 
 def api_error(detail: str, retryable: bool, code: str) -> dict[str, Any]:
     return {"detail": detail, "retryable": retryable, "code": code}
+
+
+# Task IDs are always a sha256 hex digest (raw pdf hash or hash of options).
+# Reject anything else before it reaches a filesystem path, so a crafted
+# task_id cannot traverse outside CACHE_DIR.
+_TASK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_task_id(task_id: str) -> None:
+    if not _TASK_ID_RE.match(task_id or ""):
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("invalid task id", False, "bad_task_id"),
+        )
 
 
 class APIConfig(BaseModel):
@@ -1003,6 +1018,7 @@ async def upload_pdf(
 
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
+    validate_task_id(task_id)
     final_md_path = CACHE_DIR / task_id / "final.md"
 
     with state_lock:
@@ -1093,6 +1109,8 @@ async def get_queue():
 async def delete_queue_item(task_id: str):
     global current_task_id
 
+    validate_task_id(task_id)
+
     with state_lock:
         meta = tasks.get(task_id)
 
@@ -1146,6 +1164,7 @@ async def delete_queue_item(task_id: str):
 
 @app.get("/result/{task_id}")
 async def get_result(task_id: str):
+    validate_task_id(task_id)
     final_md_path = CACHE_DIR / task_id / "final.md"
 
     if not final_md_path.exists():

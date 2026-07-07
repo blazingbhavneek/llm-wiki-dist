@@ -594,6 +594,64 @@ class GraphStore:
             except Exception:
                 pass
 
+    def snapshot_to(self, dest_path: str | Path) -> None:
+        """Consistent whole-database copy via SQLite's online backup API.
+
+        Copies committed state (including WAL) page-by-page, so it is safe to
+        run while other connections read the same file. Used to take a revert
+        point right before a long ingest.
+        """
+        if self.readonly:
+            raise RuntimeError("cannot snapshot from a readonly database")
+
+        dest_path = Path(dest_path)
+
+        # Start from a clean destination so no stale pages/side files survive.
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(str(dest_path) + suffix)
+            if candidate.exists():
+                candidate.unlink()
+
+        dest = sqlite3.connect(str(dest_path))
+        try:
+            with dest:
+                # backup() copies this thread's live connection -> dest.
+                self.connection.backup(dest)
+        finally:
+            dest.close()
+
+    def restore_from(self, src_path: str | Path) -> None:
+        """Overwrite this database's contents from a snapshot file (backup API,
+        reverse direction). Reverts a failed/cancelled ingest to the snapshot.
+
+        Must run with no write transaction open on this thread's connection and
+        with the librarian write lock held so no other writer is active.
+        """
+        if self.readonly:
+            raise RuntimeError("cannot restore into a readonly database")
+
+        src_path = Path(src_path)
+        if not src_path.exists():
+            raise FileNotFoundError(f"snapshot not found: {src_path}")
+
+        # Never restore on top of a half-open transaction on this connection.
+        try:
+            self.connection.rollback()
+        except sqlite3.Error:
+            pass
+
+        src = sqlite3.connect(str(src_path))
+        try:
+            # backup() copies snapshot -> this thread's live connection.
+            src.backup(self.connection)
+        finally:
+            src.close()
+
+        # The restored meta table may carry a different embedding dim; drop the
+        # cached value and re-read it so vector ops stay consistent.
+        self._dim = None
+        self._restore_dim()
+
     def upsert_node(self, node: Node) -> None:
         # Upserting modifies the database, so block it in readonly mode.
         if self.readonly:
