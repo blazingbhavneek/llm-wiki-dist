@@ -1978,26 +1978,35 @@ async def process_one_markdown_file(
             for index in image_line_indices
         ]
 
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         new_lines = list(lines)
+        replaced = 0
 
-        for index, replacement_line in results:
+        for result in results:
+            # One image raising should not discard every other image's work for
+            # this file; keep the original line for the failed one and continue.
+            if isinstance(result, BaseException):
+                print(f"[WARN] Image task failed for {input_path}: {result}")
+                continue
+
+            index, replacement_line = result
             new_lines[index] = replacement_line
+            replaced += 1
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text("".join(new_lines), encoding="utf-8")
 
         print(f"Done: {input_path}")
         print(f"Output: {output_path}")
-        print(f"Replaced image lines: {len(results)}")
+        print(f"Replaced image lines: {replaced}/{len(results)}")
 
         return {
             "status": "done",
             "input": str(input_path),
             "output": str(output_path),
             "reason": "",
-            "replaced_image_lines": len(results),
+            "replaced_image_lines": replaced,
         }
 
     except Exception as exc:

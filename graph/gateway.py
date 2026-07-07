@@ -272,10 +272,13 @@ class LlmClient:
             except Exception as exc:
                 last_exc = exc
 
-                print(
-                    f"[LLM Retry] {label} failed on attempt "
-                    f"{attempt}/{max_total_attempts}: "
-                    f"{type(exc).__name__}: {exc}"
+                log.warning(
+                    "[LLM Retry] %s failed on attempt %d/%d: %s: %s",
+                    label,
+                    attempt,
+                    max_total_attempts,
+                    type(exc).__name__,
+                    exc,
                 )
 
                 if attempt >= max_total_attempts:
@@ -890,6 +893,7 @@ class ModelGateway:
         old = self.settings
         new_llm = self.llm
         new_reranker = self.reranker
+        new_embedder = self.embedder
 
         chat_keys = ("chat_model", "chat_base_url", "chat_api_key", "chat_temperature")
         if any(getattr(old, k) != getattr(settings, k) for k in chat_keys):
@@ -905,9 +909,39 @@ class ModelGateway:
         if any(getattr(old, k) != getattr(settings, k) for k in rerank_keys):
             new_reranker = self._build_reranker(settings)
 
+        # Keep gateway.embedder consistent with gateway.settings. Rebuilding at
+        # runtime does NOT re-embed existing vectors (that happens only at the
+        # next bootstrap, which detects the model change): new nodes get vectors
+        # in the new model's space while stored vectors keep the old space, so
+        # search quality can degrade until a restart re-embeds everything.
+        embed_keys = (
+            "embed_backend",
+            "embed_base_url",
+            "embed_api_key",
+            "embed_model",
+            "hf_embed_model",
+            "hf_device",
+            "embed_dim",
+        )
+        if any(getattr(old, k) != getattr(settings, k) for k in embed_keys):
+            try:
+                new_embedder = Embedder(settings)
+                log.warning(
+                    "embedder rebuilt for new embed settings; existing stored "
+                    "vectors are only re-embedded at the next bootstrap — search "
+                    "quality may degrade until restart"
+                )
+            except Exception as exc:
+                log.error(
+                    "failed to rebuild embedder for new settings; keeping previous: %s",
+                    exc,
+                )
+                new_embedder = self.embedder
+
         self.settings = settings
         self.llm = new_llm
         self.reranker = new_reranker
+        self.embedder = new_embedder
 
     def close(self) -> None:
         for obj in (self.embedder, self.reranker, self.llm):

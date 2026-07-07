@@ -256,8 +256,14 @@ class Settings(BaseModel):
         )
 
 
+# from_env() reads Settings.<field> as a plain default value; pydantic v2 stores
+# a FieldInfo there instead, so expose the resolved default (handling
+# default_factory too, in case a future field uses one) as the class attribute.
 for _settings_field, _settings_info in Settings.model_fields.items():
-    setattr(Settings, _settings_field, _settings_info.default)
+    if _settings_info.default_factory is not None:
+        setattr(Settings, _settings_field, _settings_info.default_factory())
+    else:
+        setattr(Settings, _settings_field, _settings_info.default)
 
 
 #  whether a node was created from source file or made by AI Agent

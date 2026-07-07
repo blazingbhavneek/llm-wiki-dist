@@ -791,6 +791,7 @@ async def ingest(payload: IngestBody) -> dict:
 
 @app.get("/api/write-jobs")
 async def list_write_jobs(status: str | None = None, limit: int = 100) -> list[dict]:
+    limit = max(1, min(int(limit), 500))
     jobs = writes().list_jobs(status=status, limit=limit)
     return [_job_response(j) for j in jobs]
 
