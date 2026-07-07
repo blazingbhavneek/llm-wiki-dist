@@ -83,6 +83,8 @@ class LlmClient:
 
         # LangChain/OpenAI handles retries internally via max_retries.
         # retry_delay_seconds is kept only so the public constructor stays the same.
+        # We also use retry_delay_seconds for app-level retries around parsing,
+        # structured output, empty responses, provider errors, and timeouts.
         self.retry_attempts = max(0, retry_attempts)
         self.retry_delay_seconds = max(0.0, retry_delay_seconds)
 
@@ -116,6 +118,7 @@ class LlmClient:
         messages = [*self.message_history, user_message]
 
         # Run the request, then save the user message and assistant reply.
+        # History is only saved after a successful retry cycle.
         reply = self.run_messages(messages)
         self.message_history.append(user_message)
         self.message_history.append({"role": "assistant", "content": reply})
@@ -133,9 +136,11 @@ class LlmClient:
         messages = [*self.message_history, user_message]
 
         # Let LangChain/OpenAI handle structured output parsing and validation.
+        # App-level retry will rerun this if JSON/Pydantic parsing fails.
         result = self.run_messages_structured(messages, output_model)
 
         # Store the structured result as text in message history.
+        # History is only saved after a successful retry cycle.
         self.message_history.append(user_message)
         self.message_history.append(
             {"role": "assistant", "content": self._stringify_output(result)}
@@ -145,25 +150,62 @@ class LlmClient:
 
     def run_messages(self, messages: list[Any]) -> str:
         # Normalize message formats and call LangChain's chat model.
-        response = self.llm.invoke(self._normalize_messages(messages))
+        normalized_messages = self._normalize_messages(messages)
 
-        # LangChain returns an AIMessage; extract its text content.
-        return self._message_text(response)
+        def operation() -> str:
+            response = self.llm.invoke(normalized_messages)
+
+            # LangChain returns an AIMessage; extract its text content.
+            text = self._message_text(response)
+
+            # Treat empty output as a failed LLM call so it can be retried.
+            if not text:
+                raise RuntimeError("LLM returned empty response")
+
+            return text
+
+        return self._run_with_retries(
+            operation,
+            label="run_messages",
+        )
 
     def run_messages_structured(
         self,
         messages: list[Any],
         output_model: type[Any],
     ) -> Any:
-        # Wrap the base model with LangChain's structured-output parser.
-        # If output_model is a Pydantic model, this returns an instance of that model.
-        structured_llm = self.llm.with_structured_output(
-            output_model,
-            method="json_schema",
-        )
+        # Normalize messages once so every retry sends the same input.
+        normalized_messages = self._normalize_messages(messages)
 
-        # No manual JSON extraction or model_validate_json needed.
-        return structured_llm.invoke(self._normalize_messages(messages))
+        def operation() -> Any:
+            # Wrap the base model with LangChain's structured-output parser.
+            # If output_model is a Pydantic model, this returns an instance of that model.
+            structured_llm = self.llm.with_structured_output(
+                output_model,
+                method="json_schema",
+            )
+
+            # No manual JSON extraction or model_validate_json needed.
+            # If this raises JSON/Pydantic errors, app-level retry catches it.
+            result = structured_llm.invoke(normalized_messages)
+
+            # Defensive validation in case a provider/LangChain version returns
+            # a dict/string instead of the already-validated Pydantic object.
+            if isinstance(result, output_model):
+                return result
+
+            if isinstance(result, dict):
+                return output_model.model_validate(result)
+
+            if isinstance(result, str):
+                return output_model.model_validate_json(result)
+
+            return output_model.model_validate(result)
+
+        return self._run_with_retries(
+            operation,
+            label=f"run_messages_structured:{getattr(output_model, '__name__', str(output_model))}",
+        )
 
     def complete(self, system_prompt: str, user_content: str) -> str:
         # One-shot completion that does not use persistent message_history.
@@ -198,6 +240,65 @@ class LlmClient:
             self.message_history.append(
                 {"role": "system", "content": self.system_prompt.strip()}
             )
+
+    def _make_llm(self) -> Any:
+        # Create a fresh LangChain OpenAI-compatible chat client.
+        return ChatOpenAI(
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            temperature=self.temperature,
+            timeout=self.timeout,
+            max_retries=self.retry_attempts,
+        )
+
+    def _rebuild_llm(self) -> None:
+        # Rebuild the client before retrying in case the underlying session is bad.
+        self.llm = self._make_llm()
+
+    def _run_with_retries(
+        self,
+        operation: Callable[[], Any],
+        *,
+        label: str,
+    ) -> Any:
+        # Run one initial attempt plus retry_attempts additional attempts.
+        # Example: retry_attempts=3 means up to 4 total tries.
+        max_total_attempts = self.retry_attempts + 1
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_total_attempts + 1):
+            try:
+                return operation()
+
+            except Exception as exc:
+                last_exc = exc
+
+                print(
+                    f"[LLM Retry] {label} failed on attempt "
+                    f"{attempt}/{max_total_attempts}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                if attempt >= max_total_attempts:
+                    break
+
+                self._rebuild_llm()
+                self._sleep_before_retry(attempt)
+
+        raise RuntimeError(
+            f"{label} failed after {max_total_attempts} attempt(s)"
+        ) from last_exc
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        # Wait before retrying, using exponential backoff plus small jitter.
+        if self.retry_delay_seconds <= 0:
+            return
+
+        delay = self.retry_delay_seconds * (2 ** min(max(0, attempt - 1), 6))
+        delay += random.uniform(0.0, 0.25)
+
+        time.sleep(delay)
 
     def _normalize_base_url(self, value: str) -> str:
         # LangChain/OpenAI wants the API base URL, usually ending in /v1.

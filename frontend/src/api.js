@@ -28,7 +28,7 @@ async function waitForJob(job, { timeoutMs = 10 * 60 * 1000, onProgress } = {}) 
       throw new Error(`Write job timed out: ${current.type}`)
     }
 
-    await sleep(current.status === 'queued' ? 400 : 900)
+    await sleep(current.status === 'queued' ? 5000 : 10000)
     current = await req(`/api/write-jobs/${encodeURIComponent(current.id)}`)
     onProgress?.(current)
   }

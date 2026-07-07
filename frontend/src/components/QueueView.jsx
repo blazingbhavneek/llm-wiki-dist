@@ -270,10 +270,10 @@ export default function QueueView() {
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0">
                     <div className="truncate text-[13.5px] font-bold text-slate-900">
-                      {t.types[job.type] || job.type}
+                      {jobLabel(job, t)}
                     </div>
                     <div className="truncate text-[12px] text-slate-500">
-                      {jobLabel(job, t)}
+                      {t.types[job.type] || job.type}
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">

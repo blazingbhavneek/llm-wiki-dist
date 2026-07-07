@@ -60,7 +60,7 @@ def read_b64(path: str) -> str:
 
 
 class _AsyncChatCompletions:
-    def __init__(self, client: "NvidiaAsyncClient"):
+    def __init__(self, client: "LLMAsyncClient"):
         self._client = client
 
     async def create(
@@ -82,11 +82,11 @@ class _AsyncChatCompletions:
 
 
 class _AsyncChatNamespace:
-    def __init__(self, client: "NvidiaAsyncClient"):
+    def __init__(self, client: "LLMAsyncClient"):
         self.completions = _AsyncChatCompletions(client)
 
 
-class NvidiaAsyncClient:
+class LLMAsyncClient:
     def __init__(self, *, base_url: str, api_key: str, timeout: int = 300):
         self.base_url = normalize_invoke_url(base_url)
         self.api_key = api_key
@@ -718,7 +718,7 @@ def build_mermaid_repair_prompt(error_text: str, current_description: str) -> st
 
 
 async def repair_mermaid_if_needed(
-    client: NvidiaAsyncClient,
+    client: LLMAsyncClient,
     original_content,
     description: str,
 ):
@@ -1068,7 +1068,7 @@ def build_original_image_blocks_for_compare(images):
 
 
 async def judge_mermaid_visual_match(
-    client: NvidiaAsyncClient,
+    client: LLMAsyncClient,
     original_image_blocks,
     rendered_mermaid_images,
     description: str,
@@ -1249,7 +1249,7 @@ async def judge_mermaid_visual_match(
 
 
 async def improve_mermaid_from_visual_feedback(
-    client: NvidiaAsyncClient,
+    client: LLMAsyncClient,
     original_image_blocks,
     rendered_mermaid_images,
     description: str,
@@ -1330,7 +1330,7 @@ async def improve_mermaid_from_visual_feedback(
 
 
 async def improve_mermaid_visual_match_loop(
-    client: NvidiaAsyncClient,
+    client: LLMAsyncClient,
     original_image_blocks,
     original_content,
     description: str,
@@ -1546,7 +1546,7 @@ def build_reconstruction_prompt(
 
 
 async def describe_image_line(
-    client: NvidiaAsyncClient,
+    client: LLMAsyncClient,
     markdown_file: Path,
     lines,
     index: int,
@@ -1861,7 +1861,7 @@ def find_markdown_files_to_process(
 
 
 async def process_one_markdown_file(
-    client: NvidiaAsyncClient,
+    client: LLMAsyncClient,
     input_path: Path,
     image_semaphore: asyncio.Semaphore,
 ):
@@ -1968,7 +1968,7 @@ async def process_one_markdown_file(
 
 
 async def process_one_markdown_file_with_file_semaphore(
-    client: NvidiaAsyncClient,
+    client: LLMAsyncClient,
     input_path: Path,
     image_semaphore: asyncio.Semaphore,
     file_semaphore: asyncio.Semaphore,
@@ -2063,7 +2063,7 @@ async def process_markdown_folder():
 
             print("")
 
-    client = NvidiaAsyncClient(
+    client = LLMAsyncClient(
         base_url=OPENAI_BASE_URL,
         api_key=OPENAI_API_KEY,
     )
