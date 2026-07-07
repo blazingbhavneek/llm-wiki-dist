@@ -8,7 +8,7 @@ import logging
 import threading
 import warnings
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from threading import Event
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -908,7 +908,7 @@ class ResearchSession:
                 continue
         if not clean:
             return
-        self.settings = replace(self.settings, **clean)
+        self.settings = self.settings.model_copy(update=clean)
         if any(k in clean for k in str_keys) or "chat_temperature" in clean:
             self.llm = OpenAiLlmClient(
                 model=self.settings.chat_model,
@@ -1772,6 +1772,9 @@ class Researcher:
                 on_event=on_event,
                 stop_event=stop_event,
             )
+
+        if on_event and self.agent_sem.locked():
+            on_event({"type": "queued_for_agent"})
 
         async with self.agent_sem:
             return await asyncio.to_thread(work)

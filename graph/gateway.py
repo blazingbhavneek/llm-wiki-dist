@@ -5,17 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import time
 import urllib.error
 import urllib.request
-import uuid
-from typing import TYPE_CHECKING, Any
+from typing import Any, Callable
 
-import requests
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from pydantic import ValidationError
 
 from .core import GRAPH_SYSTEM_PROMPT, Settings, strip_image_media
 
@@ -445,11 +443,17 @@ class Embedder:
             )
 
             self._backend = "hf"
-            self._client = self._build_client("hf")
+            try:
+                self._client = self._build_client("hf")
 
-            # Probe HF too, so dimension is known and HF failures happen early.
-            vector = self._client.embed_query("local HF embedding availability probe")
-            self._dim = len(vector)
+                # Probe HF too, so dimension is known and HF failures happen early.
+                vector = self._client.embed_query("local HF embedding availability probe")
+                self._dim = len(vector)
+            except Exception as hf_err:
+                raise RuntimeError(
+                    "embedding server unavailable and local HF fallback failed: "
+                    f"{hf_err}"
+                ) from hf_err
 
             log.info(
                 "local HF embedding backend ready: model=%s dim=%s device=%s",
@@ -884,10 +888,12 @@ class ModelGateway:
     def update_settings(self, settings: Settings) -> None:
 
         old = self.settings
-        self.settings = settings
+        new_llm = self.llm
+        new_reranker = self.reranker
+
         chat_keys = ("chat_model", "chat_base_url", "chat_api_key", "chat_temperature")
         if any(getattr(old, k) != getattr(settings, k) for k in chat_keys):
-            self.llm = self._build_llm(settings)
+            new_llm = self._build_llm(settings)
         rerank_keys = (
             "rerank_backend",
             "rerank_base_url",
@@ -897,7 +903,11 @@ class ModelGateway:
             "rerank_device",
         )
         if any(getattr(old, k) != getattr(settings, k) for k in rerank_keys):
-            self.reranker = self._build_reranker(settings)
+            new_reranker = self._build_reranker(settings)
+
+        self.settings = settings
+        self.llm = new_llm
+        self.reranker = new_reranker
 
     def close(self) -> None:
         for obj in (self.embedder, self.reranker, self.llm):

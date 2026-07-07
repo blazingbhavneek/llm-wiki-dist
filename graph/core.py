@@ -32,8 +32,7 @@ def now_iso() -> str:
 
 
 #  settings
-@dataclass
-class Settings:
+class Settings(BaseModel):
 
     # For Chat UI
     chat_base_url: str = "http://localhost:8080/v1"
@@ -122,12 +121,12 @@ class Settings:
 
     # API service concurrency (semaphores in ReadGraphService)
     service_max_reads: int = 16
-    service_max_agents: int = 16
+    service_max_agents: int = 4
 
     enable_mermaid: bool = True
     mermaid_repair_attempts: int = 3
     mermaid_cli_bin: str = "mmdc"
-    mermaid_puppeteer_config: str = "/home/seigyo/llm-wiki/puppeteer-config.json"
+    mermaid_puppeteer_config: str = "./puppeteer-config.json"
     mermaid_render_timeout: int = 30
 
     @classmethod
@@ -257,6 +256,10 @@ class Settings:
         )
 
 
+for _settings_field, _settings_info in Settings.model_fields.items():
+    setattr(Settings, _settings_field, _settings_info.default)
+
+
 #  whether a node was created from source file or made by AI Agent
 class NodeType(str, Enum):
     endogenous = "endogenous"
@@ -287,6 +290,10 @@ class Node(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     summary: str = ""
     cluster: str | None = None
+    # HyDE-style probe: "what broader concept/field does this connect to",
+    # embedded separately (vec_bridge) to surface analogically related nodes
+    # that plain body/summary embeddings would never rank as neighbors.
+    bridge_probe: str = ""
     status: NodeStatus = NodeStatus.active
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
@@ -321,6 +328,11 @@ class EdgeSuggestion(BaseModel):
 # list of above edge model
 class EdgeSuggestions(BaseModel):
     edges: list[EdgeSuggestion] = Field(default_factory=list)
+
+
+# HyDE-style bridge probe: one short "what does this connect to" sentence
+class BridgeProbe(BaseModel):
+    probe: str = ""
 
 
 # For metadata filtering
@@ -557,7 +569,7 @@ class EnrichmentWorker(Protocol):
 
 @dataclass(frozen=True)
 class EnrichJob:
-    kind: str  # "summary" | "entity_dedup" | "cascade" | "maybe_recluster"
+    kind: str  # "summary" | "entity_dedup" | "cascade" | "maybe_recluster" | "cluster_bridge"
     node_id: str | None = None
     replacements: dict[str, str] = field(default_factory=dict)
     stale_sources: list[str] = field(default_factory=list)
@@ -667,15 +679,41 @@ REGENERATE_EXOGENOUS_PROMPT = (
 )
 
 EDGE_PROMPT = (
-    "あなたはWikiグラフを維持します。新しいノードと、既存ノードの候補リスト"
-    "（意味的類似性によって事前にフィルタ済み）が与えられたら、"
+    "あなたはWikiグラフを維持します。新しいノードと、既存ノードの候補の少人数グループ"
+    "（複数の検索方法で見つかった候補です。意味的類似性だけとは限りません）が与えられたら、"
     "新しいノードがどの候補にリンクすべきか、またその理由を判断してください。\n"
+    "各ノードの 'header' は、そのチャンクが属するより大きなセクション/トピックです。"
+    "本文だけでは文脈が薄いチャンクでも、headerを見て判断してください。\n"
     "ルール：\n"
     "- 与えられた候補IDのみを使用してください。\n"
     "- ラベルは、ターゲットが新しいノードにどのように関連するかを説明する短い動詞句です"
     "（例：'uses', 'defines', 'example-of', 'prerequisite-for', 'contradicts'）。\n"
     "- 関係が明確に有用な場合のみエッジを提案してください。弱い関係は省略してください。\n"
+    "- 候補が少数（3〜4件）しか渡されない場合でも、無理にすべてを繋げる必要はありません。\n"
     "- summary：リンクを説明する短い節を1つ書いてください。"
+)
+
+BRIDGE_PROBE_PROMPT = (
+    "あなたはWikiグラフを維持します。次のノート（前後の文脈を含む場合があります）を読み、"
+    "これがどの分野・概念・応用につながる可能性があるかを1〜2文で書いてください。\n"
+    "ルール：\n"
+    "- ノート本文の言い換えはしないでください。本文が示唆する、より広い文脈や"
+    "関連しうる領域・分野・応用を書いてください。\n"
+    "- 確信が持てない場合は無理に広げず、素直に本文の主題を短く書いてください。"
+)
+
+CLUSTER_BRIDGE_PROMPT = (
+    "あなたはWikiグラフを維持します。異なるクラスタ（トピック）を代表する2つのノードが"
+    "与えられます。これらは意味的類似性やキーワードでは直接見つからない組み合わせです。\n"
+    "両者の間に、共有される仕組み・原因・応用・類推など、非自明だが本当に有用なつながりが"
+    "あるかどうかを判断してください。\n"
+    "ルール：\n"
+    "- 与えられた候補IDのみを使用してください。\n"
+    "- 関連がはっきりせず、こじつけに感じる場合は無理につなげないでください。"
+    "その場合は空のリストを返してください。\n"
+    "- ラベルは、ターゲットが新しいノードにどのように関連するかを説明する短い動詞句です"
+    "（例：'analogous-to', 'shares-mechanism-with', 'application-of', 'inspired-by'）。\n"
+    "- summary：どのようにつながっているかを短く具体的に説明してください。"
 )
 
 ENTITY_DEDUP_PROMPT = (
@@ -1020,6 +1058,9 @@ def repair_answer_mermaid(
     """Validate + repair every mermaid block in `answer`, emitting progress events."""
     blocks = list(_MERMAID_BLOCK_RE.finditer(answer))
     if not blocks:
+        return answer
+    if shutil.which(settings.mermaid_cli_bin) is None:
+        emit({"type": "diagram_skipped", "reason": "mermaid CLI not installed"})
         return answer
     emit({"type": "diagram_pending"})
 

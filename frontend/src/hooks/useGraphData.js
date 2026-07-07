@@ -64,8 +64,24 @@ export function useGraphData() {
   const [health, setHealth] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [errorRetryable, setErrorRetryable] = useState(false)
+  const [readyState, setReadyState] = useState(null)
 
   const reload = useCallback(async () => {
+    setError(null)
+    setErrorRetryable(false)
+
+    const ready = await api.ready()
+    setReadyState(ready)
+
+    if (!ready.ready) {
+      const detail = ready.error || `Backend is starting (${ready.stage})`
+      const err = new Error(detail)
+      err.retryable = true
+      err.code = 'not_ready'
+      throw err
+    }
+
     const [g, h] = await Promise.all([api.graph(), api.health()])
 
     setRaw({ nodes: g.nodes, edges: g.edges })
@@ -75,9 +91,28 @@ export function useGraphData() {
   }, [])
 
   useEffect(() => {
-    reload()
-      .catch((e) => setError(String(e.message || e)))
-      .finally(() => setLoading(false))
+    let cancelled = false
+
+    const tick = async () => {
+      try {
+        await reload()
+        if (!cancelled) setLoading(false)
+      } catch (e) {
+        if (cancelled) return
+        setError(String(e.message || e))
+        setErrorRetryable(Boolean(e.retryable))
+        setLoading(false)
+        if (e.code === 'not_ready') {
+          setTimeout(tick, 1500)
+        }
+      }
+    }
+
+    tick()
+
+    return () => {
+      cancelled = true
+    }
   }, [reload])
 
   const rawById = useMemo(() => new Map(raw.nodes.map((n) => [n.id, n])), [raw])
@@ -92,5 +127,34 @@ export function useGraphData() {
     })
   }, [raw.nodes, raw.edges])
 
-  return { raw, rawById, graph, docLibrary, health, loading, error, reload }
+  const retry = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    setErrorRetryable(false)
+    if (readyState && !readyState.ready && readyState.error) {
+      await api.restartBootstrap()
+    }
+    try {
+      await reload()
+    } catch (e) {
+      setError(String(e.message || e))
+      setErrorRetryable(Boolean(e.retryable))
+    } finally {
+      setLoading(false)
+    }
+  }, [readyState, reload])
+
+  return {
+    raw,
+    rawById,
+    graph,
+    docLibrary,
+    health,
+    loading,
+    error,
+    errorRetryable,
+    readyState,
+    reload,
+    retry,
+  }
 }

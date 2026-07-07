@@ -23,8 +23,9 @@ import image
 import pdf
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 CACHE_DIR = Path("./cache")
@@ -32,7 +33,15 @@ TEMP_DIR = Path("./temp")
 CACHE_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
-MINERU_VENV_BIN = Path("/home/seigyo/llm-wiki/.venv/bin")
+MINERU_VENV_BIN = (
+    Path(os.environ["MINERU_VENV_BIN"]) if os.environ.get("MINERU_VENV_BIN") else None
+)
+PUPPETEER_CONFIG_PATH = os.environ.get(
+    "PUPPETEER_CONFIG_PATH", "./puppeteer-config.json"
+)
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+CACHE_RETENTION_HOURS = float(os.environ.get("CACHE_RETENTION_HOURS", "720"))
+CACHE_RETENTION_SECONDS = CACHE_RETENTION_HOURS * 60 * 60
 
 GPU_MEMORY_UTILIZATION = "0.05"
 INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
@@ -52,7 +61,7 @@ IMAGE_EXTENSIONS = {
 
 DONE_RETENTION_SECONDS = 72 * 60 * 60
 
-MP_CONTEXT = mp.get_context("fork" if os.name == "posix" else "spawn")
+MP_CONTEXT = mp.get_context("spawn")
 
 tasks: dict[str, dict[str, Any]] = {}
 
@@ -64,13 +73,15 @@ scheduler_thread: Optional[threading.Thread] = None
 shutdown_started = False
 
 
+def api_error(detail: str, retryable: bool, code: str) -> dict[str, Any]:
+    return {"detail": detail, "retryable": retryable, "code": code}
+
+
 class APIConfig(BaseModel):
     base_url: str = INVOKE_URL
     api_key: str = API_KEY
     model: str = MODEL
-    puppeteer_config_path: Optional[str] = (
-        "/home/seigyo/llm-wiki-dist/puppeteer-config.json"
-    )
+    puppeteer_config_path: Optional[str] = PUPPETEER_CONFIG_PATH
 
 
 def now_ts() -> float:
@@ -162,6 +173,7 @@ def remove_from_queue(task_id: str):
 
 def prune_old_done_tasks():
     cutoff = now_ts() - DONE_RETENTION_SECONDS
+    cache_cutoff = now_ts() - CACHE_RETENTION_SECONDS
 
     for task_id, meta in list(tasks.items()):
         status = meta.get("status")
@@ -175,6 +187,27 @@ def prune_old_done_tasks():
 
         if done_at and done_at < cutoff:
             tasks.pop(task_id, None)
+
+    failed_logs = CACHE_DIR / "_failed_logs"
+    if failed_logs.exists():
+        for log_file in failed_logs.iterdir():
+            try:
+                if log_file.is_file() and log_file.stat().st_mtime < cutoff:
+                    log_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    for cache_path in list(CACHE_DIR.iterdir()):
+        if not cache_path.is_dir() or cache_path.name == "_failed_logs":
+            continue
+        if (cache_path / ".processing").exists():
+            continue
+        final_md = cache_path / "final.md"
+        try:
+            if final_md.exists() and final_md.stat().st_mtime < cache_cutoff:
+                shutil.rmtree(cache_path, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def shutdown_all_tasks():
@@ -214,27 +247,17 @@ def shutdown_all_tasks():
         current_task_id = None
 
 
-def install_signal_handlers():
-    def handle_signal(signum, frame):
-        print(f"\n[SIGNAL] Received {signal.Signals(signum).name}")
-        shutdown_all_tasks()
-        raise SystemExit(128 + signum)
-
-    try:
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
-    except Exception as e:
-        print(f"[WARN] Failed to install signal handlers: {e}")
-
-
 def scheduler_loop():
     while not scheduler_stop.is_set():
-        with state_lock:
-            if current_task_id:
-                refresh_task_status(current_task_id)
+        try:
+            with state_lock:
+                if current_task_id:
+                    refresh_task_status(current_task_id)
 
-            start_next_task_if_possible()
-            prune_old_done_tasks()
+                start_next_task_if_possible()
+                prune_old_done_tasks()
+        except Exception:
+            print("[SCHEDULER] tick failed:\n" + traceback.format_exc())
 
         time.sleep(0.5)
 
@@ -243,7 +266,6 @@ def scheduler_loop():
 async def lifespan(app: FastAPI):
     global scheduler_thread
 
-    install_signal_handlers()
     cleanup_stale_processing_dirs()
 
     scheduler_stop.clear()
@@ -269,11 +291,39 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=os.environ.get(
+        "WIKI_CORS_ORIGINS", "http://localhost:5173"
+    ).split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    print(
+        f"[ERROR] unhandled error on {request.method} {request.url.path}:\n"
+        + traceback.format_exc()
+    )
+    return JSONResponse(
+        status_code=500,
+        content=api_error(
+            f"サーバー内部エラー: {type(exc).__name__}: {exc}",
+            True,
+            "internal_error",
+        ),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict) and {"detail", "retryable", "code"} <= set(
+        exc.detail
+    ):
+        content = exc.detail
+    else:
+        content = api_error(str(exc.detail), exc.status_code >= 500, "http_error")
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 def compute_pdf_hash(file_path: str) -> str:
@@ -366,6 +416,17 @@ def vision_smoke_test(api_config: dict, image_path: Path) -> bool:
     except Exception as e:
         print(f"[WARN] Vision smoke test failed: {e}")
         return False
+
+
+def build_task_id(pdf_hash: str, describe_images: bool, generate_mermaid: bool) -> str:
+    if not describe_images and not generate_mermaid:
+        return pdf_hash
+
+    options = (
+        f"{pdf_hash}:describe_images={int(describe_images)}:"
+        f"generate_mermaid={int(generate_mermaid)}"
+    )
+    return hashlib.sha256(options.encode("utf-8")).hexdigest()
 
 
 def build_empty_image_unit(data_url: str, alt: str) -> str:
@@ -464,7 +525,7 @@ def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str
 
     redirect_worker_output(cache_dir, task_id)
 
-    if MINERU_VENV_BIN.exists():
+    if MINERU_VENV_BIN and MINERU_VENV_BIN.exists():
         os.environ["PATH"] = (
             f"{MINERU_VENV_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
         )
@@ -488,11 +549,9 @@ def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str
         expected_output_folder = mineru_dir / Path(pdf_path).stem
 
         if not expected_output_folder.exists():
-            try:
-                pdf.main()
-            except SystemExit as e:
-                if e.code != 0:
-                    raise RuntimeError(f"pdf.main() exited with code {e.code}")
+            exit_code = pdf.main()
+            if exit_code != 0:
+                raise RuntimeError(f"pdf.main() exited with code {exit_code}")
 
         markdown_file = find_single_markdown_file(mineru_dir)
         smallest_image = find_smallest_image(mineru_dir)
@@ -508,24 +567,31 @@ def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str
             f"({smallest_image.stat().st_size} bytes)"
         )
 
-        vision_ok = vision_smoke_test(api_config, smallest_image)
+        if not api_config.get("describe_images"):
+            fallback_embed_images(markdown_file, final_md_path)
+            processing_marker.unlink(missing_ok=True)
+            return str(final_md_path)
 
-        # TODO: Remove this after test is done, currently disabling vision for speed purpose
-        vision_ok = False
+        vision_ok = vision_smoke_test(api_config, smallest_image)
 
         if vision_ok:
             try:
+                generate_mermaid = bool(api_config.get("generate_mermaid"))
+
                 image.MARKDOWN_FOLDER = str(mineru_dir)
                 image.OPENAI_BASE_URL = api_config["base_url"]
                 image.OPENAI_API_KEY = api_config["api_key"]
                 image.OPENAI_MODEL = api_config["model"]
                 image.MERMAID_PUPPETEER_CONFIG_FILE = api_config.get(
                     "puppeteer_config_path",
-                    "/home/seigyo/llm-wiki/puppeteer-config.json",
+                    PUPPETEER_CONFIG_PATH,
                 )
 
                 image.CONCURRENCY = 1
                 image.FILE_CONCURRENCY = 1
+                image.ENABLE_MERMAID_DIAGRAMS = generate_mermaid
+                image.VALIDATE_MERMAID = generate_mermaid
+                image.ENABLE_MERMAID_VISUAL_MATCH_LOOP = generate_mermaid
 
                 asyncio.run(image.process_markdown_folder())
 
@@ -576,6 +642,15 @@ def worker_entry(
         print(f"[ERROR] Task {task_id} failed: {e}")
         print(traceback.format_exc())
 
+        log_src = cache_path / "worker.log"
+        if log_src.exists():
+            try:
+                failed_logs = CACHE_DIR / "_failed_logs"
+                failed_logs.mkdir(exist_ok=True)
+                shutil.copyfile(log_src, failed_logs / f"{task_id}.log")
+            except Exception:
+                pass
+
         shutil.rmtree(cache_path, ignore_errors=True)
 
         try:
@@ -621,6 +696,9 @@ def public_task(task_id: str, meta: dict[str, Any], position: Optional[int] = No
 
     if meta.get("error"):
         item["error"] = meta["error"]
+
+    if status == "failed":
+        item["retryable"] = True
 
     if status == "completed":
         item["result_url"] = f"/result/{task_id}"
@@ -692,7 +770,7 @@ def refresh_task_status(task_id: str):
             while True:
                 try:
                     msg = result_queue.get_nowait()
-                except queue_module.Empty:
+                except (queue_module.Empty, EOFError, OSError):
                     break
 
                 meta["last_message"] = msg
@@ -750,12 +828,15 @@ async def upload_pdf(
     base_url: str = Form(INVOKE_URL),
     api_key: str = Form(API_KEY),
     model: str = Form(MODEL),
-    puppeteer_config_path: Optional[str] = Form(
-        "/home/seigyo/llm-wiki/puppeteer-config.json"
-    ),
+    describe_images: bool = Form(False),
+    generate_mermaid: bool = Form(False),
+    puppeteer_config_path: Optional[str] = Form(PUPPETEER_CONFIG_PATH),
 ):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("Only PDF files are supported", False, "bad_upload"),
+        )
 
     pending_dir = TEMP_DIR / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
@@ -764,15 +845,29 @@ async def upload_pdf(
     pending_pdf_path = pending_dir / f"{uuid.uuid4().hex}_{safe_filename}"
 
     sha256 = hashlib.sha256()
+    total_bytes = 0
 
     with open(pending_pdf_path, "wb") as f:
         while chunk := await file.read(8192):
+            total_bytes += len(chunk)
+            if total_bytes > MAX_UPLOAD_BYTES:
+                f.close()
+                pending_pdf_path.unlink(missing_ok=True)
+                limit_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+                raise HTTPException(
+                    status_code=413,
+                    detail=api_error(
+                        f"PDF too large (limit {limit_mb}MB)", False, "bad_upload"
+                    ),
+                )
             f.write(chunk)
             sha256.update(chunk)
 
     pdf_hash = sha256.hexdigest()
+    generate_mermaid = bool(describe_images and generate_mermaid)
+    task_id = build_task_id(pdf_hash, describe_images, generate_mermaid)
 
-    cache_path = CACHE_DIR / pdf_hash
+    cache_path = CACHE_DIR / task_id
     final_md_path = cache_path / "final.md"
 
     if final_md_path.exists():
@@ -781,13 +876,13 @@ async def upload_pdf(
         with state_lock:
             ts = now_ts()
 
-            tasks[pdf_hash] = {
+            tasks[task_id] = {
                 "process": None,
                 "queue": None,
                 "status": "completed",
                 "filename": safe_filename,
                 "cache_path": str(cache_path),
-                "task_dir": str(TEMP_DIR / pdf_hash),
+                "task_dir": str(TEMP_DIR / task_id),
                 "error": None,
                 "created_at": ts,
                 "started_at": None,
@@ -798,51 +893,51 @@ async def upload_pdf(
             prune_old_done_tasks()
 
         return {
-            "task_id": pdf_hash,
+            "task_id": task_id,
             "filename": safe_filename,
             "status": "completed",
             "message": "Returned from cache",
-            "result_url": f"/result/{pdf_hash}",
+            "result_url": f"/result/{task_id}",
             "queue_position": None,
         }
 
     with state_lock:
         prune_old_done_tasks()
 
-        if pdf_hash in tasks:
-            meta = refresh_task_status(pdf_hash)
+        if task_id in tasks:
+            meta = refresh_task_status(task_id)
 
             if meta and meta.get("status") in {"queued", "processing"}:
                 pending_pdf_path.unlink(missing_ok=True)
 
                 return {
-                    "task_id": pdf_hash,
+                    "task_id": task_id,
                     "filename": meta.get("filename"),
                     "status": meta["status"],
                     "message": "Task already running",
-                    "queue_position": get_queue_position(pdf_hash),
+                    "queue_position": get_queue_position(task_id),
                 }
 
             if meta and meta.get("status") == "completed":
                 pending_pdf_path.unlink(missing_ok=True)
 
                 return {
-                    "task_id": pdf_hash,
+                    "task_id": task_id,
                     "filename": meta.get("filename") or safe_filename,
                     "status": "completed",
                     "message": "Task already completed",
-                    "result_url": f"/result/{pdf_hash}",
+                    "result_url": f"/result/{task_id}",
                     "queue_position": None,
                 }
 
             # Failed or stale task with same hash. Replace it.
-            old_meta = tasks.pop(pdf_hash, None)
-            remove_from_queue(pdf_hash)
+            old_meta = tasks.pop(task_id, None)
+            remove_from_queue(task_id)
 
             if old_meta:
                 shutil.rmtree(old_meta.get("task_dir", ""), ignore_errors=True)
 
-        task_dir = TEMP_DIR / pdf_hash
+        task_dir = TEMP_DIR / task_id
         task_dir.mkdir(parents=True, exist_ok=True)
 
         final_temp_pdf = task_dir / safe_filename
@@ -854,6 +949,8 @@ async def upload_pdf(
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
+            "describe_images": describe_images,
+            "generate_mermaid": generate_mermaid,
             "puppeteer_config_path": puppeteer_config_path,
         }
 
@@ -862,7 +959,7 @@ async def upload_pdf(
         process = MP_CONTEXT.Process(
             target=worker_entry,
             args=(
-                pdf_hash,
+                task_id,
                 str(final_temp_pdf),
                 api_config,
                 str(cache_path),
@@ -871,7 +968,7 @@ async def upload_pdf(
             daemon=False,
         )
 
-        tasks[pdf_hash] = {
+        tasks[task_id] = {
             "process": process,
             "queue": result_queue,
             "status": "queued",
@@ -885,14 +982,14 @@ async def upload_pdf(
             "done_at": None,
         }
 
-        task_queue.append(pdf_hash)
+        task_queue.append(task_id)
 
         start_next_task_if_possible()
 
-        meta = tasks[pdf_hash]
+        meta = tasks[task_id]
 
         return {
-            "task_id": pdf_hash,
+            "task_id": task_id,
             "filename": safe_filename,
             "status": meta["status"],
             "message": (
@@ -900,7 +997,7 @@ async def upload_pdf(
                 if meta["status"] == "processing"
                 else "Task submitted to queue"
             ),
-            "queue_position": get_queue_position(pdf_hash),
+            "queue_position": get_queue_position(task_id),
         }
 
 
@@ -922,7 +1019,10 @@ async def get_status(task_id: str):
                     "queue_position": None,
                 }
 
-            raise HTTPException(status_code=404, detail="Task not found")
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("Task not found", True, "not_ready"),
+            )
 
         meta = refresh_task_status(task_id)
 
@@ -978,7 +1078,7 @@ async def get_queue():
         failed.sort(key=lambda x: x.get("finished_at") or 0, reverse=True)
 
         return {
-            "retention_hours": 72,
+            "retention_hours": DONE_RETENTION_SECONDS / 3600,
             "processing": processing,
             "queued_count": len(queued),
             "queued": queued,
@@ -1056,10 +1156,15 @@ async def get_result(task_id: str):
                 if meta.get("status") == "failed":
                     raise HTTPException(
                         status_code=500,
-                        detail=meta.get("error", "Task failed"),
+                        detail=api_error(
+                            meta.get("error", "Task failed"), True, "worker_failed"
+                        ),
                     )
 
-        raise HTTPException(status_code=404, detail="Result not ready or not found")
+        raise HTTPException(
+            status_code=404,
+            detail=api_error("Result not ready or not found", True, "not_ready"),
+        )
 
     return FileResponse(
         final_md_path,

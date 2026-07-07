@@ -15,18 +15,21 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from tqdm import tqdm
 
 from .core import (
+    BRIDGE_PROBE_PROMPT,
     CLAIM_PROMPT,
+    CLUSTER_BRIDGE_PROMPT,
     CLUSTER_NAMER_SYSTEM,
     EDGE_PROMPT,
     ENTITY_DEDUP_PROMPT,
     KEYWORD_PROMPT,
     REGENERATE_EXOGENOUS_PROMPT,
     SUMMARY_PROMPT,
+    BridgeProbe,
     ClaimExtraction,
     ClusterRenamePlan,
     Edge,
@@ -66,6 +69,30 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 _NUMBERED_DOC_RE = re.compile(r"^\d+-(.+\.md)$")
 _CASCADE_MATCH_THRESHOLD = 0.45
 
+# Cap on extra bridge candidates (entity-match + 2-hop graph-walk) added on top
+# of the RRF-fused candidates. Keeps LLM prompt payload bounded.
+_BRIDGE_CANDIDATE_CAP = 5
+
+# Reciprocal rank fusion constant (standard default; dampens how much exact
+# rank position matters so a candidate near the top of several channels beats
+# one that's #1 in only a single channel).
+_RRF_K = 60
+
+# Ceiling on how many candidates survive RRF fusion (across vector/lexical
+# channels) before the small deterministic bridge set is unioned in.
+_MAX_FUSED_CANDIDATES = 16
+
+# Candidates are shown to the edge-decision LLM in small groups rather than
+# all at once: a small local model handling 15+ mixed-relevance candidates in
+# one call tends to miss or misjudge; a handful of top-ranked peers at a time
+# is more reliable and still bounded in call count.
+_EDGE_GROUP_SIZE = 4
+
+# How many lines of the original source file to pull before/after a chunk's
+# own range when generating its bridge-probe text, so a small/thin chunk
+# still carries some context of what was happening around it.
+_BRIDGE_CONTEXT_RADIUS = 100
+
 # private key to change when to force a re-index
 # Bump when the search_items chunking scheme changes; forces a bootstrap rebuild.
 SEARCH_INDEX_VERSION = "chunk512-80-v1"
@@ -76,6 +103,18 @@ RECLUSTER_COUNTER_KEY = "endo_since_recluster"
 
 # possible status of a write job
 WriteStatus = Literal["queued", "running", "done", "failed", "cancelled"]
+
+
+class ClusterNamingError(RuntimeError):
+    pass
+
+
+class JobCancelled(RuntimeError):
+    pass
+
+
+def _is_job_cancelled(exc: BaseException) -> bool:
+    return isinstance(exc, JobCancelled) or type(exc).__name__ == "JobCancelled"
 
 
 @dataclass
@@ -93,6 +132,7 @@ class WriteJob:
     # Live progress for long-running jobs (chunk_and_ingest): updated in-place
     # by the worker thread, read by the /api/write-jobs pollers.
     progress: dict[str, Any] | None = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
 
 
 # flatten a job object to a dict
@@ -279,9 +319,14 @@ class Librarian:
         while True:
             job = await self.queue.get()
             try:
-                await self._run_job(
-                    job
-                )  # Get the job from the queue and put it another thread
+                await self._run_job(job)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except BaseException as exc:
+                job.status = "failed"
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.finished_at = datetime.now(timezone.utc)
+                log.exception("write worker iteration failed for job %s", job.id)
             finally:
                 # Tells asyncio.Queue that this queued item has finished processing.
                 self.queue.task_done()
@@ -304,10 +349,16 @@ class Librarian:
             # Store successful result and mark complete.
             job.result = result
             job.status = "done"
-        except Exception as exc:
-            # Convert exceptions into job failure state instead of crashing worker loop.
-            job.status = "failed"
-            job.error = f"{type(exc).__name__}: {exc}"
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except BaseException as exc:
+            if _is_job_cancelled(exc):
+                job.status = "cancelled"
+                job.error = str(exc) or "job cancelled"
+            else:
+                # Convert exceptions into job failure state instead of crashing worker loop.
+                job.status = "failed"
+                job.error = f"{type(exc).__name__}: {exc}"
         finally:
             # Always stamp finish time and prune old finished jobs.
             job.finished_at = datetime.now(timezone.utc)
@@ -377,11 +428,17 @@ class Librarian:
             return {"clusters": mapping}
 
         if job.type == "cascading_update":
-            actions = self.cascading_update(job.payload["source_file"])
+            actions = self.cascading_update(
+                job.payload["source_file"],
+                stop_check=lambda: job.stop_event.is_set(),
+            )
             return {"actions": actions}
 
         if job.type == "ingest_md_output":
-            nodes = self.ingest_md_output(job.payload["path"])
+            nodes = self.ingest_md_output(
+                job.payload["path"],
+                stop_check=lambda: job.stop_event.is_set(),
+            )
             return {"ingested": len(nodes)}
 
         if job.type == "chunk_and_ingest":
@@ -430,17 +487,21 @@ class Librarian:
         return None
 
     def cancel_job(self, job_id: str) -> bool:
-        # Only queued jobs can be cancelled safely.
-        # Running jobs are already executing, so this method does not stop them.
         job = self.jobs.get(job_id)
 
-        if job is None or job.status != "queued":
+        if job is None:
             return False
 
-        job.status = "cancelled"
-        job.finished_at = datetime.now(timezone.utc)
+        if job.status == "queued":
+            job.status = "cancelled"
+            job.finished_at = datetime.now(timezone.utc)
+            return True
 
-        return True
+        if job.status == "running":
+            job.stop_event.set()
+            return True
+
+        return False
 
     # endregion Init, Queue and Job manager
 
@@ -506,9 +567,11 @@ class Librarian:
             try:
                 # Run the actual enrichment handler for this job.
                 self._enrich_handle(job)
-            except Exception as exc:  # noqa: BLE001 - background best-effort
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - background best-effort
                 # Enrichment is best-effort: log failures but do not crash the thread.
-                log.warning("enrichment job %s failed: %s", job.kind, exc)
+                log.warning("enrichment job %s failed: %s", job.kind, exc, exc_info=True)
             finally:
                 # Tell the queue this job has finished processing.
                 self._enrich_queue.task_done()
@@ -541,6 +604,10 @@ class Librarian:
                 # Increment recluster counter and refresh clusters only if threshold is hit.
                 self._maybe_recluster()
 
+            elif job.kind == "cluster_bridge":
+                # Scan cluster-pairs for non-obvious cross-topic connections.
+                self.discover_cluster_bridges()
+
             else:
                 # Ignore jobs with missing/invalid fields instead of crashing the worker.
                 log.info("enrichment: ignoring malformed job %r", job)
@@ -556,10 +623,84 @@ class Librarian:
         if count >= self._recluster_every:
             log.info("enrichment: recluster threshold hit (%d) -> reclustering", count)
             self.refresh_clusters()
+            # Cluster assignments just changed; representatives are stale too.
+            self._enrich_put(EnrichJob("cluster_bridge"))
             count = 0
 
         # Persist the updated counter so it survives across later calls.
         self.set_meta(RECLUSTER_COUNTER_KEY, str(count))
+
+    def discover_cluster_bridges(self) -> list[Edge]:
+        """One representative node per cluster, one LLM call per cluster-pair
+        (O(C^2), bounded by cluster count not node count) asking whether a
+        non-obvious connection exists. This is the only place in the pipeline
+        that deliberately looks *across* clusters instead of at KNN/lexical
+        neighbors, so it's what catches bridges the rest of the candidate
+        channels structurally cannot see."""
+
+        groups: dict[str, list[str]] = {}
+        for node in self.store.get_all_nodes():
+            if node.status != NodeStatus.active:
+                continue
+            cluster = (node.cluster or "").strip()
+            if cluster:
+                groups.setdefault(cluster, []).append(node.id)
+
+        reps: dict[str, Node] = {}
+        for cluster, node_ids in groups.items():
+            rep = self._cluster_representative(node_ids)
+            if rep:
+                reps[cluster] = rep
+
+        names = sorted(reps)
+        edges: list[Edge] = []
+
+        for i, cluster_a in enumerate(names):
+            node_a = reps[cluster_a]
+
+            for cluster_b in names[i + 1 :]:
+                node_b = reps[cluster_b]
+
+                # Already directly connected: not what this scan hunts for.
+                if any(
+                    node_b.id in (edge.source_node_id, edge.target_node_id)
+                    for edge in self.store.get_edges_for_node(node_a.id)
+                ):
+                    continue
+
+                try:
+                    edges += self._request_edges_for_group(
+                        node_a, [node_b], prompt=CLUSTER_BRIDGE_PROMPT
+                    )
+                except Exception as exc:
+                    # Best-effort: one bad pair should not stop the whole scan.
+                    log.info(
+                        "cluster bridge scan failed for %s/%s: %s",
+                        cluster_a,
+                        cluster_b,
+                        exc,
+                    )
+
+        return edges
+
+    def _cluster_representative(self, node_ids: list[str]) -> Node | None:
+        # Pick the highest-degree active node as the cluster's stand-in for
+        # the bridge scan - a cheap proxy for "most connected to what this
+        # cluster is actually about", without a real centroid computation.
+        best: Node | None = None
+        best_degree = -1
+
+        for node_id in node_ids:
+            node = self.store.get_node(node_id)
+            if not node or node.status != NodeStatus.active:
+                continue
+
+            degree = len(self.store.get_edges_for_node(node_id))
+            if degree > best_degree:
+                best_degree = degree
+                best = node
+
+        return best
 
     # endregion Background Enrichment Queue
 
@@ -663,6 +804,16 @@ class Librarian:
                         node.id,
                         "vec_summary",
                         self.gateway.embedder.embed_document(node.summary),
+                    )
+
+                # Bridge-probe text is already generated; just re-embed it under
+                # the new model. Nodes missing it get filled in lazily later
+                # (next time _store_vectors runs for them).
+                if node.bridge_probe.strip():
+                    self.store.set_vector(
+                        node.id,
+                        "vec_bridge",
+                        self.gateway.embedder.embed_document(node.bridge_probe),
                     )
             except Exception as exc:
                 # Best-effort per node: one failed node should not stop all bootstrap.
@@ -928,7 +1079,7 @@ class Librarian:
         self.store.upsert_node(node)
 
         # Store vectors and use body vector to choose a cluster based on references.
-        body_vec, _ = self._store_vectors(node)
+        body_vec, _, _ = self._store_vectors(node)
 
         node.cluster = self._cluster_for_references(node.id, source_node_ids, body_vec)
         self.store.upsert_node(node)
@@ -1057,13 +1208,20 @@ class Librarian:
         # Public wrapper to ensure cluster names are Japanese/UI-friendly.
         return self._ensure_japanese_clusters()
 
-    def ingest_md_output(self, md_output_dir: str | Path) -> list[Node]:
+    def ingest_md_output(
+        self,
+        md_output_dir: str | Path,
+        stop_check: Callable[[], bool] | None = None,
+        raw_source_path: str | Path | None = None,
+    ) -> list[Node]:
         # Load a markdown-output directory produced by the parser/chunker.
         out_path = Path(md_output_dir)
         if not out_path.exists():
             raise FileNotFoundError(f"input directory does not exist: {out_path}")
 
-        nodes, structural_edges = self._load_md_output(out_path)
+        nodes, structural_edges = self._load_md_output(
+            out_path, raw_source_path=raw_source_path
+        )
         if not nodes:
             return []
 
@@ -1072,17 +1230,21 @@ class Librarian:
         version = self._source_version_for_nodes(nodes)
 
         if document_name and self.store.get_source(document_name):
+            if stop_check and stop_check():
+                raise JobCancelled("ingest cancelled")
             # Re-ingest of a known document: run the revision flow so changed
             # pages supersede their old versions (and dependents cascade)
             # instead of piling up duplicates next to stale active nodes.
             actions = self._revise_document(
-                nodes, structural_edges, document_name, version
+                nodes, structural_edges, document_name, version, stop_check=stop_check
             )
             log.info("re-ingest via revision flow: %s", "; ".join(actions) or "no-op")
         else:
             # First ingest: persist each node and build semantic/dedup edges.
             edge_count = 0
             for index, node in enumerate(nodes, start=1):
+                if stop_check and stop_check():
+                    raise JobCancelled("ingest cancelled")
                 node.source_version = version
                 edges = self._ingest_one(node)
                 edge_count += len(edges)
@@ -1108,6 +1270,8 @@ class Librarian:
 
         # Best-effort clustering after ingest.
         try:
+            if stop_check and stop_check():
+                raise JobCancelled("ingest cancelled")
             mapping = self.recluster()
             self.ensure_japanese_clusters()
             log.info("reclustered into %d topics", len(set(mapping.values())))
@@ -1117,9 +1281,10 @@ class Librarian:
         return nodes
 
     def chunk_and_ingest(self, job: WriteJob) -> dict[str, Any]:
-        from .chunk import run_chunk_pipeline
+        from .chunk import make_llm, run_chunk_pipeline
 
         body = job.payload["body"]
+        settings = self.settings
 
         document_name = self._document_name(
             job.payload.get("document_name")
@@ -1128,28 +1293,62 @@ class Librarian:
         )
 
         out_dir = (
-            Path(self.settings.database_path).parent
+            Path(settings.database_path).parent
             / "chunked"
             / f"{Path(document_name).stem}-{short_hash(body)}"
         )
 
+        # Persist the raw pre-chunk text somewhere durable. out_dir (the
+        # chunker's per-chunk pages) gets deleted right after ingest, so
+        # without this, node.source_path would point at a chunk-sized file
+        # with no extra context — nothing left to read once ingest finishes.
+        sources_dir = Path(settings.database_path).parent / "sources"
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        raw_source_path = (
+            sources_dir / f"{Path(document_name).stem}-{short_hash(body)}.md"
+        )
+        raw_source_path.write_text(body, encoding="utf-8")
+
         def on_progress(update: dict[str, Any]) -> None:
             job.progress = update
+
+        def stop_check() -> bool:
+            return job.stop_event.is_set()
+
+        if stop_check():
+            raise JobCancelled("job cancelled")
+
+        llm = make_llm(
+            model=settings.chat_model,
+            base_url=settings.chat_base_url,
+            api_key=settings.chat_api_key,
+            temperature=settings.chat_temperature,
+        )
 
         result = run_chunk_pipeline(
             source_text=body,
             document_name=document_name,
             out_dir=out_dir,
-            llm=None,
+            llm=llm,
             on_progress=on_progress,
+            stop_check=stop_check,
         )
+
+        if stop_check():
+            raise JobCancelled("job cancelled")
 
         job.progress = {"stage": "ingesting", "total": result.file_count}
 
         try:
-            nodes = self.ingest_md_output(result.out_dir)
+            nodes = self.ingest_md_output(
+                result.out_dir,
+                stop_check=stop_check,
+                raw_source_path=raw_source_path,
+            )
 
             for index, node in enumerate(nodes, start=1):
+                if stop_check():
+                    raise JobCancelled("job cancelled")
                 job.progress = {
                     "stage": "enriching",
                     "current": index,
@@ -1172,7 +1371,11 @@ class Librarian:
             if result.out_dir.exists():
                 shutil.rmtree(result.out_dir)
 
-    def cascading_update(self, source_file: str | Path) -> list[str]:
+    def cascading_update(
+        self,
+        source_file: str | Path,
+        stop_check: Callable[[], bool] | None = None,
+    ) -> list[str]:
         # Update an already-ingested source file and cascade changes to dependents.
         out_path = Path(source_file)
         if not out_path.exists():
@@ -1185,7 +1388,9 @@ class Librarian:
         # Compute document version and run shared revision logic.
         document_name = nodes[0].original_document_name or out_path.name
         version = self._source_version_for_nodes(nodes)
-        actions = self._revise_document(nodes, structural_edges, document_name, version)
+        actions = self._revise_document(
+            nodes, structural_edges, document_name, version, stop_check=stop_check
+        )
 
         # Best-effort recluster after update.
         try:
@@ -1202,6 +1407,7 @@ class Librarian:
         structural_edges: list[Edge],
         document_name: str,
         version: str,
+        stop_check: Callable[[], bool] | None = None,
     ) -> list[str]:
         """Revision matching for one document: unchanged pages keep their node,
         changed pages supersede the old one, removed pages go stale, and
@@ -1209,6 +1415,8 @@ class Librarian:
 
         # Cheap pass: stamp version + body hash.
         for node in nodes:
+            if stop_check and stop_check():
+                raise JobCancelled("revision cancelled")
             node.source_version = version
             if not node.source_material_hash:
                 node.source_material_hash = source_hash(node.body)
@@ -1243,6 +1451,8 @@ class Librarian:
         # First pass: exact hash matches are unchanged; others need fuzzy matching.
         pending: list[Node] = []
         for node in nodes:
+            if stop_check and stop_check():
+                raise JobCancelled("revision cancelled")
             exact = exact_by_hash.get(node.source_material_hash)
             if exact and exact.id not in matched_old:
                 matched_old.add(exact.id)
@@ -1252,6 +1462,8 @@ class Librarian:
 
         # Fill expensive/derived fields only for nodes that may be new/changed.
         for node in pending:
+            if stop_check and stop_check():
+                raise JobCancelled("revision cancelled")
             self._fill_derived_fields(node)
 
         # Prepare old unmatched nodes for fuzzy revision matching.
@@ -1262,6 +1474,8 @@ class Librarian:
         ]
 
         for node in pending:
+            if stop_check and stop_check():
+                raise JobCancelled("revision cancelled")
             # Find best old candidate for this new node.
             candidates = [old for old in unmatched_old if old.id not in matched_old]
             best = max(
@@ -1292,6 +1506,8 @@ class Librarian:
 
         # Any old node not matched by exact/fuzzy matching is stale.
         for old in active_old:
+            if stop_check and stop_check():
+                raise JobCancelled("revision cancelled")
             if old.id not in matched_old:
                 self.store.set_node_status(old.id, NodeStatus.stale)
                 stale_sources.add(old.id)
@@ -1353,12 +1569,12 @@ class Librarian:
         self._fill_derived_fields(node)
         self.store.upsert_node(node)
 
-        body_vec, summary_vec = self._store_vectors(node)
-        edges = self._build_semantic_edges(node, body_vec, summary_vec)
+        body_vec, summary_vec, bridge_vec = self._store_vectors(node)
+        edges = self._build_semantic_edges(node, body_vec, summary_vec, bridge_vec)
 
         # Optionally find and link duplicate/same-entity nodes.
         if self.settings.entity_dedup:
-            candidates = self._knn_candidates(node.id, body_vec, summary_vec)
+            candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
             edges += self._link_entity_duplicates(node, candidates)
 
         return edges
@@ -1371,8 +1587,11 @@ class Librarian:
         # Make sure vector tables exist and match the current embedder dimension.
         self.store.ensure_vec_tables(self.gateway.embedder.dim)
 
-    def _store_vectors(self, node: Node) -> tuple[list[float], list[float] | None]:
-        # Store the main body vector, optional summary vector, and search-item vectors.
+    def _store_vectors(
+        self, node: Node
+    ) -> tuple[list[float], list[float] | None, list[float] | None]:
+        # Store the main body vector, optional summary vector, the HyDE-style
+        # bridge-probe vector, and search-item vectors.
         self._ensure_vec()
 
         body_vec = self.gateway.embedder.embed_document(node.body)
@@ -1383,10 +1602,70 @@ class Librarian:
             summary_vec = self.gateway.embedder.embed_document(node.summary)
             self.store.set_vector(node.id, "vec_summary", summary_vec)
 
+        if not node.bridge_probe.strip():
+            try:
+                node.bridge_probe = self._generate_bridge_probe(node)
+            except Exception as exc:
+                # Best-effort: a failed probe should not break ingestion.
+                log.info("bridge probe generation failed for %s: %s", node.id, exc)
+                node.bridge_probe = ""
+            self.store.upsert_node(node)
+
+        bridge_vec = None
+        if node.bridge_probe.strip():
+            bridge_vec = self.gateway.embedder.embed_document(node.bridge_probe)
+            self.store.set_vector(node.id, "vec_bridge", bridge_vec)
+
         # Also rebuild chunk/title/claim search rows for this node.
         self._store_search_items(node)
 
-        return body_vec, summary_vec
+        return body_vec, summary_vec, bridge_vec
+
+    def _bridge_probe_context(self, node: Node) -> str:
+        # Best-effort: pull surrounding lines from the original source file so
+        # a small/thin chunk still carries some context of what was happening
+        # around it. Falls back to the bare chunk body if no source file is
+        # available (legacy per-chunk source_path, deleted file, etc).
+        if not node.source_path or not node.source_ranges:
+            return node.body
+
+        path = Path(node.source_path)
+        if not path.exists():
+            return node.body
+
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            return node.body
+
+        if not lines:
+            return node.body
+
+        start = min(s for s, _ in node.source_ranges)
+        end = max(e for _, e in node.source_ranges)
+
+        lo = max(1, start - _BRIDGE_CONTEXT_RADIUS)
+        hi = min(len(lines), end + _BRIDGE_CONTEXT_RADIUS)
+
+        context = "\n".join(lines[lo - 1 : hi]).strip()
+        return context or node.body
+
+    def _generate_bridge_probe(self, node: Node) -> str:
+        context = self._bridge_probe_context(node)
+        if not context.strip():
+            return ""
+
+        result = self.gateway.llm.complete_structured(
+            BRIDGE_PROBE_PROMPT, context[:6000], BridgeProbe
+        )
+
+        parsed = (
+            result
+            if isinstance(result, BridgeProbe)
+            else BridgeProbe.model_validate(result)
+        )
+
+        return parsed.probe.strip()
 
     def _build_search_items(self, node: Node) -> list[dict]:
 
@@ -1488,38 +1767,124 @@ class Librarian:
 
     def _knn_candidates(
         self,
-        node_id: str,
+        node: Node,
         body_vec: list[float],
         summary_vec: list[float] | None,
+        bridge_vec: list[float] | None = None,
         k: int | None = None,
     ) -> list[Node]:
-        # Find nearest active nodes using body vector and summary vector if available.
+        # Multi-channel candidate retrieval: dense embedding channels (body,
+        # summary, HyDE bridge-probe) and sparse lexical channels (BM25 over
+        # full text, BM25 over just the keyword list) are fused by reciprocal
+        # rank fusion, since their raw scores aren't on comparable scales but
+        # their rank positions are. A candidate corroborated by several
+        # independent channels outranks one that only one channel liked.
         if k is None:
             k = self.settings.edge_candidate_k
 
-        ranked: list[str] = []
+        node_id = node.id
+        channels: list[list[str]] = []
 
-        probes = [("vec_body", body_vec)] + (
-            [("vec_summary", summary_vec)] if summary_vec else []
-        )
+        def add_vec_channel(table: str, vector: list[float] | None) -> None:
+            if not vector:
+                return
+            ids = [
+                cid
+                for cid, _distance in self.store.vector_search(vector, table, k + 1)
+                if cid != node_id
+            ]
+            if ids:
+                channels.append(ids)
 
-        # Collect unique nearest-neighbor IDs, excluding the node itself.
-        for table, vector in probes:
-            for candidate_id, _distance in self.store.vector_search(
-                vector, table, k + 1
-            ):
-                if candidate_id != node_id and candidate_id not in ranked:
-                    ranked.append(candidate_id)
+        add_vec_channel("vec_body", body_vec)
+        add_vec_channel("vec_summary", summary_vec)
+        add_vec_channel("vec_bridge", bridge_vec)
+
+        lexical_text = " ".join(filter(None, [node.title, node.body[:1500]]))
+        text_channel = self._lexical_candidate_ids(lexical_text, node_id, k + 1)
+        if text_channel:
+            channels.append(text_channel)
+
+        if node.keywords:
+            keyword_channel = self._lexical_candidate_ids(
+                " ".join(node.keywords), node_id, k + 1
+            )
+            if keyword_channel:
+                channels.append(keyword_channel)
+
+        ranked = self._rrf_fuse(channels)[:_MAX_FUSED_CANDIDATES]
+
+        # Bridge candidates: nodes the scored channels above would never
+        # surface, reached instead via a shared named entity or one hop
+        # through an existing edge of a fused candidate. Additive only,
+        # capped small, still passes through the same downstream LLM
+        # filtering as the rest.
+        bridge = self._bridge_candidate_ids(node_id, ranked, node.entity)
 
         # Load only active candidate nodes.
         candidates = [
-            node
-            for node in (self.store.get_node(cid) for cid in ranked)
-            if node and node.status == NodeStatus.active
+            n
+            for n in (self.store.get_node(cid) for cid in ranked + bridge)
+            if n and n.status == NodeStatus.active
         ]
 
         # Collapse same-as duplicates so the LLM sees fewer redundant candidates.
-        return self._collapse_same_as(candidates)[:k]
+        return self._collapse_same_as(candidates)
+
+    def _lexical_candidate_ids(self, text: str, node_id: str, limit: int) -> list[str]:
+        # BM25 lookup (nodes_fts blends title+summary+body+keywords already).
+        # Sparse/exact-term signal, distinct from the dense vector channels.
+        if not text.strip():
+            return []
+
+        return [
+            n.id for n in self.store.keyword_search(text, limit=limit) if n.id != node_id
+        ]
+
+    def _rrf_fuse(self, channels: list[list[str]], k: int = _RRF_K) -> list[str]:
+        # Reciprocal rank fusion: score[id] = sum over channels of 1/(k+rank).
+        # Only rank position matters, so channels with incomparable raw scores
+        # (vector distance vs. BM25 vs. hop count) combine cleanly.
+        scores: dict[str, float] = {}
+
+        for channel in channels:
+            for rank, candidate_id in enumerate(channel, start=1):
+                scores[candidate_id] = scores.get(candidate_id, 0.0) + 1.0 / (k + rank)
+
+        return sorted(scores, key=lambda cid: scores[cid], reverse=True)
+
+    def _bridge_candidate_ids(
+        self, node_id: str, ranked: list[str], entity: str | None
+    ) -> list[str]:
+        bridge: list[str] = []
+
+        def add(candidate_id: str) -> bool:
+            if (
+                candidate_id != node_id
+                and candidate_id not in ranked
+                and candidate_id not in bridge
+            ):
+                bridge.append(candidate_id)
+            return len(bridge) >= _BRIDGE_CANDIDATE_CAP
+
+        # Same named entity, even if body embeddings sit far apart.
+        if entity and entity.strip():
+            for node in self.store.get_nodes_by_entity(entity):
+                if add(node.id):
+                    return bridge
+
+        # 2-hop: neighbors of the KNN neighbors, via edges already in the graph.
+        for neighbor_id in ranked[:5]:
+            for edge in self.store.get_edges_for_node(neighbor_id):
+                other = (
+                    edge.target_node_id
+                    if edge.source_node_id == neighbor_id
+                    else edge.source_node_id
+                )
+                if add(other):
+                    return bridge
+
+        return bridge
 
     def _link_entity_duplicates(self, node: Node, candidates: list[Node]) -> list[Edge]:
         # Ask the LLM whether the new node is the same real-world entity as a candidate.
@@ -1713,19 +2078,36 @@ class Librarian:
     # region Semantic Edges / Node Persistence
 
     def _build_semantic_edges(
-        self, node: Node, body_vec: list[float], summary_vec: list[float] | None
+        self,
+        node: Node,
+        body_vec: list[float],
+        summary_vec: list[float] | None,
+        bridge_vec: list[float] | None = None,
     ) -> list[Edge]:
-        # Find nearby nodes, then ask the LLM what relationships should be created.
-        candidates = self._knn_candidates(node.id, body_vec, summary_vec)
+        # Find nearby/bridged nodes, then ask the LLM what relationships exist.
+        # Candidates are sent in small groups (best-ranked first) rather than
+        # all at once - see _EDGE_GROUP_SIZE.
+        candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
         if not candidates:
             return []
 
+        edges: list[Edge] = []
+        for start in range(0, len(candidates), _EDGE_GROUP_SIZE):
+            group = candidates[start : start + _EDGE_GROUP_SIZE]
+            edges += self._request_edges_for_group(node, group)
+
+        return edges
+
+    def _request_edges_for_group(
+        self, node: Node, group: list[Node], prompt: str = EDGE_PROMPT
+    ) -> list[Edge]:
         payload = {
             "new_node": {
                 "id": node.id,
                 "title": node.title,
                 "summary": node.summary,
                 "keywords": node.keywords,
+                "header": node.cluster or "",
                 "body": node.body[:4000],
             },
             "candidates": [
@@ -1734,14 +2116,15 @@ class Librarian:
                     "title": c.title,
                     "summary": c.summary,
                     "keywords": c.keywords,
+                    "header": c.cluster or "",
                     "body": c.body[:1200],
                 }
-                for c in candidates
+                for c in group
             ],
         }
 
         result = self.gateway.llm.complete_structured(
-            EDGE_PROMPT, json.dumps(payload, ensure_ascii=False), EdgeSuggestions
+            prompt, json.dumps(payload, ensure_ascii=False), EdgeSuggestions
         )
 
         parsed = (
@@ -1750,7 +2133,7 @@ class Librarian:
             else EdgeSuggestions.model_validate(result)
         )
 
-        allowed = {c.id for c in candidates}
+        allowed = {c.id for c in group}
         edges: list[Edge] = []
 
         for suggestion in parsed.edges:
@@ -1806,8 +2189,8 @@ class Librarian:
 
         self.store.upsert_node(node)
 
-        body_vec, summary_vec = self._store_vectors(node)
-        self._build_semantic_edges(node, body_vec, summary_vec)
+        body_vec, summary_vec, bridge_vec = self._store_vectors(node)
+        self._build_semantic_edges(node, body_vec, summary_vec, bridge_vec)
 
         return node
 
@@ -2013,8 +2396,9 @@ class Librarian:
             body_vec = self.gateway.embedder.embed_document(node.body)
 
         summary_vec = self.store.get_vector(node.id, "vec_summary")
+        bridge_vec = self.store.get_vector(node.id, "vec_bridge")
 
-        candidates = self._knn_candidates(node.id, body_vec, summary_vec)
+        candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
         self._link_entity_duplicates(node, candidates)
 
     def enrich_cascade(
@@ -2331,7 +2715,11 @@ class Librarian:
             tqdm(ordered, desc="recluster: naming clusters", unit="cluster")
         ):
             keywords = self._tfidf_keywords(per_comm[index], doc_freq, n_comms, k=8)
-            label = self._name_cluster(keywords, titles[index][:12], used_labels)
+            try:
+                label = self._name_cluster(keywords, titles[index][:12], used_labels)
+            except ClusterNamingError as exc:
+                log.warning("cluster naming fallback: %s", exc)
+                label = f"クラスタ {index + 1}"
 
             used[label] += 1
             if used[label] > 1:
@@ -2380,9 +2768,7 @@ class Librarian:
             return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text))
 
         if not keywords and not titles:
-            raise SystemExit(
-                "fatal: cluster naming failed: no keywords or titles were available"
-            )
+            return "クラスタ"
 
         user = (
             f"キーワード: {', '.join(keywords) or '(なし)'}\n"
@@ -2399,7 +2785,7 @@ class Librarian:
         try:
             raw = self.gateway.llm.complete(CLUSTER_NAMER_SYSTEM, user)
         except Exception as exc:
-            raise SystemExit(
+            raise ClusterNamingError(
                 f"fatal: cluster naming failed: LLM call raised {type(exc).__name__}: {exc}"
             ) from exc
 
@@ -2407,24 +2793,28 @@ class Librarian:
         name = " ".join(raw.strip().strip("\"'").split())
 
         if not name:
-            raise SystemExit(
+            raise ClusterNamingError(
                 f"fatal: cluster naming failed: empty LLM response; "
                 f"keywords={keywords!r}; titles={titles[:5]!r}"
             )
 
         if len(name) > 60:
-            raise SystemExit(f"fatal: cluster naming failed: name too long: {name!r}")
+            raise ClusterNamingError(
+                f"fatal: cluster naming failed: name too long: {name!r}"
+            )
 
         if len(name.split()) > 6:
-            raise SystemExit(f"fatal: cluster naming failed: too many words: {name!r}")
+            raise ClusterNamingError(
+                f"fatal: cluster naming failed: too many words: {name!r}"
+            )
 
         if name.lower() in {u.lower() for u in used_names}:
-            raise SystemExit(
+            raise ClusterNamingError(
                 f"fatal: cluster naming failed: duplicate cluster name: {name!r}"
             )
 
         if not has_japanese(name):
-            raise SystemExit(
+            raise ClusterNamingError(
                 "fatal: cluster naming failed: LLM returned English-only/non-Japanese name: "
                 f"{name!r}; keywords={keywords!r}; titles={titles[:5]!r}"
             )
@@ -2544,12 +2934,18 @@ class Librarian:
 
     # region Markdown Output Dispatch
 
-    def _load_md_output(self, out_path: Path) -> tuple[list[Node], list[Edge]]:
+    def _load_md_output(
+        self, out_path: Path, raw_source_path: str | Path | None = None
+    ) -> tuple[list[Node], list[Edge]]:
         # Detect output format: old parser output has manifest.json, new one has docs/.
         if (out_path / "manifest.json").exists():
+            # Old format's source_path already points at the whole original
+            # document (persists on disk), so there's nothing to override.
             return self._load_old_manifest_output(out_path)
 
-        return self._load_new_planning_docs_output(out_path)
+        return self._load_new_planning_docs_output(
+            out_path, raw_source_path=raw_source_path
+        )
 
     # endregion Markdown Output Dispatch
 
@@ -2619,7 +3015,7 @@ class Librarian:
     # region New Planning Docs Output Loader
 
     def _load_new_planning_docs_output(
-        self, out_path: Path
+        self, out_path: Path, raw_source_path: str | Path | None = None
     ) -> tuple[list[Node], list[Edge]]:
         # New parser output stores metadata in _planning/ and markdown pages in docs/.
         planning_dir = out_path / "_planning"
@@ -2689,7 +3085,11 @@ class Librarian:
                     or self._humanize(canonical.removesuffix(".md"))
                 ),
                 original_document_name=document_name,
-                source_path=str(md_file),
+                # Prefer the persisted raw source file (holds the whole
+                # original document, so bridge-probe context can see lines
+                # before/after this chunk) over the per-chunk file, which
+                # chunk_and_ingest deletes right after ingest anyway.
+                source_path=str(raw_source_path) if raw_source_path else str(md_file),
                 source_ranges=ranges,
                 summary=cov_rec.get("summary") or meta.get("summary") or "",
                 cluster=cov_rec.get("header") or meta_rec.get("header") or "General",

@@ -20,12 +20,14 @@ load_dotenv()
 # CONFIG VALUES (env-overridable, see .env)
 # =========================
 
-MARKDOWN_FOLDER = "/home/seigyo/llm-wiki/mineru/"
+MARKDOWN_FOLDER = os.environ.get("MARKDOWN_FOLDER", "./mineru")
 
 # Number of Markdown files to process at the same time.
 FILE_CONCURRENCY = 5
 
-MERMAID_PUPPETEER_CONFIG_FILE = "/home/seigyo/llm-wiki/puppeteer-config.json"
+MERMAID_PUPPETEER_CONFIG_FILE = os.environ.get(
+    "PUPPETEER_CONFIG_PATH", "./puppeteer-config.json"
+)
 
 OUTPUT_FILE = None
 # If OUTPUT_FILE is None, output will be:
@@ -135,6 +137,7 @@ class LLMAsyncClient:
 # MERMAID VALIDATION CONFIG
 # =========================
 
+ENABLE_MERMAID_DIAGRAMS = True
 VALIDATE_MERMAID = True
 MERMAID_CLI_BIN = "mmdc"
 MERMAID_REPAIR_ATTEMPTS = 2
@@ -144,7 +147,7 @@ MERMAID_PARSE_TIMEOUT_SECONDS = 30
 #   If mmdc is missing, stop with an error.
 # False:
 #   If mmdc is missing, warn and skip Mermaid validation.
-MERMAID_CLI_REQUIRED = True
+MERMAID_CLI_REQUIRED = False
 
 
 # =========================
@@ -574,7 +577,7 @@ async def validate_mermaid_code_with_mmdc(code: str, diagram_index: int):
             f"{puppeteer_config_file}\n\n"
             "Expected config should point to your working Chrome Headless Shell, for example:\n"
             "{\n"
-            '  "executablePath": "/home/seigyo/llm-wiki/chrome-headless-shell-linux64/chrome-headless-shell",\n'
+            '  "executablePath": "/path/to/chrome-headless-shell",\n'
             '  "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]\n'
             "}"
         )
@@ -884,7 +887,7 @@ async def render_mermaid_code_to_png_data_url(code: str, diagram_index: int):
             f"{puppeteer_config_file}\n\n"
             "Expected config should point to your working Chrome Headless Shell, for example:\n"
             "{\n"
-            '  "executablePath": "/home/seigyo/llm-wiki/chrome-headless-shell-linux64/chrome-headless-shell",\n'
+            '  "executablePath": "/path/to/chrome-headless-shell",\n'
             '  "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]\n'
             "}"
         )
@@ -1036,9 +1039,11 @@ def build_original_image_blocks_for_compare(images):
             image_url = img["resolved"]
         else:
             if not os.path.exists(img["resolved"]):
-                raise FileNotFoundError(
-                    f"Image not found for visual comparison: {img['resolved']}"
+                print(
+                    "[WARN] Skipping missing image for visual comparison: "
+                    f"{img['resolved']}"
                 )
+                continue
 
             image_url = image_file_to_data_url(img["resolved"])
 
@@ -1456,6 +1461,52 @@ async def improve_mermaid_visual_match_loop(
 def build_reconstruction_prompt(
     markdown_file: Path, index: int, original_line: str, context: str
 ) -> str:
+    if ENABLE_MERMAID_DIAGRAMS:
+        diagram_guidance = (
+            "For flowcharts, architecture diagrams, block diagrams, dependency graphs, sequence diagrams, or data-flow diagrams:\n"
+            "- Output a Mermaid diagram whenever possible.\n"
+            "- Use flowchart TD, flowchart LR, graph TD, graph LR, sequenceDiagram, or another appropriate Mermaid syntax.\n"
+            "- Include every visible node, box, component, actor, storage element, process, file, subsystem, and external system.\n"
+            "- Include every visible arrow, line, connection, edge, and data flow.\n"
+            "- Preserve arrow direction when visible.\n"
+            "- Preserve labels on arrows if visible.\n"
+            "- Preserve grouping boundaries, containers, subsystems, layers, computers, networks, and external actors.\n"
+            "- After the Mermaid block, include detailed reconstruction notes describing layout, direction, grouping, "
+            "line styles, missing details, and visual features Mermaid cannot express.\n\n"
+            "Mermaid syntax requirements:\n"
+            "- Mermaid diagrams must be parseable by mermaid-cli.\n"
+            "- Use simple ASCII node IDs like n1, n2, server1, process_a.\n"
+            "- Put Japanese labels, spaces, parentheses, punctuation, and long text inside quoted labels.\n"
+            '- Good: n1["エラー処理機能"] --> n2["ログファイル"]\n'
+            "- Bad: エラー処理機能 --> ログファイル\n"
+            "- Do not put Markdown bullets, notes, prose, or table syntax inside Mermaid code blocks.\n"
+            "- Mermaid code blocks must contain only Mermaid syntax.\n"
+            "- If a detailed visual feature is hard to express in Mermaid, keep the Mermaid simple and explain the detail outside the code block.\n\n"
+        )
+        reconstructed_content = (
+            "<Markdown table, Mermaid diagram, transcribed text, or detailed structured representation>"
+        )
+        mermaid_format_hint = (
+            "If using Mermaid, include it as a fenced mermaid code block exactly like:\n"
+            "```mermaid\n"
+            "flowchart TD\n"
+            '    A["Example"] --> B["Example"]\n'
+            "```\n\n"
+        )
+    else:
+        diagram_guidance = (
+            "For flowcharts, architecture diagrams, block diagrams, dependency graphs, sequence diagrams, or data-flow diagrams:\n"
+            "- Do not output Mermaid code blocks.\n"
+            "- Reconstruct the diagram as structured Markdown text instead.\n"
+            "- Include every visible node, box, component, actor, storage element, process, file, subsystem, and external system.\n"
+            "- Include every visible arrow, line, connection, edge, and data flow.\n"
+            "- Preserve arrow direction, labels, grouping boundaries, containers, layers, and layout notes when visible.\n\n"
+        )
+        reconstructed_content = (
+            "<Markdown table, structured node/edge list, transcribed text, or detailed representation>"
+        )
+        mermaid_format_hint = ""
+
     return (
         "You are replacing an embedded image in a Markdown technical document with a reconstruction-quality textual representation.\n\n"
         "The goal is NOT to write a short caption. The goal is to extract enough information that a reader could "
@@ -1479,26 +1530,8 @@ def build_reconstruction_prompt(
         "- The output may be multiline.\n"
         "- Return only the Markdown replacement for the image line.\n"
         "- Do not include any preface like 'Here is the reconstruction'.\n\n"
-        "For flowcharts, architecture diagrams, block diagrams, dependency graphs, sequence diagrams, or data-flow diagrams:\n"
-        "- Output a Mermaid diagram whenever possible.\n"
-        "- Use flowchart TD, flowchart LR, graph TD, graph LR, sequenceDiagram, or another appropriate Mermaid syntax.\n"
-        "- Include every visible node, box, component, actor, storage element, process, file, subsystem, and external system.\n"
-        "- Include every visible arrow, line, connection, edge, and data flow.\n"
-        "- Preserve arrow direction when visible.\n"
-        "- Preserve labels on arrows if visible.\n"
-        "- Preserve grouping boundaries, containers, subsystems, layers, computers, networks, and external actors.\n"
-        "- After the Mermaid block, include detailed reconstruction notes describing layout, direction, grouping, "
-        "line styles, missing details, and visual features Mermaid cannot express.\n\n"
-        "Mermaid syntax requirements:\n"
-        "- Mermaid diagrams must be parseable by mermaid-cli.\n"
-        "- Use simple ASCII node IDs like n1, n2, server1, process_a.\n"
-        "- Put Japanese labels, spaces, parentheses, punctuation, and long text inside quoted labels.\n"
-        '- Good: n1["エラー処理機能"] --> n2["ログファイル"]\n'
-        "- Bad: エラー処理機能 --> ログファイル\n"
-        "- Do not put Markdown bullets, notes, prose, or table syntax inside Mermaid code blocks.\n"
-        "- Mermaid code blocks must contain only Mermaid syntax.\n"
-        "- If a detailed visual feature is hard to express in Mermaid, keep the Mermaid simple and explain the detail outside the code block.\n\n"
-        "For tables:\n"
+        + diagram_guidance
+        + "For tables:\n"
         "- Recreate the table as a Markdown table.\n"
         "- Preserve all headers, row labels, column labels, values, merged-cell meaning, units, footnotes, and notes.\n"
         "- If the table has merged cells, explain the merge/grouping after the table.\n"
@@ -1524,15 +1557,11 @@ def build_reconstruction_prompt(
         "Type: <table / flowchart / block diagram / chart / screenshot / photo / other>\n"
         "Title/caption: <visible title or context-derived figure title if available>\n"
         "Reconstructed content:\n"
-        "<Markdown table, Mermaid diagram, transcribed text, or detailed structured representation>\n"
+        f"{reconstructed_content}\n"
         "Detailed notes: <layout, relationships, visual encoding, missing/unclear text, and context-based meaning>\n"
         "]\n\n"
-        "If using Mermaid, include it as a fenced mermaid code block exactly like:\n"
-        "```mermaid\n"
-        "flowchart TD\n"
-        '    A["Example"] --> B["Example"]\n'
-        "```\n\n"
-        "Make the output detailed enough that another person could redraw the image approximately from the text alone.\n\n"
+        + mermaid_format_hint
+        + "Make the output detailed enough that another person could redraw the image approximately from the text alone.\n\n"
         f"Markdown file: {markdown_file}\n"
         f"Image line number: {index + 1}\n\n"
         f"Original image Markdown line:\n{original_line}\n\n"
@@ -1567,7 +1596,22 @@ async def describe_image_line(
             return index, lines[index]
 
         context = build_context(lines, index)
-        original_image_blocks = build_original_image_blocks_for_compare(images)
+        resolvable_images = []
+        for img in images:
+            if is_remote_url(img["resolved"]) or os.path.exists(img["resolved"]):
+                resolvable_images.append(img)
+            else:
+                print(
+                    f"[WARN] Skipping missing image for line {index + 1}: "
+                    f"{img['resolved']}"
+                )
+
+        if not resolvable_images:
+            return index, lines[index]
+
+        original_image_blocks = build_original_image_blocks_for_compare(
+            resolvable_images
+        )
 
         prompt = build_reconstruction_prompt(
             markdown_file=markdown_file,
@@ -1583,15 +1627,10 @@ async def describe_image_line(
             }
         ]
 
-        for image_number, img in enumerate(images, start=1):
+        for image_number, img in enumerate(resolvable_images, start=1):
             if is_remote_url(img["resolved"]):
                 image_url = img["resolved"]
             else:
-                if not os.path.exists(img["resolved"]):
-                    raise FileNotFoundError(
-                        f"Image not found for line {index + 1}: {img['resolved']}"
-                    )
-
                 image_url = image_file_to_data_url(img["resolved"])
 
             content.append(
@@ -1678,6 +1717,17 @@ async def describe_image_line(
             print(f"Description for line {index + 1} looks too shallow. Retrying...")
             print("")
 
+            if ENABLE_MERMAID_DIAGRAMS:
+                diagram_retry_instruction = (
+                    "If it is a table, output a Markdown table. If it is a flowchart, block diagram, architecture diagram, "
+                    "or data-flow diagram, output a Mermaid diagram plus detailed notes. "
+                )
+            else:
+                diagram_retry_instruction = (
+                    "If it is a table, output a Markdown table. If it is a flowchart, block diagram, architecture diagram, "
+                    "or data-flow diagram, output a structured node/edge list plus detailed notes. "
+                )
+
             retry_messages = [
                 {
                     "role": "user",
@@ -1692,8 +1742,8 @@ async def describe_image_line(
                     "content": (
                         "The previous answer is too shallow or caption-like. Rewrite it as a reconstruction-quality "
                         "Markdown replacement. The reader should be able to approximately redraw the original image from your output. "
-                        "If it is a table, output a Markdown table. If it is a flowchart, block diagram, architecture diagram, "
-                        "or data-flow diagram, output a Mermaid diagram plus detailed notes. Preserve all visible labels, arrows, "
+                        + diagram_retry_instruction
+                        + "Preserve all visible labels, arrows, "
                         "nodes, directions, groups, titles, captions, values, Japanese text, English text, and relationships. "
                         "Do not summarize. Do not merely say what the image is about. Return only the replacement Markdown. "
                         "Multiline output is allowed and preferred."
@@ -1767,19 +1817,17 @@ async def describe_image_line(
 
         image_tags = []
 
-        for img in images:
+        for img in resolvable_images:
             if is_remote_url(img["resolved"]):
                 src = img["resolved"]
             else:
-                if not os.path.exists(img["resolved"]):
-                    raise FileNotFoundError(
-                        f"Image not found for line {index + 1}: {img['resolved']}"
-                    )
-
                 src = image_file_to_data_url(img["resolved"])
 
             alt_escaped = img["alt"].replace('"', "&quot;")
             image_tags.append(f'<img src="{src}" alt="{alt_escaped}">')
+
+        if not image_tags and not description:
+            return index, lines[index]
 
         media_html = "\n    ".join(image_tags)
         safe_description = description.replace("\n\n", "\n") if description else ""
