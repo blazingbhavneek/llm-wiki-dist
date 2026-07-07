@@ -2,17 +2,18 @@
 
 import subprocess
 import sys
+import os
 from pathlib import Path
 
-PDF_DIR = Path("/home/seigyo/llm-wiki/pdfs")
-OUTPUT_DIR = Path("/home/seigyo/llm-wiki/mineru")
+PDF_DIR = Path(os.environ.get("PDF_DIR", "./pdfs"))
+OUTPUT_DIR = Path(os.environ.get("MINERU_OUTPUT_DIR", "./mineru"))
 GPU_MEMORY_UTILIZATION = "0.05"
 
 
-def main():
+def main() -> int:
     if not PDF_DIR.exists():
         print(f"ERROR: PDF directory does not exist: {PDF_DIR}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -22,7 +23,7 @@ def main():
 
     if not pdf_files:
         print(f"No PDF files found in: {PDF_DIR}")
-        return
+        return 0
 
     print(f"Found {len(pdf_files)} PDF file(s).")
     print(f"PDF dir: {PDF_DIR}")
@@ -60,7 +61,7 @@ def main():
             result = subprocess.run(cmd)
         except KeyboardInterrupt:
             print("\nInterrupted by user. Exiting.")
-            sys.exit(130)
+            return 130
         except Exception as e:
             print(f"  ERROR: Failed to start command: {e}", file=sys.stderr)
             failed += 1
@@ -84,7 +85,8 @@ def main():
     print(f"  Completed:  {completed}")
     print(f"  Skipped:    {skipped}")
     print(f"  Failed:     {failed}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

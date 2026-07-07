@@ -48,6 +48,12 @@ const STR = {
     unknownFile: 'ファイル名不明',
     resultNotReady: '結果はまだ準備できていません。',
     deleteConfirm: 'この項目を一覧から削除しますか？',
+    imageDescriptions: '画像説明を生成',
+    imageDescriptionsHelp:
+      '画像説明の生成は時間がかかるため、必要な場合だけ有効にしてください。',
+    mermaidDiagrams: 'Mermaid 図を生成',
+    mermaidDiagramsHelp:
+      'Mermaid 図はフロー図をテキストとして残せますが、検証と修復のため追加処理が必要です。',
     footer:
       '画像対応モデルであれば画像説明付き Markdown が返ります。画像非対応の場合は、バックエンド側のフォールバック処理により画像を埋め込んだ Markdown が返ります。',
   },
@@ -90,6 +96,12 @@ const STR = {
     unknownFile: 'Unknown filename',
     resultNotReady: 'The result is not ready yet.',
     deleteConfirm: 'Delete this item from the list?',
+    imageDescriptions: 'Generate image descriptions',
+    imageDescriptionsHelp:
+      'Image description generation takes a long time, so enable it only when needed.',
+    mermaidDiagrams: 'Generate Mermaid diagrams',
+    mermaidDiagramsHelp:
+      'Mermaid diagrams can capture flow diagrams in text, but validation and repair add extra processing.',
     footer:
       'An image-capable model returns Markdown with image descriptions. Without image support, the backend falls back to Markdown with embedded images.',
   },
@@ -300,6 +312,8 @@ export default function PdfParserView({
   const [baseUrl, setBaseUrl] = useState(import.meta.env.VITE_OPENAI_BASE_URL || 'http://localhost:8080/v1')
   const [apiKey, setApiKey] = useState(import.meta.env.VITE_OPENAI_API_KEY || '')
   const [model, setModel] = useState(import.meta.env.VITE_MODEL || 'openai/gpt-oss-120b')
+  const [generateImageDescriptions, setGenerateImageDescriptions] = useState(false)
+  const [generateMermaidDiagrams, setGenerateMermaidDiagrams] = useState(false)
 
   const [busy, setBusy] = useState(false)
   const [queueBusy, setQueueBusy] = useState(false)
@@ -315,6 +329,12 @@ export default function PdfParserView({
     queueRef.current = queueItems
     saveStoredQueue(queueItems)
   }, [queueItems])
+
+  useEffect(() => {
+    if (!generateImageDescriptions) {
+      setGenerateMermaidDiagrams(false)
+    }
+  }, [generateImageDescriptions])
 
   const upsertQueueItems = (items) => {
     setQueueItems((prev) => mergeQueueItems(prev, items))
@@ -423,6 +443,11 @@ export default function PdfParserView({
       fd.append('base_url', baseUrl.trim())
       fd.append('api_key', apiKey.trim())
       fd.append('model', model.trim())
+      fd.append('describe_images', generateImageDescriptions ? 'true' : 'false')
+      fd.append(
+        'generate_mermaid',
+        generateImageDescriptions && generateMermaidDiagrams ? 'true' : 'false'
+      )
 
       const uploadRes = await fetch(`${apiBase}/upload`, {
         method: 'POST',
@@ -623,6 +648,34 @@ export default function PdfParserView({
               disabled={busy}
               password
             />
+
+            <div className="grid gap-[8px]">
+              <ToggleField
+                label={t.imageDescriptions}
+                checked={generateImageDescriptions}
+                onChange={setGenerateImageDescriptions}
+                disabled={busy}
+              />
+
+              <p className="m-0 text-[12px] leading-[1.45] text-muted">
+                {t.imageDescriptionsHelp}
+              </p>
+
+              {generateImageDescriptions && (
+                <div className="grid gap-[8px]">
+                  <ToggleField
+                    label={t.mermaidDiagrams}
+                    checked={generateMermaidDiagrams}
+                    onChange={setGenerateMermaidDiagrams}
+                    disabled={busy}
+                  />
+
+                  <p className="m-0 text-[12px] leading-[1.45] text-muted">
+                    {t.mermaidDiagramsHelp}
+                  </p>
+                </div>
+              )}
+            </div>
 
             <div className="mt-[4px] flex flex-wrap items-center gap-[10px]">
               <button
@@ -840,6 +893,27 @@ function Field({
         onChange={(e) => onChange(e.target.value)}
         className="h-[38px] w-full border border-line bg-white px-[11px] text-[13px] text-ink outline-none placeholder:text-muted/60 focus:border-blue/50 disabled:opacity-60"
       />
+    </label>
+  )
+}
+
+function ToggleField({
+  label,
+  checked,
+  onChange,
+  disabled,
+}) {
+  return (
+    <label className="flex items-center gap-[9px] text-[13px] font-bold text-slate-700">
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+        className="h-[15px] w-[15px] accent-blue disabled:opacity-60"
+      />
+
+      <span>{label}</span>
     </label>
   )
 }

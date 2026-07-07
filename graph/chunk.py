@@ -23,16 +23,16 @@ from pydantic import BaseModel, Field
 # Runtime config
 # ---------------------------------------------------------------------
 
-SOURCE_PATH = "/home/seigyo/llm-wiki/input_mini"
-OUTPUT_ROOT = "/home/seigyo/llm-wiki/output_mini"
+SOURCE_PATH = os.environ.get("WIKI_CHUNK_SOURCE_PATH", "input_mini")
+OUTPUT_ROOT = os.environ.get("WIKI_CHUNK_OUTPUT_ROOT", "output_mini")
 
 PHASE = "all"  # all | generate | generate-flat | verify | repair
 
-BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
+BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1")
 API_KEY = os.environ.get("OPENAI_API_KEY", "local")
 
-GEN_MODEL = "gemma-4-31B"
-VERIFY_MODEL = "gemma-4-31B"
+GEN_MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")
+VERIFY_MODEL = os.environ.get("WIKI_VERIFY_MODEL", GEN_MODEL)
 
 GENERATION_LINES = 10
 VERIFICATION_LINES = 25
@@ -49,7 +49,17 @@ TIMEOUT = 300
 
 CLEAN_OUTPUT = True
 
-PARTITION_RETRY_ATTEMPTS = 3
+PARTITION_RETRY_ATTEMPTS = 6
+PARTITION_RETRY_BACKOFF_SECONDS = 2.0
+CHUNK_FALLBACK_MECHANICAL = True
+
+
+class ChunkPlanningError(RuntimeError):
+    pass
+
+
+class JobCancelled(RuntimeError):
+    pass
 
 # ---------------------------------------------------------------------
 # Pydantic schemas
@@ -1769,6 +1779,7 @@ async def split_window_until_valid(
     pending: ConceptFilePlan | None,
     label: str,
     max_output_tokens: int = 8000,
+    stop_check: Callable[[], bool] | None = None,
 ) -> list[ConceptFilePlan]:
     """
     Calls the model until it returns exact coverage for source_start-source_end.
@@ -1789,10 +1800,12 @@ async def split_window_until_valid(
         source_start,
     )
 
-    attempt = 1
     last_error: str | None = None
 
-    while True:
+    for attempt in range(1, PARTITION_RETRY_ATTEMPTS + 1):
+        if stop_check and stop_check():
+            raise JobCancelled("chunk planning cancelled")
+
         print(
             f"[Planning] {label}: split attempt {attempt}, "
             f"source lines {source_start}-{source_end}"
@@ -1856,7 +1869,31 @@ async def split_window_until_valid(
             f"Reason: {last_error}"
         )
 
-        attempt += 1
+        if attempt < PARTITION_RETRY_ATTEMPTS:
+            await asyncio.sleep(
+                min(30.0, PARTITION_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            )
+
+    if CHUNK_FALLBACK_MECHANICAL:
+        fallback_title = f"{label} 自動分割"
+        print(
+            f"[Planning] {label}: using mechanical fallback after "
+            f"{PARTITION_RETRY_ATTEMPTS} attempts. Last error: {last_error}"
+        )
+        return [
+            ConceptFilePlan(
+                title=fallback_title,
+                filename=normalize_filename(f"{label}.md", fallback_title),
+                source_start=source_start,
+                source_end=source_end,
+                summary="LLMによる分割に失敗したため、元の範囲を機械的に保持しました。",
+            )
+        ]
+
+    raise ChunkPlanningError(
+        f"{label}: could not produce a valid concept split after "
+        f"{PARTITION_RETRY_ATTEMPTS} attempts. Last error: {last_error}"
+    )
 
 # ---------------------------------------------------------------------
 # Streaming concept planning
@@ -1869,6 +1906,7 @@ async def plan_concept_files_streaming(
     source_lines: list[str],
     target_lines: int = 100,
     max_extra: int = 30,
+    stop_check: Callable[[], bool] | None = None,
 ) -> list[ConceptFilePlan]:
     """
     Main planner.
@@ -1909,6 +1947,9 @@ async def plan_concept_files_streaming(
     pending: ConceptFilePlan | None = None
 
     for chunk_index, (chunk_start, chunk_end) in enumerate(global_chunks, start=1):
+        if stop_check and stop_check():
+            raise JobCancelled("chunk planning cancelled")
+
         is_final_chunk = chunk_index == len(global_chunks)
 
         if pending is not None:
@@ -1926,6 +1967,7 @@ async def plan_concept_files_streaming(
             source_end=prompt_end,
             pending=pending,
             label=label,
+            stop_check=stop_check,
         )
 
         if not split:
@@ -2329,6 +2371,7 @@ async def enrich_concept_plan(
     llm: ChatOpenAI,
     original_filename: str,
     files: list[ConceptFilePlan],
+    stop_check: Callable[[], bool] | None = None,
 ) -> EnrichmentResult:
     """
     Sequentially infers headers for each file and a global filename.
@@ -2357,17 +2400,25 @@ async def enrich_concept_plan(
 
     # First chunk
     print(f"[Enrichment] Inferring header for chunk 1/{len(files)}...")
-    first_raw = await structured_ainvoke(
-        llm,
-        ChunkHeader,
-        build_first_chunk_prompt(original_filename, files[0]),
-        max_output_tokens=100,
-    )
-    first_header = ChunkHeader.model_validate(first_raw).header
+    if stop_check and stop_check():
+        raise JobCancelled("chunk enrichment cancelled")
+    try:
+        first_raw = await structured_ainvoke(
+            llm,
+            ChunkHeader,
+            build_first_chunk_prompt(original_filename, files[0]),
+            max_output_tokens=100,
+        )
+        first_header = ChunkHeader.model_validate(first_raw).header
+    except Exception as e:
+        print(f"[Enrichment] Failed to infer header for chunk 1: {e}. Using fallback.")
+        first_header = "一般"
     inferred_headers.append(first_header)
 
     # Subsequent chunks
     for i in range(1, len(files)):
+        if stop_check and stop_check():
+            raise JobCancelled("chunk enrichment cancelled")
         print(f"[Enrichment] Inferring header for chunk {i+1}/{len(files)}...")
         prompt = build_subsequent_chunk_prompt(
             original_filename=original_filename,
@@ -2375,8 +2426,15 @@ async def enrich_concept_plan(
             prev=files[i - 1],
             prev_header=inferred_headers[-1],
         )
-        raw = await structured_ainvoke(llm, ChunkHeader, prompt, max_output_tokens=100)
-        header = ChunkHeader.model_validate(raw).header
+        try:
+            raw = await structured_ainvoke(llm, ChunkHeader, prompt, max_output_tokens=100)
+            header = ChunkHeader.model_validate(raw).header
+        except Exception as e:
+            print(
+                f"[Enrichment] Failed to infer header for chunk {i+1}: {e}. "
+                "Using fallback."
+            )
+            header = "一般"
         inferred_headers.append(header)
 
     return EnrichmentResult(
@@ -2535,6 +2593,7 @@ def run_chunk_pipeline(
     out_dir: Path,
     llm: Any = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> SimpleNamespace:
     return _run_async_blocking(
         arun_chunk_pipeline(
@@ -2543,6 +2602,7 @@ def run_chunk_pipeline(
             out_dir=out_dir,
             llm=llm,
             on_progress=on_progress,
+            stop_check=stop_check,
         )
     )
 
@@ -2554,6 +2614,7 @@ async def arun_chunk_pipeline(
     out_dir: Path,
     llm: Any = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> SimpleNamespace:
     source_path = Path(document_name)
     docs_dir = out_dir / "docs"
@@ -2568,6 +2629,9 @@ async def arun_chunk_pipeline(
 
     source_lines = source_text.splitlines()
     source_line_count = len(source_lines)
+
+    if stop_check and stop_check():
+        raise JobCancelled("chunk pipeline cancelled")
 
     manifest = init_manifest(source_path)
 
@@ -2609,6 +2673,7 @@ async def arun_chunk_pipeline(
             source_lines=source_lines,
             target_lines=100,
             max_extra=MAX_CHUNK_EXTRA,
+            stop_check=stop_check,
         )
 
         assert_concept_coverage(
@@ -2643,6 +2708,7 @@ async def arun_chunk_pipeline(
             llm=llm,
             original_filename=source_path.name,
             files=concept_files,
+            stop_check=stop_check,
         )
 
         inferred_headers = [f.header for f in enrichment_result.files]

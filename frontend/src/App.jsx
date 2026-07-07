@@ -55,7 +55,7 @@ export default function App() {
   }
 
   const { overrides, applyOverrides } = useOverrides()
-  const { rawById, graph, docLibrary, health, loading, error, reload } =
+  const { rawById, graph, docLibrary, health, loading, error, errorRetryable, reload, retry } =
     useGraphData()
   const { assimPending, startAssimilationPolling } = useAssimilation()
 
@@ -346,6 +346,15 @@ export default function App() {
           <div className="max-w-[420px] text-center">
             <p className="font-bold text-red">{t.cannotReach}</p>
             <p className="mt-2 text-[13px] text-muted">{error}</p>
+            {errorRetryable && (
+              <button
+                type="button"
+                onClick={retry}
+                className="mt-4 border border-line bg-white px-[13px] py-[8px] text-[13px] font-bold text-slate-700 hover:border-line2"
+              >
+                再試行
+              </button>
+            )}
           </div>
         </Centered>
       )

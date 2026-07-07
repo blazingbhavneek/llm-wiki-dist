@@ -45,6 +45,7 @@ def _row_to_node(row: sqlite3.Row) -> Node:
         keywords=json.loads(row["keywords_json"] or "[]"),
         summary=row["summary"] or "",
         cluster=row["cluster"],
+        bridge_probe=(row["bridge_probe"] or "") if "bridge_probe" in row.keys() else "",
         status=row["status"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -381,6 +382,7 @@ class GraphStore:
             "source_material_hash": "TEXT",
             "entity": "TEXT",
             "claims_json": "TEXT NOT NULL DEFAULT '[]'",
+            "bridge_probe": "TEXT",
         }
 
         # Add any missing columns to the existing nodes table.
@@ -461,7 +463,7 @@ class GraphStore:
         # Virtual tables are special SQLite tables powered by extensions/modules.
         # We use them here for features normal tables do not provide efficiently,
         # such as full-text search with FTS5 or vector search with sqlite-vec.
-        for table in ("vec_body", "vec_summary", "vec_search_item"):
+        for table in ("vec_body", "vec_summary", "vec_bridge", "vec_search_item"):
             self.connection.execute(
                 f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} "
                 f"USING vec0(node_id TEXT PRIMARY KEY, embedding float[{dim}])"
@@ -490,6 +492,7 @@ class GraphStore:
         # These are recreated later by ensure_vec_tables(...).
         self.connection.execute("DROP TABLE IF EXISTS vec_body")
         self.connection.execute("DROP TABLE IF EXISTS vec_summary")
+        self.connection.execute("DROP TABLE IF EXISTS vec_bridge")
         self.connection.execute("DROP TABLE IF EXISTS vec_search_item")
 
         # Remove the saved embedding dimension from metadata.
@@ -627,11 +630,12 @@ class GraphStore:
                 keywords_json,
                 summary,
                 cluster,
+                bridge_probe,
                 status,
                 created_at,
                 updated_at
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 body=excluded.body,
                 type=excluded.type,
@@ -646,6 +650,7 @@ class GraphStore:
                 keywords_json=excluded.keywords_json,
                 summary=excluded.summary,
                 cluster=excluded.cluster,
+                bridge_probe=excluded.bridge_probe,
                 status=excluded.status,
                 updated_at=excluded.updated_at
             """,
@@ -665,6 +670,7 @@ class GraphStore:
                 json.dumps(node.keywords),
                 node.summary,
                 node.cluster,
+                node.bridge_probe,
                 node.status.value,
                 node.created_at,
                 node.updated_at,
@@ -808,6 +814,17 @@ class GraphStore:
         return [
             _row_to_node(r) for r in self.connection.execute(sql, params).fetchall()
         ]
+
+    def get_nodes_by_entity(self, entity: str, limit: int = 20) -> list[Node]:
+        # Nodes tagged with the exact same entity string. Cheap indexed lookup
+        # (idx_nodes_entity) used as a bridge-candidate channel: catches nodes
+        # that share a named subject even when their body embeddings sit far apart.
+        rows = self.connection.execute(
+            "SELECT * FROM nodes WHERE entity=? AND status='active' "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (entity, limit),
+        ).fetchall()
+        return [_row_to_node(r) for r in rows]
 
     def upsert_edge(self, edge: Edge) -> None:
         # Upserting modifies the database, so block it in readonly mode.

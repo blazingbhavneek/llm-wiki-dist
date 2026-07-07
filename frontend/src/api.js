@@ -4,14 +4,35 @@
 const BASE = import.meta.env.VITE_API_URL || 'http://localhost:51023'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+export class ApiError extends Error {
+  constructor(status, payload, fallback) {
+    const detail = payload?.detail || fallback || `Request failed: ${status}`
+    super(detail)
+    this.name = 'ApiError'
+    this.status = status
+    this.detail = detail
+    this.retryable = Boolean(payload?.retryable)
+    this.code = payload?.code || 'request_failed'
+    this.payload = payload
+  }
+}
+
+async function parseError(res) {
+  const text = await res.text().catch(() => res.statusText)
+  try {
+    return JSON.parse(text)
+  } catch {
+    return { detail: text || res.statusText, retryable: res.status >= 500 }
+  }
+}
+
 async function req(path, opts) {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   })
   if (!res.ok) {
-    const detail = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status}: ${detail}`)
+    throw new ApiError(res.status, await parseError(res), res.statusText)
   }
   return res.status === 204 ? null : res.json()
 }
@@ -34,10 +55,18 @@ async function waitForJob(job, { timeoutMs = 10 * 60 * 1000, onProgress } = {}) 
   }
 
   if (current.status === 'failed') {
-    throw new Error(current.error || `Write job failed: ${current.type}`)
+    throw new ApiError(500, {
+      detail: current.error || `Write job failed: ${current.type}`,
+      retryable: true,
+      code: 'write_job_failed',
+    })
   }
   if (current.status === 'cancelled') {
-    throw new Error(`Write job was cancelled: ${current.type}`)
+    throw new ApiError(409, {
+      detail: `Write job was cancelled: ${current.type}`,
+      retryable: false,
+      code: 'write_job_cancelled',
+    })
   }
 
   return current.result
@@ -59,6 +88,9 @@ function unwrapAdd(result, jobOpts) {
 }
 
 export const api = {
+  ready: () => req('/api/ready'),
+  restartBootstrap: () => req('/api/admin/restart-bootstrap', { method: 'POST' }),
+
   graph: () => req('/api/graph'),
   health: (nodeId) => req(`/api/health${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
   recluster: (resolution = 1.0, jobOpts) =>
@@ -89,8 +121,7 @@ export const api = {
       body: JSON.stringify({ question, overrides }),
     })
     if (!res.ok || !res.body) {
-      const detail = await res.text().catch(() => res.statusText)
-      throw new Error(`${res.status}: ${detail}`)
+      throw new ApiError(res.status, await parseError(res), res.statusText)
     }
 
     const reader = res.body.getReader()
