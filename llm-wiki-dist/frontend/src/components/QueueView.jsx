@@ -13,7 +13,7 @@ import { useT } from '../i18n.jsx'
 // Self-contained librarian write-queue monitor. Deliberately has no imports
 // from api.js or hooks so it can be dropped into another checkout with only
 // a sidebar entry + a route line (it talks to the backend directly).
-const API_BASE = import.meta.env.VITE_API_URL || ''
+const API_BASE = import.meta.env.VITE_API_URL ?? window.location.pathname.replace(/\/$/, '')
 const POLL_MS = 2500
 
 const STR = {

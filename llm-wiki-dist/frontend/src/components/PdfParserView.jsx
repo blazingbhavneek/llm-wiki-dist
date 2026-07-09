@@ -309,9 +309,9 @@ export default function PdfParserView({
   const queueRef = useRef([])
 
   const [file, setFile] = useState(null)
-  const [baseUrl, setBaseUrl] = useState(import.meta.env.VITE_OPENAI_BASE_URL || 'http://localhost:8080/v1')
+  const [baseUrl, setBaseUrl] = useState(import.meta.env.VITE_OPENAI_BASE_URL || 'http://10.160.144.101:51029/v1')
   const [apiKey, setApiKey] = useState(import.meta.env.VITE_OPENAI_API_KEY || '')
-  const [model, setModel] = useState(import.meta.env.VITE_MODEL || 'openai/gpt-oss-120b')
+  const [model, setModel] = useState(import.meta.env.VITE_MODEL || 'gemma-4-31B')
   const [generateImageDescriptions, setGenerateImageDescriptions] = useState(false)
   const [generateMermaidDiagrams, setGenerateMermaidDiagrams] = useState(false)
 
@@ -627,7 +627,7 @@ export default function PdfParserView({
                 label="Base URL"
                 value={baseUrl}
                 onChange={setBaseUrl}
-                placeholder="http://localhost:8080/v1"
+                placeholder="http://10.160.144.101:51029/v1"
                 disabled={busy}
               />
 
@@ -635,7 +635,7 @@ export default function PdfParserView({
                 label="Model"
                 value={model}
                 onChange={setModel}
-                placeholder="openai/gpt-oss-120b"
+                placeholder="gemma-4-31B"
                 disabled={busy}
               />
             </div>

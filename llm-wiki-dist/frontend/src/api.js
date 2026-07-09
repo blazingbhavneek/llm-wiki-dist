@@ -1,7 +1,9 @@
 // Thin client over the FastAPI backend (app.py).
 // Base URL configurable via VITE_API_URL; defaults to the dev server port.
 
-const BASE = import.meta.env.VITE_API_URL || ''
+// Served under {prefix}/{db}/ behind the proxy; derive the API base from the URL
+// the SPA was loaded from so calls hit {prefix}/{db}/api/... for the right wiki.
+const BASE = import.meta.env.VITE_API_URL ?? window.location.pathname.replace(/\/$/, '')
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export class ApiError extends Error {

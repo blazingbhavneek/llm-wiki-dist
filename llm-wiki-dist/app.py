@@ -20,9 +20,11 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,7 +33,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 
 from graph.core import Settings
@@ -78,15 +85,21 @@ class AgentRunRegistry:
         return True
 
 
-gateway: ModelGateway | None = None
-researcher: Researcher | None = None
-librarian: Librarian | None = None
-write_store: GraphStore | None = None
-read_store: GraphStore | None = None
-startup_stage = "starting"
-startup_error: str | None = None
-bootstrap_task: asyncio.Task | None = None
-bootstrap_running = False
+# Per-db runtime config (reverse-proxy prefix + where the .sqlite files live).
+DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki"))
+DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
+PREFIX = os.environ.get("WIKI_PREFIX", "").rstrip("/")  # e.g. "/llm-wiki"
+_DB_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+# The db for the current request; set by the db_routing middleware from the URL.
+current_db: ContextVar[str] = ContextVar("current_db", default=DEFAULT_DB)
+
+# One stack per db, built lazily on first request and cached. Each value is a
+# dict: {"gateway", "write_store", "librarian", "read_store", "researcher"}.
+STACKS: dict[str, dict] = {}
+stages: dict[str, str] = {}
+errors: dict[str, str | None] = {}
+building: set[str] = set()
 agent_runs = AgentRunRegistry()
 
 
@@ -94,31 +107,28 @@ def api_error(detail: str, retryable: bool, code: str, **extra: Any) -> dict[str
     return {"detail": detail, "retryable": retryable, "code": code, **extra}
 
 
-def _not_ready_detail() -> dict[str, Any]:
+def _not_ready_detail(db: str) -> dict[str, Any]:
+    stage = stages.get(db, "starting")
     return api_error(
-        startup_error or f"server is not ready ({startup_stage})",
+        errors.get(db) or f"server is not ready ({stage})",
         True,
         "not_ready",
-        stage=startup_stage,
+        stage=stage,
     )
 
 
-def _build_stack():
-    global startup_stage
-
-    startup_stage = "gateway"
-    log.info("startup: initializing gateway")
+def _build_stack(db_path: str) -> dict:
+    log.info("startup: building stack db=%s", db_path)
     settings = Settings.from_env()
-    new_gateway = ModelGateway(settings)
+    settings.database_path = db_path  # pick the sqlite for this db
 
-    startup_stage = "bootstrap"
-    log.info("startup: opening store db=%s", settings.database_path)
-    new_write_store = GraphStore(settings.database_path)
+    new_gateway = ModelGateway(settings)
+    new_write_store = GraphStore(settings.database_path)  # rwc: created if missing
     new_librarian = Librarian(new_gateway, new_write_store, max_queue_size=100)
 
     log.info("startup: running bootstrap (embed/search/cluster catch-up)")
     try:
-        new_librarian.bootstrap()
+        new_librarian.bootstrap()  # empty db -> no-op, same as first-run
         new_read_store = GraphStore(settings.database_path, readonly=True)
         new_researcher = Researcher(new_gateway, new_read_store)
     except BaseException:
@@ -131,63 +141,46 @@ def _build_stack():
         new_gateway.close()
         raise
 
-    return new_gateway, new_write_store, new_librarian, new_read_store, new_researcher
+    return {
+        "gateway": new_gateway,
+        "write_store": new_write_store,
+        "librarian": new_librarian,
+        "read_store": new_read_store,
+        "researcher": new_researcher,
+    }
 
 
-async def _shutdown_stack() -> None:
-    global gateway, researcher, librarian, write_store, read_store
-
-    current_librarian = librarian
-    current_write_store = write_store
-    current_read_store = read_store
-    current_gateway = gateway
-
-    gateway = None
-    researcher = None
-    librarian = None
-    write_store = None
-    read_store = None
-
-    if current_librarian is not None:
-        await current_librarian.stop()
-    if current_write_store is not None:
-        current_write_store.close()
-    if current_read_store is not None:
-        current_read_store.close()
-    if current_gateway is not None:
-        current_gateway.close()
-
-
-async def _guarded_bootstrap() -> None:
-    global gateway, researcher, librarian, write_store, read_store
-    global startup_stage, startup_error, bootstrap_running
-
-    if bootstrap_running:
+async def _bootstrap_db(db: str) -> None:
+    """Build + start the stack for one db, caching it in STACKS."""
+    if db in building or db in STACKS:
         return
 
-    bootstrap_running = True
-    startup_error = None
-    await _shutdown_stack()
-
+    building.add(db)
+    errors[db] = None
+    stages[db] = "starting"
     try:
-        stack = await asyncio.to_thread(_build_stack)
-        gateway, write_store, librarian, read_store, researcher = stack
-        await librarian.start()
-        startup_stage = "ready"
-        startup_error = None
-        log.info("startup: ready, serving requests")
+        stack = await asyncio.to_thread(_build_stack, str(DB_DIR / f"{db}.sqlite"))
+        await stack["librarian"].start()
+        STACKS[db] = stack
+        stages[db] = "ready"
+        errors[db] = None
+        log.info("startup: ready db=%s, serving requests", db)
     except Exception as exc:
-        startup_stage = "failed"
-        startup_error = f"{type(exc).__name__}: {exc}"
-        log.exception("startup/bootstrap failed")
+        stages[db] = "failed"
+        errors[db] = f"{type(exc).__name__}: {exc}"
+        log.exception("startup/bootstrap failed db=%s", db)
     finally:
-        bootstrap_running = False
+        building.discard(db)
+
+
+def _ensure_building(db: str) -> None:
+    """Kick off a lazy build for db if it isn't ready or already building."""
+    if db not in STACKS and db not in building:
+        asyncio.create_task(_bootstrap_db(db))
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global bootstrap_task, startup_stage, startup_error
-
     # Surface graph.* INFO logs (bootstrap / reclustering / cluster naming) that
     # otherwise stay hidden behind the root logger's WARNING default.
     logging.basicConfig(
@@ -202,38 +195,39 @@ async def lifespan(_: FastAPI):
         ThreadPoolExecutor(max_workers=64, thread_name_prefix="default")
     )
 
-    startup_stage = "starting"
-    startup_error = None
-    bootstrap_task = asyncio.create_task(_guarded_bootstrap())
-
+    # Stacks are built lazily on first request per db; nothing to pre-build.
     try:
         yield
     finally:
-        if bootstrap_task and not bootstrap_task.done():
-            bootstrap_task.cancel()
+        for stack in list(STACKS.values()):
             try:
-                await bootstrap_task
-            except asyncio.CancelledError:
+                await stack["librarian"].stop()
+            except Exception:
                 pass
-        await _shutdown_stack()
+            stack["write_store"].close()
+            stack["read_store"].close()
+            stack["gateway"].close()
+        STACKS.clear()
+
+
+def _ready_stack() -> dict:
+    db = current_db.get()
+    if stages.get(db) == "ready" and db in STACKS:
+        return STACKS[db]
+    _ensure_building(db)
+    raise HTTPException(status_code=503, detail=_not_ready_detail(db))
 
 
 def _gateway() -> ModelGateway:
-    if gateway is None or startup_stage != "ready":
-        raise HTTPException(status_code=503, detail=_not_ready_detail())
-    return gateway
+    return _ready_stack()["gateway"]
 
 
 def reads() -> Researcher:
-    if researcher is None or startup_stage != "ready":
-        raise HTTPException(status_code=503, detail=_not_ready_detail())
-    return researcher
+    return _ready_stack()["researcher"]
 
 
 def writes() -> Librarian:
-    if librarian is None or startup_stage != "ready":
-        raise HTTPException(status_code=503, detail=_not_ready_detail())
-    return librarian
+    return _ready_stack()["librarian"]
 
 
 # ============================================================================
@@ -298,6 +292,41 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def db_routing(request: Request, call_next):
+    """Peel the reverse-proxy prefix + the db segment off the URL.
+
+    Layout served: {PREFIX}/{db}/            -> frontend
+                   {PREFIX}/{db}/api/...      -> backend for that db
+    The proxy does NOT strip the prefix; the app owns it here. The first path
+    segment after the prefix selects which .sqlite to open (stashed in
+    current_db); the rest is routed as the usual /api/... or / path.
+    """
+    raw = request.scope["path"]
+    path = raw[len(PREFIX):] or "/" if PREFIX and raw.startswith(PREFIX) else raw
+    stripped = path.strip("/")
+
+    if stripped == "":  # bare prefix / root -> point at the default db
+        return RedirectResponse(f"{PREFIX}/{DEFAULT_DB}/", status_code=307)
+
+    seg, _, tail = stripped.partition("/")
+    if not _DB_RE.fullmatch(seg):
+        return PlainTextResponse("unknown wiki", status_code=404)
+    if tail == "" and not path.endswith("/"):  # /{prefix}/{db} -> add trailing slash
+        return RedirectResponse(f"{PREFIX}/{seg}/", status_code=307)
+
+    clean = "/" + tail
+    request.scope["path"] = clean
+    request.scope["raw_path"] = clean.encode()
+    request.scope["root_path"] = f"{PREFIX}/{seg}"  # so the app stays prefix-aware
+
+    token = current_db.set(seg)
+    try:
+        return await call_next(request)
+    finally:
+        current_db.reset(token)
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     log.exception("unhandled error on %s %s", request.method, request.url.path)
@@ -324,25 +353,25 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.get("/api/ready")
 async def ready() -> dict[str, Any]:
+    db = current_db.get()
+    _ensure_building(db)
+    stage = stages.get(db, "starting")
     return {
-        "ready": startup_stage == "ready",
-        "stage": startup_stage,
-        "error": startup_error,
-        "retryable": startup_stage != "ready",
+        "ready": stage == "ready",
+        "stage": stage,
+        "error": errors.get(db),
+        "retryable": stage != "ready",
     }
 
 
 @app.post("/api/admin/restart-bootstrap")
 async def restart_bootstrap() -> dict[str, Any]:
-    global bootstrap_task
-
-    if startup_stage == "ready":
-        return {"ready": True, "stage": startup_stage, "error": None}
-    if bootstrap_running:
-        return {"ready": False, "stage": startup_stage, "error": startup_error}
-
-    bootstrap_task = asyncio.create_task(_guarded_bootstrap())
-    return {"ready": False, "stage": "starting", "error": None}
+    db = current_db.get()
+    if stages.get(db) == "ready":
+        return {"ready": True, "stage": "ready", "error": None}
+    if db not in building:
+        asyncio.create_task(_bootstrap_db(db))
+    return {"ready": False, "stage": stages.get(db, "starting"), "error": errors.get(db)}
 
 
 # ============================================================================

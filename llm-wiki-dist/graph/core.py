@@ -35,7 +35,7 @@ def now_iso() -> str:
 class Settings(BaseModel):
 
     # For Chat UI
-    chat_base_url: str = "http://localhost:8080/v1"
+    chat_base_url: str = "http://10.160.144.101:51029/v1"
     chat_api_key: str = "local"
     chat_model: str = "gemma-4-31B"
     chat_temperature: float = 0.4

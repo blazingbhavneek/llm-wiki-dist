@@ -373,7 +373,7 @@ export default function App() {
             answerIds={activeSourceIds}
             showConflict={false}
             showStale={false}
-            onOpenNode={openNode}
+            onOpenNode={(n) => openNodeById(n.id)}
           />
         </div>
       )

@@ -28,7 +28,7 @@ OUTPUT_ROOT = os.environ.get("WIKI_CHUNK_OUTPUT_ROOT", "output_mini")
 
 PHASE = "all"  # all | generate | generate-flat | verify | repair
 
-BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1")
+BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
 API_KEY = os.environ.get("OPENAI_API_KEY", "local")
 
 GEN_MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")

@@ -1,8 +1,16 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+# MinerU's official Docker docs use vllm/vllm-openai as the GPU base.
+# This keeps vLLM/CUDA runtime pieces prebuilt instead of installing the
+# full cuda-toolkit stack again inside this app image.
+FROM vllm/vllm-openai:v0.21.0
+# If your host driver needs the CUDA 12.9-compatible vLLM image, use:
+# FROM vllm/vllm-openai:v0.21.0-cu129
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENTRYPOINT []
+USER root
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TERM=xterm-256color
@@ -32,33 +40,19 @@ ENV NO_PROXY="${NO_PROXY_VALUE}"
 # Parser app environment
 # ------------------------------------------------------------
 ENV APP_HOME=/home/seigyo/parser
-
-# ------------------------------------------------------------
-# CUDA toolkit environment
-#
-# cuda-toolkit install creates /usr/local/cuda-13.3 in your tested setup.
-# Dockerfile also creates /usr/local/cuda symlink.
-# ------------------------------------------------------------
-ARG CUDA_TOOLKIT_VERSION="13.3"
-
 ENV CUDA_HOME=/usr/local/cuda
-ENV PATH="${APP_HOME}/.venv/bin:/usr/local/cuda/bin:/usr/local/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+ENV PATH="${APP_HOME}:${APP_HOME}/.local/bin:/usr/local/cuda/bin:/usr/local/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}"
 
 ENV CHROME_BIN=/usr/local/bin/chrome-headless-shell
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chrome-headless-shell
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
-ENV UV_CACHE_DIR=/root/.cache/uv
-ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV MINERU_MODEL_SOURCE=local
 
-# ------------------------------------------------------------
-# Simplified HuggingFace model cache location.
 # Host cache is copied into this same path at build time.
-# ------------------------------------------------------------
 ENV XDG_CACHE_HOME=/home/seigyo/.cache
 ENV HF_HOME=/home/seigyo/.cache/huggingface
 ENV HUGGINGFACE_HUB_CACHE=/home/seigyo/.cache/huggingface/hub
@@ -93,11 +87,15 @@ RUN set -eux; \
       "export NO_PROXY=${NO_PROXY_VALUE}" \
       > /etc/profile.d/proxy.sh; \
     chmod 0644 /etc/profile.d/proxy.sh; \
-    printf '%s\n' \
-      "Acquire::http::Proxy \"${PROXY_URL}\";" \
-      "Acquire::https::Proxy \"${PROXY_URL}\";" \
-      "Acquire::ftp::Proxy \"${PROXY_URL}\";" \
-      > /etc/apt/apt.conf.d/95proxies
+    if [ -n "${PROXY_URL}" ]; then \
+      printf '%s\n' \
+        "Acquire::http::Proxy \"${PROXY_URL}\";" \
+        "Acquire::https::Proxy \"${PROXY_URL}\";" \
+        "Acquire::ftp::Proxy \"${PROXY_URL}\";" \
+        > /etc/apt/apt.conf.d/95proxies; \
+    else \
+      rm -f /etc/apt/apt.conf.d/95proxies; \
+    fi
 
 # ------------------------------------------------------------
 # Enable APT package cache
@@ -112,126 +110,119 @@ RUN set -eux; \
 # ------------------------------------------------------------
 # Base packages
 # ------------------------------------------------------------
-RUN --mount=type=cache,id=apt-lists-parser,target=/var/lib/apt/lists,sharing=locked \
-    --mount=type=cache,id=apt-cache-parser,target=/var/cache/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    ca-certificates \
-    curl \
-    wget \
-    gnupg \
-    unzip \
-    jq \
-    openssh-server \
-    sudo \
-    bash \
-    git \
-    nano \
-    tmux \
-    iproute2 \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    build-essential \
-    fonts-liberation \
-    fonts-noto-color-emoji \
-    fonts-noto-cjk \
-    libasound2t64 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libcairo2 \
-    libcups2 \
-    libdbus-1-3 \
-    libdrm2 \
-    libexpat1 \
-    libgbm1 \
-    libglib2.0-0 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libpango-1.0-0 \
-    libx11-6 \
-    libxcb1 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxkbcommon0 \
-    libxrandr2 \
-    xdg-utils
-
-# ------------------------------------------------------------
-# Install CUDA Toolkit / nvcc
-#
-# This integrates your working commands:
-#   sudo apt update
-#   sudo apt-get install -y cuda-toolkit
-#   sudo ln -sfn /usr/local/cuda-13.3 /usr/local/cuda
-#
-# Also makes CUDA env available to non-interactive processes,
-# not only bash shells.
-# ------------------------------------------------------------
-RUN --mount=type=cache,id=apt-lists-parser,target=/var/lib/apt/lists,sharing=locked \
-    --mount=type=cache,id=apt-cache-parser,target=/var/cache/apt,sharing=locked \
+RUN --mount=type=cache,id=apt-lists-parser-reduced,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=apt-cache-parser-reduced,target=/var/cache/apt,sharing=locked \
     set -eux; \
     apt-get update; \
-    apt-get install -y \
+    if apt-cache show libasound2t64 >/dev/null 2>&1; then \
+      ALSA_PKG=libasound2t64; \
+    else \
+      ALSA_PKG=libasound2; \
+    fi; \
+    apt-get install -y --no-install-recommends \
       -o Dpkg::Options::="--force-confdef" \
       -o Dpkg::Options::="--force-confold" \
-      cuda-toolkit; \
-    if [ -d "/usr/local/cuda-${CUDA_TOOLKIT_VERSION}" ]; then \
-      CUDA_DIR="/usr/local/cuda-${CUDA_TOOLKIT_VERSION}"; \
-    else \
-      CUDA_DIR="$(find /usr/local -maxdepth 1 -type d -name 'cuda-[0-9]*' | sort -V | tail -n 1)"; \
-    fi; \
-    test -n "${CUDA_DIR}"; \
-    test -d "${CUDA_DIR}"; \
-    ln -sfn "${CUDA_DIR}" /usr/local/cuda; \
-    test -x /usr/local/cuda/bin/nvcc; \
+      ca-certificates \
+      curl \
+      wget \
+      gnupg \
+      unzip \
+      jq \
+      openssh-server \
+      sudo \
+      bash \
+      git \
+      nano \
+      tmux \
+      iproute2 \
+      fontconfig \
+      fonts-liberation \
+      fonts-noto-core \
+      fonts-noto-color-emoji \
+      fonts-noto-cjk \
+      "${ALSA_PKG}" \
+      libatk-bridge2.0-0 \
+      libatk1.0-0 \
+      libcairo2 \
+      libcups2 \
+      libdbus-1-3 \
+      libdrm2 \
+      libexpat1 \
+      libgbm1 \
+      libgl1 \
+      libglib2.0-0 \
+      libgtk-3-0 \
+      libnspr4 \
+      libnss3 \
+      libpango-1.0-0 \
+      libx11-6 \
+      libxcb1 \
+      libxcomposite1 \
+      libxdamage1 \
+      libxext6 \
+      libxfixes3 \
+      libxkbcommon0 \
+      libxrandr2 \
+      xdg-utils; \
+    command -v ssh-keygen; \
+    fc-cache -fv
+
+# ------------------------------------------------------------
+# CUDA env for shells.
+# vLLM base provides the CUDA/vLLM runtime; this reduced Dockerfile
+# intentionally does not apt-install cuda-toolkit.
+# ------------------------------------------------------------
+RUN set -eux; \
     printf '%s\n' \
       'export CUDA_HOME=/usr/local/cuda' \
       'export PATH=/usr/local/cuda/bin:$PATH' \
       'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH' \
       > /etc/profile.d/cuda.sh; \
     chmod 0644 /etc/profile.d/cuda.sh; \
-    /usr/local/cuda/bin/nvcc --version; \
-    ls -lah /usr/local/cuda/bin/nvcc
+    if command -v nvcc >/dev/null 2>&1; then nvcc --version; else echo "WARNING: nvcc not found in base image"; fi
 
 # ------------------------------------------------------------
 # wget proxy
 # ------------------------------------------------------------
 RUN set -eux; \
-    printf '%s\n' \
-      "use_proxy = on" \
-      "http_proxy = ${PROXY_URL}" \
-      "https_proxy = ${PROXY_URL}" \
-      > /etc/wgetrc
+    if [ -n "${PROXY_URL}" ]; then \
+      printf '%s\n' \
+        "use_proxy = on" \
+        "http_proxy = ${PROXY_URL}" \
+        "https_proxy = ${PROXY_URL}" \
+        > /etc/wgetrc; \
+    fi
 
 # ------------------------------------------------------------
 # git proxy
 # ------------------------------------------------------------
 RUN set -eux; \
-    git config --system http.proxy "${PROXY_URL}"; \
-    git config --system https.proxy "${PROXY_URL}"
+    if [ -n "${PROXY_URL}" ]; then \
+      git config --system http.proxy "${PROXY_URL}"; \
+      git config --system https.proxy "${PROXY_URL}"; \
+    else \
+      git config --system --unset http.proxy || true; \
+      git config --system --unset https.proxy || true; \
+    fi
 
 # ------------------------------------------------------------
 # Install Node.js
 # ------------------------------------------------------------
-RUN --mount=type=cache,id=apt-lists-parser,target=/var/lib/apt/lists,sharing=locked \
-    --mount=type=cache,id=apt-cache-parser,target=/var/cache/apt,sharing=locked \
+RUN --mount=type=cache,id=node-download-cache-parser-reduced,target=/root/.cache/node \
     set -eux; \
-    mkdir -p /etc/apt/keyrings; \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
-      > /etc/apt/sources.list.d/nodesource.list; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      -o Dpkg::Options::="--force-confdef" \
-      -o Dpkg::Options::="--force-confold" \
-      nodejs; \
+    cd /tmp; \
+    NODE_DIST_BASE="https://nodejs.org/dist/latest-v${NODE_MAJOR}.x"; \
+    curl -fsSL "${NODE_DIST_BASE}/SHASUMS256.txt" -o node-shasums.txt; \
+    NODE_TARBALL="$(awk '$2 ~ /node-v.*-linux-x64\.tar\.xz$/ { print $2; exit }' node-shasums.txt)"; \
+    test -n "${NODE_TARBALL}"; \
+    curl -fsSL "${NODE_DIST_BASE}/${NODE_TARBALL}" -o "${NODE_TARBALL}"; \
+    grep "  ${NODE_TARBALL}$" node-shasums.txt | sha256sum -c -; \
+    mkdir -p node-dist; \
+    python3 -c "import tarfile; tarfile.open('${NODE_TARBALL}', 'r:xz').extractall('node-dist')"; \
+    NODE_DIR="$(find node-dist -mindepth 1 -maxdepth 1 -type d | head -n 1)"; \
+    test -n "${NODE_DIR}"; \
+    cp -a "${NODE_DIR}/." /usr/local/; \
+    rm -rf node-shasums.txt "${NODE_TARBALL}" node-dist; \
     node --version; \
     npm --version
 
@@ -239,34 +230,48 @@ RUN --mount=type=cache,id=apt-lists-parser,target=/var/lib/apt/lists,sharing=loc
 # npm proxy
 # ------------------------------------------------------------
 RUN set -eux; \
-    npm config set proxy "${PROXY_URL}" --global; \
-    npm config set https-proxy "${PROXY_URL}" --global; \
+    if [ -n "${PROXY_URL}" ]; then \
+      npm config set proxy "${PROXY_URL}" --global; \
+      npm config set https-proxy "${PROXY_URL}" --global; \
+    else \
+      npm config delete proxy --global || true; \
+      npm config delete https-proxy --global || true; \
+    fi; \
     npm config set fetch-retries 5 --global; \
     npm config set fetch-retry-mintimeout 20000 --global; \
     npm config set fetch-retry-maxtimeout 120000 --global
 
 # ------------------------------------------------------------
-# Install uv
-# ------------------------------------------------------------
-RUN --mount=type=cache,id=curl-cache-root-parser,target=/root/.cache \
-    set -eux; \
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh; \
-    uv --version
-
-# ------------------------------------------------------------
 # Create user and configure SSH
 # ------------------------------------------------------------
-RUN useradd -m -s /bin/bash seigyo \
-    && echo "seigyo:seigyo@rikiseisan" | chpasswd \
-    && usermod -aG sudo seigyo \
-    && mkdir -p /run/sshd \
-    && mkdir -p /home/seigyo/.ssh \
-    && chmod 700 /home/seigyo/.ssh \
-    && chown -R seigyo:seigyo /home/seigyo/.ssh \
-    && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
-    && sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config \
-    && sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
-    && ssh-keygen -A
+RUN set -eux; \
+    useradd -m -s /bin/bash seigyo; \
+    echo "seigyo:seigyo@rikiseisan" | chpasswd; \
+    usermod -aG sudo seigyo; \
+    mkdir -p /run/sshd /etc/ssh /etc/ssh/sshd_config.d; \
+    touch /etc/ssh/sshd_config; \
+    mkdir -p /home/seigyo/.ssh; \
+    chmod 700 /home/seigyo/.ssh; \
+    chown -R seigyo:seigyo /home/seigyo/.ssh; \
+    if ! grep -q '^Include /etc/ssh/sshd_config.d/\*.conf' /etc/ssh/sshd_config; then \
+      printf '%s\n' 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config; \
+    fi; \
+    if ! grep -q '^Subsystem[[:space:]]\+sftp' /etc/ssh/sshd_config; then \
+      printf '%s\n' 'Subsystem sftp /usr/lib/openssh/sftp-server' >> /etc/ssh/sshd_config; \
+    fi; \
+    sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config; \
+    sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config; \
+    sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config; \
+    if ! grep -q '^PasswordAuthentication ' /etc/ssh/sshd_config; then \
+      printf '%s\n' 'PasswordAuthentication yes' >> /etc/ssh/sshd_config; \
+    fi; \
+    if ! grep -q '^PermitRootLogin ' /etc/ssh/sshd_config; then \
+      printf '%s\n' 'PermitRootLogin no' >> /etc/ssh/sshd_config; \
+    fi; \
+    if ! grep -q '^PubkeyAuthentication ' /etc/ssh/sshd_config; then \
+      printf '%s\n' 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config; \
+    fi; \
+    ssh-keygen -A
 
 # ------------------------------------------------------------
 # Persist CUDA env for seigyo login shells too
@@ -274,7 +279,7 @@ RUN useradd -m -s /bin/bash seigyo \
 RUN set -eux; \
     printf '%s\n' \
       '' \
-      '# CUDA toolkit' \
+      '# CUDA runtime' \
       'export CUDA_HOME=/usr/local/cuda' \
       'export PATH=/usr/local/cuda/bin:$PATH' \
       'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH' \
@@ -297,8 +302,8 @@ RUN mkdir -p \
 # Build with:
 #   docker buildx build \
 #     --build-context hf_cache=/home/seigyo/.cache/huggingface \
-#     -f parser/Dockerfile \
-#     -t doc-parser-rikiseisan \
+#     -f parser/Dockerfile.reduced \
+#     -t doc-parser-rikiseisan:reduced \
 #     --load \
 #     .
 # ------------------------------------------------------------
@@ -313,7 +318,7 @@ WORKDIR ${APP_HOME}
 # ------------------------------------------------------------
 # Download Chrome Headless Shell
 # ------------------------------------------------------------
-RUN --mount=type=cache,id=chrome-download-cache-parser,target=/root/.cache/chrome-download \
+RUN --mount=type=cache,id=chrome-download-cache-parser-reduced,target=/root/.cache/chrome-download \
     set -eux; \
     CHROME_URL="$(curl -fsSL https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json \
       | jq -r '.channels.Stable.downloads["chrome-headless-shell"][] | select(.platform=="linux64") | .url')"; \
@@ -346,7 +351,7 @@ RUN chown seigyo:seigyo ${APP_HOME}/puppeteer-config.json
 # ------------------------------------------------------------
 # Install Mermaid CLI
 # ------------------------------------------------------------
-RUN --mount=type=cache,id=npm-cache-root-parser,target=/root/.npm \
+RUN --mount=type=cache,id=npm-cache-root-parser-reduced,target=/root/.npm \
     set -eux; \
     npm install -g @mermaid-js/mermaid-cli; \
     MMDC_ORIG="$(command -v mmdc)"; \
@@ -407,40 +412,28 @@ RUN set -eux; \
     rm -f /tmp/mermaid-test.mmd /tmp/mermaid-test.svg
 
 # ------------------------------------------------------------
-# Copy requirements.txt first for Docker layer cache
-# ------------------------------------------------------------
-COPY --chown=seigyo:seigyo requirements.txt ${APP_HOME}/requirements.txt
-
-# ------------------------------------------------------------
 # Backend dependency setup
 # ------------------------------------------------------------
-USER root
-
-WORKDIR ${APP_HOME}
-
-RUN --mount=type=cache,id=uv-cache-root-parser,target=/root/.cache/uv \
+# PIP_CACHE_DIR overrides XDG_CACHE_HOME, which points at seigyo-owned
+# /home/seigyo/.cache; pip disables a cache dir not owned by uid 0 when run as root.
+RUN --mount=type=cache,id=pip-cache-parser-reduced,target=/root/.cache/pip \
     set -eux; \
-    mkdir -p /opt/uv/python /root/.cache/uv; \
-    test -f requirements.txt; \
-    uv python install 3.13; \
-    uv venv .venv --python 3.13; \
-    uv pip install --python .venv/bin/python -r requirements.txt --no-deps; \
-    chown -R seigyo:seigyo ${APP_HOME}/.venv ${APP_HOME}/requirements.txt; \
-    chmod -R a+rX /opt/uv/python
+    export PIP_CACHE_DIR=/root/.cache/pip; \
+    python3 -m pip install --upgrade --break-system-packages \
+      'mineru[all]>=3.4.0' \
+      fastapi \
+      'uvicorn[standard]' \
+      requests \
+      python-dotenv \
+      python-multipart; \
+    command -v mineru; \
+    python3 -c "import fastapi, requests, dotenv, uvicorn"
 
 # ------------------------------------------------------------
 # Copy parser backend source files
 # ------------------------------------------------------------
 COPY --chown=seigyo:seigyo parser/*.py ${APP_HOME}/
 COPY --chown=seigyo:seigyo parser/test_utils/ ${APP_HOME}/test_utils/
-
-# ------------------------------------------------------------
-# Validate test PDF exists at build time.
-# No MinerU execution happens during docker build.
-# ------------------------------------------------------------
-RUN set -eux; \
-    test -f "${APP_HOME}/test_utils/test.pdf"; \
-    chown -R seigyo:seigyo "${APP_HOME}/test_utils"
 
 # ------------------------------------------------------------
 # Copy parser frontend package files first for Docker layer cache
@@ -450,11 +443,9 @@ COPY --chown=seigyo:seigyo parser/frontend/package*.json ${APP_HOME}/frontend/
 # ------------------------------------------------------------
 # Install parser frontend dependencies
 # ------------------------------------------------------------
-USER root
-
 WORKDIR ${APP_HOME}/frontend
 
-RUN --mount=type=cache,id=npm-cache-root-parser-frontend,target=/root/.npm \
+RUN --mount=type=cache,id=npm-cache-root-parser-reduced-frontend,target=/root/.npm \
     set -eux; \
     rm -rf node_modules; \
     if [ -f package-lock.json ]; then \
@@ -469,14 +460,15 @@ RUN --mount=type=cache,id=npm-cache-root-parser-frontend,target=/root/.npm \
 COPY --chown=seigyo:seigyo parser/frontend/ ${APP_HOME}/frontend/
 
 # ------------------------------------------------------------
-# Build parser frontend
+# Build parser frontend, then drop node_modules from the final image
 # ------------------------------------------------------------
-RUN --mount=type=cache,id=npm-cache-root-parser-frontend,target=/root/.npm \
+RUN --mount=type=cache,id=npm-cache-root-parser-reduced-frontend,target=/root/.npm \
     set -eux; \
     npm run build; \
     if [ -d dist ]; then chown -R seigyo:seigyo dist; fi; \
     if [ -d build ]; then chown -R seigyo:seigyo build; fi; \
-    if [ -d .next ]; then chown -R seigyo:seigyo .next; fi
+    if [ -d .next ]; then chown -R seigyo:seigyo .next; fi; \
+    rm -rf node_modules
 
 # ------------------------------------------------------------
 # Startup script
@@ -494,8 +486,6 @@ RUN --mount=type=cache,id=npm-cache-root-parser-frontend,target=/root/.npm \
 #       /home/seigyo/.cache/huggingface
 #   - Copied from host at build time using named build context hf_cache.
 # ------------------------------------------------------------
-USER root
-
 WORKDIR ${APP_HOME}
 
 RUN cat > /usr/local/bin/start-parser.sh <<'EOF'
@@ -506,9 +496,11 @@ APP_HOME="/home/seigyo/parser"
 SESSION_NAME="parser"
 TARGET_MB="${GPU_TARGET_ALLOC_MB:-7168}"
 
+export HOME="/home/seigyo"
 export CUDA_HOME="/usr/local/cuda"
-export PATH="/usr/local/cuda/bin:${PATH}"
+export PATH="/usr/local/cuda/bin:/usr/local/bin:${PATH}"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"
+export MINERU_MODEL_SOURCE="${MINERU_MODEL_SOURCE:-local}"
 
 echo "============================================================"
 echo "Starting parser container"
@@ -531,10 +523,7 @@ if command -v nvcc >/dev/null 2>&1; then
   command -v nvcc
   nvcc --version || true
 else
-  echo "ERROR: nvcc not found."
-  echo "ERROR: Expected /usr/local/cuda/bin/nvcc"
-  ls -lah /usr/local/cuda /usr/local/cuda/bin 2>/dev/null || true
-  exit 1
+  echo "WARNING: nvcc not found. This image relies on the prebuilt vLLM/MinerU runtime."
 fi
 
 echo
@@ -581,6 +570,11 @@ du -sh /home/seigyo/.cache/huggingface 2>/dev/null || true
 find /home/seigyo/.cache/huggingface -maxdepth 3 -type d 2>/dev/null | head -n 30 || true
 
 echo
+echo "MinerU:"
+command -v mineru || true
+mineru --help >/dev/null 2>&1 || true
+
+echo
 echo "Starting parser tmux session..."
 
 if runuser -u seigyo -- tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
@@ -591,17 +585,17 @@ else
   sleep 1
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "cd ${APP_HOME}" C-m
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "source .venv/bin/activate" C-m
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export HOME=/home/seigyo" C-m
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export CUDA_HOME=/usr/local/cuda" C-m
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export PATH=/usr/local/cuda/bin:\$PATH" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export PATH=/usr/local/cuda/bin:/usr/local/bin:\$PATH" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:\${LD_LIBRARY_PATH:-}" C-m
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export XDG_CACHE_HOME=/home/seigyo/.cache" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export HF_HOME=/home/seigyo/.cache/huggingface" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export HUGGINGFACE_HUB_CACHE=/home/seigyo/.cache/huggingface/hub" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export MINERU_MODEL_SOURCE='${MINERU_MODEL_SOURCE}'" C-m
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export CHROME_BIN=/usr/local/bin/chrome-headless-shell" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chrome-headless-shell" C-m
@@ -610,8 +604,8 @@ else
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export GPU_MEMORY_UTILIZATION='${GPU_MEMORY_UTILIZATION}'" C-m
 
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "which nvcc && nvcc --version" C-m
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "python -m uvicorn server:app --host 0.0.0.0 --port 8000" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "which nvcc && nvcc --version || true" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "python3 -m uvicorn server:app --host 0.0.0.0 --port 8000" C-m
 fi
 
 sleep 2
