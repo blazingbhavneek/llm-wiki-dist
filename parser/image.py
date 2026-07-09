@@ -33,9 +33,9 @@ OUTPUT_FILE = None
 # If OUTPUT_FILE is None, output will be:
 # input_filename.described.md
 
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "local")
-OPENAI_MODEL = os.environ.get("WIKI_MODEL", "openai/gpt-oss-120b")
+OPENAI_MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")
 
 CONCURRENCY = 5
 TEMPERATURE = 0.3
@@ -45,6 +45,8 @@ NEXT_CONTEXT_LINES = 10
 
 TOP_P = 0.95
 MAX_TOKENS = 16384
+LLM_THINKING_TIMEOUT_SECONDS = int(os.environ.get("LLM_THINKING_TIMEOUT_SECONDS", "600"))
+LLM_FALLBACK_TIMEOUT_SECONDS = int(os.environ.get("LLM_FALLBACK_TIMEOUT_SECONDS", "300"))
 
 
 def normalize_invoke_url(base_url: str) -> str:
@@ -848,6 +850,10 @@ def extract_json_object(text: str):
         return None
 
 
+def remove_mermaid_blocks(markdown_text: str) -> str:
+    return ensure_reconstruction_wrapper(MERMAID_BLOCK_RE.sub("", markdown_text).strip())
+
+
 async def render_mermaid_code_to_png_data_url(code: str, diagram_index: int):
     """
     Renders one Mermaid diagram to PNG using mmdc.
@@ -1164,12 +1170,15 @@ async def judge_mermaid_visual_match(
                 "- whether someone could reconstruct the original diagram's meaning from the Mermaid output\n\n"
                 "Return STRICT JSON only, with this schema:\n"
                 "{\n"
+                '  "should_keep_mermaid": true,\n'
                 '  "score": 0,\n'
                 '  "reason": "short explanation that mentions node and edge correctness",\n'
                 '  "missing": ["missing nodes, missing edges, or missing labels"],\n'
                 '  "wrong": ["wrong nodes, wrong edges, wrong directions, or harmful extras"],\n'
                 '  "suggested_fixes": ["concrete fixes, especially missing edges or node corrections"]\n'
                 "}\n\n"
+                "If the original image is not suitable for Mermaid at all, set should_keep_mermaid=false and score=100. "
+                "This means the Mermaid block should be removed and the textual reconstruction should be kept.\n\n"
                 "Important: If the only issue is orientation/layout direction, say that clearly and still give a high score. "
                 "If any edge is missing, say exactly which edge is missing. Never overlook missing relationships.\n\n"
                 "Surrounding context:\n"
@@ -1413,13 +1422,17 @@ async def improve_mermaid_visual_match_loop(
         print(f"Judge reason: {judge_result.get('reason', '')}")
         print("")
 
-        # Step 4: Keep best candidate.
+        # Step 4: Drop Mermaid if the judge says it should not exist.
+        if not judge_result.get("should_keep_mermaid", True):
+            return remove_mermaid_blocks(current_description)
+
+        # Step 5: Keep best candidate.
         if score > best_score:
             best_score = score
             best_description = current_description
             best_judge = judge_result
 
-        # Step 5: Stop early if good enough.
+        # Step 6: Stop early if good enough.
         if score >= MERMAID_VISUAL_MATCH_GOOD_ENOUGH_SCORE:
             print(
                 f"Mermaid visual match score {score} >= "
@@ -1427,7 +1440,7 @@ async def improve_mermaid_visual_match_loop(
             )
             break
 
-        # Step 6: Improve for next attempt.
+        # Step 7: Improve for next attempt.
         current_description = await improve_mermaid_from_visual_feedback(
             client=client,
             original_image_blocks=original_image_blocks,
@@ -1464,7 +1477,9 @@ def build_reconstruction_prompt(
     if ENABLE_MERMAID_DIAGRAMS:
         diagram_guidance = (
             "For flowcharts, architecture diagrams, block diagrams, dependency graphs, sequence diagrams, or data-flow diagrams:\n"
-            "- Output a Mermaid diagram whenever possible.\n"
+            "- Only output Mermaid when the image visibly contains a node/edge/process/flow diagram.\n"
+            "- Do not output Mermaid for photos, screenshots, plain text, equations, tables, normal charts, icons, or ambiguous figures.\n"
+            "- If Mermaid would require inventing nodes or arrows, use structured Markdown instead.\n"
             "- Use flowchart TD, flowchart LR, graph TD, graph LR, sequenceDiagram, or another appropriate Mermaid syntax.\n"
             "- Include every visible node, box, component, actor, storage element, process, file, subsystem, and external system.\n"
             "- Include every visible arrow, line, connection, edge, and data flow.\n"
@@ -1673,11 +1688,12 @@ async def describe_image_line(
                         ],
                         temperature=TEMPERATURE,
                     ),
-                    timeout=120,
+                    timeout=LLM_THINKING_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
                 print(
-                    f"Image line {index + 1} timed out after 120s. "
+                    f"Image line {index + 1} timed out after "
+                    f"{LLM_THINKING_TIMEOUT_SECONDS}s. "
                     "Retrying with thinking disabled..."
                 )
 
@@ -1697,7 +1713,7 @@ async def describe_image_line(
                             }
                         },
                     ),
-                    timeout=120,
+                    timeout=LLM_FALLBACK_TIMEOUT_SECONDS,
                 )
 
             description = get_response_text(response)
@@ -1759,11 +1775,12 @@ async def describe_image_line(
                             messages=retry_messages,
                             temperature=TEMPERATURE,
                         ),
-                        timeout=120,
+                        timeout=LLM_THINKING_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
                     print(
-                        f"Retry for image line {index + 1} timed out after 120s. "
+                        f"Retry for image line {index + 1} timed out after "
+                        f"{LLM_THINKING_TIMEOUT_SECONDS}s. "
                         "Retrying with thinking disabled..."
                     )
 
@@ -1778,7 +1795,7 @@ async def describe_image_line(
                                 }
                             },
                         ),
-                        timeout=120,
+                        timeout=LLM_FALLBACK_TIMEOUT_SECONDS,
                     )
 
                 description = get_response_text(retry_response)

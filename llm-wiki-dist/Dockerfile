@@ -26,6 +26,14 @@ ENV NO_PROXY="${NO_PROXY_VALUE}"
 ENV APP_HOME=/home/seigyo/llm-wiki
 ENV PATH="${APP_HOME}/.venv/bin:/usr/local/bin:${PATH}"
 
+# llm-wiki runtime config — override at `docker run -e ...`
+#   WIKI_DB_DIR     dir holding <db>.sqlite files (relative to APP_HOME)
+#   WIKI_DEFAULT_DB db that bare /<prefix>/ redirects to
+#   WIKI_PREFIX     reverse-proxy path prefix ("" = none)
+ENV WIKI_DB_DIR=.wiki
+ENV WIKI_DEFAULT_DB=wiki
+ENV WIKI_PREFIX=/llm-wiki
+
 ENV CHROME_BIN=/usr/local/bin/chrome-headless-shell
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chrome-headless-shell
 ENV PUPPETEER_SKIP_DOWNLOAD=true
@@ -421,7 +429,9 @@ else
   sleep 1
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "cd ${APP_HOME}" C-m
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_DB=.wiki/wiki.sqlite" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_DB_DIR=${WIKI_DB_DIR:-.wiki}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_DEFAULT_DB=${WIKI_DEFAULT_DB:-wiki}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_PREFIX=${WIKI_PREFIX-/llm-wiki}" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export UV_CACHE_DIR=/home/seigyo/.cache/uv" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export CHROME_BIN=/usr/local/bin/chrome-headless-shell" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chrome-headless-shell" C-m

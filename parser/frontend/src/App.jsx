@@ -9,7 +9,6 @@ import {
   Download,
   Globe2,
   RefreshCcw,
-  Server,
   Trash2,
   UploadCloud,
 } from 'lucide-react'
@@ -835,9 +834,7 @@ export default function App() {
 
   const t = STR[lang] || STR.ja
 
-  const [parserUrl, setParserUrl] = useState(
-    () => getCookie(COOKIE_KEYS.parserUrl) || import.meta.env.VITE_PDF_API_URL || ''
-  )
+  const [parserUrl] = useState(() => import.meta.env.VITE_PDF_API_URL || '')
 
   const [llmBaseUrl, setLlmBaseUrl] = useState(
     () => getCookie(COOKIE_KEYS.llmBaseUrl) || import.meta.env.VITE_OPENAI_BASE_URL || ''
@@ -857,7 +854,6 @@ export default function App() {
 
   const [busy, setBusy] = useState(false)
   const [queueBusy, setQueueBusy] = useState(false)
-  const [checkingParser, setCheckingParser] = useState(false)
   const [checkingVision, setCheckingVision] = useState(false)
   const [downloadingTaskId, setDownloadingTaskId] = useState(null)
   const [deletingTaskId, setDeletingTaskId] = useState(null)
@@ -865,7 +861,6 @@ export default function App() {
   const [status, setStatus] = useState('')
   const [taskId, setTaskId] = useState(null)
   const [error, setError] = useState(null)
-  const [parserCheck, setParserCheck] = useState('')
   const [visionCheck, setVisionCheck] = useState('')
 
   const [queueItems, setQueueItems] = useState(() => loadStoredQueue())
@@ -903,7 +898,6 @@ export default function App() {
 
   useEffect(() => setCookie(COOKIE_KEYS.lang, lang), [lang])
   useEffect(() => setCookie(COOKIE_KEYS.codeLang, codeLang), [codeLang])
-  useEffect(() => setCookie(COOKIE_KEYS.parserUrl, parserUrl), [parserUrl])
   useEffect(() => setCookie(COOKIE_KEYS.llmBaseUrl, llmBaseUrl), [llmBaseUrl])
   useEffect(() => setCookie(COOKIE_KEYS.llmApiKey, llmApiKey), [llmApiKey])
   useEffect(() => setCookie(COOKIE_KEYS.llmModel, llmModel), [llmModel])
@@ -1009,31 +1003,6 @@ export default function App() {
     setError(null)
     setStatus('')
     setTaskId(null)
-  }
-
-  const checkParserServer = async () => {
-    setCheckingParser(true)
-    setParserCheck('')
-    setError(null)
-
-    try {
-      if (!apiBase) throw new Error(t.enterParser)
-
-      const res = await fetch(`${apiBase}/queue`)
-
-      if (!res.ok) {
-        const text = await readErrorResponse(res)
-        throw new Error(text || `HTTP ${res.status}`)
-      }
-
-      const data = await res.json()
-      setParserCheck(t.connected(data))
-    } catch (e) {
-      setParserCheck('')
-      setError(t.parserCheckFailed(e.message || e))
-    } finally {
-      setCheckingParser(false)
-    }
   }
 
   const runChatProbe = async ({ withImage }) => {
@@ -1306,38 +1275,6 @@ export default function App() {
         </header>
 
         <div className="grid gap-[16px]">
-          <section className={UI.pageCard}>
-            <SectionTitle icon={<Server size={17} />} title={t.parserServer} />
-
-            <p className="mt-[4px] text-[12px] leading-[1.5] text-slate-500">
-              {t.parserHelp}
-            </p>
-
-            <div className="mt-[12px] grid gap-[10px] md:grid-cols-[1fr_auto]">
-              <Field
-                label={t.parserUrl}
-                value={parserUrl}
-                onChange={setParserUrl}
-                placeholder={import.meta.env.VITE_PDF_API_URL || ''}
-                disabled={busy}
-              />
-
-              <div className="flex items-end">
-                <button
-                  type="button"
-                  disabled={checkingParser}
-                  onClick={checkParserServer}
-                  className={`inline-flex h-[38px] items-center gap-[7px] ${UI.secondaryButton}`}
-                >
-                  <CheckCircle2 size={15} />
-                  {checkingParser ? t.checking : t.checkParser}
-                </button>
-              </div>
-            </div>
-
-            {parserCheck && <Notice type="success">{parserCheck}</Notice>}
-          </section>
-
           <section className={UI.pageCard}>
             <SectionTitle icon={<UploadCloud size={17} />} title={t.uploadPdf} />
 

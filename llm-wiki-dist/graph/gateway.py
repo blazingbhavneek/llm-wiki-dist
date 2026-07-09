@@ -26,9 +26,9 @@ load_dotenv()
 log = logging.getLogger("graph_gateway")
 
 
-INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1")
+INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
 API_KEY = os.environ.get("OPENAI_API_KEY", "local")
-MODEL = os.environ.get("WIKI_MODEL", "openai/gpt-oss-120b")
+MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")
 
 
 _IMAGE_UNIT_RE = re.compile(
