@@ -44,7 +44,7 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)
 CACHE_RETENTION_HOURS = float(os.environ.get("CACHE_RETENTION_HOURS", "720"))
 CACHE_RETENTION_SECONDS = CACHE_RETENTION_HOURS * 60 * 60
 
-GPU_MEMORY_UTILIZATION = "0.05"
+GPU_MEMORY_UTILIZATION = os.environ.get("GPU_MEMORY_UTILIZATION", "0.05")
 INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
 API_KEY = os.environ.get("OPENAI_API_KEY", "local")
 MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")
@@ -306,9 +306,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get(
-        "WIKI_CORS_ORIGINS", "http://localhost:5173"
-    ).split(","),
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1114,19 +1112,26 @@ async def delete_queue_item(task_id: str):
     with state_lock:
         meta = tasks.get(task_id)
 
+        # Always remove from in-memory queue.
+        remove_from_queue(task_id)
+
+        # Always try to remove cache/temp by task_id.
+        # This matters for cache-only tasks after server restart.
+        cache_path = CACHE_DIR / task_id
+        task_dir = TEMP_DIR / task_id
+
         if not meta:
-            remove_from_queue(task_id)
+            shutil.rmtree(cache_path, ignore_errors=True)
+            shutil.rmtree(task_dir, ignore_errors=True)
 
             return {
                 "task_id": task_id,
                 "deleted": True,
-                "message": "Task was not in queue history",
+                "message": "Task/cache deleted",
             }
 
         status = meta.get("status")
         process: Optional[mp.Process] = meta.get("process")
-
-        remove_from_queue(task_id)
 
         if status == "processing":
             if process and process.is_alive():
@@ -1135,21 +1140,11 @@ async def delete_queue_item(task_id: str):
             if current_task_id == task_id:
                 current_task_id = None
 
-            shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
-            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
-
-        elif status == "queued":
-            shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
-            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
-
-        elif status == "failed":
-            shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
-            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
-
-        elif status == "completed":
-            # Delete from queue/history only.
-            # Keep cache/{task_id}/final.md so /result/{task_id} can still work.
-            shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
+        # Delete both metadata paths and canonical task paths.
+        shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
+        shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
+        shutil.rmtree(cache_path, ignore_errors=True)
+        shutil.rmtree(task_dir, ignore_errors=True)
 
         tasks.pop(task_id, None)
 
@@ -1159,6 +1154,7 @@ async def delete_queue_item(task_id: str):
             "task_id": task_id,
             "deleted": True,
             "status": status,
+            "cache_deleted": True,
         }
 
 
@@ -1190,3 +1186,13 @@ async def get_result(task_id: str):
         media_type="text/markdown",
         filename=f"{task_id}.md",
     )
+
+
+DIST_DIR = Path(__file__).parent / "frontend" / "dist"
+
+from fastapi.staticfiles import StaticFiles
+app.mount(
+    "/",
+    StaticFiles(directory=DIST_DIR, html=True),
+    name="frontend",
+)
