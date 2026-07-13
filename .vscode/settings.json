@@ -1,0 +1,5 @@
+{
+  "http.proxy": "http://133.141.7.237:9515/",
+  "http.proxySupport": "override",
+  "http.proxyStrictSSL": false
+}

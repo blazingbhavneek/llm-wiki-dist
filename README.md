@@ -4,7 +4,7 @@
 
 ```bash
 cd llm-wiki-dist
-DOCKER_BUILDKIT=1 docker build --build-arg PROXY_URL= -t llm-wiki:latest .
+DOCKER_BUILDKIT=1 docker build -t llm-wiki-rikiseisan:latest .
 ```
 
 (`--build-arg PROXY_URL=` disables the baked proxy; drop it to use it.)
@@ -12,10 +12,10 @@ DOCKER_BUILDKIT=1 docker build --build-arg PROXY_URL= -t llm-wiki:latest .
 ## Run
 
 ```bash
-docker run -d --name llm-wiki \
+docker run -d --name llm-wiki-rikiseisan \
   -p 8000:8000 -p 51027:22 \
   -v "$PWD/.wiki:/home/seigyo/llm-wiki/.wiki" \
-  llm-wiki:latest
+  llm-wiki-rikiseisan:latest
 ```
 
 Open http://localhost:8000/llm-wiki/ (redirects to `/llm-wiki/wiki/`).
@@ -30,13 +30,14 @@ Any URL segment picks/creates a db: `/llm-wiki/manual/`, `/llm-wiki/meetings/`.
   To point at local vllm (`./vllm_embed_reranker.sh`, embed 8081 / rerank 8082):
 
 ```bash
-docker run -d --name llm-wiki \
+docker run -d --name llm-wiki-rikiseisan \
   --add-host=host.docker.internal:host-gateway \
-  -p 8000:8000 -p 51027:22 \
-  -v "$PWD/.wiki:/home/seigyo/llm-wiki/.wiki" \
-  -e WIKI_EMBED_BASE_URL=http://host.docker.internal:8081/v1 \
-  -e WIKI_RERANK_BASE_URL=http://host.docker.internal:8082/v1 \
-  llm-wiki:latest
+  -p 51025:8000 -p 51024:22 \
+  -e WIKI_PREFIX="/llm-wiki" \
+  llm-wiki-rikiseisan:latest
+  # -v "$PWD/.wiki:/home/seigyo/llm-wiki/.wiki" \
+  # -e WIKI_EMBED_BASE_URL=http://host.docker.internal:8081/v1 \
+  # -e WIKI_RERANK_BASE_URL=http://host.docker.internal:8082/v1 \
 ```
 
 ---
@@ -50,11 +51,10 @@ GPU PDF parser (MinerU + vLLM). Base image `vllm/vllm-openai:v0.21.0`.
 From repo root (not `parser/`):
 
 ```bash
-DOCKER_BUILDKIT=1 docker buildx build \
-  --build-arg PROXY_URL= \
+docker build \
   --build-context hf_cache="$HOME/.cache/huggingface" \
   -f parser/Dockerfile \
-  -t doc-parser-rikiseisan:reduced \
+  -t doc-parser-rikiseisan:latest \
   --load .
 ```
 

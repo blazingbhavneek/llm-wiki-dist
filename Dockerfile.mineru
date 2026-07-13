@@ -1,0 +1,78 @@
+# Use the official vllm image for gpu with Volta、Turing、Ampere、Ada Lovelace、Hopper、Blackwell architecture (7.0 <= Compute Capability <= 12.1)
+# The default base image uses vLLM 0.21.0 with CUDA 13.0. For CUDA 12.9 environments, switch to the commented cu129 image below.
+# Compute Capability version query (https://developer.nvidia.com/cuda-gpus)
+# support x86_64 architecture and ARM(AArch64) architecture
+FROM vllm/vllm-openai:v0.21.0
+# FROM vllm/vllm-openai:v0.21.0-cu129
+
+# ------------------------------------------------------------
+# Proxy configuration
+# ------------------------------------------------------------
+ARG PROXY_URL="http://133.141.7.237:9515"
+ARG NO_PROXY_VALUE="localhost,127.0.0.1,::1"
+
+ENV http_proxy="${PROXY_URL}"
+ENV https_proxy="${PROXY_URL}"
+ENV HTTP_PROXY="${PROXY_URL}"
+ENV HTTPS_PROXY="${PROXY_URL}"
+ENV all_proxy="${PROXY_URL}"
+ENV ALL_PROXY="${PROXY_URL}"
+ENV no_proxy="${NO_PROXY_VALUE}"
+ENV NO_PROXY="${NO_PROXY_VALUE}"
+
+# ------------------------------------------------------------
+# Persist proxy settings
+# ------------------------------------------------------------
+RUN set -eux; \
+    printf '%s\n' \
+      "http_proxy=${PROXY_URL}" \
+      "https_proxy=${PROXY_URL}" \
+      "HTTP_PROXY=${PROXY_URL}" \
+      "HTTPS_PROXY=${PROXY_URL}" \
+      "all_proxy=${PROXY_URL}" \
+      "ALL_PROXY=${PROXY_URL}" \
+      "no_proxy=${NO_PROXY_VALUE}" \
+      "NO_PROXY=${NO_PROXY_VALUE}" \
+      >> /etc/environment; \
+    printf '%s\n' \
+      "export http_proxy=${PROXY_URL}" \
+      "export https_proxy=${PROXY_URL}" \
+      "export HTTP_PROXY=${PROXY_URL}" \
+      "export HTTPS_PROXY=${PROXY_URL}" \
+      "export all_proxy=${PROXY_URL}" \
+      "export ALL_PROXY=${PROXY_URL}" \
+      "export no_proxy=${NO_PROXY_VALUE}" \
+      "export NO_PROXY=${NO_PROXY_VALUE}" \
+      > /etc/profile.d/proxy.sh; \
+    chmod 0644 /etc/profile.d/proxy.sh; \
+    if [ -n "${PROXY_URL}" ]; then \
+      printf '%s\n' \
+        "Acquire::http::Proxy \"${PROXY_URL}\";" \
+        "Acquire::https::Proxy \"${PROXY_URL}\";" \
+        "Acquire::ftp::Proxy \"${PROXY_URL}\";" \
+        > /etc/apt/apt.conf.d/95proxies; \
+    else \
+      rm -f /etc/apt/apt.conf.d/95proxies; \
+    fi
+
+
+# Install libgl for opencv support & Noto fonts for Chinese characters
+RUN apt-get update && \
+    apt-get install -y \
+        fonts-noto-core \
+        fonts-noto-cjk \
+        fontconfig \
+        libgl1 && \
+    fc-cache -fv && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install mineru latest
+RUN python3 -m pip install -U 'mineru[core]>=3.4.0' --break-system-packages && \
+    python3 -m pip cache purge
+
+# Download models and update the configuration file
+RUN /bin/bash -c "mineru-models-download -s huggingface -m all"
+
+# Set the entry point to activate the virtual environment and run the command line tool
+ENTRYPOINT ["/bin/bash", "-c", "export MINERU_MODEL_SOURCE=local && exec \"$@\"", "--"]

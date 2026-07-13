@@ -25,7 +25,6 @@ const COOKIE_DAYS = 180
 const COOKIE_KEYS = {
   lang: 'pdf_parser_lang',
   codeLang: 'pdf_parser_code_lang',
-  parserUrl: 'pdf_parser_url',
   llmBaseUrl: 'pdf_parser_llm_base_url',
   llmApiKey: 'pdf_parser_llm_api_key',
   llmModel: 'pdf_parser_llm_model',
@@ -272,21 +271,8 @@ const STR = {
     switchLanguage: 'English',
     appTitle: 'ドキュメント解析ツール',
     appSubtitle:
-      'PDF をアップロードして解析サーバーへ送信し、生成された Markdown をダウンロードできます。',
+      'PDF をアップロードして、生成された Markdown をダウンロードできます。',
     latestTask: '最新タスク',
-
-    parserServer: '解析サーバー',
-    parserHelp:
-      'PDF 解析サーバーの URL を指定します。この値はブラウザの Cookie に保存されます。',
-    parserUrl: 'PDF 解析サーバー URL',
-    checkParser: '解析サーバーを確認',
-    checking: '確認中…',
-    connected: (d) =>
-      `接続成功。キュー API が利用できます。完了: ${d.completed_count ?? 0} 件、待機中: ${
-        d.queued_count ?? 0
-      } 件、失敗: ${d.failed_count ?? 0} 件。`,
-    parserCheckFailed: (e) =>
-      `解析サーバーの確認に失敗しました。サーバー起動状態と CORS 設定を確認してください。詳細: ${e}`,
 
     uploadPdf: 'PDF アップロード',
     pdfFile: 'PDF ファイル',
@@ -314,7 +300,6 @@ const STR = {
     processing: '処理中…',
     uploading: 'アップロード中…',
     selectPdf: 'PDF ファイルを選択してください。',
-    enterParser: 'PDF 解析サーバー URL を入力してください。',
     fillLlm:
       '画像処理を有効にする場合は、LLM ベース URL、API キー、モデルを入力してください。',
     submittedQueued: '送信しました。キューで待機中です…',
@@ -370,21 +355,8 @@ const STR = {
     switchLanguage: '日本語',
     appTitle: 'Document Parser',
     appSubtitle:
-      'Upload a PDF, send it to your parser server, and download the generated Markdown.',
+      'Upload a PDF and download the generated Markdown.',
     latestTask: 'Latest task',
-
-    parserServer: 'Parser Server',
-    parserHelp:
-      'Enter the PDF parser server URL. This value is saved in browser cookies.',
-    parserUrl: 'PDF Parser Server URL',
-    checkParser: 'Check parser server',
-    checking: 'Checking…',
-    connected: (d) =>
-      `Connected. Queue API is available. Completed: ${d.completed_count ?? 0}, waiting: ${
-        d.queued_count ?? 0
-      }, failed: ${d.failed_count ?? 0}.`,
-    parserCheckFailed: (e) =>
-      `Parser server check failed. Make sure the server is running and CORS is allowed. Details: ${e}`,
 
     uploadPdf: 'Upload PDF',
     pdfFile: 'PDF File',
@@ -412,7 +384,6 @@ const STR = {
     processing: 'Processing…',
     uploading: 'Uploading…',
     selectPdf: 'Please select a PDF file.',
-    enterParser: 'Enter the PDF parser server URL.',
     fillLlm: 'When image processing is enabled, enter LLM Base URL, API Key, and Model.',
     submittedQueued: 'Submitted. Waiting in queue…',
     submittedProcessing: 'Submitted. Processing…',
@@ -749,6 +720,14 @@ function normalizeBaseUrl(url) {
   return String(url || '').trim().replace(/\/+$/, '')
 }
 
+const PARSER_API = {
+  queue: '/queue',
+  upload: '/upload',
+  status: (taskId) => `/status/${encodeURIComponent(taskId)}`,
+  result: (taskId) => `/result/${encodeURIComponent(taskId)}`,
+  queueItem: (taskId) => `/queue/${encodeURIComponent(taskId)}`,
+}
+
 function chatCompletionsUrl(baseUrl) {
   const base = normalizeBaseUrl(baseUrl)
 
@@ -834,8 +813,6 @@ export default function App() {
 
   const t = STR[lang] || STR.ja
 
-  const [parserUrl] = useState(() => import.meta.env.VITE_PDF_API_URL || '')
-
   const [llmBaseUrl, setLlmBaseUrl] = useState(
     () => getCookie(COOKIE_KEYS.llmBaseUrl) || import.meta.env.VITE_OPENAI_BASE_URL || ''
   )
@@ -864,8 +841,6 @@ export default function App() {
   const [visionCheck, setVisionCheck] = useState('')
 
   const [queueItems, setQueueItems] = useState(() => loadStoredQueue())
-
-  const apiBase = useMemo(() => normalizeBaseUrl(parserUrl), [parserUrl])
 
   const promptText = useMemo(() => buildPromptText(lang, codeLang), [lang, codeLang])
 
@@ -922,8 +897,6 @@ export default function App() {
   }
 
   const refreshQueue = async ({ silent = true } = {}) => {
-    if (!apiBase) return
-
     if (!silent) {
       setQueueBusy(true)
       setError(null)
@@ -932,7 +905,7 @@ export default function App() {
     try {
       const incoming = []
 
-      const queueRes = await fetch(`${apiBase}/queue`)
+      const queueRes = await fetch(PARSER_API.queue)
 
       if (queueRes.ok) {
         const queueData = await queueRes.json()
@@ -946,7 +919,7 @@ export default function App() {
       const statusItems = await Promise.all(
         pending.map(async (item) => {
           try {
-            const res = await fetch(`${apiBase}/status/${encodeURIComponent(item.task_id)}`)
+            const res = await fetch(PARSER_API.status(item.task_id))
             if (!res.ok) return null
 
             const data = await res.json()
@@ -995,7 +968,7 @@ export default function App() {
       clearInterval(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiBase])
+  }, [])
 
   const pickFile = (e) => {
     const next = e.target.files?.[0] || null
@@ -1077,11 +1050,6 @@ export default function App() {
   }
 
   const upload = async () => {
-    if (!apiBase) {
-      setError(t.enterParser)
-      return
-    }
-
     if (!file) {
       setError(t.selectPdf)
       return
@@ -1112,7 +1080,7 @@ export default function App() {
         generateImageDescriptions && generateMermaidDiagrams ? 'true' : 'false'
       )
 
-      const uploadRes = await fetch(`${apiBase}/upload`, {
+      const uploadRes = await fetch(PARSER_API.upload, {
         method: 'POST',
         body: fd,
       })
@@ -1167,7 +1135,7 @@ export default function App() {
     setError(null)
 
     try {
-      const resultRes = await fetch(`${apiBase}/result/${encodeURIComponent(item.task_id)}`)
+      const resultRes = await fetch(PARSER_API.result(item.task_id))
 
       if (!resultRes.ok) {
         const text = await readErrorResponse(resultRes)
@@ -1202,7 +1170,7 @@ export default function App() {
     setError(null)
 
     try {
-      const res = await fetch(`${apiBase}/queue/${encodeURIComponent(item.task_id)}`, {
+      const res = await fetch(PARSER_API.queueItem(item.task_id), {
         method: 'DELETE',
       })
 

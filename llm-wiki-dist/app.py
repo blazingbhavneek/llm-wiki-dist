@@ -88,7 +88,7 @@ class AgentRunRegistry:
 # Per-db runtime config (reverse-proxy prefix + where the .sqlite files live).
 DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki"))
 DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
-PREFIX = os.environ.get("WIKI_PREFIX", "").rstrip("/")  # e.g. "/llm-wiki"
+PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
 _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 # The db for the current request; set by the db_routing middleware from the URL.
@@ -291,34 +291,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+DIST_DIR = Path(__file__).parent / "frontend" / "dist"
+
+STATIC_ROOT_FILES = {
+    "/favicon.svg",
+    "/favicon.ico",
+    "/manifest.json",
+    "/robots.txt",
+}
+
+STATIC_PREFIXES = (
+    "/assets/",
+)
+
 
 @app.middleware("http")
 async def db_routing(request: Request, call_next):
     """Peel the reverse-proxy prefix + the db segment off the URL.
 
-    Layout served: {PREFIX}/{db}/            -> frontend
-                   {PREFIX}/{db}/api/...      -> backend for that db
-    The proxy does NOT strip the prefix; the app owns it here. The first path
-    segment after the prefix selects which .sqlite to open (stashed in
-    current_db); the rest is routed as the usual /api/... or / path.
+    Layout served:
+        {PREFIX}/{db}/              -> frontend
+        {PREFIX}/{db}/api/...        -> backend for that db
+        {PREFIX}/favicon.svg         -> static frontend asset
+        {PREFIX}/assets/...          -> static frontend assets
+
+    The proxy should NOT strip PREFIX. The app owns PREFIX here.
     """
     raw = request.scope["path"]
-    path = raw[len(PREFIX):] or "/" if PREFIX and raw.startswith(PREFIX) else raw
+
+    if PREFIX and raw.startswith(PREFIX):
+        path = raw[len(PREFIX):] or "/"
+    else:
+        path = raw
+
+    # ------------------------------------------------------------------
+    # Safe static asset bypass.
+    #
+    # This handles paths like:
+    #   /llm-wiki/favicon.svg
+    #   /llm-wiki/assets/index-abc123.js
+    #
+    # It intentionally only allows known frontend asset locations, so it
+    # does not interfere with db routes like:
+    #   /llm-wiki/wiki/
+    #   /llm-wiki/wiki/api/ready
+    # ------------------------------------------------------------------
+    is_static_asset = (
+        path in STATIC_ROOT_FILES
+        or any(path.startswith(prefix) for prefix in STATIC_PREFIXES)
+    )
+
+    if is_static_asset:
+        static_candidate = (DIST_DIR / path.lstrip("/")).resolve()
+
+        try:
+            static_candidate.relative_to(DIST_DIR.resolve())
+        except ValueError:
+            return PlainTextResponse("not found", status_code=404)
+
+        if static_candidate.is_file():
+            request.scope["path"] = path
+            request.scope["raw_path"] = path.encode()
+            request.scope["root_path"] = PREFIX
+            return await call_next(request)
+
+        return PlainTextResponse("not found", status_code=404)
+
     stripped = path.strip("/")
 
-    if stripped == "":  # bare prefix / root -> point at the default db
+    if stripped == "":
         return RedirectResponse(f"{PREFIX}/{DEFAULT_DB}/", status_code=307)
 
     seg, _, tail = stripped.partition("/")
+
     if not _DB_RE.fullmatch(seg):
         return PlainTextResponse("unknown wiki", status_code=404)
-    if tail == "" and not path.endswith("/"):  # /{prefix}/{db} -> add trailing slash
+
+    if tail == "" and not path.endswith("/"):
         return RedirectResponse(f"{PREFIX}/{seg}/", status_code=307)
 
     clean = "/" + tail
     request.scope["path"] = clean
     request.scope["raw_path"] = clean.encode()
-    request.scope["root_path"] = f"{PREFIX}/{seg}"  # so the app stays prefix-aware
+    request.scope["root_path"] = f"{PREFIX}/{seg}"
 
     token = current_db.set(seg)
     try:
@@ -847,8 +902,6 @@ async def cancel_write_job(job_id: str) -> dict:
         )
     return {"job_id": job_id, "status": "cancelling" if status == "running" else "cancelled"}
 
-
-DIST_DIR = Path(__file__).parent / "frontend" / "dist"
 
 app.mount(
     "/",
