@@ -252,6 +252,14 @@ def _dump(obj: Any) -> Any:
     return obj
 
 
+def _compact_node(obj: Any) -> dict[str, Any]:
+    data = _dump(obj)
+    if not isinstance(data, dict):
+        return {"id": str(data)}
+    fields = ("id", "title", "summary", "type", "cluster")
+    return {key: data[key] for key in fields if data.get(key) is not None}
+
+
 def _job_response(job):
     d = job_to_dict(job)
     # Job payloads can embed whole markdown documents; clients polling job
@@ -602,10 +610,18 @@ async def read_node(node_id: str) -> dict:
 
 @app.get("/api/node/{node_id}/links")
 async def node_links(
-    node_id: str, direction: str = "both", label: str | None = None
+    node_id: str,
+    direction: str = "both",
+    label: str | None = None,
+    limit: int | None = None,
+    compact: bool = False,
 ) -> list[dict]:
+    if limit is not None:
+        limit = max(1, min(limit, 200))
     try:
-        pairs = await reads().follow_link(node_id, label=label, direction=direction)
+        pairs = await reads().follow_link(
+            node_id, label=label, direction=direction, limit=limit
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -616,11 +632,14 @@ async def node_links(
             status_code=500,
             detail=api_error(f"links failed: {exc}", True, "search_failed"),
         ) from exc
-    return [{"edge": _dump(e), "node": _dump(n)} for e, n in pairs]
+    return [
+        {"edge": _dump(e), "node": _compact_node(n) if compact else _dump(n)}
+        for e, n in pairs
+    ]
 
 
 @app.get("/api/search")
-async def search(q: str, limit: int | None = None) -> list[dict]:
+async def search(q: str, limit: int | None = None, compact: bool = False) -> list[dict]:
     try:
         if limit is not None:
             limit = max(1, min(int(limit), 200))
@@ -631,7 +650,7 @@ async def search(q: str, limit: int | None = None) -> list[dict]:
         ) from exc
     try:
         nodes = await reads().search(q, limit)
-        return [_dump(n) for n in nodes]
+        return [(_compact_node(n) if compact else _dump(n)) for n in nodes]
     except Exception as exc:
         raise HTTPException(
             status_code=502,

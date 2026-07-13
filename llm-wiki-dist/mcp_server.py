@@ -11,28 +11,29 @@ from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
+import httpx
+import uvicorn
 from fastmcp import FastMCP
-
-# Reuse your existing app.py runtime.
-#
-# This gives us:
-# - DB_DIR
-# - _DB_RE
-# - STACKS
-# - stages
-# - errors
-# - _ensure_building()
-# - _dump()
-# - Researcher stack
-import app as wiki_runtime
-
+from fastmcp.server.dependencies import get_http_request
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 log = logging.getLogger("llm_wiki_mcp")
 
-# Current sqlite/wiki name for this MCP server process.
-# Direct FastMCP mode serves one wiki per process.
-ACTIVE_DB: str | None = None
+_DB_RE = re.compile(r"[A-Za-z0-9_-]+")
+DEFAULT_PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")
+DEFAULT_BACKEND_ORIGIN = os.environ.get(
+    "MCP_BACKEND_ORIGIN", "http://127.0.0.1:8000"
+).rstrip("/")
+DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
+DEFAULT_DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki")).resolve()
+BACKEND_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
+BACKEND_READY_TIMEOUT_SECONDS = float(
+    os.environ.get("MCP_BACKEND_READY_TIMEOUT_SECONDS", "90")
+)
+BACKEND_READY_POLL_SECONDS = 0.25
 
 
 # =============================================================================
@@ -207,111 +208,222 @@ def sanitize_markdown_for_text_llm(text: str) -> str:
 # Runtime helpers
 # =============================================================================
 
-def _validate_db_name(db: str) -> None:
-    if not wiki_runtime._DB_RE.fullmatch(db):
-        raise ValueError("unknown wiki")
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _set_active_db(db: str) -> None:
-    global ACTIVE_DB
-
-    _validate_db_name(db)
-    ACTIVE_DB = db
+def _env_wiki_allowlist() -> frozenset[str]:
+    values = os.environ.get("MCP_ALLOWED_WIKIS", "").split(",")
+    return frozenset(value.strip() for value in values if value.strip())
 
 
-async def _wait_until_ready(db: str, timeout_seconds: float = 90.0) -> dict:
-    """
-    Lazily bootstrap the requested DB using app.py's existing stack builder.
+class WikiRoutingApp:
+    """Route one FastMCP ASGI app by wiki name without global request state."""
 
-    app.py already supports one runtime stack per sqlite name:
-        STACKS[db]
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        prefix: str = DEFAULT_PREFIX,
+        backend_origin: str = DEFAULT_BACKEND_ORIGIN,
+        default_db: str | None = DEFAULT_DB,
+        db_dir: Path = DEFAULT_DB_DIR,
+        allowed_wikis: frozenset[str] | None = None,
+        allow_new_wikis: bool = False,
+    ) -> None:
+        self.app = app
+        self.prefix = prefix.rstrip("/")
+        self.backend_origin = backend_origin.rstrip("/")
+        self.default_db = default_db
+        self.db_dir = db_dir.resolve()
+        self.allowed_wikis = allowed_wikis or frozenset()
+        self.allow_new_wikis = allow_new_wikis
 
-    This waits up to timeout_seconds so the first MCP call can trigger startup.
-    """
-    _validate_db_name(db)
+    def _db_from_path(self, path: str) -> str | None:
+        if path.rstrip("/") == "/mcp" and self.default_db:
+            return self.default_db
 
-    if wiki_runtime.stages.get(db) == "ready" and db in wiki_runtime.STACKS:
-        return wiki_runtime.STACKS[db]
+        route_prefix = f"{self.prefix}/" if self.prefix else "/"
+        if not path.startswith(route_prefix):
+            return None
 
-    wiki_runtime._ensure_building(db)
+        remainder = path[len(route_prefix) :].strip("/")
+        parts = remainder.split("/")
+        if len(parts) != 2 or parts[1] != "mcp":
+            return None
+        return parts[0]
 
+    def _is_allowed(self, db: str) -> bool:
+        if not _DB_RE.fullmatch(db):
+            return False
+        if self.allowed_wikis and db not in self.allowed_wikis:
+            return False
+        if self.allow_new_wikis:
+            return True
+        return (self.db_dir / f"{db}.sqlite").is_file()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        db = self._db_from_path(scope.get("path", ""))
+        if not db or not self._is_allowed(db):
+            response = JSONResponse({"detail": "unknown wiki"}, status_code=404)
+            await response(scope, receive, send)
+            return
+
+        routed_scope = dict(scope)
+        state = dict(scope.get("state") or {})
+        state.update(
+            {
+                "wiki_db": db,
+                "wiki_backend_origin": self.backend_origin,
+                "wiki_backend_prefix": self.prefix,
+            }
+        )
+        routed_scope["state"] = state
+        routed_scope["path"] = "/mcp"
+        routed_scope["raw_path"] = b"/mcp"
+        routed_scope["root_path"] = f"{self.prefix}/{db}"
+        await self.app(routed_scope, receive, send)
+
+
+class BackendRequestError(RuntimeError):
+    def __init__(self, status_code: int, detail: str, code: str = "backend_error"):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.code = code
+
+
+def _backend_error(response: httpx.Response) -> tuple[str, str]:
+    try:
+        raw_error = response.json()
+    except ValueError:
+        raw_error = {}
+    error = raw_error if isinstance(raw_error, dict) else {}
+    nested_detail = error.get("detail")
+    if isinstance(nested_detail, dict):
+        detail = str(
+            nested_detail.get("message")
+            or nested_detail.get("detail")
+            or response.reason_phrase
+        )
+        code = str(nested_detail.get("code") or "backend_error")
+    else:
+        detail = str(nested_detail or response.text or response.reason_phrase)
+        code = str(error.get("code") or "backend_error")
+    return detail, code
+
+
+async def _wait_for_backend_ready(client: httpx.AsyncClient, ready_url: str) -> None:
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_seconds
+    deadline = loop.time() + BACKEND_READY_TIMEOUT_SECONDS
 
     while loop.time() < deadline:
-        if wiki_runtime.stages.get(db) == "ready" and db in wiki_runtime.STACKS:
-            return wiki_runtime.STACKS[db]
+        response = await client.request("GET", ready_url)
+        if response.is_error:
+            detail, code = _backend_error(response)
+            raise BackendRequestError(response.status_code, detail, code)
 
-        if wiki_runtime.stages.get(db) == "failed":
-            raise RuntimeError(
-                f"wiki '{db}' bootstrap failed: {wiki_runtime.errors.get(db)}"
+        try:
+            status = response.json()
+        except ValueError as exc:
+            raise RuntimeError("LLM-Wiki backend returned invalid readiness JSON") from exc
+        if not isinstance(status, dict):
+            raise RuntimeError("LLM-Wiki backend returned invalid readiness data")
+        if status.get("ready"):
+            return
+        if status.get("stage") == "failed":
+            raise BackendRequestError(
+                503,
+                str(status.get("error") or "wiki bootstrap failed"),
+                "bootstrap_failed",
             )
+        await asyncio.sleep(BACKEND_READY_POLL_SECONDS)
 
-        await asyncio.sleep(0.25)
-
-    stage = wiki_runtime.stages.get(db, "starting")
-    err = wiki_runtime.errors.get(db)
-
-    raise RuntimeError(
-        f"wiki '{db}' is not ready yet; stage={stage}; detail={err or 'building'}"
+    raise BackendRequestError(
+        503,
+        "wiki backend did not become ready before the MCP timeout",
+        "not_ready",
     )
 
 
-async def _researcher_for_current_db():
-    db = ACTIVE_DB
-
-    if not db:
-        raise RuntimeError("missing db context; start server with --wiki {sqlite_name}")
-
-    stack = await _wait_until_ready(db)
-    return stack["researcher"]
-
-
-async def _search_with_evidence(researcher, query: str, limit: int):
-    """
-    Prefer public Researcher.search_with_evidence() if it exists.
-    Otherwise use the existing Researcher._run(...) bridge.
-    """
-    if hasattr(researcher, "search_with_evidence"):
-        return await researcher.search_with_evidence(query, limit)
-
-    return await researcher._run(
-        lambda session: session.search_with_evidence(query, limit)
-    )
+def _request_backend() -> tuple[str, str, str]:
+    request = get_http_request()
+    db = getattr(request.state, "wiki_db", None)
+    origin = getattr(request.state, "wiki_backend_origin", None)
+    prefix = getattr(request.state, "wiki_backend_prefix", None)
+    if not db or not origin or prefix is None:
+        raise RuntimeError("missing wiki route context")
+    return db, origin, prefix
 
 
-async def _follow_link_limited(
-    researcher,
+async def _backend_json(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+    allow_not_found: bool = False,
+) -> Any:
+    db, origin, prefix = _request_backend()
+    url = f"{origin}{prefix}/{db}{path}"
+    ready_url = f"{origin}{prefix}/{db}/api/ready"
+
+    try:
+        async with httpx.AsyncClient(timeout=BACKEND_TIMEOUT) as client:
+            response = await client.request(method, url, params=params, json=payload)
+            if response.status_code == 503:
+                _detail, code = _backend_error(response)
+                if code == "not_ready":
+                    await _wait_for_backend_ready(client, ready_url)
+                    response = await client.request(
+                        method, url, params=params, json=payload
+                    )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"LLM-Wiki backend unavailable: {exc}") from exc
+
+    if allow_not_found and response.status_code == 404:
+        return None
+
+    if response.is_error:
+        detail, code = _backend_error(response)
+        raise BackendRequestError(response.status_code, detail, code)
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError("LLM-Wiki backend returned invalid JSON") from exc
+
+
+async def _backend_links(
     node_id: str,
     *,
     label: str | None,
     direction: str,
     limit: int,
-):
-    """
-    Follow graph links from a node.
-
-    Supports both possible Researcher signatures:
-    - follow_link(..., limit=N)
-    - follow_link(...) then slice result
-    """
-    try:
-        return await researcher.follow_link(
-            node_id,
-            label=label,
-            direction=direction,
-            limit=limit,
-        )
-    except TypeError as exc:
-        if "limit" not in str(exc):
-            raise
-
-        pairs = await researcher.follow_link(
-            node_id,
-            label=label,
-            direction=direction,
-        )
-        return pairs[:limit]
+) -> list[tuple[Any, Any]]:
+    params: dict[str, Any] = {
+        "direction": direction,
+        "limit": limit,
+        "compact": True,
+    }
+    if label:
+        params["label"] = label
+    items = await _backend_json(
+        "GET", f"/api/node/{quote(node_id, safe='')}/links", params=params
+    )
+    if not isinstance(items, list):
+        raise RuntimeError("LLM-Wiki backend returned invalid link data")
+    return [
+        (item.get("edge"), item.get("node"))
+        for item in items[:limit]
+        if isinstance(item, dict)
+    ]
 
 
 # =============================================================================
@@ -320,10 +432,8 @@ async def _follow_link_limited(
 
 def _jsonable(obj: Any) -> Any:
     """
-    Convert app objects / dataclasses / pydantic models into JSON-safe values.
+    Convert dataclasses and pydantic models into JSON-safe values.
     """
-    obj = wiki_runtime._dump(obj)
-
     if obj is None:
         return None
 
@@ -338,6 +448,12 @@ def _jsonable(obj: Any) -> Any:
 
     if is_dataclass(obj) and not isinstance(obj, type):
         return _jsonable(asdict(obj))
+
+    if hasattr(obj, "model_dump"):
+        return _jsonable(obj.model_dump())
+
+    if hasattr(obj, "dict"):
+        return _jsonable(obj.dict())
 
     if isinstance(obj, Path):
         return str(obj)
@@ -555,14 +671,19 @@ def _compact_error(exc: Exception) -> str:
 mcp = FastMCP(
     name="llm-wiki-graph",
     instructions=(
-        "Read-only LLM-Wiki graph exploration server. "
-        "Recommended workflow: "
-        "1) Use hybrid_search to find relevant node IDs. "
-        "2) Use read_nodes on the best node IDs to read the full source body and see neighboring nodes. "
-        "3) Use explore_links if wider graph traversal is needed. "
+        "Request-scoped LLM-Wiki graph research server. The wiki is selected by the "
+        "database name in the MCP endpoint URL and must not be changed with tool arguments. "
+        "The main agent orchestrates: use hybrid_search only for bounded initial seeding, "
+        "then delegate every read_nodes call, explore_links call, and later gap search to "
+        "route subagents. Subagents return compact cited reports; they do not synthesize, "
+        "spawn agents, or write. Explore every selected material route before synthesis. "
+        "After producing reusable, evidence-grounded knowledge, the main agent calls "
+        "queue_agent_note exactly once. "
+        "That tool only queues the note; do not poll or wait for assimilation. "
         "Tool responses are Markdown, not raw JSON. "
         "Node bodies are returned in full; embedded base64 image payloads are removed before output. "
-        "If image descriptions exist, they are preserved as semantic text."
+        "If image descriptions exist, they are preserved as semantic text. "
+        "Do not save raw transcripts, secrets, chain-of-thought, or unsupported speculation."
     ),
 )
 
@@ -603,7 +724,8 @@ async def hybrid_search(query: str, limit: int = 10) -> str:
     - This tool intentionally does NOT return evidence chunks, full bodies,
       image payloads, or raw large JSON.
     - The purpose is to identify the right node IDs.
-    - After this tool, call read_nodes with the most relevant node IDs.
+    - After this tool, the main agent delegates the most relevant node IDs to route
+      subagents, which call read_nodes and traverse their assigned regions.
     - Use node IDs exactly as returned.
     """
     query = query.strip()
@@ -616,8 +738,11 @@ async def hybrid_search(query: str, limit: int = 10) -> str:
 
     limit = max(1, int(limit or 10))
 
-    researcher = await _researcher_for_current_db()
-    results = await _search_with_evidence(researcher, query, limit)
+    results = await _backend_json(
+        "GET", "/api/search", params={"q": query, "limit": limit, "compact": True}
+    )
+    if not isinstance(results, list):
+        raise RuntimeError("LLM-Wiki backend returned invalid search data")
 
     lines: list[str] = [
         "# Hybrid Search Results",
@@ -627,7 +752,7 @@ async def hybrid_search(query: str, limit: int = 10) -> str:
         "",
         "## How to use these results",
         "",
-        "Pick the most relevant node IDs below, then call `read_nodes` to inspect the full source body and neighboring nodes.",
+        "The main agent assigns relevant node IDs to route subagents. Each subagent calls `read_nodes` and explores its assigned region.",
         "",
     ]
 
@@ -636,7 +761,7 @@ async def hybrid_search(query: str, limit: int = 10) -> str:
     for rank, item in enumerate(results, start=1):
         dumped = _jsonable(item)
 
-        if isinstance(dumped, dict):
+        if isinstance(dumped, dict) and "node" in dumped:
             node = dumped.get("node")
             score = dumped.get("score")
         else:
@@ -654,7 +779,7 @@ async def hybrid_search(query: str, limit: int = 10) -> str:
             "",
             "## Next step",
             "",
-            "Call `read_nodes` with one or more Node IDs from above.",
+            "Delegate one or more Node IDs above to route subagents for `read_nodes` and graph traversal.",
         ]
     )
 
@@ -719,7 +844,7 @@ async def read_nodes(
     How the LLM should use the response:
     - Use the Body section as the primary source for answering the user.
     - Use Neighboring Nodes to decide what node to read next.
-    - If more graph context is needed, call explore_links.
+    - If more graph context is needed, the route subagent calls explore_links.
     """
     ids = _normalize_node_ids(node_ids)
 
@@ -738,8 +863,6 @@ async def read_nodes(
 
     neighbor_limit = max(0, int(neighbor_limit or 0))
 
-    researcher = await _researcher_for_current_db()
-
     lines: list[str] = [
         "# Read Nodes",
         "",
@@ -755,7 +878,11 @@ async def read_nodes(
 
     for node_index, node_id in enumerate(ids, start=1):
         try:
-            node = await researcher.read_node(node_id)
+            node = await _backend_json(
+                "GET",
+                f"/api/node/{quote(node_id, safe='')}",
+                allow_not_found=True,
+            )
         except Exception as exc:
             lines.extend(
                 [
@@ -838,8 +965,7 @@ async def read_nodes(
             )
 
             try:
-                pairs = await _follow_link_limited(
-                    researcher,
+                pairs = await _backend_links(
                     actual_id,
                     label=None,
                     direction=normalized_direction,
@@ -895,7 +1021,7 @@ async def read_nodes(
         [
             "## Next step",
             "",
-            "If more context is needed, call `read_nodes` on one of the Neighbor Node IDs or call `explore_links` for wider graph traversal.",
+            "The route subagent should read promising Neighbor Node IDs or call `explore_links` until its assigned frontier is closed or bounded.",
         ]
     )
 
@@ -949,7 +1075,7 @@ async def explore_links(
     How the LLM should use the response:
     - Use this as a navigation map.
     - Pick promising Neighbor Node IDs.
-    - Then call read_nodes on those IDs to inspect full source content.
+    - Then the route subagent calls read_nodes on those IDs to inspect full source content.
     """
     ids = _normalize_node_ids(node_ids)
 
@@ -968,8 +1094,6 @@ async def explore_links(
         )
 
     limit = max(1, int(limit or 30))
-
-    researcher = await _researcher_for_current_db()
 
     lines: list[str] = [
         "# Explore Links",
@@ -1002,8 +1126,7 @@ async def explore_links(
         )
 
         try:
-            pairs = await _follow_link_limited(
-                researcher,
+            pairs = await _backend_links(
                 node_id,
                 label=label,
                 direction=normalized_direction,
@@ -1080,24 +1203,148 @@ async def explore_links(
         [
             "## Next step",
             "",
-            "Call `read_nodes` on the most relevant Neighbor Node IDs.",
+            "The route subagent calls `read_nodes` on the most relevant Neighbor Node IDs.",
         ]
     )
 
     return "\n".join(lines)
 
 
+async def _queue_agent_note(
+    body: str,
+    source_node_ids: list[str] | None = None,
+    question: str | None = None,
+) -> str:
+    clean_body = sanitize_markdown_for_text_llm(str(body or "")).strip()
+    if not clean_body:
+        raise ValueError("agent note body must not be empty")
+
+    cited_ids = _normalize_node_ids(source_node_ids or [])
+    clean_question = " ".join(str(question or "").split()) or None
+    result = await _backend_json(
+        "POST",
+        "/api/exogenous",
+        payload={
+            "body": clean_body,
+            "source_node_ids": cited_ids,
+            "origin": "agent:mcp",
+            "question": clean_question,
+        },
+    )
+    if not isinstance(result, dict) or not result.get("id"):
+        raise RuntimeError("LLM-Wiki backend returned invalid write-job data")
+
+    db, _origin, _prefix = _request_backend()
+    lines = [
+        "# Agent Note Queued",
+        "",
+        f"- **Wiki:** `{db}`",
+        f"- **Job ID:** `{result['id']}`",
+        f"- **Status:** `{result.get('status', 'queued')}`",
+        f"- **Cited node count:** `{len(cited_ids)}`",
+    ]
+    if result.get("position") is not None:
+        lines.append(f"- **Queue position:** `{result['position']}`")
+    lines.extend(
+        [
+            "",
+            "The backend accepted the write. Continue immediately; do not poll or wait for assimilation.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def queue_agent_note(
+    body: str,
+    source_node_ids: list[str] | None = None,
+    question: str | None = None,
+) -> str:
+    """Queue one durable, evidence-grounded agent note in the active wiki.
+
+    Call this once after completing useful research. The backend serializes the
+    addition with every other graph write and assimilates it in the background.
+    This tool returns when the job is accepted; do not poll or wait for completion.
+
+    Input:
+    - body: The concise synthesized knowledge to preserve as Markdown.
+    - source_node_ids: Exact node IDs that support the note.
+    - question: The original question, used as the note title when provided.
+
+    Do not submit raw transcripts, secrets, chain-of-thought, unsupported claims,
+    or partial subagent reports.
+    """
+    return await _queue_agent_note(body, source_node_ids, question)
+
+
 # =============================================================================
 # CLI
 # =============================================================================
+
+def create_app(
+    *,
+    prefix: str = DEFAULT_PREFIX,
+    backend_origin: str = DEFAULT_BACKEND_ORIGIN,
+    default_db: str | None = DEFAULT_DB,
+    db_dir: Path = DEFAULT_DB_DIR,
+    allowed_wikis: frozenset[str] | None = None,
+    allow_new_wikis: bool | None = None,
+) -> ASGIApp:
+    """Build the multi-wiki ASGI wrapper around FastMCP's static route."""
+    inner = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
+    return WikiRoutingApp(
+        inner,
+        prefix=prefix,
+        backend_origin=backend_origin,
+        default_db=default_db,
+        db_dir=db_dir,
+        allowed_wikis=(
+            _env_wiki_allowlist() if allowed_wikis is None else allowed_wikis
+        ),
+        allow_new_wikis=(
+            _env_flag("MCP_ALLOW_NEW_WIKIS")
+            if allow_new_wikis is None
+            else allow_new_wikis
+        ),
+    )
+
+
+# ASGI entrypoint for `uvicorn mcp_server:app`.
+app = create_app()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LLM-Wiki MCP server")
 
     parser.add_argument(
         "--wiki",
-        default=os.environ.get("MCP_WIKI", "wiki"),
-        help="SQLite/wiki name to serve. Example: wiki",
+        default=os.environ.get("MCP_WIKI", DEFAULT_DB),
+        help="Default wiki for the legacy /mcp route. Named routes ignore this.",
+    )
+
+    parser.add_argument(
+        "--prefix",
+        default=DEFAULT_PREFIX,
+        help="Route prefix shared with app.py. Default: /llm-wiki",
+    )
+
+    parser.add_argument(
+        "--backend-origin",
+        default=DEFAULT_BACKEND_ORIGIN,
+        help="Trusted app.py origin. Default: http://127.0.0.1:8000",
+    )
+
+    parser.add_argument(
+        "--db-dir",
+        default=str(DEFAULT_DB_DIR),
+        help="Directory containing <wiki>.sqlite files.",
+    )
+
+    parser.add_argument(
+        "--allow-new-wikis",
+        action="store_true",
+        default=_env_flag("MCP_ALLOW_NEW_WIKIS"),
+        help="Allow routes for sqlite names that do not exist yet.",
     )
 
     parser.add_argument(
@@ -1123,14 +1370,20 @@ def main() -> None:
 
     logging.getLogger("graph_librarian").setLevel(logging.INFO)
 
-    _set_active_db(args.wiki)
-
     log.info("Starting LLM-Wiki MCP server")
-    log.info("wiki=%s", args.wiki)
+    log.info("route=%s/{wiki}/mcp", args.prefix)
+    log.info("legacy_default_wiki=%s", args.wiki)
+    log.info("backend=%s", args.backend_origin)
     log.info("bind=%s:%s", args.host, args.port)
 
-    mcp.run(
-        transport="http",
+    uvicorn.run(
+        create_app(
+            prefix=args.prefix,
+            backend_origin=args.backend_origin,
+            default_db=args.wiki,
+            db_dir=Path(args.db_dir),
+            allow_new_wikis=args.allow_new_wikis,
+        ),
         host=args.host,
         port=args.port,
     )

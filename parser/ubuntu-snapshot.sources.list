@@ -1,0 +1,6 @@
+# Ubuntu 22.04 archive state used by parser/Dockerfile.
+# Direct snapshot URLs avoid any fallback to the moving archive endpoints.
+deb https://snapshot.ubuntu.com/ubuntu/20260713T000000Z jammy main universe restricted multiverse
+deb https://snapshot.ubuntu.com/ubuntu/20260713T000000Z jammy-updates main universe restricted multiverse
+deb https://snapshot.ubuntu.com/ubuntu/20260713T000000Z jammy-backports main universe restricted multiverse
+deb https://snapshot.ubuntu.com/ubuntu/20260713T000000Z jammy-security main universe restricted multiverse

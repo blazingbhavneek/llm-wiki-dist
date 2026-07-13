@@ -44,7 +44,6 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)
 CACHE_RETENTION_HOURS = float(os.environ.get("CACHE_RETENTION_HOURS", "720"))
 CACHE_RETENTION_SECONDS = CACHE_RETENTION_HOURS * 60 * 60
 
-GPU_MEMORY_UTILIZATION = os.environ.get("GPU_MEMORY_UTILIZATION", "0.05")
 INVOKE_URL = os.environ.get("OPENAI_BASE_URL", "http://10.160.144.101:51029/v1")
 API_KEY = os.environ.get("OPENAI_API_KEY", "local")
 MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")
@@ -557,7 +556,6 @@ def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str
     try:
         pdf.PDF_DIR = temp_pdf_dir
         pdf.OUTPUT_DIR = mineru_dir
-        pdf.GPU_MEMORY_UTILIZATION = GPU_MEMORY_UTILIZATION
 
         expected_output_folder = mineru_dir / Path(pdf_path).stem
 
