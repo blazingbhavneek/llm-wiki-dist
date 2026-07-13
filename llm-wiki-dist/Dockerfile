@@ -440,6 +440,17 @@ else
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "uv run uvicorn app:app --port 8000 --host 0.0.0.0" C-m
 fi
 
+if ! runuser -u seigyo -- tmux list-windows -t "${SESSION_NAME}" -F '#{window_name}' | grep -qx mcp; then
+  echo "Starting MCP tmux window..."
+  runuser -u seigyo -- tmux new-window -t "${SESSION_NAME}" -n mcp -c "${APP_HOME}" bash
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export WIKI_DB_DIR=${WIKI_DB_DIR:-.wiki}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export WIKI_DEFAULT_DB=${WIKI_DEFAULT_DB:-wiki}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export WIKI_PREFIX=${WIKI_PREFIX-/llm-wiki}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export MCP_BACKEND_ORIGIN=${MCP_BACKEND_ORIGIN:-http://127.0.0.1:8000}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export UV_CACHE_DIR=/home/seigyo/.cache/uv" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "uv run python mcp_server.py --port 8001 --host 0.0.0.0" C-m
+fi
+
 sleep 2
 
 echo
@@ -448,7 +459,7 @@ runuser -u seigyo -- tmux ls || true
 
 echo
 echo "Processes:"
-ps -ef | grep -E "sshd|tmux|uvicorn" | grep -v grep || true
+ps -ef | grep -E "sshd|tmux|uvicorn|mcp_server" | grep -v grep || true
 
 echo
 echo "Listening ports:"
@@ -471,6 +482,9 @@ echo
 echo "Backend:"
 echo "  http://<HOST>:51028"
 echo
+echo "MCP:"
+echo "  http://<HOST>:8001${WIKI_PREFIX-/llm-wiki}/{wiki}/mcp"
+echo
 echo "Attach backend:"
 echo "  tmux attach -t backend"
 echo
@@ -483,6 +497,6 @@ EOF
 
 RUN chmod +x /usr/local/bin/start-llm-wiki.sh
 
-EXPOSE 22 8000
+EXPOSE 22 8000 8001
 
 CMD ["/usr/local/bin/start-llm-wiki.sh"]

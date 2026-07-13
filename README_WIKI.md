@@ -40,7 +40,7 @@ llm-wiki-rikiseisan:latest
 
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
-  -p 51025:8000 -p 51024:22 \
+  -p 51025:8000 -p 51026:8001 -p 51024:22 \
   -e WIKI_PREFIX="/llm-wiki" \
   llm-wiki-rikiseisan:latest
 ```
@@ -50,6 +50,7 @@ docker run -d --name llm-wiki-rikiseisan \
 | ホストポート | コンテナポート | 用途 |
 |---:|---:|---|
 | `51025` | `8000` | Webアプリ / バックエンド |
+| `51026` | `8001` | MCP (`/llm-wiki/{db}/mcp`) |
 | `51024` | `22` | コンテナへのSSHアクセス |
 
 バックエンドサーバーはコンテナ内で自動的に起動します。
@@ -58,6 +59,13 @@ WebアプリURL:
 
 ```text
 http://10.160.152.38:51025/llm-wiki
+```
+
+MCP URLはSQLite名をパスで選択します:
+
+```text
+http://10.160.152.38:51026/llm-wiki/wiki/mcp
+http://10.160.152.38:51026/llm-wiki/moove/mcp
 ```
 
 ---
@@ -94,7 +102,7 @@ tmux attach -t backend -d
 
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
-  -p 51025:8000 -p 51024:22 \
+  -p 51025:8000 -p 51026:8001 -p 51024:22 \
   -e WIKI_PREFIX="/llm-wiki" \
   -v "$PWD/.wiki:/home/seigyo/llm-wiki/.wiki" \
   llm-wiki-rikiseisan:latest
@@ -149,7 +157,7 @@ $PWD/.wiki/meetings.sqlite
 
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
-  -p 51025:8000 -p 51024:22 \
+  -p 51025:8000 -p 51026:8001 -p 51024:22 \
   -e WIKI_PREFIX="/llm-wiki" \
   -e WIKI_EMBED_BASE_URL=http://your-embed-server:8081/v1 \
   -e WIKI_RERANK_BASE_URL=http://your-rerank-server:8082/v1 \
@@ -179,7 +187,7 @@ docker rm llm-wiki-rikiseisan
 
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
-  -p 51025:8000 -p 51024:22 \
+  -p 51025:8000 -p 51026:8001 -p 51024:22 \
   -e WIKI_PREFIX="/llm-wiki" \
   llm-wiki-rikiseisan:latest
 ```

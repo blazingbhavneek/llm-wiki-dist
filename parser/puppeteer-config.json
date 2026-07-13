@@ -1,5 +1,5 @@
 {
-  "executablePath": "/home/seigyo/llm-wiki/chrome-headless-shell-linux64/chrome-headless-shell",
+  "executablePath": "/usr/local/bin/chrome-headless-shell",
   "args": [
     "--no-sandbox",
     "--disable-setuid-sandbox",

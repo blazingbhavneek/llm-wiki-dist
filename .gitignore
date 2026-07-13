@@ -2,3 +2,4 @@ llm-wiki-dist/.wiki
 *__pycache__/
 **.pyc
 **.tar.gz
+.codegraph

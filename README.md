@@ -13,7 +13,7 @@ DOCKER_BUILDKIT=1 docker build -t llm-wiki-rikiseisan:latest .
 
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
-  -p 8000:8000 -p 51027:22 \
+  -p 8000:8000 -p 8001:8001 -p 51027:22 \
   -v "$PWD/.wiki:/home/seigyo/llm-wiki/.wiki" \
   llm-wiki-rikiseisan:latest
 ```
@@ -21,18 +21,34 @@ docker run -d --name llm-wiki-rikiseisan \
 Open http://localhost:8000/llm-wiki/ (redirects to `/llm-wiki/wiki/`).
 Any URL segment picks/creates a db: `/llm-wiki/manual/`, `/llm-wiki/meetings/`.
 
+The same database segment selects the stateless MCP endpoint:
+
+```text
+http://localhost:8001/llm-wiki/manual/mcp
+http://localhost:8001/llm-wiki/meetings/mcp
+```
+
+MCP reads are proxied to the backend, and `queue_agent_note` submits to the
+backend's existing per-wiki write queue and returns immediately. By default MCP
+only serves existing `<db>.sqlite` files; set `MCP_ALLOW_NEW_WIKIS=1` to allow
+MCP routes to create new wikis, or set `MCP_ALLOWED_WIKIS=manual,meetings` to
+restrict the service to an explicit allowlist.
+
 ### Env overrides (optional)
 
 - `WIKI_PREFIX` — reverse-proxy prefix (default `/llm-wiki`)
 - `WIKI_DEFAULT_DB` — db the bare prefix redirects to (default `wiki`)
 - `WIKI_DB_DIR` — dir of `<db>.sqlite` files (default `.wiki`)
+- `MCP_BACKEND_ORIGIN` — trusted `app.py` origin (default `http://127.0.0.1:8000`)
+- `MCP_ALLOWED_WIKIS` — optional comma-separated MCP wiki allowlist
+- `MCP_ALLOW_NEW_WIKIS` — allow MCP access before the sqlite file exists (default `0`)
 - Models default to `10.160.144.101` (chat 51029, embed 51024, rerank 51025).
   To point at local vllm (`./vllm_embed_reranker.sh`, embed 8081 / rerank 8082):
 
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
   --add-host=host.docker.internal:host-gateway \
-  -p 51025:8000 -p 51024:22 \
+  -p 51025:8000 -p 51026:8001 -p 51024:22 \
   -e WIKI_PREFIX="/llm-wiki" \
   llm-wiki-rikiseisan:latest
   # -v "$PWD/.wiki:/home/seigyo/llm-wiki/.wiki" \
@@ -44,66 +60,107 @@ docker run -d --name llm-wiki-rikiseisan \
 
 # doc-parser
 
-GPU PDF parser (MinerU + vLLM). Base image `vllm/vllm-openai:v0.21.0`.
+GPU PDF parser (MinerU 3.4.4 + vLLM 0.21.0 + torch 2.11.0+cu130).
+The CUDA 13 base image is pinned by digest, Ubuntu packages come from a dated
+archive snapshot, Python and npm dependencies are locked, and all MinerU models
+are downloaded at pinned commits and checksummed during the build. The running
+container is configured for offline model access.
 
 ## Build
 
-From repo root (not `parser/`):
+Run from the repository root, not `parser/`. The work proxy
+`http://133.141.7.237:9515` is the default for every build-network operation:
 
 ```bash
-docker build \
-  --build-context hf_cache="$HOME/.cache/huggingface" \
-  -f parser/Dockerfile \
-  -t doc-parser-rikiseisan:latest \
-  --load .
+docker build -f parser/Dockerfile \
+  -t doc-parser-rikiseisan:3.4.4-cuda13 \
+  -t doc-parser-rikiseisan:latest .
 ```
 
-`hf_cache` is a named build context, not a volume: MinerU models are copied from
-the host cache into the image at build time. Populate `~/.cache/huggingface`
-first or the parser has no models at runtime.
+Outside the work network, disable it with one empty build argument:
+
+```bash
+docker build --build-arg PROXY_URL= -f parser/Dockerfile \
+  -t doc-parser-rikiseisan:latest .
+```
+
+No host Hugging Face cache or named build context is needed. BuildKit retains
+partial downloads and retries/resumes unreliable model transfers. The embedded
+model revisions are:
+
+- `opendatalab/PDF-Extract-Kit-1.0@ed6b654c018d742e65a17671e379c5e6ecc87ec9`
+- `opendatalab/MinerU2.5-Pro-2605-1.2B@bff20d4ae2bf202df9f45284b4d43681555a97ed`
+
+The standalone MinerU CLI image uses the same locks and model bundle:
+
+```bash
+docker build -f Dockerfile.mineru \
+  -t mineru-offline:3.4.4-cuda13 \
+  -t mineru-offline:latest .
+```
+
+Outside the work network, use the same `--build-arg PROXY_URL=` empty override
+for the standalone build.
 
 ## Run
 
-Needs `nvidia-container-toolkit` on the host (driver alone is not enough — the
-container's start script exits if `nvidia-smi` is missing):
-
-```bash
-sudo pacman -S nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
+The host needs an NVIDIA driver new enough for CUDA 13 and
+`nvidia-container-toolkit`. A host CUDA toolkit is not required because the
+image contains the CUDA 13 user-space stack.
 
 ```bash
 docker run -d --name parser --gpus all \
   -p 127.0.0.1:8000:8000 \
-  -p 127.0.0.1:2222:22 \
   --shm-size=8g \
-  doc-parser-rikiseisan:reduced
+  doc-parser-rikiseisan:latest
 ```
 
-API on http://localhost:8000
+This uses the embedded work proxy. On any machine outside the work network, add
+the single empty runtime override; the entrypoint then unsets all upper- and
+lower-case HTTP, HTTPS, and ALL proxy variables:
+
+```bash
+docker run -d --name parser --gpus all \
+  -e PROXY_URL= \
+  -p 127.0.0.1:8000:8000 \
+  --shm-size=8g \
+  doc-parser-rikiseisan:latest
+```
+
+API and frontend: http://localhost:8000. The health check calls `/queue`.
 
 ### Flags that matter
 
-- `--gpus all` — required. Startup aborts without it.
-- `--shm-size=8g` — required. Torch gets 64 MB of `/dev/shm` by default and crashes.
-- `-p 127.0.0.1:2222:22` — sshd runs with password auth and a password baked into
-  the image. Bind to loopback; do not publish on all interfaces.
+- `--gpus all` — required for normal parsing; startup fails clearly without a GPU.
+- `--shm-size=8g` — avoids Docker's 64 MB shared-memory default for torch/vLLM.
+- `-e PROXY_URL=` — disables the embedded work proxy outside that network.
 
 ### Env overrides (optional)
 
-- `GPU_TARGET_ALLOC_MB` — VRAM to reserve, default `7168`. Container refuses to
-  start if the GPU has less total VRAM than this. `GPU_MEMORY_UTILIZATION` is
-  derived as `GPU_TARGET_ALLOC_MB / total_vram_mb`.
-- `MINERU_MODEL_SOURCE` — default `local` (use the baked-in `hf_cache` models).
+- `MINERU_BACKEND` — `hybrid-engine` by default; `pipeline` is useful for
+  CPU-only validation.
+- `MINERU_METHOD` — `auto` by default; supported values are `auto`, `txt`, and
+  `ocr`.
+- `MINERU_EFFORT` — `medium` by default; set `high` for higher-accuracy hybrid
+  parsing with image/chart analysis.
+- `PARSER_REQUIRE_GPU=0` — allows CPU/pipeline diagnostics and slow validation;
+  normal hybrid-engine production parsing expects a GPU.
+- `PROXY_URL` — proxy applied to all common proxy variables; empty unsets them.
+- `NO_PROXY_VALUE` — default `localhost,127.0.0.1,::1`.
 
 ### Logs
 
-`uvicorn` runs inside tmux, not as PID 1 — `docker logs` shows only the startup
-banner. For server output:
+Uvicorn runs directly as PID 1, so normal Docker logging and signals work:
 
 ```bash
-docker exec -it parser runuser -u seigyo -- tmux attach -t parser
+docker logs -f parser
 ```
 
-Detach with `Ctrl-b d`.
+To transfer the already-built, self-contained image to an offline H200 host:
+
+```bash
+docker save -o doc-parser-rikiseisan-3.4.4-cuda13.tar \
+  doc-parser-rikiseisan:3.4.4-cuda13
+# Copy the tar to the server, then:
+docker load -i doc-parser-rikiseisan-3.4.4-cuda13.tar
+```
