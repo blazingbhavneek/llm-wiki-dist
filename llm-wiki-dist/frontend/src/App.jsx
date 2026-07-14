@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { BookMarked } from 'lucide-react'
 
 import ChatPanel from './components/ChatPanel'
@@ -27,7 +27,7 @@ import { useOverrides } from './hooks/useOverrides'
 import { useSearch } from './hooks/useSearch'
 import { useWorkspace } from './hooks/useWorkspace'
 
-const pdfApiBase = import.meta.env.VITE_PDF_API_URL || 'http://10.160.144.101:51028'
+const pdfApiBase = import.meta.env.VITE_PDF_API_URL || 'http://10.160.144.101:51023'
 
 export default function App() {
   const t = useT(STR)
@@ -45,6 +45,7 @@ export default function App() {
   const [activeRightTabId, setActiveRightTabId] = useState('explorer')
 
   const [activeAnswerId, setActiveAnswerId] = useState(null)
+  const [answerMentionedIdsByAnswerId, setAnswerMentionedIdsByAnswerId] = useState(() => new Map())
   const [focusIds, setFocusIds] = useState(null)
   const [toast, setToast] = useState(null)
   const answerSeq = useRef(0)
@@ -331,9 +332,30 @@ export default function App() {
     setWorkspace(null)
     setActiveAnswerId(null)
     setRightTabs([])
+    setAnswerMentionedIdsByAnswerId(new Map())
     setActiveRightTabId('explorer')
     setCenterView('chat')
   }
+
+  const handleAnswerMentionedIds = useCallback((answerId, ids) => {
+    if (!answerId) return
+
+    const cleanIds = Array.from(
+      new Set(Array.isArray(ids) ? ids.filter(Boolean) : []),
+    )
+
+    setAnswerMentionedIdsByAnswerId((prev) => {
+      const prevIds = prev.get(answerId) || []
+      const prevKey = prevIds.join('|')
+      const nextKey = cleanIds.join('|')
+
+      if (prevKey === nextKey) return prev
+
+      const next = new Map(prev)
+      next.set(answerId, cleanIds)
+      return next
+    })
+  }, [])
 
   const renderCenter = () => {
     if (loading) {
@@ -490,6 +512,8 @@ export default function App() {
               agentCanStop={!!chat.agentRunId}
               agentStopping={chat.agentStopping}
               onStopAgent={chat.stopAgent}
+              rawById={rawById}
+              onAnswerMentionedIds={handleAnswerMentionedIds}
             />
           </div>
         </div>
@@ -557,6 +581,7 @@ export default function App() {
               onOpenFullDoc={openFullDoc}
               rawById={rawById}
               onViewAnswer={(answer) => openAnswerTab(answer, true)}
+              mentionedNodeIdsByAnswerId={answerMentionedIdsByAnswerId}
               onClose={() => setRightOpen(false)}
             />
           )}

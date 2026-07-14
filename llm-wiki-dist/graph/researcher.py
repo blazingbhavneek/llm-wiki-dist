@@ -17,6 +17,9 @@ from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from typing import Any, Callable
 
 from .core import (
     GRAPH_SYSTEM_PROMPT,
@@ -794,7 +797,7 @@ def run_subagent(
     state = agent.invoke(
         {"messages": [{"role": "user", "content": user_prompt}]},
         config={
-            "recursion_limit": max(20, session.settings.subagent_max_steps * 2 + 6),
+            "recursion_limit": max(30, session.settings.subagent_max_steps * 2 + 6),
             # Optional but useful with SQLite/tool thread issues.
             "max_concurrency": 1,
         },
@@ -1580,48 +1583,90 @@ class ResearchSession:
                 "no valid starting nodes resolved from those ids. Search again and pass "
                 "exact node ids from the search results to explore."
             )
+
+        start_refs = []
+        for s in starts:
+            node = self.read_node(s)
+            if node:
+                start_refs.append(node_ref(node))
+
         emit(
             {
                 "type": "subagents_spawned",
-                "starts": [
-                    node_ref(self.read_node(s)) for s in starts if self.read_node(s)
-                ],
+                "starts": start_refs,
             }
         )
 
         assignments = [(start, [o for o in starts if o != start]) for start in starts]
-        reports: list[dict[str, Any]] = []
 
-        for index, (start, siblings) in enumerate(assignments, start=1):
-            try:
+        reports: list[dict[str, Any] | None] = [None] * len(assignments)
 
-                # the subagent is started given the same question but a different starting point to explore multiple possible paths
-                report = self._run_single_subagent(
-                    start, siblings, question, index, emit, stop_event=stop_event
-                )
-                reports.append(report)
-            except AgentStopped:
-                raise
-            except Exception as exc:
-                reports.append(
-                    {
-                        "start": "?",
+        max_workers = max(1, int(getattr(self.settings, "subagent_concurrency", 1) or 1))
+        max_workers = min(max_workers, len(assignments))
+
+        # emit may touch shared UI/websocket state, so serialize calls from worker threads.
+        emit_lock = threading.Lock()
+
+        def safe_emit(event: dict[str, Any]) -> None:
+            with emit_lock:
+                emit(event)
+
+        def run_one(pos: int, start: str, siblings: list[str]) -> dict[str, Any]:
+            if stop_event is not None and stop_event.is_set():
+                raise AgentStopped("agent run cancelled")
+
+            return self._run_single_subagent(
+                start,
+                siblings,
+                question,
+                pos + 1,
+                safe_emit,
+                stop_event=stop_event,
+            )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(run_one, pos, start, siblings): (pos, start)
+                for pos, (start, siblings) in enumerate(assignments)
+            }
+
+            for future in as_completed(futures):
+                pos, start = futures[future]
+
+                try:
+                    reports[pos] = future.result()
+
+                except AgentStopped:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+
+                except Exception as exc:
+                    reports[pos] = {
+                        "start": start,
                         "answer": f"(subagent failed: {exc})",
                         "cited": [],
                     }
-                )
 
-        # Aggregate results in a seperate report
-        for report in reports:
+        final_reports: list[dict[str, Any]] = [
+            report
+            for report in reports
+            if report is not None
+        ]
+
+        # Aggregate cited evidence from all reports.
+        for report in final_reports:
             evidence.extend(report.get("cited", []))
 
         blocks = ["Subagent reports (each explored a different region):"]
-        for index, report in enumerate(reports, start=1):
+
+        for index, report in enumerate(final_reports, start=1):
             cited_str = ", ".join(report.get("cited", [])) or "(none)"
             blocks.append(
                 f"\n### Subagent {index} — start node: {report.get('start')}\n"
                 f"{report.get('answer', '').strip()}\nEvidence node ids: {cited_str}"
             )
+
         return "\n".join(blocks)
 
     # Dedup already seen nodes

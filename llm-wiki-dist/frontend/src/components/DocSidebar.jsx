@@ -11,6 +11,8 @@ const STR = {
     filter: 'ドキュメントを絞り込み…',
     empty: 'まだドキュメントがありません。',
     openFull: '完全なドキュメントを開く',
+    untitledDocument: 'Untitled document',
+    untitledSection: 'Untitled section',
   },
   en: {
     documents: 'Referenced Knowledge',
@@ -20,6 +22,8 @@ const STR = {
     filter: 'Filter documents…',
     empty: 'No documents ingested yet.',
     openFull: 'Open full document',
+    untitledDocument: 'Untitled document',
+    untitledSection: 'Untitled section',
   },
 }
 
@@ -44,6 +48,11 @@ export default function DocSidebar({
 
     return (
       String(doc?.name || '').toLowerCase().includes(q) ||
+      String(doc?.originalName || '').toLowerCase().includes(q) ||
+      String(doc?.documentName || '').toLowerCase().includes(q) ||
+      String(doc?.sourceName || '').toLowerCase().includes(q) ||
+      String(doc?.filename || '').toLowerCase().includes(q) ||
+      String(doc?.fileName || '').toLowerCase().includes(q) ||
       String(doc?.cluster || '').toLowerCase().includes(q)
     )
   }
@@ -68,6 +77,7 @@ export default function DocSidebar({
 
         <div className="flex shrink-0 items-center gap-1">
           <button
+            type="button"
             onClick={() => onModeChange?.('documents')}
             className={`rounded-md px-[8px] py-[4px] text-[11px] font-bold ${
               mode === 'documents'
@@ -79,6 +89,7 @@ export default function DocSidebar({
           </button>
 
           <button
+            type="button"
             onClick={() => onModeChange?.('topics')}
             className={`rounded-md px-[8px] py-[4px] text-[11px] font-bold ${
               mode === 'topics'
@@ -102,7 +113,7 @@ export default function DocSidebar({
         {!showingTopics &&
           filteredDocuments.map((doc, index) => (
             <KnowledgeCard
-              key={doc.name}
+              key={getDocumentKey(doc, index)}
               doc={doc}
               index={index}
               onOpenNode={onOpenNode}
@@ -113,14 +124,14 @@ export default function DocSidebar({
 
         {showingTopics &&
           filteredTopics.map((topic) => (
-            <div key={topic.cluster} className="mb-[16px]">
+            <div key={topic.cluster || topic.name} className="mb-[16px]">
               <div className="mb-[8px] px-[2px] text-[12px] font-extrabold text-slate-600">
-                {topic.cluster}
+                {topic.cluster || topic.name}
               </div>
 
               {topic.docs.map((doc, index) => (
                 <KnowledgeCard
-                  key={doc.name}
+                  key={getDocumentKey(doc, index)}
                   doc={doc}
                   index={index}
                   onOpenNode={onOpenNode}
@@ -139,24 +150,6 @@ export default function DocSidebar({
   )
 }
 
-function getOriginalDocName(doc) {
-  const firstNode = Array.isArray(doc?.nodes) ? doc.nodes[0] : null
-
-  return (
-    doc?.originalName ||
-    doc?.documentName ||
-    doc?.sourceName ||
-    doc?.filename ||
-    doc?.fileName ||
-    firstNode?.documentName ||
-    firstNode?.sourceName ||
-    firstNode?.filename ||
-    firstNode?.fileName ||
-    doc?.name ||
-    'Untitled document'
-  )
-}
-
 function KnowledgeCard({
   doc,
   index,
@@ -169,7 +162,7 @@ function KnowledgeCard({
 
   const nodes = Array.isArray(doc?.nodes) ? doc.nodes : []
   const isAgent = doc.type === 'exogenous'
-  const displayName = getOriginalDocName(doc)
+  const displayName = getOriginalDocName(doc, t)
 
   const colors = [
     'bg-blue/10 text-blue',
@@ -194,12 +187,10 @@ function KnowledgeCard({
         </div>
 
         <div className="min-w-0 flex-1">
-          {/* Top: original document name only */}
           <div className="whitespace-normal break-words text-[13px] font-semibold leading-[1.35] text-slate-800">
             {displayName}
           </div>
 
-          {/* Bottom: count only, no inferred title / cluster badge */}
           <div className="mt-[4px] text-[11.5px] text-slate-500">
             {nodes.length} section{nodes.length === 1 ? '' : 's'}
           </div>
@@ -212,12 +203,14 @@ function KnowledgeCard({
 
       {open && (
         <ol className="border-t border-line bg-[#fbfcff] py-[6px]">
-          {nodes.map((node) => {
-            const active = activeTabId === `doc:${node.id}`
+          {nodes.map((node, nodeIndex) => {
+            const active = isNodeActive(activeTabId, node?.id)
+            const title = getNodeDisplayTitle(node, t)
 
             return (
-              <li key={node.id}>
+              <li key={node?.id || `${displayName}:${nodeIndex}`}>
                 <button
+                  type="button"
                   onClick={() => onOpenNode?.(node)}
                   className={`flex w-full px-[14px] py-[7px] text-left text-[12px] hover:bg-blue/5 ${
                     active
@@ -226,7 +219,7 @@ function KnowledgeCard({
                   }`}
                 >
                   <span className="min-w-0 flex-1 whitespace-normal break-words leading-[1.35]">
-                    {node.title || node.entity || node.id}
+                    {title}
                   </span>
                 </button>
               </li>
@@ -235,6 +228,7 @@ function KnowledgeCard({
 
           <li>
             <button
+              type="button"
               title={t.openFull}
               onClick={() => onOpenFullDoc?.(doc)}
               className="mt-[4px] flex w-full items-center justify-end gap-[6px] px-[14px] py-[7px] text-[12px] font-bold text-blue hover:bg-blue/5"
@@ -247,4 +241,64 @@ function KnowledgeCard({
       )}
     </div>
   )
+}
+
+function getDocumentKey(doc, index) {
+  return (
+    doc?.id ||
+    doc?.name ||
+    doc?.originalName ||
+    doc?.documentName ||
+    doc?.sourceName ||
+    doc?.filename ||
+    doc?.fileName ||
+    `doc:${index}`
+  )
+}
+
+function getOriginalDocName(doc, t) {
+  const firstNode = Array.isArray(doc?.nodes) ? doc.nodes[0] : null
+
+  return (
+    doc?.originalName ||
+    doc?.documentName ||
+    doc?.sourceName ||
+    doc?.filename ||
+    doc?.fileName ||
+    firstNode?.original_document_name ||
+    firstNode?.documentName ||
+    firstNode?.sourceName ||
+    firstNode?.filename ||
+    firstNode?.fileName ||
+    doc?.name ||
+    t.untitledDocument
+  )
+}
+
+function getNodeDisplayTitle(node, t) {
+  return (
+    node?.title ||
+    node?.label ||
+    node?.entity ||
+    node?.name ||
+    node?.heading ||
+    node?.metadata?.title ||
+    node?.metadata?.label ||
+    t.untitledSection
+  )
+}
+
+function isNodeActive(activeTabId, nodeId) {
+  const active = String(activeTabId || '').trim()
+  const cleanNodeId = String(nodeId || '').trim()
+
+  if (!active || !cleanNodeId) return false
+
+  const activeWithoutDocPrefix = active.replace(/^doc:/, '')
+
+  return normalizeNodeId(activeWithoutDocPrefix) === normalizeNodeId(cleanNodeId)
+}
+
+function normalizeNodeId(id) {
+  return String(id || '').trim().replace(/^node:/, '')
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import MermaidDiagram from './MermaidDiagram'
@@ -7,6 +7,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Download,
   Expand,
   Loader2,
   MessageCircle,
@@ -31,11 +32,14 @@ const STR = {
     thinking: '考えています…',
     working: '作業中…',
     answerDone: '回答が完了しました',
+    requestFailed: 'リクエストに失敗しました',
     hideSteps: '手順を隠す',
     showSteps: '手順を表示',
     references: '参照',
+    citations: '引用',
     viewing: '表示中',
     viewFull: '全画面で表示',
+    downloadMarkdown: 'Markdown をダウンロード',
     adding: '追加中...',
     saved: '保存済み',
     addToWiki: 'Wikiに追加',
@@ -45,7 +49,8 @@ const STR = {
     diagramFailed: '図のレンダリングに失敗しました。',
     suggestWiki: 'Wikiに追記を提案',
     relatedConcepts: '関連概念',
-    disclaimer: '回答はAIが生成しています。内容の正確性をご確認ください。',
+    disclaimer:
+      'AI生成の回答です。重要な内容は確認してください。Ctrl/Cmd + Enter で送信できます。',
     emptyTitle: 'LLM Wiki に質問する',
     emptyText: '上部の検索バーまたは下部の入力欄から、ナレッジグラフに質問できます。',
     ai: 'AI',
@@ -64,11 +69,14 @@ const STR = {
     thinking: 'Thinking…',
     working: 'Working…',
     answerDone: 'Answer ready',
+    requestFailed: 'Request failed',
     hideSteps: 'Hide steps',
     showSteps: 'Show steps',
     references: 'References',
+    citations: 'Citations',
     viewing: 'Viewing',
     viewFull: 'View full',
+    downloadMarkdown: 'Download Markdown',
     adding: 'Adding...',
     saved: 'Saved',
     addToWiki: 'Add to wiki',
@@ -78,7 +86,8 @@ const STR = {
     diagramFailed: 'Diagram rendering failed.',
     suggestWiki: 'Suggest adding to Wiki',
     relatedConcepts: 'Related concepts',
-    disclaimer: 'AI-generated answer. Please verify critical information.',
+    disclaimer:
+      'AI-generated answer. Please verify critical information. Press Ctrl/Cmd + Enter to send.',
     emptyTitle: 'Ask LLM Wiki',
     emptyText: 'Use the top search bar or the input below to ask the knowledge graph.',
     ai: 'AI',
@@ -101,14 +110,27 @@ export default function ChatPanel({
   agentCanStop,
   agentStopping,
   onStopAgent,
+
+  // Optional but strongly recommended.
+  // Expected shape: Map<nodeId, node> or plain object keyed by nodeId.
+  rawById,
+
+  // Tells App / right document rail which chunks were explicitly mentioned
+  // in the final answer text by raw node ID.
+  onAnswerMentionedIds,
 }) {
   const t = useT(STR)
   const [question, setQuestion] = useState('')
   const endRef = useRef(null)
+  const inputRef = useRef(null)
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  useEffect(() => {
+    autoResizeTextarea(inputRef.current)
+  }, [question])
 
   const submit = () => {
     const clean = question.trim()
@@ -118,9 +140,6 @@ export default function ChatPanel({
     setQuestion('')
   }
 
-  const lastAssistantWithRefs = [...messages]
-    .reverse()
-    .find((m) => m.role === 'assistant' && m.refs?.length > 0)
 
   return (
     <section className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden bg-transparent">
@@ -144,29 +163,30 @@ export default function ChatPanel({
                 saved={!!(m.answer && savedIds?.has(m.answer.id))}
                 saving={!!(m.answer && addingIds?.has(m.answer.id))}
                 writeStatus={m.answer ? writeStatuses?.get(m.answer.id) : ''}
+                rawById={rawById}
+                onAnswerMentionedIds={onAnswerMentionedIds}
               />
             ),
           )}
         </div>
 
-        {lastAssistantWithRefs?.refs?.length > 0 && (
-          <RelatedConcepts
-            refs={lastAssistantWithRefs.refs}
-            onOpenNode={onOpenNode}
-          />
-        )}
 
         <div ref={endRef} />
       </div>
 
       <div className="shrink-0 border-t border-blue-100/70 bg-transparent px-6 pb-3 pt-3">
-        <div className="flex min-h-[58px] items-center gap-3 rounded-2xl border border-blue-100 bg-blue-50/80 px-4 shadow-none transition focus-within:border-blue-400 focus-within:bg-blue-50 focus-within:ring-4 focus-within:ring-blue-100/70">
-          <input
-            className="min-w-0 flex-1 bg-transparent text-[14px] font-medium text-slate-800 outline-none placeholder:text-slate-400"
+        <div className="flex min-h-[58px] items-end gap-3 rounded-2xl border border-blue-100 bg-blue-50/80 px-4 py-3 shadow-none transition focus-within:border-blue-400 focus-within:bg-blue-50 focus-within:ring-4 focus-within:ring-blue-100/70">
+          <textarea
+            ref={inputRef}
+            rows={1}
+            className="max-h-[180px] min-h-[34px] min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-1 text-[14px] font-medium leading-6 text-slate-800 outline-none placeholder:text-slate-400"
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !agentRunning) submit()
+              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault()
+                submit()
+              }
             }}
             placeholder={t.askPlaceholder}
           />
@@ -281,7 +301,7 @@ function UserMessage({ message }) {
           {t.you}
         </div>
 
-        <div className="rounded-2xl rounded-tr-md border border-blue-100 bg-blue-50 px-4 py-3 text-[14px] font-semibold leading-6 text-slate-900 shadow-sm">
+        <div className="whitespace-pre-wrap rounded-2xl rounded-tr-md border border-blue-100 bg-blue-50 px-4 py-3 text-[14px] font-semibold leading-6 text-slate-900 shadow-sm">
           {message.text}
         </div>
       </div>
@@ -298,6 +318,8 @@ function AssistantMessage({
   saved,
   saving,
   writeStatus,
+  rawById,
+  onAnswerMentionedIds,
 }) {
   const t = useT(STR)
   const [stepsOpen, setStepsOpen] = useState(false)
@@ -308,14 +330,26 @@ function AssistantMessage({
   const hasSteps = !streaming && activity.length > 0
 
   const diagramState = m.diagramState || m._diagState
-  const answerMarkdown =
-    m.answer?.markdown ||
-    m._diagMd ||
-    m.text ||
-    ''
+  const answerMarkdown = getAnswerMarkdown(m)
+
+  const refs = useMemo(() => {
+    return collectAnswerRefs(m, rawById, answerMarkdown)
+  }, [m, rawById, answerMarkdown])
 
   const hasAnswerMarkdown = !!answerMarkdown.trim()
   const isViewing = !!(m.answer && m.answer.id === activeAnswerId)
+
+  const mentionedNodeIds = useMemo(() => {
+    if (!hasAnswerMarkdown || streaming) return []
+    return findMentionedNodeIds(answerMarkdown, refs, rawById)
+  }, [answerMarkdown, refs, rawById, hasAnswerMarkdown, streaming])
+
+  const mentionedNodeKey = mentionedNodeIds.join('|')
+
+  useEffect(() => {
+    if (!m.answer?.id || streaming) return
+    onAnswerMentionedIds?.(m.answer.id, mentionedNodeIds)
+  }, [m.answer?.id, streaming, mentionedNodeKey, onAnswerMentionedIds])
 
   return (
     <div className="flex w-full justify-start">
@@ -340,6 +374,7 @@ function AssistantMessage({
 
               {hasSteps && (
                 <button
+                  type="button"
                   className="mt-1 inline-flex items-center gap-1 text-[12px] font-bold text-blue-600 hover:text-blue-700"
                   onClick={() => setStepsOpen((v) => !v)}
                 >
@@ -349,8 +384,26 @@ function AssistantMessage({
               )}
             </div>
 
+            {hasAnswerMarkdown && !streaming && (
+              <button
+                type="button"
+                className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-slate-200 bg-white text-slate-500 transition hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
+                onClick={() =>
+                  downloadMarkdown(
+                    answerMarkdown,
+                    m.answer?.title || m.answer?.question || m.title || 'llm-answer',
+                  )
+                }
+                title={t.downloadMarkdown}
+                aria-label={t.downloadMarkdown}
+              >
+                <Download size={16} />
+              </button>
+            )}
+
             {m.answer && (
               <button
+                type="button"
                 className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg border transition ${
                   isViewing
                     ? 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
@@ -358,6 +411,7 @@ function AssistantMessage({
                 }`}
                 onClick={() => onViewAnswer?.(m.answer)}
                 title={isViewing ? t.viewing : t.viewFull}
+                aria-label={isViewing ? t.viewing : t.viewFull}
               >
                 <Expand size={16} />
               </button>
@@ -378,14 +432,22 @@ function AssistantMessage({
             )}
 
             {!streaming && hasAnswerMarkdown && (
-              <MarkdownMessage diagramState={diagramState}>
+              <MarkdownMessage
+                diagramState={diagramState}
+                refs={refs}
+                onOpenNode={onOpenNode}
+                rawById={rawById}
+              >
                 {answerMarkdown}
               </MarkdownMessage>
             )}
 
-            {m.refs?.length > 0 && (
-              <References refs={m.refs} onOpenNode={onOpenNode} />
-            )}
+            {/*
+              Removed the old full References list here.
+
+              The right document rail already shows all cited/used source nodes,
+              so repeating the same 20 links in the chat response is redundant.
+            */}
 
             {m.answer && (
               <AnswerActions
@@ -410,6 +472,7 @@ function AnswerActions({ answer, onAddWiki, saved, saving, writeStatus }) {
     <div className="mt-4 border-t border-slate-100 pt-4">
       <div className="flex flex-wrap items-center justify-end gap-2">
         <button
+          type="button"
           className="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[12px] font-extrabold text-blue-700 hover:bg-blue-100 disabled:cursor-default disabled:opacity-50"
           onClick={() => onAddWiki?.(answer)}
           disabled={saved || saving}
@@ -436,7 +499,7 @@ function AnswerActions({ answer, onAddWiki, saved, saving, writeStatus }) {
   )
 }
 
-function References({ refs, onOpenNode }) {
+function References({ refs, onOpenNode, rawById }) {
   const t = useT(STR)
 
   return (
@@ -449,10 +512,11 @@ function References({ refs, onOpenNode }) {
         {refs.map((r) => (
           <li key={r.id} className="pl-1">
             <button
+              type="button"
               className="font-bold text-blue-700 underline decoration-blue-200 underline-offset-2 hover:text-blue-800"
-              onClick={() => onOpenNode?.(r.id)}
+              onClick={() => openNodeFromId(r.id, rawById, onOpenNode)}
             >
-              {r.label}
+              {r.label || r.id}
             </button>
             {r.note && <span> — {r.note}</span>}
           </li>
@@ -462,7 +526,7 @@ function References({ refs, onOpenNode }) {
   )
 }
 
-function RelatedConcepts({ refs, onOpenNode }) {
+function RelatedConcepts({ refs, onOpenNode, rawById }) {
   const t = useT(STR)
 
   return (
@@ -474,12 +538,13 @@ function RelatedConcepts({ refs, onOpenNode }) {
       <div className="flex flex-wrap gap-2">
         {refs.slice(0, 8).map((r) => (
           <button
+            type="button"
             key={r.id}
-            onClick={() => onOpenNode?.(r.id)}
+            onClick={() => openNodeFromId(r.id, rawById, onOpenNode)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[12px] font-bold text-slate-600 hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
           >
             <MessageCircle size={14} />
-            {r.label}
+            {r.label || r.id}
           </button>
         ))}
       </div>
@@ -552,8 +617,23 @@ function MermaidBlock({ code, state }) {
   return <MermaidDiagram code={code} />
 }
 
-function MarkdownMessage({ children, diagramState }) {
+function MarkdownMessage({
+  children,
+  diagramState,
+  refs,
+  onOpenNode,
+  rawById,
+}) {
+  const t = useT(STR)
   const isMermaid = (cls) => (cls || '').includes('language-mermaid')
+
+  const markdownWithCitationBlock = useMemo(() => {
+    return rewriteCitedNodeIdsBlock(children || '', rawById, t.citations)
+  }, [children, rawById, t.citations])
+
+  const linkedMarkdown = useMemo(() => {
+    return linkifyNodeIdsInMarkdown(markdownWithCitationBlock || '', refs || [], rawById)
+  }, [markdownWithCitationBlock, refs, rawById])
 
   return (
     <div className="prose prose-slate max-w-none overflow-hidden text-[14px] leading-7 text-slate-800 prose-headings:font-extrabold prose-headings:text-slate-950 prose-a:text-blue-700 prose-strong:text-slate-950">
@@ -628,14 +708,39 @@ function MarkdownMessage({ children, diagramState }) {
             />
           ),
 
-          a: ({ ...props }) => (
-            <a
-              className="font-bold text-blue-700 underline decoration-blue-200 underline-offset-2 hover:text-blue-800"
-              target="_blank"
-              rel="noreferrer"
-              {...props}
-            />
-          ),
+          a: ({ href, children, ...props }) => {
+            const rawHref = String(href || '')
+
+            if (rawHref.startsWith('#llm-wiki-node:')) {
+              const id = decodeURIComponent(rawHref.slice('#llm-wiki-node:'.length))
+
+              return (
+                <button
+                  type="button"
+                  className="inline font-bold text-blue-700 underline decoration-blue-200 underline-offset-2 hover:text-blue-800"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    openNodeFromId(id, rawById, onOpenNode)
+                  }}
+                >
+                  {children}
+                </button>
+              )
+            }
+
+            return (
+              <a
+                className="font-bold text-blue-700 underline decoration-blue-200 underline-offset-2 hover:text-blue-800"
+                target="_blank"
+                rel="noreferrer"
+                href={href}
+                {...props}
+              >
+                {children}
+              </a>
+            )
+          },
 
           hr: ({ ...props }) => (
             <hr className="my-5 border-0 border-t border-slate-200" {...props} />
@@ -697,8 +802,435 @@ function MarkdownMessage({ children, diagramState }) {
           ),
         }}
       >
-        {children || ''}
+        {linkedMarkdown}
       </ReactMarkdown>
     </div>
   )
+}
+
+function rewriteCitedNodeIdsBlock(markdown, rawById, citationsLabel) {
+  const text = String(markdown || '')
+  if (!text.trim()) return text
+
+  return text.replace(
+    /(^|\n)\s*cited_node_ids\s*:\s*\[([\s\S]*?)\]/gi,
+    (full, prefix, body) => {
+      const ids = parseCitationNodeIds(body)
+
+      if (ids.length === 0) return full
+
+      const lines = ids.map((id) => {
+        const canonicalId = resolveCanonicalNodeId(id, rawById)
+        const label =
+          getNodeLabel(canonicalId, rawById) ||
+          getNodeLabel(id, rawById) ||
+          stripNodePrefix(id)
+
+        return `[${escapeMarkdownLinkText(label)}](#llm-wiki-node:${encodeURIComponent(
+          canonicalId || id,
+        )})`
+      })
+
+      return `${prefix}**${citationsLabel}**\n\n${lines.join('\n\n')}`
+    },
+  )
+}
+
+function parseCitationNodeIds(body) {
+  return Array.from(
+    new Set(
+      String(body || '')
+        .split(/[,\n]/)
+        .map((item) =>
+          item
+            .trim()
+            .replace(/^["'`]+/, '')
+            .replace(/["'`]+$/, '')
+            .trim(),
+        )
+        .filter(Boolean),
+    ),
+  )
+}
+
+function autoResizeTextarea(el) {
+  if (!el) return
+
+  el.style.height = 'auto'
+  const next = Math.min(el.scrollHeight, 180)
+  el.style.height = `${next}px`
+}
+
+function downloadMarkdown(markdown, title) {
+  if (typeof document === 'undefined') return
+
+  const filename = `${sanitizeFilename(title || 'llm-answer')}.md`
+  const blob = new Blob([markdown || ''], {
+    type: 'text/markdown;charset=utf-8',
+  })
+
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+
+  URL.revokeObjectURL(url)
+}
+
+function sanitizeFilename(value) {
+  return String(value || 'llm-answer')
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .slice(0, 90) || 'llm-answer'
+}
+
+function getAnswerMarkdown(message) {
+  return (
+    message?.answer?.markdown ||
+    message?._diagMd ||
+    message?.text ||
+    ''
+  )
+}
+
+function collectAnswerRefs(message, rawById, markdown) {
+  const byId = new Map()
+  let syntheticIndex = 1
+
+  const addRef = (ref) => {
+    if (!ref) return
+
+    const originalId = String(ref.id || ref.nodeId || ref.key || '').trim()
+    if (!originalId) return
+
+    const canonicalId = resolveCanonicalNodeId(originalId, rawById)
+    if (!canonicalId) return
+
+    const prev = byId.get(canonicalId) || {}
+
+    byId.set(canonicalId, {
+      ...prev,
+      ...ref,
+      id: canonicalId,
+      originalId,
+      label:
+        getNodeLabel(canonicalId, rawById, ref) ||
+        getNodeLabel(originalId, rawById, ref) ||
+        prev.label ||
+        `Source chunk ${syntheticIndex++}`,
+    })
+  }
+
+  for (const ref of Array.isArray(message?.answer?.refs) ? message.answer.refs : []) {
+    addRef(ref)
+  }
+
+  for (const ref of Array.isArray(message?.refs) ? message.refs : []) {
+    addRef(ref)
+  }
+
+  for (const id of Array.isArray(message?.answer?.citedIds) ? message.answer.citedIds : []) {
+    addRef({ id })
+  }
+
+  for (const id of extractExplicitNodeIdsFromMarkdown(markdown || getAnswerMarkdown(message))) {
+    addRef({ id })
+  }
+
+  return Array.from(byId.values())
+}
+
+function linkifyNodeIdsInMarkdown(markdown, refs, rawById) {
+  const text = String(markdown || '')
+  if (!text.trim()) return text
+
+  const explicitIds = extractExplicitNodeIdsFromMarkdown(text)
+
+  const catalog = buildNodeLinkCatalog(
+    [
+      ...(Array.isArray(refs) ? refs : []),
+      ...explicitIds.map((id) => ({ id })),
+    ],
+    rawById,
+  )
+
+  if (catalog.size === 0 && explicitIds.length === 0) return text
+
+  return protectMarkdownSpecialRegions(text, (plainText) => {
+    return replaceNodeIdTextWithChunkLinks(plainText, catalog, rawById)
+  })
+}
+
+function protectMarkdownSpecialRegions(markdown, replacer) {
+  return String(markdown || '')
+    .split(/(```[\s\S]*?```|`[^`\n]*`|!?\[[^\]]*\]\([^)]+\))/g)
+    .map((part) => {
+      if (!part) return part
+
+      if (part.startsWith('```')) return part
+      if (part.startsWith('`') && part.endsWith('`')) return part
+      if (/^!?\[[^\]]*\]\([^)]+\)$/.test(part)) return part
+
+      return replacer(part)
+    })
+    .join('')
+}
+
+function replaceNodeIdTextWithChunkLinks(text, catalog, rawById) {
+  const NODE_ID_CANDIDATE_RE =
+    /(^|[^A-Za-z0-9_:\\-])((?:node:)?[A-Za-z0-9][A-Za-z0-9_.\\-]*(?::[A-Za-z0-9][A-Za-z0-9_.\\-]*)+)(?=$|[^A-Za-z0-9_:\\-])/g
+
+  let syntheticIndex = 1
+
+  return String(text || '').replace(
+    NODE_ID_CANDIDATE_RE,
+    (full, prefix, candidate) => {
+      const rawCandidate = String(candidate || '').trim()
+      if (!rawCandidate) return full
+
+      const canonicalId = resolveCanonicalNodeId(rawCandidate, rawById)
+
+      const known =
+        catalog.get(canonicalId) ||
+        catalog.get(rawCandidate) ||
+        catalog.get(stripNodePrefix(rawCandidate)) ||
+        catalog.get(addNodePrefix(stripNodePrefix(rawCandidate)))
+
+      if (!known && !looksLikeExplicitNodeId(rawCandidate, rawById)) {
+        return full
+      }
+
+      const label =
+        known?.label ||
+        getNodeLabel(canonicalId, rawById) ||
+        getNodeLabel(rawCandidate, rawById) ||
+        `Source chunk ${syntheticIndex++}`
+
+      const href = `#llm-wiki-node:${encodeURIComponent(canonicalId || rawCandidate)}`
+
+      return `${prefix}[${escapeMarkdownLinkText(label)}](${href})`
+    },
+  )
+}
+
+function buildNodeLinkCatalog(refs, rawById) {
+  const catalog = new Map()
+  let syntheticIndex = 1
+
+  const add = (ref) => {
+    const originalId = String(ref?.id || ref?.nodeId || ref?.key || '').trim()
+    if (!originalId) return
+
+    const canonicalId = resolveCanonicalNodeId(originalId, rawById)
+    if (!canonicalId) return
+
+    const label =
+      getNodeLabel(canonicalId, rawById, ref) ||
+      getNodeLabel(originalId, rawById, ref) ||
+      ref?.label ||
+      ref?.title ||
+      ref?.entity ||
+      ref?.name ||
+      `Source chunk ${syntheticIndex++}`
+
+    const item = {
+      id: canonicalId,
+      originalId,
+      label,
+    }
+
+    catalog.set(canonicalId, item)
+    catalog.set(originalId, item)
+    catalog.set(stripNodePrefix(originalId), item)
+    catalog.set(addNodePrefix(stripNodePrefix(originalId)), item)
+    catalog.set(stripNodePrefix(canonicalId), item)
+    catalog.set(addNodePrefix(stripNodePrefix(canonicalId)), item)
+  }
+
+  for (const ref of refs || []) {
+    add(ref)
+  }
+
+  return catalog
+}
+
+function findMentionedNodeIds(markdown, refs, rawById) {
+  const text = stripMarkdownCode(String(markdown || ''))
+  const explicitIds = extractExplicitNodeIdsFromMarkdown(text)
+
+  const catalog = buildNodeLinkCatalog(
+    [
+      ...(Array.isArray(refs) ? refs : []),
+      ...explicitIds.map((id) => ({ id })),
+    ],
+    rawById,
+  )
+
+  const found = new Set()
+
+  const NODE_ID_CANDIDATE_RE =
+    /(^|[^A-Za-z0-9_:\\-])((?:node:)?[A-Za-z0-9][A-Za-z0-9_.\\-]*(?::[A-Za-z0-9][A-Za-z0-9_.\\-]*)+)(?=$|[^A-Za-z0-9_:\\-])/g
+
+  let match
+
+  while ((match = NODE_ID_CANDIDATE_RE.exec(text)) !== null) {
+    const rawCandidate = String(match[2] || '').trim()
+    if (!rawCandidate) continue
+
+    const canonicalId = resolveCanonicalNodeId(rawCandidate, rawById)
+
+    const known =
+      catalog.get(canonicalId) ||
+      catalog.get(rawCandidate) ||
+      catalog.get(stripNodePrefix(rawCandidate)) ||
+      catalog.get(addNodePrefix(stripNodePrefix(rawCandidate)))
+
+    if (known?.id) {
+      found.add(known.id)
+      continue
+    }
+
+    if (looksLikeExplicitNodeId(rawCandidate, rawById)) {
+      found.add(canonicalId || rawCandidate)
+    }
+  }
+
+  return Array.from(found)
+}
+
+function extractExplicitNodeIdsFromMarkdown(markdown) {
+  const text = stripMarkdownCode(String(markdown || ''))
+  const found = new Set()
+
+  const NODE_ID_CANDIDATE_RE =
+    /(^|[^A-Za-z0-9_:\\-])((?:node:)?[A-Za-z0-9][A-Za-z0-9_.\\-]*(?::[A-Za-z0-9][A-Za-z0-9_.\\-]*)+)(?=$|[^A-Za-z0-9_:\\-])/g
+
+  let match
+
+  while ((match = NODE_ID_CANDIDATE_RE.exec(text)) !== null) {
+    const candidate = String(match[2] || '').trim()
+    if (!candidate) continue
+
+    if (looksLikeExplicitNodeId(candidate)) {
+      found.add(candidate)
+    }
+  }
+
+  return Array.from(found)
+}
+
+function looksLikeExplicitNodeId(value, rawById) {
+  const id = String(value || '').trim()
+  if (!id) return false
+
+  const canonicalId = resolveCanonicalNodeId(id, rawById)
+
+  if (id.startsWith('node:')) return true
+
+  if (hasRawNode(rawById, id)) return true
+  if (hasRawNode(rawById, canonicalId)) return true
+  if (hasRawNode(rawById, stripNodePrefix(id))) return true
+  if (hasRawNode(rawById, addNodePrefix(stripNodePrefix(id)))) return true
+
+  const lastSegment = id.split(':').pop() || ''
+  if (/^[0-9a-fA-F]{8,}$/.test(lastSegment)) return true
+
+  return false
+}
+
+function resolveCanonicalNodeId(id, rawById) {
+  const clean = String(id || '').trim()
+  if (!clean) return clean
+
+  const withoutNode = stripNodePrefix(clean)
+  const withNode = addNodePrefix(withoutNode)
+
+  if (hasRawNode(rawById, clean)) return clean
+  if (hasRawNode(rawById, withoutNode)) return withoutNode
+  if (hasRawNode(rawById, withNode)) return withNode
+
+  return withoutNode || clean
+}
+
+function openNodeFromId(id, rawById, onOpenNode) {
+  const canonicalId = resolveCanonicalNodeId(id, rawById)
+
+  if (canonicalId) {
+    onOpenNode?.(canonicalId)
+    return
+  }
+
+  onOpenNode?.(id)
+}
+
+function getNodeLabel(id, rawById, fallbackRef) {
+  const node =
+    getRawNode(rawById, id) ||
+    getRawNode(rawById, stripNodePrefix(id)) ||
+    getRawNode(rawById, addNodePrefix(stripNodePrefix(id)))
+
+  return (
+    node?.title ||
+    node?.label ||
+    node?.entity ||
+    node?.name ||
+    node?.heading ||
+    node?.metadata?.title ||
+    node?.metadata?.label ||
+    fallbackRef?.label ||
+    fallbackRef?.title ||
+    fallbackRef?.entity ||
+    fallbackRef?.name ||
+    ''
+  )
+}
+
+function getRawNode(rawById, id) {
+  const clean = String(id || '').trim()
+  if (!clean || !rawById) return null
+
+  if (typeof rawById.get === 'function') {
+    return rawById.get(clean) || null
+  }
+
+  return rawById[clean] || null
+}
+
+function hasRawNode(rawById, id) {
+  const clean = String(id || '').trim()
+  if (!clean || !rawById) return false
+
+  if (typeof rawById.has === 'function') {
+    return rawById.has(clean)
+  }
+
+  return Object.prototype.hasOwnProperty.call(rawById, clean)
+}
+
+function stripNodePrefix(id) {
+  return String(id || '').replace(/^node:/, '')
+}
+
+function addNodePrefix(id) {
+  const clean = String(id || '').trim()
+  if (!clean) return clean
+  return clean.startsWith('node:') ? clean : `node:${clean}`
+}
+
+function stripMarkdownCode(markdown) {
+  return String(markdown || '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`\n]*`/g, '')
+}
+
+function escapeMarkdownLinkText(value) {
+  return String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
 }

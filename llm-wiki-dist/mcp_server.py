@@ -1,4 +1,5 @@
-# mcp_server.py
+# region Imports
+
 from __future__ import annotations
 
 import argparse
@@ -20,26 +21,31 @@ from fastmcp.server.dependencies import get_http_request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+# endregion Imports
+
+# region Global vars/Configs
+
 log = logging.getLogger("llm_wiki_mcp")
 
 _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
 DEFAULT_PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")
 DEFAULT_BACKEND_ORIGIN = os.environ.get(
-    "MCP_BACKEND_ORIGIN", "http://127.0.0.1:8000"
+    "MCP_BACKEND_ORIGIN", "http://locahost:8000" # TODO Make this sync with backend auto
 ).rstrip("/")
 DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
 DEFAULT_DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki")).resolve()
+
 BACKEND_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 BACKEND_READY_TIMEOUT_SECONDS = float(
     os.environ.get("MCP_BACKEND_READY_TIMEOUT_SECONDS", "90")
 )
-BACKEND_READY_POLL_SECONDS = 0.25
+BACKEND_READY_POLL_SECONDS = 1
 
+# endregion Global vars/Configs
 
-# =============================================================================
-# Image block cleanup helpers
-# =============================================================================
+# region Utils
 
+# Image cleaner regexes 
 _IMAGE_UNIT_RE = re.compile(
     r"<image-unit\b[^>]*>(?P<body>.*?)</image-unit>",
     re.IGNORECASE | re.DOTALL,
@@ -65,31 +71,27 @@ _DATA_IMAGE_URL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Image cleaner helpers
+# TODO: I made a mistake of giving it a prompt which contained a lot of helper, so it made a lot of utils that are prolly
+# Not needed, so i need to remove some useless ones
 
+# Return True if the text contains at least one image-unit block.
 def has_image_units(text: str) -> bool:
-    """Return True if the text contains at least one image-unit block."""
     if not isinstance(text, str) or not text:
         return False
 
     return _IMAGE_UNIT_RE.search(text) is not None
 
-
+# Return the number of image-unit blocks
 def count_image_units(text: str) -> int:
-    """Return the number of image-unit blocks."""
     if not isinstance(text, str) or not text:
         return 0
 
     return len(list(_IMAGE_UNIT_RE.finditer(text)))
 
-
+# Remove embedded image media payloads from image-unit blocks
 def strip_image_media(text: str) -> str:
-    """
-    Remove embedded image media payloads from image-unit blocks.
 
-    If an image-description exists, keep only the description.
-    If no description exists, remove only the image-media block and keep
-    any remaining non-media content inside the image-unit.
-    """
     if not isinstance(text, str) or not text:
         return text
 
@@ -104,25 +106,19 @@ def strip_image_media(text: str) -> str:
 
     return _IMAGE_UNIT_RE.sub(replace_image_unit, text).strip()
 
-
+# Replace image-media blocks with a marker while preserving image-unit structure
 def replace_image_media_with_marker(
     text: str,
     marker: str = "[image omitted]",
 ) -> str:
-    """
-    Replace image-media blocks with a marker while preserving image-unit structure.
 
-    This is useful when the caller wants to keep a visible placeholder instead
-    of deleting image payloads completely.
-    """
     if not isinstance(text, str) or not text:
         return text
 
     return _IMAGE_MEDIA_RE.sub(marker, text).strip()
 
-
+# Return non-empty image-description values from image-unit blocks
 def extract_image_descriptions(text: str) -> list[str]:
-    """Return non-empty image-description values from image-unit blocks."""
     if not isinstance(text, str) or not text:
         return []
 
@@ -139,9 +135,8 @@ def extract_image_descriptions(text: str) -> list[str]:
 
     return descriptions
 
-
+# Return data:image/... URLs from image-media blocks
 def extract_image_data_urls(text: str) -> list[str]:
-    """Return data:image/... URLs from image-media blocks."""
     if not isinstance(text, str) or not text:
         return []
 
@@ -161,9 +156,8 @@ def extract_image_data_urls(text: str) -> list[str]:
 
     return urls
 
-
+# Return raw base64 payloads from image data URLs
 def extract_image_base64(text: str) -> list[str]:
-    """Return raw base64 payloads from image data URLs."""
     values: list[str] = []
 
     for data_url in extract_image_data_urls(text):
@@ -172,24 +166,15 @@ def extract_image_base64(text: str) -> list[str]:
 
     return values
 
-
+# Remove embedded image payloads before sending Markdown to a text-only LLM
+# - Removes base64 image data from image-unit/image-media blocks.
+# - If image-description exists, keeps that semantic description.
+# - If image-description is empty/missing, removes image-media payload and
+#     keeps any remaining non-media text.
+# - Also handles standalone image-media blocks and standalone data:image URLs
+#     defensively, in case malformed content exists outside image-unit blocks.
 def sanitize_markdown_for_text_llm(text: str) -> str:
-    """
-    Remove embedded image payloads before sending Markdown to a text-only LLM.
 
-    Behavior:
-    - Removes base64 image data from image-unit/image-media blocks.
-    - If image-description exists, keeps that semantic description.
-    - If image-description is empty/missing, removes image-media payload and
-      keeps any remaining non-media text.
-    - Also handles standalone image-media blocks and standalone data:image URLs
-      defensively, in case malformed content exists outside image-unit blocks.
-
-    Important:
-    - This does NOT truncate normal text.
-    - This does NOT impose any character limit.
-    - Full node body text is preserved except embedded base64 image payloads.
-    """
     if not isinstance(text, str) or not text:
         return text
 
@@ -204,25 +189,28 @@ def sanitize_markdown_for_text_llm(text: str) -> str:
     return cleaned.strip()
 
 
-# =============================================================================
-# Runtime helpers
-# =============================================================================
-
+# Reads an environment variable and returns a boolean (if its activated or not)
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
-
+# Get a list of allowed wiki names and make it a set
 def _env_wiki_allowlist() -> frozenset[str]:
     values = os.environ.get("MCP_ALLOWED_WIKIS", "").split(",")
     return frozenset(value.strip() for value in values if value.strip())
 
+# endregion Utils
+
+# region Routing
+
+# ASGI = Asynchronous Server Gateway Interface.
 
 class WikiRoutingApp:
-    """Route one FastMCP ASGI app by wiki name without global request state."""
 
+    # Stores the wrapped ASGI app and routing/security config, such as URL prefix,
+    # DB directory, allowed wiki names, and whether unknown/new wikis are accepted.
     def __init__(
         self,
         app: ASGIApp,
@@ -242,6 +230,8 @@ class WikiRoutingApp:
         self.allowed_wikis = allowed_wikis or frozenset()
         self.allow_new_wikis = allow_new_wikis
 
+    # Extracts the wiki/database name from the request URL path.
+    # Example: "/wiki/cats/mcp" -> "cats", "/mcp" -> default_db, invalid paths -> None.
     def _db_from_path(self, path: str) -> str | None:
         if path.rstrip("/") == "/mcp" and self.default_db:
             return self.default_db
@@ -250,21 +240,32 @@ class WikiRoutingApp:
         if not path.startswith(route_prefix):
             return None
 
+        # Remove prefix, then expect "{db}/mcp".
         remainder = path[len(route_prefix) :].strip("/")
         parts = remainder.split("/")
+
         if len(parts) != 2 or parts[1] != "mcp":
             return None
+
         return parts[0]
 
+    # Validates whether the extracted DB/wiki name is safe and permitted.
+    # It checks name format, allow-list, allow_new_wikis, or whether "db.sqlite" exists.
     def _is_allowed(self, db: str) -> bool:
+        # Reject unsafe DB names before using them in a file path.
         if not _DB_RE.fullmatch(db):
             return False
+
         if self.allowed_wikis and db not in self.allowed_wikis:
             return False
+
         if self.allow_new_wikis:
             return True
+
         return (self.db_dir / f"{db}.sqlite").is_file()
 
+    # Main ASGI entry point: receives the request, finds the wiki DB, rejects invalid ones,
+    # rewrites the path to "/mcp", adds wiki info to scope["state"], then forwards to self.app.
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
@@ -276,7 +277,10 @@ class WikiRoutingApp:
             await response(scope, receive, send)
             return
 
+        # Copy scope so we can modify routing info without changing the original.
         routed_scope = dict(scope)
+
+        # Add wiki-specific data for the inner app to read.
         state = dict(scope.get("state") or {})
         state.update(
             {
@@ -286,19 +290,26 @@ class WikiRoutingApp:
             }
         )
         routed_scope["state"] = state
+
+        # Make the inner app always handle "/mcp".
         routed_scope["path"] = "/mcp"
         routed_scope["raw_path"] = b"/mcp"
+
+        # Preserve the public mount path, e.g. "/wiki/cats".
         routed_scope["root_path"] = f"{self.prefix}/{db}"
+
         await self.app(routed_scope, receive, send)
 
-
+# Custom error for backend failures, since this is an MCP server, not main backend, we are defining a "backend error"
+# meaning the error is related to interaction with HTTP Backend conncetion, not within this server
 class BackendRequestError(RuntimeError):
     def __init__(self, status_code: int, detail: str, code: str = "backend_error"):
         super().__init__(detail)
         self.status_code = status_code
         self.code = code
 
-
+# Extracts a clean error message and error code from a backend HTTP response.
+# This function's return will be used to make above BackendRequestError
 def _backend_error(response: httpx.Response) -> tuple[str, str]:
     try:
         raw_error = response.json()
@@ -318,7 +329,8 @@ def _backend_error(response: httpx.Response) -> tuple[str, str]:
         code = str(error.get("code") or "backend_error")
     return detail, code
 
-
+# Polls the backend readiness endpoint until the wiki is ready, the backend has a wiki initializing logic
+# if the wiki didnt exist already, it will wait for the backend to create one
 async def _wait_for_backend_ready(client: httpx.AsyncClient, ready_url: str) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + BACKEND_READY_TIMEOUT_SECONDS
@@ -351,9 +363,9 @@ async def _wait_for_backend_ready(client: httpx.AsyncClient, ready_url: str) -> 
         "not_ready",
     )
 
-
+# This connects to above WikiRoutingApp, which inserted the 3 params this is extracting
 def _request_backend() -> tuple[str, str, str]:
-    request = get_http_request()
+    request = get_http_request() # Gets routing info from the current request state
     db = getattr(request.state, "wiki_db", None)
     origin = getattr(request.state, "wiki_backend_origin", None)
     prefix = getattr(request.state, "wiki_backend_prefix", None)
@@ -361,7 +373,7 @@ def _request_backend() -> tuple[str, str, str]:
         raise RuntimeError("missing wiki route context")
     return db, origin, prefix
 
-
+# This is the main helper that calls the backend API and returns JSON
 async def _backend_json(
     method: str,
     path: str,
@@ -399,7 +411,7 @@ async def _backend_json(
     except ValueError as exc:
         raise RuntimeError("LLM-Wiki backend returned invalid JSON") from exc
 
-
+# Fetches links for a node from backend
 async def _backend_links(
     node_id: str,
     *,
@@ -426,14 +438,13 @@ async def _backend_links(
     ]
 
 
-# =============================================================================
-# JSON serialization helpers
-# =============================================================================
+# endregion Routing
 
+# region Graph utils
+
+# Convert dataclasses and pydantic models into JSON-safe values
 def _jsonable(obj: Any) -> Any:
-    """
-    Convert dataclasses and pydantic models into JSON-safe values.
-    """
+
     if obj is None:
         return None
 
@@ -466,12 +477,8 @@ def _jsonable(obj: Any) -> Any:
 
     return str(obj)
 
-
+# Accept a single node ID or a list of node IDs, Remove blank values and duplicates while preserving order
 def _normalize_node_ids(node_ids: str | list[str]) -> list[str]:
-    """
-    Accept a single node ID or a list of node IDs.
-    Remove blank values and duplicates while preserving order.
-    """
     if isinstance(node_ids, str):
         raw = [node_ids]
     else:
@@ -494,7 +501,7 @@ def _normalize_node_ids(node_ids: str | list[str]) -> list[str]:
 
     return cleaned
 
-
+# stringify anything
 def _as_text(value: Any, default: str = "") -> str:
     if value is None:
         return default
@@ -544,11 +551,8 @@ def _node_source_from_data(data: dict[str, Any]) -> str:
 
     return "; ".join(source_bits)
 
-
+# Extract a useful relation label from an edge object
 def _edge_label(edge: Any) -> str:
-    """
-    Extract a useful relation label from an edge object.
-    """
     data = _jsonable(edge)
 
     if isinstance(data, dict):
@@ -579,23 +583,15 @@ def _edge_label(edge: Any) -> str:
 
     return "related"
 
-
+# Format one compact search result, dont dump node metadata to llm context
 def _format_ranked_search_result(rank: int, node: Any, score: Any = None) -> str:
-    """
-    Format one compact search result.
 
-    Important:
-    - No evidence chunks.
-    - No body text.
-    - No embedded media.
-    - No raw giant JSON.
-    """
     data = _jsonable(node)
 
     if not isinstance(data, dict):
         return (
-            f"### {rank}. Unknown node\n\n"
-            f"- **Raw:** `{data}`\n"
+            f"### {rank}. 不明なノード\n\n"
+            f"- **生データ:** `{data}`\n"
         )
 
     node_id = _node_id_from_data(data)
@@ -606,16 +602,16 @@ def _format_ranked_search_result(rank: int, node: Any, score: Any = None) -> str
     lines = [
         f"### {rank}. {title}",
         "",
-        f"- **Node ID:** `{node_id}`",
+        f"- **ノードID:** `{node_id}`",
     ]
 
     if score is not None:
-        lines.append(f"- **Score:** `{score}`")
+        lines.append(f"- **スコア:** `{score}`")
 
     if node_type:
-        lines.append(f"- **Type:** `{node_type}`")
+        lines.append(f"- **種別:** `{node_type}`")
 
-    lines.append(f"- **Summary:** {summary}")
+    lines.append(f"- **概要:** {summary}")
     lines.append("")
 
     return "\n".join(lines)
@@ -635,10 +631,10 @@ def _format_neighbor(
 
     if not isinstance(data, dict):
         return (
-            f"{index}. Unknown neighboring node\n"
-            f"   - **Seed Node ID:** `{seed_node_id}`\n"
-            f"   - **Relation:** `{label}`\n"
-            f"   - **Raw:** `{data}`\n"
+            f"{index}. 不明な隣接ノード\n"
+            f"   - **起点ノードID:** `{seed_node_id}`\n"
+            f"   - **関係:** `{label}`\n"
+            f"   - **生データ:** `{data}`\n"
         )
 
     node_id = _node_id_from_data(data)
@@ -648,14 +644,14 @@ def _format_neighbor(
 
     lines = [
         f"{index}. **{title}**",
-        f"   - **Neighbor Node ID:** `{node_id}`",
-        f"   - **Relation:** `{label}`",
+        f"   - **隣接ノードID:** `{node_id}`",
+        f"   - **関係:** `{label}`",
     ]
 
     if node_type:
-        lines.append(f"   - **Type:** `{node_type}`")
+        lines.append(f"   - **種別:** `{node_type}`")
 
-    lines.append(f"   - **Summary:** {summary}")
+    lines.append(f"   - **概要:** {summary}")
 
     return "\n".join(lines) + "\n"
 
@@ -663,27 +659,28 @@ def _format_neighbor(
 def _compact_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
+# endregion Graph utils
 
-# =============================================================================
-# MCP server + tools
-# =============================================================================
+# region MCP and its tools
 
 mcp = FastMCP(
     name="llm-wiki-graph",
     instructions=(
-        "Request-scoped LLM-Wiki graph research server. The wiki is selected by the "
-        "database name in the MCP endpoint URL and must not be changed with tool arguments. "
-        "The main agent orchestrates: use hybrid_search only for bounded initial seeding, "
-        "then delegate every read_nodes call, explore_links call, and later gap search to "
-        "route subagents. Subagents return compact cited reports; they do not synthesize, "
-        "spawn agents, or write. Explore every selected material route before synthesis. "
-        "After producing reusable, evidence-grounded knowledge, the main agent calls "
-        "queue_agent_note exactly once. "
-        "That tool only queues the note; do not poll or wait for assimilation. "
-        "Tool responses are Markdown, not raw JSON. "
-        "Node bodies are returned in full; embedded base64 image payloads are removed before output. "
-        "If image descriptions exist, they are preserved as semantic text. "
-        "Do not save raw transcripts, secrets, chain-of-thought, or unsupported speculation."
+        "リクエスト単位で動作する LLM-Wiki グラフ調査サーバーです。Wiki は "
+        "MCP エンドポイントURL内のデータベース名によって選択され、ツール引数で変更してはなりません。"
+        "メインエージェントが全体を統括します。hybrid_search は、範囲を限定した初期シード取得にのみ使用し、"
+        "その後の read_nodes 呼び出し、explore_links 呼び出し、および後続の不足情報検索は、"
+        "すべてルート担当サブエージェントに委任してください。"
+        "サブエージェントは、引用付きのコンパクトなレポートを返します。サブエージェントは統合を行わず、"
+        "エージェントを生成せず、書き込みも行いません。"
+        "統合前に、選択されたすべての資料ルートを探索してください。"
+        "再利用可能で、証拠に基づいた知識を生成した後、メインエージェントは "
+        "queue_agent_note を正確に1回呼び出します。"
+        "このツールはノートをキューに入れるだけです。同化処理をポーリングしたり待機したりしないでください。"
+        "ツール応答は Markdown であり、生の JSON ではありません。"
+        "ノード本文は全文返されます。ただし、埋め込まれた base64 画像ペイロードは出力前に削除されます。"
+        "画像説明が存在する場合、それらは意味的テキストとして保持されます。"
+        "生のトランスクリプト、秘密情報、思考過程、または根拠のない推測を保存しないでください。"
     ),
 )
 
@@ -691,49 +688,45 @@ mcp = FastMCP(
 @mcp.tool()
 async def hybrid_search(query: str, limit: int = 10) -> str:
     """
-    Search the active wiki graph and return compact ranked results.
+    Wikiを検索し、関連度順にランク付けされた結果を返します。
 
-    Use this tool FIRST when the user asks about an unknown topic, API,
-    error code, design rule, behavior, Japanese manual concept, subsystem,
-    or implementation detail.
+    ユーザーが未知のトピック、API、エラーコード、設計ルール、挙動、
+    日本語マニュアル上の概念、サブシステム、または実装詳細について質問した場合は、
+    最初にこのツールを使用してください。
 
-    Input:
+    既に答えを知っていると思う場合でも、回答前の確認としてこのツールを使用してください。
+    ユーザーが使った語句は、このWiki固有のドメイン知識における特別な意味を持つ可能性があります。
+    意味が不明確な場合は、誤った文脈で回答しないよう、まず短く検索してください。
+
+    入力:
     - query:
-        Natural-language search query. Japanese and English are both okay.
-        Examples:
+        自然言語の検索クエリです。日本語と英語のどちらも使用できます。
+        例:
         - "ファイルのデッドロック"
         - "E_MFS_ETIMEOUT"
         - "category lock deadlock"
+
     - limit:
-        Number of search results to return.
-        Default: 10.
-        This controls result count only. It is not a body/text character limit.
+        返す検索結果の件数です。
+        デフォルト: 10。
+        これは結果件数のみを制御します。本文やテキストの文字数制限ではありません。
 
-    Response format:
-    - Markdown, not raw JSON.
-    - Results are sorted by best relevance/ranking.
-    - Each result contains:
-        - Rank number
-        - Node title
-        - Node ID
-        - Score, if available
-        - Node type, if available
-        - Node summary
-
-    Important:
-    - This tool intentionally does NOT return evidence chunks, full bodies,
-      image payloads, or raw large JSON.
-    - The purpose is to identify the right node IDs.
-    - After this tool, the main agent delegates the most relevant node IDs to route
-      subagents, which call read_nodes and traverse their assigned regions.
-    - Use node IDs exactly as returned.
+    応答形式:
+    - 結果は関連度またはランキングが高い順に並びます。
+    - 各結果には以下が含まれます:
+        - 順位
+        - ノードタイトル
+        - ノードID
+        - スコア、利用可能な場合
+        - ノード種別、利用可能な場合
+        - ノード概要
     """
     query = query.strip()
 
     if not query:
         return (
-            "# Hybrid Search Results\n\n"
-            "**Error:** empty query.\n"
+            "# ハイブリッド検索結果\n\n"
+            "**エラー:** クエリが空です。\n"
         )
 
     limit = max(1, int(limit or 10))
@@ -742,17 +735,17 @@ async def hybrid_search(query: str, limit: int = 10) -> str:
         "GET", "/api/search", params={"q": query, "limit": limit, "compact": True}
     )
     if not isinstance(results, list):
-        raise RuntimeError("LLM-Wiki backend returned invalid search data")
+        raise RuntimeError("LLM-Wikiバックエンドが無効な検索データを返しました")
 
     lines: list[str] = [
-        "# Hybrid Search Results",
+        "# ハイブリッド検索結果",
         "",
-        f"- **Query:** `{query}`",
-        f"- **Requested result count:** `{limit}`",
+        f"- **検索クエリ:** `{query}`",
+        f"- **要求された結果件数:** `{limit}`",
         "",
-        "## How to use these results",
+        "## この検索結果の使い方",
         "",
-        "The main agent assigns relevant node IDs to route subagents. Each subagent calls `read_nodes` and explores its assigned region.",
+        "メインエージェントは、関連するノードIDをルート担当サブエージェントに割り当てます。各サブエージェントは `read_nodes` を呼び出し、割り当てられた領域を探索します。",
         "",
     ]
 
@@ -772,14 +765,14 @@ async def hybrid_search(query: str, limit: int = 10) -> str:
         output_count += 1
 
     if output_count == 0:
-        lines.append("No matching nodes found.")
+        lines.append("一致するノードは見つかりませんでした。")
 
     lines.extend(
         [
             "",
-            "## Next step",
+            "## 次のステップ",
             "",
-            "Delegate one or more Node IDs above to route subagents for `read_nodes` and graph traversal.",
+            "上記の1つ以上のノードIDをルート担当サブエージェントに委任し、`read_nodes` とグラフ探索を実行してください。",
         ]
     )
 
@@ -793,84 +786,79 @@ async def read_nodes(
     direction: str = "both",
 ) -> str:
     """
-    Read one or more wiki nodes by exact node ID.
+    正確なノードIDを指定して、1つ以上のWikiノードを読み取ります。
 
-    Use this tool AFTER hybrid_search when you need actual source/manual
-    content from selected nodes.
+    hybrid_search で候補ノードを見つけた後、選択したノードの実際の
+    ソース内容、マニュアル本文、または詳細情報を確認するために使用してください。
 
-    Input:
+    入力:
     - node_ids:
-        A single node ID string or a list of node ID strings.
-        Examples:
+        単一のノードID文字列、またはノードID文字列のリストです。
+        例:
         - "node:moove-file-management-us:2fa49de66669"
         - ["node:a", "node:b"]
+
     - neighbor_limit:
-        Number of neighboring linked nodes to show per requested node.
-        Default: 10.
-        This controls only how many related nodes are listed.
-        It does NOT truncate or limit the requested node body.
-        Use 0 if you only want the requested full node body.
+        要求した各ノードごとに表示する隣接リンクノードの件数です。
+        デフォルト: 10。
+        これは関連ノードの表示件数のみを制御します。
+        要求したノード本文を切り詰めたり制限したりするものではありません。
+        要求ノードの全文本文だけが必要な場合は 0 を指定してください。
+
     - direction:
-        Which graph links to show around the node.
-        Allowed values:
-        - "incoming": nodes that point to this node
-        - "outgoing": nodes this node points to
-        - "both": both incoming and outgoing links
-        Default: "both".
+        対象ノードの周辺で表示するグラフリンクの方向です。
+        指定可能な値:
+        - "incoming": このノードを指しているノード
+        - "outgoing": このノードが指しているノード
+        - "both": incoming と outgoing の両方
+        デフォルト: "both"。
 
-    Response format:
-    - Markdown, not raw JSON.
-    - For each requested node:
-        - Node ID
-        - Title
-        - Type, if available
-        - Summary
-        - Source information, if available
-        - Full body text
-        - Image cleanup stats
-        - Neighboring nodes with:
-            - Neighbor node ID
-            - Relation label
-            - Neighbor title
-            - Neighbor summary
+    応答形式:
+    - 生のJSONではなく Markdown を返します。
+    - 要求された各ノードについて、以下を含みます:
+        - ノードID
+        - タイトル
+        - 種別、利用可能な場合
+        - 概要
+        - ソース情報、利用可能な場合
+        - 本文全文
+        - 画像クリーンアップ統計
+        - 隣接ノード:
+            - 隣接ノードID
+            - 関係ラベル
+            - 隣接ノードのタイトル
+            - 隣接ノードの概要
 
-    Image/base64 behavior:
-    - The body is returned in full except embedded image payloads.
-    - image-media base64 data is removed before output.
-    - If image-description exists, the description is preserved and used as
-      the semantic image text.
-    - Base64 data URLs are never sent to the text-only LLM.
-
-    How the LLM should use the response:
-    - Use the Body section as the primary source for answering the user.
-    - Use Neighboring Nodes to decide what node to read next.
-    - If more graph context is needed, the route subagent calls explore_links.
+    LLMでの利用方法:
+    - ユーザーへの回答では、Body セクションを主要な根拠として使用してください。
+    - Neighboring Nodes は、次に読むべきノードを判断するために使用してください。
+    - さらにグラフ文脈が必要な場合、ルート担当サブエージェントが explore_links を呼び出します。
     """
     ids = _normalize_node_ids(node_ids)
 
     if not ids:
         return (
-            "# Read Nodes\n\n"
-            "**Error:** no node IDs supplied.\n"
+            "# ノード読み取り\n\n"
+            "**エラー:** ノードIDが指定されていません。\n"
         )
 
     normalized_direction = direction.lower().strip()
     if normalized_direction not in {"incoming", "outgoing", "both"}:
         return (
-            "# Read Nodes\n\n"
-            "**Error:** direction must be `incoming`, `outgoing`, or `both`.\n"
+            "# ノード読み取り\n\n"
+            "**エラー:** direction は `incoming`、`outgoing`、または `both` のいずれかである必要があります。\n"
         )
 
     neighbor_limit = max(0, int(neighbor_limit or 0))
 
     lines: list[str] = [
-        "# Read Nodes",
+        "# ノード読み取り",
         "",
-        f"- **Requested node count:** `{len(ids)}`",
-        f"- **Neighbor direction:** `{normalized_direction}`",
-        f"- **Neighbor count per node:** `{neighbor_limit}`",
-        "- **Body behavior:** full body returned; no character truncation",
-        "- **Image behavior:** embedded base64 image payloads removed; image descriptions preserved",
+        f"- **要求されたノード数:** `{len(ids)}`",
+        f"- **隣接ノードの方向:** `{normalized_direction}`",
+        f"- **ノードごとの隣接ノード数:** `{neighbor_limit}`",
+        "- **本文の扱い:** 全文を返します。文字数による切り詰めはありません",
+        "- **画像の扱い:** 埋め込まれた base64 画像ペイロードは削除し、画像説明は保持します",
         "",
     ]
 
@@ -888,7 +876,7 @@ async def read_nodes(
                 [
                     f"## {node_index}. `{node_id}`",
                     "",
-                    f"**Error reading node:** `{_compact_error(exc)}`",
+                    f"**ノード読み取りエラー:** `{_compact_error(exc)}`",
                     "",
                 ]
             )
@@ -928,28 +916,28 @@ async def read_nodes(
             [
                 f"## {node_index}. {title}",
                 "",
-                f"- **Node ID:** `{actual_id}`",
+                f"- **ノードID:** `{actual_id}`",
             ]
         )
 
         if node_type:
-            lines.append(f"- **Type:** `{node_type}`")
+            lines.append(f"- **種別:** `{node_type}`")
 
-        lines.append(f"- **Summary:** {summary}")
+        lines.append(f"- **概要:** {summary}")
 
         if source:
-            lines.append(f"- **Source:** {source}")
+            lines.append(f"- **ソース:** {source}")
 
         lines.extend(
             [
-                "- **Body returned:** full body, no character truncation",
-                f"- **Image units detected:** `{image_unit_count}`",
-                f"- **Image descriptions preserved:** `{image_description_count}`",
-                f"- **Embedded image payloads removed:** `{image_payload_count}`",
+                "- **本文の返却:** 全文を返します。文字数による切り詰めはありません",
+                f"- **検出された画像ユニット数:** `{image_unit_count}`",
+                f"- **保持された画像説明数:** `{image_description_count}`",
+                f"- **削除された埋め込み画像ペイロード数:** `{image_payload_count}`",
                 "",
-                "### Body",
+                "### 本文",
                 "",
-                body if body else "(no body text)",
+                body if body else "（本文テキストなし）",
                 "",
             ]
         )
@@ -957,9 +945,9 @@ async def read_nodes(
         if neighbor_limit > 0:
             lines.extend(
                 [
-                    "### Neighboring Nodes",
+                    "### 隣接ノード",
                     "",
-                    "These are useful next reads connected to this node.",
+                    "このノードに接続されている、次に読む候補となるノードです。",
                     "",
                 ]
             )
@@ -975,7 +963,7 @@ async def read_nodes(
                 if not pairs:
                     lines.extend(
                         [
-                            "(no neighboring nodes found)",
+                            "（隣接ノードは見つかりませんでした）",
                             "",
                         ]
                     )
@@ -985,7 +973,7 @@ async def read_nodes(
                             edge, neighbor_node = pair
                         except Exception:
                             lines.append(
-                                f"{neighbor_index}. Could not parse neighbor pair: `{pair}`"
+                                f"{neighbor_index}. 隣接ノードのペアを解析できませんでした: `{pair}`"
                             )
                             continue
 
@@ -1001,8 +989,8 @@ async def read_nodes(
             except Exception as exc:
                 lines.extend(
                     [
-                        f"Could not fetch neighboring nodes for `{actual_id}`.",
-                        f"- **Error:** `{_compact_error(exc)}`",
+                        f"`{actual_id}` の隣接ノードを取得できませんでした。",
+                        f"- **エラー:** `{_compact_error(exc)}`",
                         "",
                     ]
                 )
@@ -1010,7 +998,7 @@ async def read_nodes(
     if missing:
         lines.extend(
             [
-                "## Missing Nodes",
+                "## 見つからなかったノード",
                 "",
                 *[f"- `{node_id}`" for node_id in missing],
                 "",
@@ -1019,14 +1007,13 @@ async def read_nodes(
 
     lines.extend(
         [
-            "## Next step",
+            "## 次のステップ",
             "",
-            "The route subagent should read promising Neighbor Node IDs or call `explore_links` until its assigned frontier is closed or bounded.",
+            "ルート担当サブエージェントは、有望な隣接ノードIDを読み取るか、割り当てられた探索範囲が閉じる、または境界付けられるまで `explore_links` を呼び出してください。",
         ]
     )
 
     return "\n".join(lines)
-
 
 @mcp.tool()
 async def explore_links(
@@ -1036,76 +1023,82 @@ async def explore_links(
     limit: int = 30,
 ) -> str:
     """
-    Explore graph links from one or more seed nodes.
+    1つ以上の起点ノードからグラフリンクを探索します。
 
-    Use this tool when:
-    - read_nodes shows a useful node and you want related concepts.
-    - You need to understand what is upstream or downstream of a node.
-    - You want to choose the next node to read.
-    - You need graph context without reading full bodies.
+    次の場合にこのツールを使用してください:
+    - read_nodes の結果に有用なノードがあり、関連概念を確認したい場合。
+    - ノードの上流または下流にある情報を理解したい場合。
+    - 次に読むノードを選びたい場合。
+    - 本文全文を読まずに、グラフ上の文脈だけを確認したい場合。
 
-    Input:
+    入力:
     - node_ids:
-        A single seed node ID string or a list of seed node IDs.
+        単一の起点ノードID文字列、または起点ノードID文字列のリストです。
+
     - direction:
-        Allowed values:
-        - "incoming": nodes that point to the seed node
-        - "outgoing": nodes the seed node points to
-        - "both": both incoming and outgoing links
-        Default: "both".
+        表示するリンク方向です。
+        指定可能な値:
+        - "incoming": 起点ノードを指しているノード
+        - "outgoing": 起点ノードが指しているノード
+        - "both": incoming と outgoing の両方
+        デフォルト: "both"。
+
     - label:
-        Optional relation/edge label filter.
-        Use null or omit this parameter to show all relation labels.
+        任意の関係ラベルまたはエッジラベルのフィルタです。
+        すべての関係ラベルを表示する場合は、null を指定するか、この引数を省略してください。
+
     - limit:
-        Total number of links returned across all seed nodes.
-        Default: 30.
-        This controls graph fanout only. It is not a text/body character limit.
+        すべての起点ノードを合計して返すリンク数です。
+        デフォルト: 30。
+        これはグラフの展開数のみを制御します。
+        本文やテキストの文字数制限ではありません。
 
-    Response format:
-    - Markdown, not raw JSON.
-    - For each seed node, the response lists linked neighbor nodes.
-    - Each linked neighbor shows:
-        - Seed node ID
-        - Relation/edge label
-        - Neighbor node ID
-        - Neighbor title
-        - Neighbor type, if available
-        - Neighbor summary
+    応答形式:
+    - 生のJSONではなく Markdown を返します。
+    - 各起点ノードごとに、リンクされた隣接ノードを一覧表示します。
+    - 各隣接ノードには以下が含まれます:
+        - 起点ノードID
+        - 関係ラベルまたはエッジラベル
+        - 隣接ノードID
+        - 隣接ノードのタイトル
+        - 隣接ノードの種別、利用可能な場合
+        - 隣接ノードの概要
 
-    How the LLM should use the response:
-    - Use this as a navigation map.
-    - Pick promising Neighbor Node IDs.
-    - Then the route subagent calls read_nodes on those IDs to inspect full source content.
+    LLMでの利用方法:
+    - この結果をナビゲーション用のマップとして使用してください。
+    - 有望な隣接ノードIDを選んでください。
+    - その後、ルート担当サブエージェントがそれらのIDに対して read_nodes を呼び出し、
+      ソース本文を詳しく確認します。
     """
     ids = _normalize_node_ids(node_ids)
 
     if not ids:
         return (
-            "# Explore Links\n\n"
-            "**Error:** no node IDs supplied.\n"
+            "# リンク探索\n\n"
+            "**エラー:** ノードIDが指定されていません。\n"
         )
 
     normalized_direction = direction.lower().strip()
 
     if normalized_direction not in {"incoming", "outgoing", "both"}:
         return (
-            "# Explore Links\n\n"
-            "**Error:** direction must be `incoming`, `outgoing`, or `both`.\n"
+            "# リンク探索\n\n"
+            "**エラー:** direction は `incoming`、`outgoing`、または `both` のいずれかである必要があります。\n"
         )
 
     limit = max(1, int(limit or 30))
 
     lines: list[str] = [
-        "# Explore Links",
+        "# リンク探索",
         "",
-        f"- **Seed node count:** `{len(ids)}`",
-        f"- **Direction:** `{normalized_direction}`",
-        f"- **Label filter:** `{label if label else 'none'}`",
-        f"- **Total link count requested:** `{limit}`",
+        f"- **起点ノード数:** `{len(ids)}`",
+        f"- **方向:** `{normalized_direction}`",
+        f"- **ラベルフィルタ:** `{label if label else 'なし'}`",
+        f"- **要求された合計リンク数:** `{limit}`",
         "",
-        "## How to use this output",
+        "## この出力の使い方",
         "",
-        "Use `read_nodes` on any promising Neighbor Node ID below to inspect full source content.",
+        "以下の有望な隣接ノードIDに対して `read_nodes` を使用し、ソース本文を詳しく確認してください。",
         "",
     ]
 
@@ -1120,7 +1113,7 @@ async def explore_links(
 
         lines.extend(
             [
-                f"## Seed {seed_index}: `{node_id}`",
+                f"## 起点 {seed_index}: `{node_id}`",
                 "",
             ]
         )
@@ -1141,8 +1134,8 @@ async def explore_links(
             )
             lines.extend(
                 [
-                    f"Could not explore links for `{node_id}`.",
-                    f"- **Error:** `{_compact_error(exc)}`",
+                    f"`{node_id}` のリンクを探索できませんでした。",
+                    f"- **エラー:** `{_compact_error(exc)}`",
                     "",
                 ]
             )
@@ -1151,7 +1144,7 @@ async def explore_links(
         if not pairs:
             lines.extend(
                 [
-                    "(no links found)",
+                    "（リンクは見つかりませんでした）",
                     "",
                 ]
             )
@@ -1162,7 +1155,7 @@ async def explore_links(
                 edge, neighbor_node = pair
             except Exception:
                 lines.append(
-                    f"{local_index}. Could not parse link pair: `{pair}`"
+                    f"{local_index}. リンクペアを解析できませんでした: `{pair}`"
                 )
                 continue
 
@@ -1184,16 +1177,16 @@ async def explore_links(
 
     lines.extend(
         [
-            "## Summary",
+            "## 概要",
             "",
-            f"- **Returned links:** `{total_count}`",
-            f"- **Failed seeds:** `{len(failed)}`",
+            f"- **返されたリンク数:** `{total_count}`",
+            f"- **失敗した起点ノード数:** `{len(failed)}`",
             "",
         ]
     )
 
     if failed:
-        lines.append("### Failed Seeds")
+        lines.append("### 失敗した起点ノード")
         lines.append("")
         for item in failed:
             lines.append(f"- `{item['node_id']}`: {item['error']}")
@@ -1201,9 +1194,9 @@ async def explore_links(
 
     lines.extend(
         [
-            "## Next step",
+            "## 次のステップ",
             "",
-            "The route subagent calls `read_nodes` on the most relevant Neighbor Node IDs.",
+            "ルート担当サブエージェントは、最も関連性の高い隣接ノードIDに対して `read_nodes` を呼び出してください。",
         ]
     )
 
@@ -1217,7 +1210,7 @@ async def _queue_agent_note(
 ) -> str:
     clean_body = sanitize_markdown_for_text_llm(str(body or "")).strip()
     if not clean_body:
-        raise ValueError("agent note body must not be empty")
+        raise ValueError("エージェントノートの本文は空にできません")
 
     cited_ids = _normalize_node_ids(source_node_ids or [])
     clean_question = " ".join(str(question or "").split()) or None
@@ -1232,23 +1225,23 @@ async def _queue_agent_note(
         },
     )
     if not isinstance(result, dict) or not result.get("id"):
-        raise RuntimeError("LLM-Wiki backend returned invalid write-job data")
+        raise RuntimeError("LLM-Wikiバックエンドが無効な書き込みジョブデータを返しました")
 
     db, _origin, _prefix = _request_backend()
     lines = [
-        "# Agent Note Queued",
+        "# エージェントノートをキューに追加しました",
         "",
         f"- **Wiki:** `{db}`",
-        f"- **Job ID:** `{result['id']}`",
-        f"- **Status:** `{result.get('status', 'queued')}`",
-        f"- **Cited node count:** `{len(cited_ids)}`",
+        f"- **ジョブID:** `{result['id']}`",
+        f"- **ステータス:** `{result.get('status', 'queued')}`",
+        f"- **引用ノード数:** `{len(cited_ids)}`",
     ]
     if result.get("position") is not None:
-        lines.append(f"- **Queue position:** `{result['position']}`")
+        lines.append(f"- **キュー内の位置:** `{result['position']}`")
     lines.extend(
         [
             "",
-            "The backend accepted the write. Continue immediately; do not poll or wait for assimilation.",
+            "バックエンドは書き込みを受け付けました。すぐに続行してください。同化処理をポーリングしたり待機したりしないでください。",
         ]
     )
     return "\n".join(lines)
@@ -1260,26 +1253,39 @@ async def queue_agent_note(
     source_node_ids: list[str] | None = None,
     question: str | None = None,
 ) -> str:
-    """Queue one durable, evidence-grounded agent note in the active wiki.
+    """現在のWikiに、永続的で証拠に基づいたエージェントノートを1件キューに追加します。
 
-    Call this once after completing useful research. The backend serializes the
-    addition with every other graph write and assimilates it in the background.
-    This tool returns when the job is accepted; do not poll or wait for completion.
+    有用な調査が完了した後に、このツールを1回だけ呼び出してください。
+    バックエンドは、この追加処理を他のすべてのグラフ書き込みと直列化し、
+    バックグラウンドで同化します。
+    このツールはジョブが受理された時点で戻ります。
+    完了をポーリングしたり待機したりしないでください。
 
-    Input:
-    - body: The concise synthesized knowledge to preserve as Markdown.
-    - source_node_ids: Exact node IDs that support the note.
-    - question: The original question, used as the note title when provided.
+    入力:
+    - body:
+        Markdown形式で保存する、簡潔に統合された知識です。
+        調査結果に基づき、再利用可能な形で記述してください。
 
-    Do not submit raw transcripts, secrets, chain-of-thought, unsupported claims,
-    or partial subagent reports.
+    - source_node_ids:
+        ノートの根拠となる正確なノードIDのリストです。
+        read_nodes などで確認した出典ノードを指定してください。
+
+    - question:
+        元の質問です。
+        指定された場合、ノートのタイトルとして使用されます。
+
+    以下は送信しないでください:
+    - 生の会話ログ
+    - 秘密情報
+    - 思考過程
+    - 根拠のない主張
+    - 未完成の部分的なサブエージェント報告
     """
     return await _queue_agent_note(body, source_node_ids, question)
 
+# endregion MCP and its tools
 
-# =============================================================================
-# CLI
-# =============================================================================
+# region App runner
 
 def create_app(
     *,
@@ -1391,3 +1397,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# endregion App runner
