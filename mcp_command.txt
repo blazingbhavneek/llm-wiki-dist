@@ -1,0 +1,6 @@
+python mcp_server.py \
+  --wiki moove_wiki \
+  --prefix /llm-wiki \
+  --backend-origin http://localhost:8000 \
+  --db-dir /home/seigyo/c_repo/bhavneek/llm-wiki-dist/llm-wiki-dist/.wiki \
+  --port 8002

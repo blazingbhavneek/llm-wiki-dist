@@ -21,16 +21,20 @@ import logging
 import os
 import queue
 import re
+import shutil
+import sqlite3
+import tempfile
 import threading
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
@@ -90,6 +94,13 @@ DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki"))
 DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
 PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
 _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
+_RESERVED_DB_NAMES = {"admin", "assets"}
+
+ADMIN_PASSWORD = os.environ.get("WIKI_ADMIN_PASSWORD", "seigyo@rikiseisan")
+MAX_SQLITE_UPLOAD_BYTES = int(
+    os.environ.get("WIKI_MAX_SQLITE_UPLOAD_BYTES", str(512 * 1024 * 1024))
+)
+ADMIN_DB_LOCK = asyncio.Lock()
 
 # The db for the current request; set by the db_routing middleware from the URL.
 current_db: ContextVar[str] = ContextVar("current_db", default=DEFAULT_DB)
@@ -173,6 +184,25 @@ async def _bootstrap_db(db: str) -> None:
         building.discard(db)
 
 
+async def _close_stack(db: str) -> None:
+    """Stop and remove one db stack before deleting/replacing its SQLite file."""
+    stack = STACKS.pop(db, None)
+    if stack is None:
+        return
+
+    with suppress(Exception):
+        await stack["librarian"].stop()
+    with suppress(Exception):
+        stack["write_store"].close()
+    with suppress(Exception):
+        stack["read_store"].close()
+    with suppress(Exception):
+        stack["gateway"].close()
+
+    stages.pop(db, None)
+    errors.pop(db, None)
+
+
 def _ensure_building(db: str) -> None:
     """Kick off a lazy build for db if it isn't ready or already building."""
     if db not in STACKS and db not in building:
@@ -189,6 +219,8 @@ async def lifespan(_: FastAPI):
         force=True,
     )
     logging.getLogger("graph_librarian").setLevel(logging.INFO)
+
+    DB_DIR.mkdir(parents=True, exist_ok=True)
 
     loop = asyncio.get_running_loop()
     loop.set_default_executor(
@@ -290,6 +322,352 @@ def _path_within_ingest_root(value: str) -> str:
     return str(path)
 
 
+def _validate_db_name(db: str) -> str:
+    if not _DB_RE.fullmatch(db) or db in _RESERVED_DB_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("invalid db name", False, "bad_db_name"),
+        )
+    return db
+
+
+def _db_path(db: str) -> Path:
+    return DB_DIR / f"{db}.sqlite"
+
+
+def _db_url(db: str) -> str:
+    return f"{PREFIX}/{quote(db)}/"
+
+
+def _db_sidecar_paths(db: str) -> list[Path]:
+    path = _db_path(db)
+    return [
+        path,
+        path.with_name(path.name + "-wal"),
+        path.with_name(path.name + "-shm"),
+    ]
+
+
+def _unlink_db_files(db: str) -> bool:
+    deleted = False
+    for path in _db_sidecar_paths(db):
+        if path.exists():
+            path.unlink()
+            deleted = True
+    return deleted
+
+
+def _require_admin(
+    password: str | None = Header(default=None, alias="X-Admin-Password"),
+) -> None:
+    if not ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail=api_error(
+                "admin API disabled: set WIKI_ADMIN_PASSWORD",
+                False,
+                "admin_disabled",
+            ),
+        )
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=401,
+            detail=api_error("invalid admin password", False, "unauthorized"),
+        )
+
+
+def _open_sqlite_ro(path: Path) -> sqlite3.Connection:
+    uri = "file:" + quote(str(path.resolve()), safe="/:\\") + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+
+    # Best effort: vector virtual tables may need sqlite-vec loaded for counts.
+    with suppress(Exception):
+        import sqlite_vec
+
+        with suppress(Exception):
+            conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        with suppress(Exception):
+            conn.enable_load_extension(False)
+
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE name=?
+          AND type IN ('table', 'virtual table')
+        LIMIT 1
+        """,
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _count_sql(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: tuple[Any, ...] = (),
+    default: int = 0,
+) -> int:
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except sqlite3.Error:
+        return default
+    if row is None:
+        return default
+    return int(row[0] or 0)
+
+
+def _validate_sqlite_file(path: Path, *, final: bool) -> None:
+    if not path.exists() or not path.is_file():
+        raise ValueError("file does not exist")
+    if path.stat().st_size <= 0:
+        raise ValueError("file is empty")
+
+    try:
+        conn = _open_sqlite_ro(path)
+    except sqlite3.Error as exc:
+        raise ValueError(f"cannot open sqlite: {exc}") from exc
+
+    try:
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+        integrity = [str(row[0]) for row in rows]
+        if integrity != ["ok"]:
+            raise ValueError(f"integrity_check failed: {integrity[:5]}")
+
+        required_tables = {
+            "meta",
+            "nodes",
+            "edges",
+            "sources",
+            "source_versions",
+        }
+        if final:
+            required_tables |= {
+                "nodes_fts",
+                "search_items",
+                "search_items_fts",
+            }
+
+        for table in sorted(required_tables):
+            if not _table_exists(conn, table):
+                raise ValueError(f"missing required table: {table}")
+
+        required_columns = {
+            "nodes": {
+                "id",
+                "body",
+                "type",
+                "title",
+                "original_document_name",
+                "source_path",
+                "source_ranges_json",
+                "keywords_json",
+                "summary",
+                "cluster",
+                "status",
+                "created_at",
+                "updated_at",
+            },
+            "edges": {
+                "id",
+                "source_node_id",
+                "target_node_id",
+                "label",
+                "summary",
+                "created_at",
+            },
+            "sources": {
+                "document_name",
+                "source_hash",
+                "ingested_at",
+            },
+            "source_versions": {
+                "document_name",
+                "source_hash",
+                "ingested_at",
+            },
+        }
+
+        if final:
+            required_columns["nodes"] |= {
+                "source_version",
+                "source_material_hash",
+                "entity",
+                "claims_json",
+                "bridge_probe",
+            }
+            required_columns["edges"] |= {
+                "valid_at",
+                "invalid_at",
+                "expired_at",
+                "source_episode_ids_json",
+            }
+
+        for table, cols in required_columns.items():
+            have = _columns(conn, table)
+            missing = sorted(cols - have)
+            if missing:
+                raise ValueError(
+                    f"missing required columns in {table}: {', '.join(missing)}"
+                )
+    finally:
+        conn.close()
+
+
+def _migrate_sqlite_file(path: Path) -> None:
+    store = None
+    try:
+        store = GraphStore(str(path), readonly=False)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _db_summary_from_path(path: Path) -> dict[str, Any]:
+    db = path.name[: -len(".sqlite")]
+    stat = path.stat()
+
+    base: dict[str, Any] = {
+        "name": db,
+        "url": _db_url(db),
+        "path": str(path),
+        "size_bytes": stat.st_size,
+        "modified_at": stat.st_mtime,
+    }
+
+    try:
+        conn = _open_sqlite_ro(path)
+    except Exception as exc:
+        return {
+            **base,
+            "valid": False,
+            "error": f"cannot open sqlite: {type(exc).__name__}: {exc}",
+        }
+
+    try:
+        required = [
+            "nodes",
+            "edges",
+            "sources",
+            "source_versions",
+            "nodes_fts",
+            "search_items",
+            "search_items_fts",
+        ]
+        for table in required:
+            if not _table_exists(conn, table):
+                return {
+                    **base,
+                    "valid": False,
+                    "error": f"missing required table: {table}",
+                }
+
+        docs = [
+            row["document_name"]
+            for row in conn.execute(
+                """
+                SELECT document_name
+                FROM sources
+                ORDER BY document_name
+                """
+            ).fetchall()
+        ]
+
+        vectors: dict[str, Any] = {
+            "embed_dim": None,
+            "vec_body": 0,
+            "vec_summary": 0,
+            "vec_bridge": 0,
+            "vec_search_item": 0,
+        }
+
+        if _table_exists(conn, "meta"):
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='embed_dim'"
+            ).fetchone()
+            if row is not None:
+                with suppress(Exception):
+                    vectors["embed_dim"] = int(row["value"])
+
+        for table in ("vec_body", "vec_summary", "vec_bridge", "vec_search_item"):
+            if _table_exists(conn, table):
+                try:
+                    vectors[table] = _count_sql(conn, f"SELECT COUNT(*) FROM {table}")
+                except sqlite3.Error:
+                    vectors[table] = 0
+
+        edge_labels = [
+            {"label": row["label"], "count": int(row["count"])}
+            for row in conn.execute(
+                """
+                SELECT label, COUNT(*) AS count
+                FROM edges
+                GROUP BY label
+                ORDER BY count DESC, label ASC
+                """
+            ).fetchall()
+        ]
+
+        return {
+            **base,
+            "valid": True,
+            "docs_count": len(docs),
+            "docs": docs,
+            "nodes_total": _count_sql(conn, "SELECT COUNT(*) FROM nodes"),
+            "nodes_active": _count_sql(
+                conn, "SELECT COUNT(*) FROM nodes WHERE status='active'"
+            ),
+            "nodes_deleted": _count_sql(
+                conn, "SELECT COUNT(*) FROM nodes WHERE status='deleted'"
+            ),
+            "nodes_endo": _count_sql(
+                conn,
+                """
+                SELECT COUNT(*)
+                FROM nodes
+                WHERE type IN ('endo', 'endogenous')
+                """,
+            ),
+            "nodes_exo": _count_sql(
+                conn,
+                """
+                SELECT COUNT(*)
+                FROM nodes
+                WHERE type IN ('exo', 'exogenous')
+                """,
+            ),
+            "links_total": _count_sql(conn, "SELECT COUNT(*) FROM edges"),
+            "search_items_total": _count_sql(
+                conn, "SELECT COUNT(*) FROM search_items"
+            ),
+            "vectors": vectors,
+            "edge_labels": edge_labels,
+        }
+    except Exception as exc:
+        return {
+            **base,
+            "valid": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        conn.close()
+
+
+def _db_summary(db: str) -> dict[str, Any]:
+    return _db_summary_from_path(_db_path(db))
+
+
 app = FastAPI(title="LLM-Wiki API", lifespan=lifespan)
 
 app.add_middleware(
@@ -320,6 +698,7 @@ async def db_routing(request: Request, call_next):
     Layout served:
         {PREFIX}/{db}/              -> frontend
         {PREFIX}/{db}/api/...        -> backend for that db
+        {PREFIX}/admin/api/...       -> admin backend, not a db
         {PREFIX}/favicon.svg         -> static frontend asset
         {PREFIX}/assets/...          -> static frontend assets
 
@@ -331,6 +710,13 @@ async def db_routing(request: Request, call_next):
         path = raw[len(PREFIX):] or "/"
     else:
         path = raw
+
+    # Admin is prefix-level, not a wiki db named "admin".
+    if path == "/admin" or path.startswith("/admin/"):
+        request.scope["path"] = path
+        request.scope["raw_path"] = path.encode()
+        request.scope["root_path"] = PREFIX
+        return await call_next(request)
 
     # ------------------------------------------------------------------
     # Safe static asset bypass.
@@ -373,6 +759,11 @@ async def db_routing(request: Request, call_next):
     seg, _, tail = stripped.partition("/")
 
     if not _DB_RE.fullmatch(seg):
+        return PlainTextResponse("unknown wiki", status_code=404)
+
+    # Important: normal wiki traffic must never create a new empty DB because
+    # of a typo in the URL. Only admin create/upload may create DB files.
+    if not _db_path(seg).exists():
         return PlainTextResponse("unknown wiki", status_code=404)
 
     if tail == "" and not path.endswith("/"):
@@ -436,6 +827,431 @@ async def restart_bootstrap() -> dict[str, Any]:
         asyncio.create_task(_bootstrap_db(db))
     return {"ready": False, "stage": stages.get(db, "starting"), "error": errors.get(db)}
 
+
+# ============================================================================
+# prefix-level ADMIN DB MANAGEMENT
+# ============================================================================
+
+
+@app.get("/admin/api/dbs")
+async def admin_list_dbs(_: str | None = Header(default=None, alias="X-Admin-Password")):
+    _require_admin(_)
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    dbs = [
+        _db_summary_from_path(path)
+        for path in sorted(DB_DIR.glob("*.sqlite"), key=lambda p: p.name)
+        if not path.name.endswith(".sqlite-wal")
+        and not path.name.endswith(".sqlite-shm")
+    ]
+    return {
+        "default": DEFAULT_DB,
+        "db_dir": str(DB_DIR),
+        "dbs": dbs,
+    }
+
+
+@app.get("/admin/api/dbs/{db}")
+async def admin_get_db(
+    db: str,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    db = _validate_db_name(db)
+    path = _db_path(db)
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=api_error("db not found", False, "not_found"),
+        )
+    return _db_summary(db)
+
+
+@app.post("/admin/api/dbs/{db}")
+async def admin_create_db(
+    db: str,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    db = _validate_db_name(db)
+
+    async with ADMIN_DB_LOCK:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        path = _db_path(db)
+        if path.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=api_error("db already exists", False, "db_exists"),
+            )
+
+        await _bootstrap_db(db)
+
+        if stages.get(db) != "ready" or not path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=api_error(
+                    errors.get(db) or "failed to create db",
+                    True,
+                    "create_failed",
+                    stage=stages.get(db),
+                ),
+            )
+
+        return {
+            "db": db,
+            "created": True,
+            "url": _db_url(db),
+            "stats": _db_summary(db),
+        }
+
+
+@app.post("/admin/api/dbs/{db}/upload")
+async def admin_upload_db(
+    db: str,
+    file: UploadFile = File(...),
+    replace: bool = Query(False),
+    bootstrap: bool = Query(True),
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    db = _validate_db_name(db)
+
+    tmp_path: Path | None = None
+
+    async with ADMIN_DB_LOCK:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        target = _db_path(db)
+
+        if target.exists() and not replace:
+            raise HTTPException(
+                status_code=409,
+                detail=api_error(
+                    "db already exists; pass replace=true to replace it",
+                    False,
+                    "db_exists",
+                ),
+            )
+
+        fd, tmp_name = tempfile.mkstemp(prefix=f"llm-wiki-upload-{db}-", suffix=".sqlite")
+        tmp_path = Path(tmp_name)
+
+        try:
+            total = 0
+            with os.fdopen(fd, "wb") as out:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+
+                    total += len(chunk)
+                    if total > MAX_SQLITE_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=api_error(
+                                (
+                                    "uploaded sqlite is too large "
+                                    f"({total} bytes > {MAX_SQLITE_UPLOAD_BYTES} bytes)"
+                                ),
+                                False,
+                                "upload_too_large",
+                            ),
+                        )
+
+                    out.write(chunk)
+
+            try:
+                _validate_sqlite_file(tmp_path, final=False)
+                await asyncio.to_thread(_migrate_sqlite_file, tmp_path)
+                _validate_sqlite_file(tmp_path, final=True)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=api_error(f"invalid sqlite: {exc}", False, "invalid_sqlite"),
+                ) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=api_error(
+                        f"sqlite migration/validation failed: {type(exc).__name__}: {exc}",
+                        False,
+                        "invalid_sqlite",
+                    ),
+                ) from exc
+
+            await _close_stack(db)
+
+            if replace:
+                _unlink_db_files(db)
+
+            shutil.move(str(tmp_path), str(target))
+            tmp_path = None
+
+            if bootstrap:
+                await _bootstrap_db(db)
+
+            return {
+                "db": db,
+                "uploaded": True,
+                "replaced": bool(replace),
+                "url": _db_url(db),
+                "bootstrap": bool(bootstrap),
+                "stage": stages.get(db),
+                "stats": _db_summary(db),
+            }
+        finally:
+            with suppress(Exception):
+                await file.close()
+            if tmp_path is not None and tmp_path.exists():
+                with suppress(Exception):
+                    tmp_path.unlink()
+
+
+@app.delete("/admin/api/dbs/{db}")
+async def admin_delete_db(
+    db: str,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    db = _validate_db_name(db)
+
+    async with ADMIN_DB_LOCK:
+        await _close_stack(db)
+        deleted = _unlink_db_files(db)
+        stages.pop(db, None)
+        errors.pop(db, None)
+
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("db not found", False, "not_found"),
+            )
+
+        return {
+            "db": db,
+            "deleted": True,
+        }
+
+
+
+class AdminDbCopyRequest(BaseModel):
+    target: str | None = None
+    bootstrap: bool = True
+
+
+class AdminDbRenameRequest(BaseModel):
+    target: str
+
+
+def _next_copy_name(db: str) -> str:
+    """
+    Initial copy name is {db}_copy.
+    If it already exists, this returns {db}_copy_2, {db}_copy_3, ...
+    You can remove the loop if you prefer strict 409 on existing {db}_copy.
+    """
+    base = f"{db}_copy"
+    candidate = base
+    i = 2
+
+    while _db_path(candidate).exists():
+        candidate = f"{base}_{i}"
+        i += 1
+
+    return candidate
+
+
+@app.post("/admin/api/dbs/{db}/copy")
+async def admin_copy_db(
+    db: str,
+    payload: AdminDbCopyRequest | None = None,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    """
+    Copy a SQLite wiki DB.
+
+    Default target:
+        source: mywiki
+        copy:   mywiki_copy
+
+    Request body optional:
+        {
+          "target": "mywiki_backup",
+          "bootstrap": true
+        }
+    """
+    _require_admin(_)
+    db = _validate_db_name(db)
+
+    payload = payload or AdminDbCopyRequest()
+    target_db = payload.target or _next_copy_name(db)
+    target_db = _validate_db_name(target_db)
+
+    if target_db == db:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("target db must be different", False, "same_db_name"),
+        )
+
+    async with ADMIN_DB_LOCK:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+
+        source = _db_path(db)
+        target = _db_path(target_db)
+
+        if not source.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("source db not found", False, "not_found"),
+            )
+
+        if target.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=api_error("target db already exists", False, "db_exists"),
+            )
+
+        # Ensure pending writes are closed/flushed before filesystem copy.
+        await _close_stack(db)
+        await _close_stack(target_db)
+
+        # Remove stale sidecars for target if somehow present.
+        _unlink_db_files(target_db)
+
+        try:
+            shutil.copy2(str(source), str(target))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=api_error(
+                    f"failed to copy db: {type(exc).__name__}: {exc}",
+                    True,
+                    "copy_failed",
+                ),
+            ) from exc
+
+        try:
+            _validate_sqlite_file(target, final=True)
+        except ValueError as exc:
+            _unlink_db_files(target_db)
+            raise HTTPException(
+                status_code=400,
+                detail=api_error(
+                    f"copied sqlite is invalid: {exc}",
+                    False,
+                    "invalid_sqlite",
+                ),
+            ) from exc
+
+        stages.pop(target_db, None)
+        errors.pop(target_db, None)
+
+        if payload.bootstrap:
+            await _bootstrap_db(target_db)
+
+        return {
+            "db": db,
+            "target": target_db,
+            "copied": True,
+            "url": _db_url(target_db),
+            "bootstrap": bool(payload.bootstrap),
+            "stage": stages.get(target_db),
+            "stats": _db_summary(target_db),
+        }
+
+
+@app.patch("/admin/api/dbs/{db}/rename")
+async def admin_rename_db(
+    db: str,
+    payload: AdminDbRenameRequest,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    """
+    Rename a SQLite wiki DB.
+
+    Request body:
+        {
+          "target": "new_name"
+        }
+    """
+    _require_admin(_)
+    db = _validate_db_name(db)
+    target_db = _validate_db_name(payload.target)
+
+    if target_db == db:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("target db must be different", False, "same_db_name"),
+        )
+
+    async with ADMIN_DB_LOCK:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+
+        source = _db_path(db)
+        target = _db_path(target_db)
+
+        if not source.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("source db not found", False, "not_found"),
+            )
+
+        if target.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=api_error("target db already exists", False, "db_exists"),
+            )
+
+        await _close_stack(db)
+        await _close_stack(target_db)
+
+        source_sidecars = _db_sidecar_paths(db)
+        target_sidecars = _db_sidecar_paths(target_db)
+
+        # Do not overwrite any target sidecars.
+        for path in target_sidecars:
+            if path.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail=api_error(
+                        f"target sidecar already exists: {path.name}",
+                        False,
+                        "db_exists",
+                    ),
+                )
+
+        moved: list[tuple[Path, Path]] = []
+
+        try:
+            for src, dst in zip(source_sidecars, target_sidecars):
+                if src.exists():
+                    shutil.move(str(src), str(dst))
+                    moved.append((src, dst))
+        except Exception as exc:
+            # Best-effort rollback.
+            for src, dst in reversed(moved):
+                with suppress(Exception):
+                    if dst.exists() and not src.exists():
+                        shutil.move(str(dst), str(src))
+
+            raise HTTPException(
+                status_code=500,
+                detail=api_error(
+                    f"failed to rename db: {type(exc).__name__}: {exc}",
+                    True,
+                    "rename_failed",
+                ),
+            ) from exc
+
+        stages.pop(db, None)
+        errors.pop(db, None)
+        stages.pop(target_db, None)
+        errors.pop(target_db, None)
+
+        return {
+            "db": db,
+            "target": target_db,
+            "renamed": True,
+            "url": _db_url(target_db),
+            "stats": _db_summary(target_db),
+        }
 
 # ============================================================================
 # request models
@@ -920,6 +1736,17 @@ async def cancel_write_job(job_id: str) -> dict:
             detail=api_error("job not cancellable", False, "job_not_cancellable"),
         )
     return {"job_id": job_id, "status": "cancelling" if status == "running" else "cancelled"}
+
+
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+# Serve admin frontend
+@app.get("/admin")
+@app.get("/admin/{path:path}")
+def serve_admin(path: str = ""):
+    return FileResponse(DIST_DIR / "admin.html")
+
 
 
 app.mount(

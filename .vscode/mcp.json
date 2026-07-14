@@ -2,7 +2,7 @@
   "servers": {
     "moove-wiki": {
       "type": "http",
-      "url": "http://10.160.152.38:8001/mcp"
+      "url": "http://10.160.152.38:8002/llm-wiki/moove_wiki/mcp"
     }
   }
 }

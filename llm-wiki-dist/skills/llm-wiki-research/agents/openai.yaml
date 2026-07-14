@@ -1,4 +1,0 @@
-interface:
-  display_name: "LLM-Wiki Research"
-  short_description: "Research a wiki through bounded graph subagents"
-  default_prompt: "Use $llm-wiki-research to investigate this question across the wiki graph and preserve the grounded result."

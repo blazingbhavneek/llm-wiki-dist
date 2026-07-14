@@ -78,7 +78,7 @@ export function useGraphData() {
     if (mountedRef.current) setReadyState(ready)
 
     if (!ready.ready) {
-      const detail = ready.error || `Backend is starting (${ready.stage})`
+      const detail = ready.error || `バックエンドの起動中です。しばらくお待ちください...`
       const err = new Error(detail)
       err.retryable = true
       err.code = 'not_ready'

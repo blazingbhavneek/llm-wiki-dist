@@ -8,17 +8,27 @@ const DONE_TTL_MS = 72 * 60 * 60 * 1000
 const POLL_MS = 2500
 const MAX_STATUS_CHECKS_PER_POLL = 10
 
+const COOKIE_PREFIX = 'llm_wiki_setting_'
+
+const PDF_SETTING_FIELDS = [
+  'chat_base_url',
+  'chat_api_key',
+  'chat_model',
+]
+
 const STR = {
   ja: {
     selectPdf: 'PDF ファイルを選択してください。',
-    fillFields: 'base_url、api_key、model を入力してください。',
+    fillFields:
+      '設定ページで base_url、api_key、model を入力してください。',
     uploading: 'アップロード中…',
     queued: 'キューに追加されました。',
     queuedWaiting: 'キューで待機中…',
     converting: 'PDF を Markdown に変換中…',
     statusOf: (s) => `状態: ${s}`,
     opened: 'Markdown を開きました。',
-    desc: 'PDF をアップロードして Markdown に変換します。完了後、キュー一覧のボタンから Markdown を開けます。',
+    desc:
+      'PDF をアップロードして Markdown に変換します。LLM 接続設定は設定ページのチャットモデル設定を使用します。完了後、キュー一覧のボタンから Markdown を開けます。',
     pdfFile: 'PDF ファイル',
     choosePdf: 'PDF を選択',
     noFile: 'ファイル未選択',
@@ -54,19 +64,24 @@ const STR = {
     mermaidDiagrams: 'Mermaid 図を生成',
     mermaidDiagramsHelp:
       'Mermaid 図はフロー図をテキストとして残せますが、検証と修復のため追加処理が必要です。',
+    usingSettings:
+      'LLM 接続設定は設定ページのチャットモデル設定を使用しています。',
+    currentModel: (model) => `現在のモデル: ${model || '-'}`,
     footer:
       '画像対応モデルであれば画像説明付き Markdown が返ります。画像非対応の場合は、バックエンド側のフォールバック処理により画像を埋め込んだ Markdown が返ります。',
   },
   en: {
     selectPdf: 'Please select a PDF file.',
-    fillFields: 'Please fill in base_url, api_key, and model.',
+    fillFields:
+      'Please configure base_url, api_key, and model in the Settings page.',
     uploading: 'Uploading…',
     queued: 'Added to the queue.',
     queuedWaiting: 'Waiting in the queue…',
     converting: 'Converting PDF to Markdown…',
     statusOf: (s) => `Status: ${s}`,
     opened: 'Opened the Markdown.',
-    desc: 'Upload a PDF to convert it to Markdown. When it finishes, open it manually from the queue list.',
+    desc:
+      'Upload a PDF to convert it to Markdown. The LLM connection is taken from the chat model settings on the Settings page. When it finishes, open it manually from the queue list.',
     pdfFile: 'PDF File',
     choosePdf: 'Choose PDF',
     noFile: 'No file selected',
@@ -102,6 +117,9 @@ const STR = {
     mermaidDiagrams: 'Generate Mermaid diagrams',
     mermaidDiagramsHelp:
       'Mermaid diagrams can capture flow diagrams in text, but validation and repair add extra processing.',
+    usingSettings:
+      'LLM connection settings are read from the chat model settings on the Settings page.',
+    currentModel: (model) => `Current model: ${model || '-'}`,
     footer:
       'An image-capable model returns Markdown with image descriptions. Without image support, the backend falls back to Markdown with embedded images.',
   },
@@ -120,6 +138,78 @@ function parseTimeMs(value) {
 
   const parsed = Date.parse(value)
   return Number.isFinite(parsed) ? parsed : null
+}
+
+function getCookie(name) {
+  if (typeof document === 'undefined') return null
+
+  const prefix = `${name}=`
+  const row = document.cookie
+    .split('; ')
+    .find((item) => item.startsWith(prefix))
+
+  if (!row) return null
+
+  return decodeURIComponent(row.slice(prefix.length))
+}
+
+function settingCookieName(field) {
+  return `${COOKIE_PREFIX}${field}`
+}
+
+function getPdfCookieOverrides() {
+  const out = {}
+
+  for (const field of PDF_SETTING_FIELDS) {
+    const value = getCookie(settingCookieName(field))
+
+    if (value !== null) {
+      out[field] = value
+    }
+  }
+
+  return out
+}
+
+function clean(value) {
+  return String(value ?? '').trim()
+}
+
+function getSettingValue(source, field, altField) {
+  if (!source) return undefined
+
+  if (source[field] !== undefined) return source[field]
+  if (altField && source[altField] !== undefined) return source[altField]
+
+  return undefined
+}
+
+function readPdfLlmSettings(source = {}) {
+  const cookieOverrides = getPdfCookieOverrides()
+
+  const baseUrl =
+    cookieOverrides.chat_base_url ??
+    getSettingValue(source, 'chat_base_url', 'baseUrl') ??
+    import.meta.env.VITE_OPENAI_BASE_URL ??
+    ''
+
+  const apiKey =
+    cookieOverrides.chat_api_key ??
+    getSettingValue(source, 'chat_api_key', 'apiKey') ??
+    import.meta.env.VITE_OPENAI_API_KEY ??
+    ''
+
+  const model =
+    cookieOverrides.chat_model ??
+    getSettingValue(source, 'chat_model', 'model') ??
+    import.meta.env.VITE_MODEL ??
+    ''
+
+  return {
+    baseUrl: clean(baseUrl),
+    apiKey: clean(apiKey),
+    model: clean(model),
+  }
 }
 
 function loadStoredQueue() {
@@ -303,15 +393,21 @@ function statusLabel(status, t) {
 export default function PdfParserView({
   apiBase = '',
   onMarkdownReady,
+  settings,
+  overrides,
 }) {
   const t = useT(STR)
   const fileRef = useRef(null)
   const queueRef = useRef([])
 
+  const settingsSource = settings || overrides || {}
+
   const [file, setFile] = useState(null)
-  const [baseUrl, setBaseUrl] = useState(import.meta.env.VITE_OPENAI_BASE_URL || 'http://10.160.144.101:51029/v1')
-  const [apiKey, setApiKey] = useState(import.meta.env.VITE_OPENAI_API_KEY || '')
-  const [model, setModel] = useState(import.meta.env.VITE_MODEL || 'gemma-4-31B')
+
+  const [llmSettings, setLlmSettings] = useState(() =>
+    readPdfLlmSettings(settingsSource)
+  )
+
   const [generateImageDescriptions, setGenerateImageDescriptions] = useState(false)
   const [generateMermaidDiagrams, setGenerateMermaidDiagrams] = useState(false)
 
@@ -335,6 +431,24 @@ export default function PdfParserView({
       setGenerateMermaidDiagrams(false)
     }
   }, [generateImageDescriptions])
+
+  useEffect(() => {
+    setLlmSettings(readPdfLlmSettings(settingsSource))
+  }, [settings, overrides])
+
+  useEffect(() => {
+    const syncSettings = () => {
+      setLlmSettings(readPdfLlmSettings(settingsSource))
+    }
+
+    window.addEventListener('focus', syncSettings)
+    document.addEventListener('visibilitychange', syncSettings)
+
+    return () => {
+      window.removeEventListener('focus', syncSettings)
+      document.removeEventListener('visibilitychange', syncSettings)
+    }
+  }, [settings, overrides])
 
   const upsertQueueItems = (items) => {
     setQueueItems((prev) => mergeQueueItems(prev, items))
@@ -427,7 +541,10 @@ export default function PdfParserView({
       return
     }
 
-    if (!baseUrl.trim() || !apiKey.trim() || !model.trim()) {
+    const activeSettings = readPdfLlmSettings(settingsSource)
+    setLlmSettings(activeSettings)
+
+    if (!activeSettings.baseUrl || !activeSettings.apiKey || !activeSettings.model) {
       setError(t.fillFields)
       return
     }
@@ -440,9 +557,9 @@ export default function PdfParserView({
     try {
       const fd = new FormData()
       fd.append('file', file)
-      fd.append('base_url', baseUrl.trim())
-      fd.append('api_key', apiKey.trim())
-      fd.append('model', model.trim())
+      fd.append('base_url', activeSettings.baseUrl)
+      fd.append('api_key', activeSettings.apiKey)
+      fd.append('model', activeSettings.model)
       fd.append('describe_images', generateImageDescriptions ? 'true' : 'false')
       fd.append(
         'generate_mermaid',
@@ -574,7 +691,7 @@ export default function PdfParserView({
           <div className="flex items-start justify-between gap-4">
             <div>
               <h1 className="m-0 text-[20px] font-extrabold tracking-tight text-ink">
-                PDF Parser
+                PDFをアップロード
               </h1>
 
               <p className="mt-[7px] max-w-[620px] text-[13px] leading-[1.55] text-muted">
@@ -622,32 +739,12 @@ export default function PdfParserView({
               </div>
             </div>
 
-            <div className="grid grid-cols-1 gap-[12px] md:grid-cols-2">
-              <Field
-                label="Base URL"
-                value={baseUrl}
-                onChange={setBaseUrl}
-                placeholder="http://10.160.144.101:51029/v1"
-                disabled={busy}
-              />
-
-              <Field
-                label="Model"
-                value={model}
-                onChange={setModel}
-                placeholder="gemma-4-31B"
-                disabled={busy}
-              />
+            <div className="border border-line bg-soft px-[12px] py-[10px] text-[12px] leading-[1.5] text-muted">
+              <div>{t.usingSettings}</div>
+              <div className="mt-[3px] font-mono">
+                {t.currentModel(llmSettings.model)}
+              </div>
             </div>
-
-            <Field
-              label="API Key"
-              value={apiKey}
-              onChange={setApiKey}
-              placeholder="nvapi-..."
-              disabled={busy}
-              password
-            />
 
             <div className="grid gap-[8px]">
               <ToggleField
@@ -868,32 +965,6 @@ function QueueItem({
         </div>
       </div>
     </div>
-  )
-}
-
-function Field({
-  label,
-  value,
-  onChange,
-  placeholder,
-  disabled,
-  password = false,
-}) {
-  return (
-    <label className="block">
-      <span className="mb-[6px] block text-[12px] font-extrabold uppercase tracking-wider text-muted">
-        {label}
-      </span>
-
-      <input
-        type={password ? 'password' : 'text'}
-        value={value}
-        disabled={disabled}
-        placeholder={placeholder}
-        onChange={(e) => onChange(e.target.value)}
-        className="h-[38px] w-full border border-line bg-white px-[11px] text-[13px] text-ink outline-none placeholder:text-muted/60 focus:border-blue/50 disabled:opacity-60"
-      />
-    </label>
   )
 }
 

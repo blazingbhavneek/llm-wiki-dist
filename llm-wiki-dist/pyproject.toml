@@ -15,6 +15,7 @@ dependencies = [
     "networkx>=3.6.1",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.32",
     "sqlite-vec>=0.1.9",
     "tqdm>=4.68.4",
     "uvicorn>=0.51.0",
