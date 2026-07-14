@@ -60,10 +60,8 @@ docker run -d --name llm-wiki-rikiseisan \
 
 # doc-parser
 
-GPU PDF parser (MinerU 3.4.4 + vLLM 0.21.0 + torch 2.11.0+cu130).
-The CUDA 13 base image is pinned by digest, Ubuntu packages come from a dated
-archive snapshot, Python and npm dependencies are locked, and all MinerU models
-are downloaded at pinned commits and checksummed during the build. The running
+GPU PDF parser (MinerU 3.4.4 on the vLLM 0.21.0 CUDA 13 base image). All
+MinerU models are baked into the image at build time and the running
 container is configured for offline model access.
 
 ## Build
@@ -73,7 +71,6 @@ Run from the repository root, not `parser/`. The work proxy
 
 ```bash
 docker build -f parser/Dockerfile \
-  -t doc-parser-rikiseisan:3.4.4-cuda13 \
   -t doc-parser-rikiseisan:latest .
 ```
 
@@ -84,23 +81,8 @@ docker build --build-arg PROXY_URL= -f parser/Dockerfile \
   -t doc-parser-rikiseisan:latest .
 ```
 
-No host Hugging Face cache or named build context is needed. BuildKit retains
-partial downloads and retries/resumes unreliable model transfers. The embedded
-model revisions are:
-
-- `opendatalab/PDF-Extract-Kit-1.0@ed6b654c018d742e65a17671e379c5e6ecc87ec9`
-- `opendatalab/MinerU2.5-Pro-2605-1.2B@bff20d4ae2bf202df9f45284b4d43681555a97ed`
-
-The standalone MinerU CLI image uses the same locks and model bundle:
-
-```bash
-docker build -f Dockerfile.mineru \
-  -t mineru-offline:3.4.4-cuda13 \
-  -t mineru-offline:latest .
-```
-
-Outside the work network, use the same `--build-arg PROXY_URL=` empty override
-for the standalone build.
+Models are pulled from `opendatalab/PDF-Extract-Kit-1.0` and
+`opendatalab/MinerU2.5-Pro-2605-1.2B` at their current `main` revisions.
 
 ## Run
 
