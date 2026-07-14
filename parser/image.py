@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
+import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -39,9 +43,6 @@ OPENAI_MODEL = os.environ.get("WIKI_MODEL", "gemma-4-31B")
 
 CONCURRENCY = 5
 TEMPERATURE = 0.3
-
-PREVIOUS_CONTEXT_LINES = 300
-NEXT_CONTEXT_LINES = 10
 
 TOP_P = 0.95
 MAX_TOKENS = 16384
@@ -164,6 +165,20 @@ JUDGE_TEMPERATURE = 0.0
 
 # If True, final output includes a small note with the selected judge score.
 INCLUDE_VISUAL_JUDGE_NOTE = True
+
+
+# =========================
+# DESCRIPTION COVERAGE JUDGE LOOP
+# =========================
+
+# Judges the textual reconstruction against the image and retries until the
+# description accounts for everything visible in the image.
+ENABLE_DESCRIPTION_COVERAGE_LOOP = True
+DESCRIPTION_COVERAGE_ATTEMPTS = 5
+DESCRIPTION_COVERAGE_GOOD_ENOUGH_SCORE = 95
+
+# If True, final output includes a small note with the selected coverage score.
+INCLUDE_COVERAGE_JUDGE_NOTE = True
 
 
 # =========================
@@ -309,19 +324,6 @@ def find_image_line_indices(lines):
             image_line_indices.append(i)
 
     return image_line_indices
-
-
-def build_context(lines, index: int) -> str:
-    start = max(0, index - PREVIOUS_CONTEXT_LINES)
-    end = min(len(lines), index + NEXT_CONTEXT_LINES + 1)
-
-    context_lines = []
-
-    for i in range(start, end):
-        marker = " <-- IMAGE LINE" if i == index else ""
-        context_lines.append(f"{i + 1}: {lines[i].rstrip()}{marker}")
-
-    return "\n".join(context_lines)
 
 
 def get_response_text(response) -> str:
@@ -1083,7 +1085,6 @@ async def judge_mermaid_visual_match(
     original_image_blocks,
     rendered_mermaid_images,
     description: str,
-    context: str,
 ):
     """
     Judge how well rendered Mermaid image(s) match original image(s).
@@ -1181,8 +1182,7 @@ async def judge_mermaid_visual_match(
                 "This means the Mermaid block should be removed and the textual reconstruction should be kept.\n\n"
                 "Important: If the only issue is orientation/layout direction, say that clearly and still give a high score. "
                 "If any edge is missing, say exactly which edge is missing. Never overlook missing relationships.\n\n"
-                "Surrounding context:\n"
-                f"{context}\n\n"
+                "Judge ONLY against the original image. You have no document context and must not assume any.\n\n"
                 "Current Markdown replacement:\n"
                 f"{description}\n"
             ),
@@ -1268,7 +1268,6 @@ async def improve_mermaid_from_visual_feedback(
     rendered_mermaid_images,
     description: str,
     judge_result: dict,
-    context: str,
 ):
     """
     Asks model to improve the Mermaid reconstruction using visual comparison feedback.
@@ -1298,8 +1297,7 @@ async def improve_mermaid_from_visual_feedback(
                 f"{get_good_mermaid_examples()}\n\n"
                 "Judge feedback:\n"
                 f"{json.dumps(judge_result, ensure_ascii=False, indent=2)}\n\n"
-                "Surrounding context:\n"
-                f"{context}\n\n"
+                "Work ONLY from the original image. You have no document context and must not invent any.\n\n"
                 "Current Markdown replacement:\n"
                 f"{description}\n"
             ),
@@ -1348,7 +1346,6 @@ async def improve_mermaid_visual_match_loop(
     original_image_blocks,
     original_content,
     description: str,
-    context: str,
 ):
     """
     Iteratively renders Mermaid, asks a visual judge to compare it to the original image,
@@ -1413,7 +1410,6 @@ async def improve_mermaid_visual_match_loop(
             original_image_blocks=original_image_blocks,
             rendered_mermaid_images=rendered_images,
             description=current_description,
-            context=context,
         )
 
         score = judge_result["score"]
@@ -1447,7 +1443,6 @@ async def improve_mermaid_visual_match_loop(
             rendered_mermaid_images=rendered_images,
             description=current_description,
             judge_result=judge_result,
-            context=context,
         )
 
     print(f"Best Mermaid visual score selected: {best_score}/100")
@@ -1467,16 +1462,278 @@ async def improve_mermaid_visual_match_loop(
 
 
 # =========================
+# DESCRIPTION COVERAGE JUDGE / IMPROVE LOOP
+# =========================
+
+
+async def judge_description_coverage(
+    client: LLMAsyncClient,
+    original_image_blocks,
+    description: str,
+):
+    """
+    Judges whether the textual reconstruction accounts for EVERYTHING visible in
+    the original image. Purely a coverage/fidelity check against the image.
+
+    Returns:
+      dict:
+        {
+          "score": int 0-100,
+          "reason": str,
+          "missing": list[str],
+          "wrong": list[str],
+          "suggested_fixes": list[str]
+        }
+    """
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "You are a strict transcription auditor. You are given an original image and a textual "
+                "reconstruction of that image. Decide whether the reconstruction captures EVERYTHING "
+                "visible in the image.\n\n"
+                "You have NO document context and must not assume any. Judge the reconstruction ONLY "
+                "against what is actually visible in the image.\n\n"
+                "Audit method - go through the image systematically:\n"
+                "- Read every piece of text in the image: titles, captions, headings, labels, legends, "
+                "axis names, units, numbers, table headers, table cells, row labels, column labels, "
+                "footnotes, annotations, UI text, button text, menu text, code, log lines, page numbers.\n"
+                "- Check that EVERY one of those strings appears in the reconstruction, transcribed exactly.\n"
+                "- Check every box, node, component, actor, icon, shape, and group/container is present.\n"
+                "- Check every arrow, line, connector, and edge is present, with correct direction.\n"
+                "- Check every arrow label is present.\n"
+                "- Check numbers and values are exact, not rounded or approximated.\n"
+                "- Check nothing was INVENTED: any text or element in the reconstruction that is not "
+                "visible in the image is a serious error.\n"
+                "- Check that unreadable text is marked '[unclear]' rather than guessed.\n\n"
+                "Scoring (0-100):\n"
+                "- 100 = every visible string, element, and relationship is present and exact; nothing invented.\n"
+                "- 90 = complete, only trivial formatting differences.\n"
+                "- 80 = one or two minor visible details missing.\n"
+                "- 60 = several visible strings/elements missing, or values approximated.\n"
+                "- 40 = large parts of the image untranscribed.\n"
+                "- 20 = only a vague summary of the image.\n"
+                "- 0 = does not correspond to the image, or is mostly invented.\n\n"
+                "MANDATORY RULES:\n"
+                "- A reconstruction that summarizes instead of transcribing must score below 40.\n"
+                "- Any missing visible text string drops the score below 80.\n"
+                "- Multiple missing visible text strings drop the score below 60.\n"
+                "- Any invented content not present in the image drops the score below 60.\n"
+                "- Do not reward verbosity. Reward exact coverage.\n\n"
+                "In 'missing', list the exact strings/elements from the image that the reconstruction omits.\n"
+                "In 'wrong', list content in the reconstruction that is invented, misread, or contradicts the image.\n\n"
+                "Return STRICT JSON only, with this schema:\n"
+                "{\n"
+                '  "score": 0,\n'
+                '  "reason": "short explanation focused on coverage and exactness",\n'
+                '  "missing": ["exact strings or elements visible in the image but absent from the reconstruction"],\n'
+                '  "wrong": ["invented, misread, or contradictory content"],\n'
+                '  "suggested_fixes": ["concrete additions or corrections"]\n'
+                "}\n\n"
+                "Reconstruction to audit:\n"
+                f"{description}\n"
+            ),
+        }
+    ]
+
+    content.extend(original_image_blocks)
+
+    response = await client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+        temperature=JUDGE_TEMPERATURE,
+    )
+
+    raw = get_response_text(response)
+    parsed = extract_json_object(raw)
+
+    if not parsed:
+        return {
+            "score": 0,
+            "reason": f"Judge did not return valid JSON. Raw output: {raw}",
+            "missing": [],
+            "wrong": ["Invalid judge JSON"],
+            "suggested_fixes": ["Return valid JSON next time."],
+        }
+
+    try:
+        score = int(parsed.get("score", 0))
+    except Exception:
+        score = 0
+
+    score = max(0, min(100, score))
+
+    missing = parsed.get("missing", [])
+    wrong = parsed.get("wrong", [])
+    suggested_fixes = parsed.get("suggested_fixes", [])
+
+    if not isinstance(missing, list):
+        missing = []
+    if not isinstance(wrong, list):
+        wrong = []
+    if not isinstance(suggested_fixes, list):
+        suggested_fixes = []
+
+    return {
+        "score": score,
+        "reason": str(parsed.get("reason", "")),
+        "missing": missing,
+        "wrong": wrong,
+        "suggested_fixes": suggested_fixes,
+    }
+
+
+async def improve_description_from_coverage_feedback(
+    client: LLMAsyncClient,
+    original_image_blocks,
+    description: str,
+    judge_result: dict,
+):
+    """
+    Rewrites the reconstruction to close the coverage gaps the judge found.
+    """
+    if ENABLE_MERMAID_DIAGRAMS:
+        mermaid_rules = (
+            "- If the current reconstruction contains a Mermaid block, KEEP it and keep it valid.\n"
+            "- Add any missing nodes, edges, edge directions, and edge labels to the Mermaid block.\n"
+            "- Use simple ASCII node IDs like n1, n2, server_a. Put Japanese text and long labels inside quoted labels.\n"
+            "- Mermaid code blocks must contain only Mermaid syntax.\n"
+            "- Transcribe text that does not belong in the diagram OUTSIDE the Mermaid block.\n"
+        )
+    else:
+        mermaid_rules = "- Do not output Mermaid code blocks.\n"
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "You are fixing an incomplete transcription of an image.\n\n"
+                "You are given:\n"
+                "1. The original image.\n"
+                "2. The current reconstruction.\n"
+                "3. Auditor feedback listing what is missing, invented, or wrong.\n\n"
+                "Task:\n"
+                "- Rewrite the FULL reconstruction so that it accounts for everything visible in the image.\n"
+                "- Add every missing string and element the auditor listed.\n"
+                "- Remove or correct everything the auditor flagged as invented or wrong.\n"
+                "- Transcribe text exactly as it appears. Do not translate, paraphrase, summarize, or round numbers.\n"
+                "- Do not invent anything that is not visible in the image. Mark unreadable text as '[unclear]'.\n"
+                "- You have NO document context. Work only from the image.\n"
+                "- Return only the full corrected Markdown replacement, with no preface.\n\n"
+                "Rules:\n"
+                f"{mermaid_rules}"
+                "\n"
+                "Auditor feedback:\n"
+                f"{json.dumps(judge_result, ensure_ascii=False, indent=2)}\n\n"
+                "Current reconstruction:\n"
+                f"{description}\n"
+            ),
+        }
+    ]
+
+    content.extend(original_image_blocks)
+
+    response = await client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+        temperature=TEMPERATURE,
+    )
+
+    return ensure_reconstruction_wrapper(get_response_text(response))
+
+
+async def improve_description_coverage_loop(
+    client: LLMAsyncClient,
+    original_image_blocks,
+    description: str,
+):
+    """
+    Iteratively audits the reconstruction against the original image and rewrites it
+    until it covers everything visible. Keeps the best-scoring candidate.
+    """
+    if not ENABLE_DESCRIPTION_COVERAGE_LOOP:
+        return description, None, -1
+
+    if not description.strip():
+        return description, None, -1
+
+    best_description = description
+    best_score = -1
+    best_judge = None
+
+    current_description = description
+
+    for attempt in range(1, DESCRIPTION_COVERAGE_ATTEMPTS + 1):
+        print(
+            f"Description coverage attempt {attempt}/{DESCRIPTION_COVERAGE_ATTEMPTS}"
+        )
+
+        judge_result = await judge_description_coverage(
+            client=client,
+            original_image_blocks=original_image_blocks,
+            description=current_description,
+        )
+
+        score = judge_result["score"]
+
+        print(f"Description coverage score: {score}/100")
+        print(f"Judge reason: {judge_result.get('reason', '')}")
+
+        if judge_result.get("missing"):
+            print(f"Missing: {judge_result['missing']}")
+        if judge_result.get("wrong"):
+            print(f"Wrong: {judge_result['wrong']}")
+        print("")
+
+        if score > best_score:
+            best_score = score
+            best_description = current_description
+            best_judge = judge_result
+
+        if score >= DESCRIPTION_COVERAGE_GOOD_ENOUGH_SCORE:
+            print(
+                f"Description coverage score {score} >= "
+                f"{DESCRIPTION_COVERAGE_GOOD_ENOUGH_SCORE}; stopping early."
+            )
+            break
+
+        if attempt == DESCRIPTION_COVERAGE_ATTEMPTS:
+            break
+
+        current_description = await improve_description_from_coverage_feedback(
+            client=client,
+            original_image_blocks=original_image_blocks,
+            description=current_description,
+            judge_result=judge_result,
+        )
+
+    print(f"Best description coverage score selected: {best_score}/100")
+    print("")
+
+    return ensure_reconstruction_wrapper(best_description), best_judge, best_score
+
+
+# =========================
 # MAIN RECONSTRUCTION PROMPT
 # =========================
 
 
-def build_reconstruction_prompt(
-    markdown_file: Path, index: int, original_line: str, context: str
-) -> str:
+def build_reconstruction_prompt() -> str:
     if ENABLE_MERMAID_DIAGRAMS:
         diagram_guidance = (
             "For flowcharts, architecture diagrams, block diagrams, dependency graphs, sequence diagrams, or data-flow diagrams:\n"
+            "- PREFER Mermaid whenever the image visibly contains a node/edge/process/flow structure. "
+            "Mermaid expresses flow and relationships better than prose.\n"
             "- Only output Mermaid when the image visibly contains a node/edge/process/flow diagram.\n"
             "- Do not output Mermaid for photos, screenshots, plain text, equations, tables, normal charts, icons, or ambiguous figures.\n"
             "- If Mermaid would require inventing nodes or arrows, use structured Markdown instead.\n"
@@ -1523,27 +1780,29 @@ def build_reconstruction_prompt(
         mermaid_format_hint = ""
 
     return (
-        "You are replacing an embedded image in a Markdown technical document with a reconstruction-quality textual representation.\n\n"
-        "The goal is NOT to write a short caption. The goal is to extract enough information that a reader could "
-        "approximately recreate the original image, table, chart, screenshot, or diagram from your output.\n\n"
-        "Use both:\n"
-        "1. The image itself.\n"
-        "2. The surrounding Markdown context.\n\n"
-        "Very important:\n"
-        "- Do not merely describe the visual appearance.\n"
-        "- Do not produce a one-sentence summary.\n"
-        "- Do not say only what the figure is generally about.\n"
-        "- Preserve structure, labels, relationships, arrows, tables, values, and layout.\n"
-        "- If the image contains Japanese text, transcribe the Japanese text accurately.\n"
-        "- If the context gives a Japanese title/caption, preserve it and optionally add an English explanation.\n"
-        "- If some text is too small or unclear, write '[unclear]' rather than inventing content.\n\n"
+        "You are transcribing an image into text. The text will replace the image in a technical document.\n\n"
+        "ABSOLUTE RULES - read these first:\n"
+        "1. Describe ONLY what is actually visible inside the attached image.\n"
+        "2. You have NO document context. None is given, and you must not assume, infer, or invent any.\n"
+        "3. Transcribe EXACTLY. Every word, every line, every label, every number, every symbol that is "
+        "visible in the image must appear in your output, character for character.\n"
+        "4. Do NOT summarize. Do NOT paraphrase. Do NOT write a caption. Do NOT explain what the figure "
+        "'is about'. Do NOT add background knowledge.\n"
+        "5. Do NOT invent any text, node, arrow, row, column, or value that you cannot actually see. "
+        "Inventing content is worse than omitting it.\n"
+        "6. If text is too small, cut off, or unreadable, write '[unclear]'. Never guess it.\n"
+        "7. Transcribe text in its original language. If the image contains Japanese, output that Japanese "
+        "verbatim. Do not translate it away; you may add an English gloss afterwards in parentheses.\n"
+        "8. Copy numbers exactly as printed. Do not round, reformat, or convert units.\n\n"
+        "Your output will be audited against the image by a strict judge. The judge lists every visible "
+        "string you omitted and every string you invented. Aim for complete coverage with zero invention.\n\n"
         "Output requirements:\n"
         "- Be exhaustive and concrete.\n"
-        "- Preserve all visible text, labels, titles, captions, legends, numbers, arrows, boxes, nodes, columns, rows, "
+        "- Transcribe all visible text, labels, titles, captions, legends, numbers, arrows, boxes, nodes, columns, rows, "
         "axes, units, UI labels, Japanese text, English text, and relationships.\n"
-        "- Prefer structured Markdown that can replace the image in the document.\n"
+        "- Prefer structured Markdown that can stand in for the image.\n"
         "- The output may be multiline.\n"
-        "- Return only the Markdown replacement for the image line.\n"
+        "- Return only the Markdown replacement for the image.\n"
         "- Do not include any preface like 'Here is the reconstruction'.\n\n"
         + diagram_guidance
         + "For tables:\n"
@@ -1554,33 +1813,31 @@ def build_reconstruction_prompt(
         "For charts/graphs:\n"
         "- Identify chart type.\n"
         "- Recreate visible data as a Markdown table when values are visible or reasonably readable.\n"
-        "- Describe x-axis, y-axis, units, scale, legend, series, colors/patterns, trends, outliers, and key comparisons.\n"
-        "- Include the main takeaway, but do not replace raw details with only a takeaway.\n\n"
+        "- Transcribe x-axis, y-axis, tick values, units, scale, legend entries, and series names exactly as printed.\n"
+        "- State trends only as far as they are visible in the plotted data. Do not speculate about causes.\n\n"
         "For screenshots:\n"
         "- Recreate the UI state in text.\n"
-        "- Preserve window titles, menus, dialogs, buttons, labels, fields, selected values, error messages, tables, "
-        "visible paths, code, logs, and layout.\n"
-        "- Describe what is selected, enabled, disabled, highlighted, or emphasized.\n\n"
+        "- Transcribe window titles, menus, dialogs, buttons, labels, fields, selected values, error messages, tables, "
+        "visible paths, code, and logs exactly, including punctuation.\n"
+        "- State what is selected, enabled, disabled, highlighted, or emphasized.\n\n"
         "For simple node/link diagrams:\n"
         "- Encode the structure explicitly, for example A --> B.\n"
         "- State the exact visible nodes and exact visible edges.\n"
-        "- If the context defines the meaning of the edge, explain that meaning.\n"
-        "- If the exact semantic meaning is not given by context, say only that the visible structure is a direct link/edge "
-        "and avoid unsupported guesses.\n\n"
-        "Preferred output structure:\n\n"
+        "- Describe the edge only as the visible structure (a direct link/edge). Do not assign it a semantic "
+        "meaning that is not printed in the image.\n\n"
+        "For photos or images with no text:\n"
+        "- State what is visibly depicted, concretely and without interpretation.\n\n"
+        "Required output structure:\n\n"
         "[Image reconstruction:\n"
         "Type: <table / flowchart / block diagram / chart / screenshot / photo / other>\n"
-        "Title/caption: <visible title or context-derived figure title if available>\n"
+        "Title/caption: <title text printed inside the image, or 'none visible'>\n"
         "Reconstructed content:\n"
         f"{reconstructed_content}\n"
-        "Detailed notes: <layout, relationships, visual encoding, missing/unclear text, and context-based meaning>\n"
+        "Detailed notes: <layout, relationships, visual encoding, and any text marked [unclear]>\n"
         "]\n\n"
         + mermaid_format_hint
-        + "Make the output detailed enough that another person could redraw the image approximately from the text alone.\n\n"
-        f"Markdown file: {markdown_file}\n"
-        f"Image line number: {index + 1}\n\n"
-        f"Original image Markdown line:\n{original_line}\n\n"
-        f"Surrounding Markdown context:\n{context}\n"
+        + "Make the output complete enough that another person could redraw the image and recover every "
+        "word of its text from your output alone.\n"
     )
 
 
@@ -1610,7 +1867,6 @@ async def describe_image_line(
         if not images:
             return index, lines[index]
 
-        context = build_context(lines, index)
         resolvable_images = []
         for img in images:
             if is_remote_url(img["resolved"]) or os.path.exists(img["resolved"]):
@@ -1628,12 +1884,7 @@ async def describe_image_line(
             resolvable_images
         )
 
-        prompt = build_reconstruction_prompt(
-            markdown_file=markdown_file,
-            index=index,
-            original_line=original_line,
-            context=context,
-        )
+        prompt = build_reconstruction_prompt()
 
         content = [
             {
@@ -1827,10 +2078,38 @@ async def describe_image_line(
                 original_image_blocks=original_image_blocks,
                 original_content=content,
                 description=description,
-                context=context,
             )
 
             description = ensure_reconstruction_wrapper(description)
+
+            # Audit the finished reconstruction against the image and close any
+            # coverage gaps. Runs last so it also audits Mermaid-derived rewrites.
+            description, coverage_judge, coverage_score = (
+                await improve_description_coverage_loop(
+                    client=client,
+                    original_image_blocks=original_image_blocks,
+                    description=description,
+                )
+            )
+
+            # Coverage rewrites can touch the Mermaid block, so re-validate syntax.
+            description = await repair_mermaid_if_needed(
+                client=client,
+                original_content=content,
+                description=description,
+            )
+
+            description = ensure_reconstruction_wrapper(description)
+
+            if INCLUDE_COVERAGE_JUDGE_NOTE and coverage_judge:
+                description = (
+                    description.rstrip()
+                    + "\n\n"
+                    + "[Image description coverage judge:\n"
+                    + f"Score: {coverage_score}/100\n"
+                    + f"Reason: {coverage_judge.get('reason', '')}\n"
+                    + "]"
+                )
 
         image_tags = []
 
@@ -2077,14 +2356,15 @@ async def process_markdown_folder():
     print(f"Skipped Markdown file(s): {len(skipped_files)}")
     print(f"File concurrency: {FILE_CONCURRENCY}")
     print(f"Image/API concurrency: {CONCURRENCY}")
-    print(f"Previous context lines: {PREVIOUS_CONTEXT_LINES}")
-    print(f"Next context lines: {NEXT_CONTEXT_LINES}")
     print(f"Validate Mermaid: {VALIDATE_MERMAID}")
     print(f"Mermaid CLI: {MERMAID_CLI_BIN}")
     print(f"Mermaid repair attempts: {MERMAID_REPAIR_ATTEMPTS}")
     print(f"Mermaid visual match loop: {ENABLE_MERMAID_VISUAL_MATCH_LOOP}")
     print(f"Mermaid visual match attempts: {MERMAID_VISUAL_MATCH_ATTEMPTS}")
     print(f"Mermaid visual good-enough score: {MERMAID_VISUAL_MATCH_GOOD_ENOUGH_SCORE}")
+    print(f"Description coverage loop: {ENABLE_DESCRIPTION_COVERAGE_LOOP}")
+    print(f"Description coverage attempts: {DESCRIPTION_COVERAGE_ATTEMPTS}")
+    print(f"Description coverage good-enough score: {DESCRIPTION_COVERAGE_GOOD_ENOUGH_SCORE}")
     print("")
 
     if skipped_files:
@@ -2185,5 +2465,565 @@ async def process_markdown_folder():
             print(f"    Error: {result['reason']}")
 
 
+# =========================
+# SQLITE <image-unit> PROCESSING
+#
+# The folder pipeline above is still used by parser/server.py during PDF parsing;
+# it embeds images as <image-unit> blocks with EMPTY descriptions. This section is
+# the CLI: it points at a wiki SQLite database, finds those blocks in nodes.body,
+# and fills in / audits the descriptions using the same judge loops.
+# =========================
+
+
+IMAGE_UNIT_RE = re.compile(
+    r"<image-unit\b[^>]*>(?P<inner>.*?)</image-unit>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+IMAGE_MEDIA_RE = re.compile(
+    r"<image-media\b[^>]*>(?P<media>.*?)</image-media>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+IMAGE_DESCRIPTION_RE = re.compile(
+    r"<image-description\b[^>]*>(?P<description>.*?)</image-description>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc=\"(?P<src>[^\"]+)\"", re.IGNORECASE)
+
+# Judge notes are appended to the description on every run. Strip old ones before
+# re-judging so repeated runs do not stack them up.
+JUDGE_NOTE_RE = re.compile(
+    r"\n*\[(?:Image description coverage judge|Mermaid visual match judge|"
+    r"Mermaid validation warning):.*?\n\]",
+    re.DOTALL,
+)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def strip_judge_notes(description: str) -> str:
+    return JUDGE_NOTE_RE.sub("", description or "").strip()
+
+
+def extract_image_units(body: str):
+    """
+    Finds every <image-unit> block in one node body.
+
+    Returns:
+      list[dict] with:
+        - span: (start, end) character offsets in body
+        - media_html: raw inner HTML of <image-media>
+        - sources: list of <img src="..."> values (base64 data URLs or remote URLs)
+        - description: current <image-description> text, judge notes stripped
+    """
+    units = []
+
+    for match in IMAGE_UNIT_RE.finditer(body or ""):
+        inner = match.group("inner")
+
+        media_match = IMAGE_MEDIA_RE.search(inner)
+        description_match = IMAGE_DESCRIPTION_RE.search(inner)
+
+        media_html = media_match.group("media").strip() if media_match else ""
+        sources = IMG_SRC_RE.findall(media_html) if media_html else []
+
+        raw_description = (
+            description_match.group("description") if description_match else ""
+        )
+
+        units.append(
+            {
+                "span": match.span(),
+                "media_html": media_html,
+                "sources": sources,
+                "description": strip_judge_notes(raw_description),
+            }
+        )
+
+    return units
+
+
+def render_image_unit(media_html: str, description: str) -> str:
+    """
+    Rebuilds an <image-unit> block, preserving the media payload untouched.
+    Matches the block shape produced by describe_image_line().
+    """
+    safe_description = description.replace("\n\n", "\n") if description else ""
+
+    return (
+        f"<image-unit>\n"
+        f"  <image-media>\n"
+        f"    {media_html.strip()}\n"
+        f"  </image-media>\n"
+        f"  <image-description>\n"
+        f"{safe_description}\n"
+        f"  </image-description>\n"
+        f"</image-unit>"
+    )
+
+
+def build_image_blocks_from_sources(sources):
+    """
+    Builds multimodal content blocks straight from the data URLs stored in the DB.
+    No filesystem access: the base64 payload is already embedded in the node body.
+    """
+    blocks = []
+
+    for image_number, src in enumerate(sources, start=1):
+        blocks.append(
+            {
+                "type": "text",
+                "text": f"Image {image_number}:",
+            }
+        )
+
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": src,
+                    "detail": "high",
+                },
+            }
+        )
+
+    return blocks
+
+
+async def request_initial_description(client: LLMAsyncClient, content, label: str) -> str:
+    """
+    First-pass description, with the same thinking-timeout fallback as the folder path.
+    """
+    try:
+        try:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": content}],
+                    temperature=TEMPERATURE,
+                ),
+                timeout=LLM_THINKING_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"{label} timed out after {LLM_THINKING_TIMEOUT_SECONDS}s. "
+                "Retrying with thinking disabled..."
+            )
+
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": content}],
+                    temperature=TEMPERATURE,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                ),
+                timeout=LLM_FALLBACK_TIMEOUT_SECONDS,
+            )
+
+        return get_response_text(response)
+
+    except Exception as exc:
+        print(f"[WARN] {label} failed after timeout fallback. Error: {exc}")
+        return ""
+
+
+async def describe_image_unit(
+    client: LLMAsyncClient,
+    sources,
+    existing_description: str,
+    semaphore: asyncio.Semaphore,
+    label: str,
+):
+    """
+    Produces the description for one image.
+
+    Empty existing description -> generate, then run the judge loops.
+    Non-empty existing description -> skip generation, go straight to the judge loops
+    so an already-written description still gets audited and improved.
+    """
+    async with semaphore:
+        image_blocks = build_image_blocks_from_sources(sources)
+
+        content = [{"type": "text", "text": build_reconstruction_prompt()}]
+        content.extend(image_blocks)
+
+        description = (existing_description or "").strip()
+
+        if description:
+            print(f"{label}: existing description found; starting at judge loop.")
+            description = ensure_reconstruction_wrapper(description)
+        else:
+            print(f"{label}: no description; generating.")
+            description = await request_initial_description(client, content, label)
+
+            if not description:
+                return ""
+
+            description = ensure_reconstruction_wrapper(description)
+
+        description = await repair_mermaid_if_needed(
+            client=client,
+            original_content=content,
+            description=description,
+        )
+
+        description = ensure_reconstruction_wrapper(description)
+
+        description = await improve_mermaid_visual_match_loop(
+            client=client,
+            original_image_blocks=image_blocks,
+            original_content=content,
+            description=description,
+        )
+
+        description = ensure_reconstruction_wrapper(description)
+
+        description, coverage_judge, coverage_score = (
+            await improve_description_coverage_loop(
+                client=client,
+                original_image_blocks=image_blocks,
+                description=description,
+            )
+        )
+
+        # Coverage rewrites can touch the Mermaid block, so re-validate syntax.
+        description = await repair_mermaid_if_needed(
+            client=client,
+            original_content=content,
+            description=description,
+        )
+
+        description = ensure_reconstruction_wrapper(description)
+
+        if INCLUDE_COVERAGE_JUDGE_NOTE and coverage_judge:
+            description = (
+                description.rstrip()
+                + "\n\n"
+                + "[Image description coverage judge:\n"
+                + f"Score: {coverage_score}/100\n"
+                + f"Reason: {coverage_judge.get('reason', '')}\n"
+                + "]"
+            )
+
+        return description
+
+
+def make_working_copy(source_path: Path, dest_path: Path) -> None:
+    """
+    Consistent whole-database copy via SQLite's online backup API.
+
+    A plain file copy can capture a torn state because committed data may still
+    live in the -wal side file. backup() copies committed pages properly.
+    The source database is opened read-only and is never modified.
+    """
+    for suffix in ("", "-wal", "-shm"):
+        stale = Path(str(dest_path) + suffix)
+        if stale.exists():
+            stale.unlink()
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+
+    try:
+        dest = sqlite3.connect(str(dest_path))
+        try:
+            with dest:
+                source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+
+
+def reindex_node_fts(conn: sqlite3.Connection, node_id: str) -> None:
+    """
+    Rebuilds the nodes_fts row for one node, mirroring GraphStore._reindex_fts.
+
+    Neither librarian bootstrap path rebuilds nodes_fts, so a changed body would
+    otherwise stay searchable only under its OLD description text.
+    """
+    row = conn.execute(
+        "SELECT title, summary, body, keywords_json, status FROM nodes WHERE id=?",
+        (node_id,),
+    ).fetchone()
+
+    if row is None:
+        return
+
+    conn.execute("DELETE FROM nodes_fts WHERE node_id=?", (node_id,))
+
+    if row["status"] == "deleted":
+        return
+
+    try:
+        keywords = json.loads(row["keywords_json"] or "[]")
+    except Exception:
+        keywords = []
+
+    text = " ".join(
+        part
+        for part in [
+            row["title"] or "",
+            row["summary"] or "",
+            row["body"] or "",
+            " ".join(k for k in keywords if isinstance(k, str)),
+        ]
+        if part
+    )
+
+    conn.execute(
+        "INSERT INTO nodes_fts(node_id, text) VALUES(?, ?)",
+        (node_id, text),
+    )
+
+
+def invalidate_search_index(conn: sqlite3.Connection, node_ids) -> None:
+    """
+    Marks the rewritten nodes so the librarian rebuilds search state on next start.
+
+    - nodes_fts: rebuilt here directly (no bootstrap path covers it).
+    - vec_body:  rows dropped, so _bootstrap_vectors sees coverage_incomplete and re-embeds.
+    - meta.search_index_version: cleared, so _bootstrap_search_items rebuilds
+      search_items + vec_search_item.
+
+    No embedder is imported; this is pure SQL on the working copy.
+    """
+    if not node_ids:
+        return
+
+    for node_id in node_ids:
+        try:
+            reindex_node_fts(conn, node_id)
+        except sqlite3.OperationalError as exc:
+            print(f"[WARN] nodes_fts reindex skipped for {node_id}: {exc}")
+
+        try:
+            conn.execute("DELETE FROM vec_body WHERE node_id=?", (node_id,))
+        except sqlite3.OperationalError:
+            # Vector tables may not exist yet; bootstrap will build them.
+            pass
+
+    try:
+        conn.execute("DELETE FROM meta WHERE key='search_index_version'")
+    except sqlite3.OperationalError as exc:
+        print(f"[WARN] could not clear search_index_version: {exc}")
+
+    print(
+        f"Search index invalidated for {len(node_ids)} node(s): "
+        "nodes_fts rebuilt, vec_body cleared, search_index_version reset."
+    )
+
+
+async def process_sqlite_database(database_path: str, output_path: str | None = None):
+    """
+    Fills in / audits <image-unit> descriptions inside a wiki SQLite database.
+
+    The source database is never modified. All work lands in a working copy.
+    """
+    source_path = Path(database_path).resolve()
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"SQLite database not found: {source_path}")
+
+    if output_path:
+        working_path = Path(output_path).resolve()
+    else:
+        working_path = source_path.with_name(
+            source_path.stem + ".described" + source_path.suffix
+        )
+
+    if working_path == source_path:
+        raise ValueError("Working copy path must differ from the source database.")
+
+    print("=" * 80)
+    print(f"Source database (read-only): {source_path}")
+    print(f"Working copy:                {working_path}")
+    print("=" * 80)
+    print(f"Image/API concurrency: {CONCURRENCY}")
+    print(f"Model: {OPENAI_MODEL}")
+    print(f"Mermaid diagrams: {ENABLE_MERMAID_DIAGRAMS}")
+    print(f"Mermaid visual match loop: {ENABLE_MERMAID_VISUAL_MATCH_LOOP}")
+    print(f"Description coverage loop: {ENABLE_DESCRIPTION_COVERAGE_LOOP}")
+    print("")
+
+    make_working_copy(source_path, working_path)
+    print("Working copy created.")
+    print("")
+
+    conn = sqlite3.connect(str(working_path))
+    conn.row_factory = sqlite3.Row
+
+    try:
+        rows = conn.execute("SELECT id, body FROM nodes").fetchall()
+
+        # node id -> its image units; plus the original body text to splice into.
+        bodies = {}
+        node_units = {}
+
+        for row in rows:
+            body = row["body"] or ""
+            units = extract_image_units(body)
+
+            if units:
+                bodies[row["id"]] = body
+                node_units[row["id"]] = units
+
+        total_units = sum(len(units) for units in node_units.values())
+
+        # The same image can appear in more than one node. Describe it once,
+        # keyed on its media payload, and reuse the result everywhere.
+        jobs = {}
+
+        for units in node_units.values():
+            for unit in units:
+                if not unit["sources"]:
+                    unit["key"] = None
+                    continue
+
+                key = hashlib.sha256(
+                    "|".join(unit["sources"]).encode("utf-8")
+                ).hexdigest()
+
+                unit["key"] = key
+
+                job = jobs.setdefault(
+                    key,
+                    {"sources": unit["sources"], "description": ""},
+                )
+
+                # Reuse any existing description found on any occurrence.
+                if not job["description"] and unit["description"]:
+                    job["description"] = unit["description"]
+
+        already_described = sum(1 for job in jobs.values() if job["description"])
+
+        print(f"Nodes with images: {len(node_units)}")
+        print(f"<image-unit> blocks: {total_units}")
+        print(f"Unique images: {len(jobs)}")
+        print(f"  with an existing description (judge loop only): {already_described}")
+        print(f"  empty (generate, then judge loop): {len(jobs) - already_described}")
+        print("")
+
+        if not jobs:
+            print("No images found. Nothing to do.")
+            return
+
+        client = LLMAsyncClient(
+            base_url=OPENAI_BASE_URL,
+            api_key=OPENAI_API_KEY,
+        )
+
+        semaphore = asyncio.Semaphore(CONCURRENCY)
+        keys = list(jobs)
+
+        tasks = [
+            describe_image_unit(
+                client=client,
+                sources=jobs[key]["sources"],
+                existing_description=jobs[key]["description"],
+                semaphore=semaphore,
+                label=f"Image {position}/{len(keys)}",
+            )
+            for position, key in enumerate(keys, start=1)
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        described = {}
+        failed = 0
+
+        for key, result in zip(keys, results):
+            # One image failing must not discard the rest of the run.
+            if isinstance(result, BaseException):
+                print(f"[WARN] Image task failed: {result}")
+                failed += 1
+                continue
+
+            if result:
+                described[key] = result
+
+        # Splice new descriptions back in, leaving <image-media> untouched.
+        touched_nodes = []
+        rewritten_units = 0
+
+        for node_id, units in node_units.items():
+            body = bodies[node_id]
+            changed = False
+
+            # Reverse order so earlier spans stay valid as we splice.
+            for unit in sorted(units, key=lambda u: u["span"][0], reverse=True):
+                description = described.get(unit["key"])
+
+                if not description:
+                    continue
+
+                start, end = unit["span"]
+                body = body[:start] + render_image_unit(
+                    unit["media_html"], description
+                ) + body[end:]
+
+                changed = True
+                rewritten_units += 1
+
+            if changed:
+                conn.execute(
+                    "UPDATE nodes SET body=?, updated_at=? WHERE id=?",
+                    (body, now_iso(), node_id),
+                )
+                touched_nodes.append(node_id)
+
+        invalidate_search_index(conn, touched_nodes)
+
+        conn.commit()
+
+        print("")
+        print("=" * 80)
+        print("Done.")
+        print("=" * 80)
+        print(f"Images described: {len(described)}/{len(keys)} (failed: {failed})")
+        print(f"<image-unit> blocks rewritten: {rewritten_units}/{total_units}")
+        print(f"Nodes updated: {len(touched_nodes)}")
+        print(f"Original left untouched: {source_path}")
+        print(f"Result written to:       {working_path}")
+
+    finally:
+        conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fill in and audit <image-unit> descriptions inside a wiki SQLite "
+            "database. Images are read from the base64 payloads already embedded "
+            "in nodes.body. The source database is never modified: all work lands "
+            "in a working copy."
+        )
+    )
+
+    parser.add_argument(
+        "database",
+        help="Path to the source .sqlite file. Opened read-only, never modified.",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help=(
+            "Path for the working copy. "
+            "Defaults to <name>.described.sqlite next to the source."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    asyncio.run(process_sqlite_database(args.database, args.output))
+
+
 if __name__ == "__main__":
-    asyncio.run(process_markdown_folder())
+    main()

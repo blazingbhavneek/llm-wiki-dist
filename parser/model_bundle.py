@@ -246,8 +246,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--manifest", type=Path, default=Path("/opt/mineru/model-manifest.json")
     )
-    result.add_argument("--pipeline-revision", required=True)
-    result.add_argument("--vlm-revision", required=True)
+    result.add_argument("--pipeline-revision", default="main")
+    result.add_argument("--vlm-revision", default="main")
     result.add_argument("--download-retries", type=int, default=100)
     result.add_argument("--max-workers", type=int, default=2)
     result.add_argument("--hashes", action="store_true")
