@@ -4,7 +4,15 @@ export function InlineSpinner() {
   )
 }
 
-export function SmallBtn({ children, onClick, active, disabled, confirm, danger }) {
+export function SmallBtn({
+  children,
+  onClick,
+  active,
+  disabled,
+  confirm,
+  danger,
+  title,
+}) {
   const base = 'border px-[11px] py-[8px] text-[12px] font-bold'
 
   const tone = disabled
@@ -23,6 +31,7 @@ export function SmallBtn({ children, onClick, active, disabled, confirm, danger 
       className={`${base} ${tone}`}
       onClick={onClick}
       disabled={disabled}
+      title={title}
     >
       {children}
     </button>

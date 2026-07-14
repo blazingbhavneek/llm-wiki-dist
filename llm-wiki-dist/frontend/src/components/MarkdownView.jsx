@@ -1,4 +1,7 @@
+import { Download } from 'lucide-react'
+
 import { useT } from '../i18n.jsx'
+import { downloadMarkdown } from '../data/download.js'
 import { STR } from './markdown/strings.js'
 import { MarkdownRenderer } from './markdown/MarkdownRenderer.jsx'
 import { RichMarkdownEditor } from './markdown/RichMarkdownEditor.jsx'
@@ -68,6 +71,11 @@ export default function MarkdownView({
 
   const handleCancelEdit = () => {
     onCancelEdit?.()
+  }
+
+  // Export exactly what is on screen: the markdown, no added metadata.
+  const handleExport = () => {
+    downloadMarkdown(draft.title || doc.title, draft.markdown, t.untitled)
   }
 
   const titlePreviewInteractionProps = !isEditing
@@ -141,6 +149,13 @@ export default function MarkdownView({
               <>
                 <SmallBtn onClick={onConfirm} disabled={saveDisabled} confirm>
                   {busy ? t.saving : t.save}
+                </SmallBtn>
+
+                <SmallBtn onClick={handleExport} title={t.exportTitle} disabled={busy}>
+                  <span className="inline-flex items-center gap-[6px]">
+                    <Download size={13} />
+                    {t.export}
+                  </span>
                 </SmallBtn>
 
                 <SmallBtn onClick={onDelete} danger disabled={busy}>

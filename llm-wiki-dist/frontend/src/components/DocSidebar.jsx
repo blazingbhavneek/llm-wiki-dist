@@ -1,6 +1,7 @@
 import { useState } from 'react'
-import { BookOpen, FileText, ExternalLink } from 'lucide-react'
+import { BookOpen, Download, ExternalLink, FileText, Trash2 } from 'lucide-react'
 import { useT } from '../i18n.jsx'
+import { buildDocumentMarkdown, downloadMarkdown } from '../data/download.js'
 
 const STR = {
   ja: {
@@ -13,6 +14,13 @@ const STR = {
     openFull: '完全なドキュメントを開く',
     untitledDocument: 'Untitled document',
     untitledSection: 'Untitled section',
+    downloadDocument: 'ダウンロード',
+    downloadDocumentTitle: 'ドキュメント全体を Markdown でダウンロード',
+    deleteDocument: '削除',
+    deleteDocumentTitle: 'ドキュメント全体をデータベースから削除',
+    deleting: '削除中...',
+    confirmDeleteDocument: (name, count) =>
+      `「${name}」（${count} セクション）とその派生エージェントノートをすべて削除します。元に戻せません。`,
   },
   en: {
     documents: 'Referenced Knowledge',
@@ -24,6 +32,13 @@ const STR = {
     openFull: 'Open full document',
     untitledDocument: 'Untitled document',
     untitledSection: 'Untitled section',
+    downloadDocument: 'Download',
+    downloadDocumentTitle: 'Download the whole document as Markdown',
+    deleteDocument: 'Delete',
+    deleteDocumentTitle: 'Delete the whole document from the database',
+    deleting: 'Deleting...',
+    confirmDeleteDocument: (name, count) =>
+      `Delete "${name}" (${count} section${count === 1 ? '' : 's'}) and every agent note derived from it? This cannot be undone.`,
   },
 }
 
@@ -33,6 +48,8 @@ export default function DocSidebar({
   onModeChange,
   onOpenNode,
   onOpenFullDoc,
+  onDeleteDocument,
+  deletingDocs,
   activeTabId,
 }) {
   const t = useT(STR)
@@ -118,6 +135,8 @@ export default function DocSidebar({
               index={index}
               onOpenNode={onOpenNode}
               onOpenFullDoc={onOpenFullDoc}
+              onDeleteDocument={onDeleteDocument}
+              deleting={isDocDeleting(deletingDocs, doc)}
               activeTabId={activeTabId}
             />
           ))}
@@ -136,6 +155,8 @@ export default function DocSidebar({
                   index={index}
                   onOpenNode={onOpenNode}
                   onOpenFullDoc={onOpenFullDoc}
+                  onDeleteDocument={onDeleteDocument}
+                  deleting={isDocDeleting(deletingDocs, doc)}
                   activeTabId={activeTabId}
                 />
               ))}
@@ -155,6 +176,8 @@ function KnowledgeCard({
   index,
   onOpenNode,
   onOpenFullDoc,
+  onDeleteDocument,
+  deleting,
   activeTabId,
 }) {
   const t = useT(STR)
@@ -163,6 +186,22 @@ function KnowledgeCard({
   const nodes = Array.isArray(doc?.nodes) ? doc.nodes : []
   const isAgent = doc.type === 'exogenous'
   const displayName = getOriginalDocName(doc, t)
+
+  const handleDownload = () => {
+    downloadMarkdown(
+      displayName,
+      buildDocumentMarkdown(displayName, nodes),
+      t.untitledDocument,
+    )
+  }
+
+  const handleDelete = () => {
+    if (!window.confirm(t.confirmDeleteDocument(displayName, nodes.length))) {
+      return
+    }
+
+    onDeleteDocument?.(doc)
+  }
 
   const colors = [
     'bg-blue/10 text-blue',
@@ -200,6 +239,32 @@ function KnowledgeCard({
           {open ? '▾' : '▸'}
         </span>
       </button>
+
+      {open && (
+        <div className="flex items-center gap-[6px] border-t border-line bg-[#fbfcff] px-[10px] py-[8px]">
+          <button
+            type="button"
+            title={t.downloadDocumentTitle}
+            onClick={handleDownload}
+            disabled={nodes.length === 0}
+            className="flex flex-1 items-center justify-center gap-[6px] rounded-md border border-line bg-white px-[8px] py-[6px] text-[11.5px] font-bold text-slate-600 hover:border-blue/40 hover:text-blue disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Download size={13} />
+            {t.downloadDocument}
+          </button>
+
+          <button
+            type="button"
+            title={t.deleteDocumentTitle}
+            onClick={handleDelete}
+            disabled={deleting}
+            className="flex flex-1 items-center justify-center gap-[6px] rounded-md border border-red-200 bg-red-50 px-[8px] py-[6px] text-[11.5px] font-bold text-red-700 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Trash2 size={13} />
+            {deleting ? t.deleting : t.deleteDocument}
+          </button>
+        </div>
+      )}
 
       {open && (
         <ol className="border-t border-line bg-[#fbfcff] py-[6px]">
@@ -241,6 +306,14 @@ function KnowledgeCard({
       )}
     </div>
   )
+}
+
+function isDocDeleting(deletingDocs, doc) {
+  if (!deletingDocs || !doc?.name) return false
+
+  return typeof deletingDocs.has === 'function'
+    ? deletingDocs.has(doc.name)
+    : false
 }
 
 function getDocumentKey(doc, index) {

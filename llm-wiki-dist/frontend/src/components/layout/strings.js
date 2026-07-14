@@ -122,6 +122,7 @@ export const STR = {
     nodeDeleted: 'ノードをグラフから削除しました。',
     noteDeleted: 'ノートを削除しました。',
     deleteFailed: (m) => `削除に失敗しました: ${m}`,
+    documentDeleted: (name) => `ドキュメント「${name}」を削除しました。`,
 
     startingWriteGraph: 'グラフへの書き込みを開始中...',
     mdAdded: 'Markdown をグラフに追加しました。',
@@ -309,6 +310,7 @@ export const STR = {
     nodeDeleted: 'Node deleted from the graph.',
     noteDeleted: 'Note deleted.',
     deleteFailed: (m) => `Delete failed: ${m}`,
+    documentDeleted: (name) => `Deleted document "${name}".`,
 
     startingWriteGraph: 'Starting graph write...',
     mdAdded: 'Markdown added to the graph.',

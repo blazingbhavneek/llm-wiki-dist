@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from .core import Edge, Node, NodeStatus, now_iso
 
@@ -18,6 +18,16 @@ from .core import Edge, Node, NodeStatus, now_iso
 
 _FTS_SPECIAL = re.compile(r'["()*:^]')
 log = logging.getLogger("raw_sqlite")
+
+# SQLite caps host parameters per statement (SQLITE_MAX_VARIABLE_NUMBER, 999 on
+# older builds). Batched `IN (...)` deletes bind ids twice in the edge sweep, so
+# stay well under half of that.
+_MAX_SQL_PARAMS = 400
+
+
+def _id_batches(ids: list[str]) -> Iterator[list[str]]:
+    for start in range(0, len(ids), _MAX_SQL_PARAMS):
+        yield ids[start : start + _MAX_SQL_PARAMS]
 
 
 # Takes a text string, cleans special FTS characters, splits into words, and joins them with OR for SQLite full-text search.
@@ -836,6 +846,69 @@ class GraphStore:
                         (item_id,),
                     )
 
+    def delete_nodes(self, node_ids: Iterable[str]) -> int:
+        # Batch version of delete_node: same tables, one transaction, and a
+        # handful of statements instead of ~10 per node. Used for document
+        # deletes, where a single document can carry hundreds of chunks.
+        if self.readonly:
+            raise RuntimeError("cannot delete nodes on readonly database")
+
+        ids = list(dict.fromkeys(str(n) for n in node_ids if n))
+
+        if not ids:
+            return 0
+
+        with self.transaction() as conn:
+            for batch in _id_batches(ids):
+                marks = ",".join("?" * len(batch))
+
+                # Search item ids are needed before the rows go away: the
+                # per-item vector table is keyed by item id, not node id.
+                item_ids = [
+                    r["id"]
+                    for r in conn.execute(
+                        f"SELECT id FROM search_items WHERE node_id IN ({marks})",
+                        batch,
+                    ).fetchall()
+                ]
+
+                # Every edge touching any node in the batch, both directions.
+                conn.execute(
+                    f"DELETE FROM edges WHERE source_node_id IN ({marks}) "
+                    f"OR target_node_id IN ({marks})",
+                    [*batch, *batch],
+                )
+
+                conn.execute(f"DELETE FROM nodes WHERE id IN ({marks})", batch)
+                conn.execute(
+                    f"DELETE FROM nodes_fts WHERE node_id IN ({marks})", batch
+                )
+                conn.execute(
+                    f"DELETE FROM search_items_fts WHERE node_id IN ({marks})", batch
+                )
+                conn.execute(
+                    f"DELETE FROM search_items WHERE node_id IN ({marks})", batch
+                )
+
+                if self._dim is not None:
+                    conn.execute(
+                        f"DELETE FROM vec_body WHERE node_id IN ({marks})", batch
+                    )
+                    conn.execute(
+                        f"DELETE FROM vec_summary WHERE node_id IN ({marks})", batch
+                    )
+
+                    # vec_search_item stores the search item id in its node_id column.
+                    for item_batch in _id_batches(item_ids):
+                        item_marks = ",".join("?" * len(item_batch))
+                        conn.execute(
+                            "DELETE FROM vec_search_item "
+                            f"WHERE node_id IN ({item_marks})",
+                            item_batch,
+                        )
+
+        return len(ids)
+
     def get_all_nodes(self, include_deleted: bool = False) -> list[Node]:
         # Start with all nodes.
         sql = "SELECT * FROM nodes"
@@ -872,6 +945,22 @@ class GraphStore:
         return [
             _row_to_node(r) for r in self.connection.execute(sql, params).fetchall()
         ]
+
+    def get_nodes_by_ids(self, node_ids: Iterable[str]) -> list[Node]:
+        # Bulk get_node. Missing ids are simply absent from the result.
+        ids = list(dict.fromkeys(str(n) for n in node_ids if n))
+        nodes: list[Node] = []
+
+        for batch in _id_batches(ids):
+            marks = ",".join("?" * len(batch))
+            nodes.extend(
+                _row_to_node(r)
+                for r in self.connection.execute(
+                    f"SELECT * FROM nodes WHERE id IN ({marks})", batch
+                ).fetchall()
+            )
+
+        return nodes
 
     def get_nodes_by_entity(self, entity: str, limit: int = 20) -> list[Node]:
         # Nodes tagged with the exact same entity string. Cheap indexed lookup
@@ -982,6 +1071,33 @@ class GraphStore:
         return [
             _row_to_edge(r) for r in self.connection.execute(sql, params).fetchall()
         ]
+
+    def get_outgoing_target_ids(
+        self,
+        node_ids: Iterable[str],
+        label: str | None = None,
+    ) -> list[str]:
+        # Bulk edge walk: every target reachable in one hop from any of these
+        # nodes. Delete cascades use it so a document of N chunks costs a few
+        # indexed queries instead of N.
+        ids = list(dict.fromkeys(str(n) for n in node_ids if n))
+        targets: list[str] = []
+
+        for batch in _id_batches(ids):
+            marks = ",".join("?" * len(batch))
+            sql = f"SELECT DISTINCT target_node_id FROM edges WHERE source_node_id IN ({marks})"
+            params = list(batch)
+
+            if label is not None:
+                sql += " AND label=?"
+                params.append(label)
+
+            targets.extend(
+                r["target_node_id"]
+                for r in self.connection.execute(sql, params).fetchall()
+            )
+
+        return list(dict.fromkeys(targets))
 
     def get_incoming_edges(
         self,

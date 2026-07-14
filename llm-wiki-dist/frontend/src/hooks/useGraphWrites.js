@@ -52,6 +52,7 @@ export function useGraphWrites({
 }) {
   const [savedIds, setSavedIds] = useState(() => new Set())
   const [addingIds, setAddingIds] = useState(() => new Set())
+  const [deletingDocs, setDeletingDocs] = useState(() => new Set())
   const [answerWriteStatuses, setAnswerWriteStatuses] = useState(() => new Map())
 
   const setAnswerWriteStatus = (answerId, text) => {
@@ -142,6 +143,46 @@ export function useGraphWrites({
       updateWorkspace(item.id, { busy: false, busyMessage: '' })
 
       fireToast(t.deleteFailed(e.message))
+    }
+  }
+
+  // Whole-document delete: one write job on the backend, whatever the chunk
+  // count. Closes the open workspace if it was showing part of this document.
+  const deleteDocument = async (doc) => {
+    const name = doc?.name
+
+    if (!name) return
+
+    setDeletingDocs((prev) => new Set(prev).add(name))
+
+    const nodeIds = (Array.isArray(doc?.nodes) ? doc.nodes : [])
+      .map((n) => n?.id)
+      .filter(Boolean)
+
+    try {
+      // Send both: the name resolves every chunk the DB still has under it,
+      // the ids cover agent-note groups that exist only as a client grouping.
+      await api.deleteDocument({ documentName: name, nodeIds })
+
+      const deletedIds = new Set(nodeIds)
+
+      const showingDeletedDoc =
+        workspace &&
+        (workspace.id === `fulldoc:${name}` || deletedIds.has(workspace.nodeId))
+
+      await reload()
+
+      if (showingDeletedDoc) closeWorkspace()
+
+      fireToast(t.documentDeleted(name))
+    } catch (e) {
+      fireToast(t.deleteFailed(e.message))
+    } finally {
+      setDeletingDocs((prev) => {
+        const next = new Set(prev)
+        next.delete(name)
+        return next
+      })
     }
   }
 
@@ -376,10 +417,12 @@ export function useGraphWrites({
   return {
     savedIds,
     addingIds,
+    deletingDocs,
     answerWriteStatuses,
     setAnswerWriteStatus,
     saveNode,
     deleteNode,
+    deleteDocument,
     uploadMarkdown,
     addDraftToGraph,
     addWiki,

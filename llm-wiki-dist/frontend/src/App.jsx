@@ -579,6 +579,8 @@ export default function App() {
               onModeChange={setRightMode}
               onOpenNode={openNode}
               onOpenFullDoc={openFullDoc}
+              onDeleteDocument={writes.deleteDocument}
+              deletingDocs={writes.deletingDocs}
               rawById={rawById}
               onViewAnswer={(answer) => openAnswerTab(answer, true)}
               mentionedNodeIdsByAnswerId={answerMentionedIdsByAnswerId}
