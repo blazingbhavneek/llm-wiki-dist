@@ -496,8 +496,14 @@ class Librarian:
             return self.update_node(job.payload["node_id"], job.payload["body"])
 
         if job.type == "delete_node":
-            self.delete_node(job.payload["node_id"])
-            return {"deleted": job.payload["node_id"]}
+            deleted = self.delete_node(job.payload["node_id"])
+            return {"deleted": job.payload["node_id"], "nodes_deleted": deleted}
+
+        if job.type == "delete_document":
+            return self.delete_document(
+                job.payload.get("document_name"),
+                job.payload.get("node_ids"),
+            )
 
         if job.type == "create_exogenous":
             node = self.create_exogenous_node(
@@ -1082,25 +1088,76 @@ class Librarian:
 
         return replacement
 
-    def delete_node(self, node_id: str) -> None:
-        # Load node first so dependents can react before final deletion.
-        node = self.store.get_node(node_id)
+    def delete_node(self, node_id: str) -> int:
+        # Hard delete, no LLM in the path: the node, every edge touching it,
+        # and every agent note derived from it (transitively) go away together.
+        return self._delete_with_derived([node_id])
 
-        if node is not None:
-            # Take the node out of retrieval first, then let dependents react
-            # while its `supports` edges still exist: notes regenerate from
-            # their remaining sources or go stale.
-            self.store.set_node_status(node_id, NodeStatus.deleted)
+    def delete_document(
+        self,
+        document_name: str | None = None,
+        node_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Delete a whole document in one shot: all of its chunks, their edges,
+        and every agent note derived from them. One write job, one transaction —
+        not one job per chunk.
 
-            actions: list[str] = []
-            try:
-                self._cascade_dependents({}, {node_id}, actions)
-            except Exception as exc:
-                # Deletion should still continue even if cascade cleanup fails.
-                log.info("delete cascade failed for %s: %s", node_id, exc)
+        `node_ids` covers documents that only exist as a client-side grouping
+        (agent notes carry no original_document_name); it is merged with
+        whatever the document name resolves to."""
+        chunk_ids = [
+            n.id
+            for n in (
+                self.store.get_nodes_by_document(document_name)
+                if document_name
+                else []
+            )
+        ]
 
-        # Remove the node from storage.
-        self.store.delete_node(node_id)
+        targets = list(dict.fromkeys([*chunk_ids, *(node_ids or [])]))
+
+        if not targets:
+            return {"document": document_name, "chunks": 0, "deleted": 0}
+
+        deleted = self._delete_with_derived(targets)
+
+        return {
+            "document": document_name,
+            "chunks": len(targets),
+            "deleted": deleted,
+        }
+
+    def _delete_with_derived(self, node_ids: list[str]) -> int:
+        # Expand the delete set across `supports` edges: an agent note built on
+        # a deleted source is deleted too, even if it still has other sources.
+        # Notes can support notes, so walk until the frontier is empty.
+        doomed: set[str] = {nid for nid in node_ids if nid}
+
+        if not doomed:
+            return 0
+
+        frontier: list[str] = list(doomed)
+
+        while frontier:
+            derived = self.store.get_outgoing_target_ids(frontier, "supports")
+            candidates = [nid for nid in derived if nid not in doomed]
+
+            if not candidates:
+                break
+
+            next_frontier = [
+                node.id
+                for node in self.store.get_nodes_by_ids(candidates)
+                if node.type == NodeType.exogenous
+            ]
+
+            if not next_frontier:
+                break
+
+            doomed.update(next_frontier)
+            frontier = next_frontier
+
+        return self.store.delete_nodes(sorted(doomed))
 
     def _clean_optional_text(
         self, value: str | None, max_len: int | None = None

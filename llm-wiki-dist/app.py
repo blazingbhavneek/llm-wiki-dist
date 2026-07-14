@@ -1278,6 +1278,14 @@ class ExogenousBody(BaseModel):
     question: str | None = None
 
 
+class DeleteDocumentBody(BaseModel):
+    # Either side may be empty: agent-note "documents" exist only client-side
+    # (their nodes carry no original_document_name), so the UI sends node ids;
+    # ingested documents are addressed by name.
+    document_name: str | None = None
+    node_ids: list[str] = Field(default_factory=list)
+
+
 class DocumentBody(BaseModel):
     body: str
     title: str | None = None
@@ -1633,6 +1641,25 @@ async def update_node(node_id: str, payload: UpdateBody) -> dict:
 @app.delete("/api/node/{node_id}")
 async def delete_node(node_id: str) -> dict:
     return await _enqueue("delete_node", {"node_id": node_id})
+
+
+# One job for the whole document, however many chunks it holds — a per-chunk
+# delete would flood the bounded write queue.
+@app.post("/api/document/delete")
+async def delete_document(payload: DeleteDocumentBody) -> dict:
+    if not payload.document_name and not payload.node_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("document_name or node_ids required", False, "bad_request"),
+        )
+
+    return await _enqueue(
+        "delete_document",
+        {
+            "document_name": payload.document_name,
+            "node_ids": payload.node_ids,
+        },
+    )
 
 
 @app.post("/api/exogenous")

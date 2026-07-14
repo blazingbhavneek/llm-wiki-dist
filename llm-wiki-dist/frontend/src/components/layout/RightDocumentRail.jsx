@@ -34,6 +34,8 @@ export function RightDocumentRail({
   onModeChange,
   onOpenNode,
   onOpenFullDoc,
+  onDeleteDocument,
+  deletingDocs,
   rawById,
   onViewAnswer,
 
@@ -130,6 +132,8 @@ export function RightDocumentRail({
             onModeChange={onModeChange}
             onOpenNode={onOpenNode}
             onOpenFullDoc={onOpenFullDoc}
+            onDeleteDocument={onDeleteDocument}
+            deletingDocs={deletingDocs}
           />
         )}
       </div>

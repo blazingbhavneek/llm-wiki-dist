@@ -106,6 +106,21 @@ export const api = {
   deleteNode: (id, jobOpts) =>
     writeReq(`/api/node/${encodeURIComponent(id)}`, { method: 'DELETE' }, jobOpts),
 
+  // One write job for the whole document, however many chunks it has.
+  // `nodeIds` covers agent-note groups, which are a client-side grouping only.
+  deleteDocument: ({ documentName, nodeIds = [] }, jobOpts) =>
+    writeReq(
+      '/api/document/delete',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          document_name: documentName ?? null,
+          node_ids: nodeIds,
+        }),
+      },
+      jobOpts,
+    ),
+
   search: (q, limit) =>
     req(`/api/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`),
   ask: (question, overrides) =>
