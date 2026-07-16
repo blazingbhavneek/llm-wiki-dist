@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import threading
 import warnings
 from collections import Counter, defaultdict
@@ -38,6 +40,8 @@ from .core import (
     RouteDecision,
     Settings,
     Subrun,
+    _IMAGE_DESCRIPTION_RE,
+    _IMAGE_UNIT_RE,
     clean_node_ref,
     dedupe,
     evidence_why,
@@ -70,6 +74,38 @@ if TYPE_CHECKING:
 # region Global vars/Helpers
 
 log = logging.getLogger("graph_researcher")
+
+_IMAGE_SRC_RE = re.compile(
+    r"""<img\b[^>]*\bsrc=["'](?P<src>data:image/[^"']+)["'][^>]*>""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _agent_multimodal_image_mode() -> str:
+    value = os.environ.get("WIKI_AGENT_MULTIMODAL_IMAGES", "").strip().lower()
+    if value in {"", "0", "false", "off", "none"}:
+        return "off"
+    return "missing" if value in {"missing", "empty", "undescribed"} else "all"
+
+
+def _image_blocks(text: str | None, mode: str) -> list[dict[str, Any]]:
+    if mode == "off":
+        return []
+
+    if mode == "all":
+        srcs = _IMAGE_SRC_RE.findall(text or "")
+    else:
+        srcs = []
+        for unit in _IMAGE_UNIT_RE.finditer(text or ""):
+            body = unit.group("body")
+            description = _IMAGE_DESCRIPTION_RE.search(body)
+            if not description or not description.group("description").strip():
+                srcs.extend(_IMAGE_SRC_RE.findall(body))
+
+    return [
+        {"type": "image_url", "image_url": {"url": src.strip()}}
+        for src in srcs
+    ]
 
 
 class AgentStopped(Exception):
@@ -128,6 +164,8 @@ def _compile_agent(
 
         # "llm_input_messages" is what the model sees for this call.
         # This keeps the graph state intact, but sends sanitized messages to the LLM.
+        if _agent_multimodal_image_mode() != "off":
+            return {"llm_input_messages": messages}
         return {"llm_input_messages": _sanitize_messages_for_llm(messages)}
 
     with warnings.catch_warnings():
@@ -603,7 +641,7 @@ def _sub_search(ctx: SubagentContext, text: str) -> str:
 
 
 # same as above, atomic version of the tool which would be wrapped later with pre-determined context
-def _sub_read(ctx: SubagentContext, node_id: str) -> str:
+def _sub_read(ctx: SubagentContext, node_id: str) -> Any:
     # Stop early if cancellation was requested.
     _check_stop(ctx.stop_event)
 
@@ -641,7 +679,12 @@ def _sub_read(ctx: SubagentContext, node_id: str) -> str:
         ctx.emit({"type": "read", "agent": run.index, "node": node_ref(node)})
 
     # Format full node details, including helpful info if node was missing.
-    return _sanitize_tool_output(format_node_full(node, requested_id, cleaned_id))
+    text = _sanitize_tool_output(format_node_full(node, requested_id, cleaned_id))
+    mode = _agent_multimodal_image_mode()
+    image_blocks = _image_blocks(node.body if node else "", mode)
+    if image_blocks:
+        return [{"type": "text", "text": text}, *image_blocks]
+    return text
 
 
 # same as above, atomic version of the tool which would be wrapped later with pre-determined context
