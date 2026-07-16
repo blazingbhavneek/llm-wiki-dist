@@ -1139,6 +1139,11 @@ class Librarian:
         frontier: list[str] = list(doomed)
 
         while frontier:
+            # TODO: Re-enable derived-node handling when we have better processing
+            # logic than "delete if related". For now, do not cascade-delete
+            # exogenous agent notes derived from deleted source nodes.
+            break
+
             derived = self.store.get_outgoing_target_ids(frontier, "supports")
             candidates = [nid for nid in derived if nid not in doomed]
 
@@ -2864,13 +2869,26 @@ class Librarian:
 
         log.info("recluster.naming communities=%d", len(ordered))
 
-        # Name each community using TF-IDF keywords and sample titles.
+        # Name each community using selected TF-IDF keywords and sample titles.
         for index, members in enumerate(
             tqdm(ordered, desc="recluster: naming clusters", unit="cluster")
         ):
-            keywords = self._tfidf_keywords(per_comm[index], doc_freq, n_comms, k=8)
+            # Give the evidence-selection pass more candidates than the final namer needs.
+            keyword_candidates = self._tfidf_keywords(
+                per_comm[index], doc_freq, n_comms, k=30
+            )
+            title_candidates = titles[index][:20]
+
+            selected_keywords, selected_titles = self._select_cluster_evidence(
+                keyword_candidates, title_candidates
+            )
+
             try:
-                label = self._name_cluster(keywords, titles[index][:12], used_labels)
+                label = self._name_cluster(
+                    selected_keywords,
+                    selected_titles,
+                    used_labels,
+                )
             except ClusterNamingError as exc:
                 log.warning("cluster naming fallback: %s", exc)
                 label = f"クラスタ {index + 1}"
@@ -2895,6 +2913,7 @@ class Librarian:
 
         return mapping
 
+
     def _tfidf_keywords(
         self, counts: Counter[str], doc_freq: Counter[str], n_comms: int, k: int = 5
     ) -> list[str]:
@@ -2911,6 +2930,123 @@ class Librarian:
         )
 
         return [kw for kw, _ in scored[:k]]
+
+
+    def _select_cluster_evidence(
+        self,
+        keyword_candidates: list[str],
+        title_candidates: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """
+        First LLM pass.
+
+        Select useful keyword/title evidence for cluster naming.
+
+        Minimal behavior:
+        - No manual stopword list.
+        - LLM chooses useful evidence from the provided candidates only.
+        - If this pass fails for any reason, return titles only.
+        """
+
+        import json
+
+        try:
+            from pydantic import BaseModel, Field
+
+            class ClusterEvidenceSelection(BaseModel):
+                keywords: list[str] = Field(default_factory=list)
+                titles: list[str] = Field(default_factory=list)
+
+        except Exception as exc:
+            log.warning("cluster evidence schema unavailable: %s", exc)
+            return [], [t.strip() for t in title_candidates if t and t.strip()][:6]
+
+        # Basic cleanup only. No manual stopword filtering.
+        keyword_candidates = list(
+            dict.fromkeys(
+                k.strip()
+                for k in keyword_candidates
+                if k and k.strip()
+            )
+        )
+
+        title_candidates = list(
+            dict.fromkeys(
+                t.strip()
+                for t in title_candidates
+                if t and t.strip()
+            )
+        )
+
+        if not keyword_candidates and not title_candidates:
+            return [], []
+
+        prompt = """
+あなたは知識グラフのクラスタに名前を付けるための根拠（evidence）を選択する役割です。
+
+キーワード候補とタイトル候補が与えられます。
+
+タスク:
+- このクラスタの命名に役立つ根拠のみを選択してください。
+- 新しいキーワードを作成しないでください。
+- 新しいタイトルを作成しないでください。
+- 必ず与えられた候補の中から選択してください。
+- ストップワード、助詞、一般的すぎる単語、壊れた断片、重複したノイズ、意味のないテキストは除外してください。
+- 意味のある技術用語、API名、ライブラリ名、モデル名、略語、製品名は保持してください。
+- 曖昧な語よりも、具体的な技術・ドメイン用語を優先してください。
+
+重要:
+- 有用なキーワードがない場合は、空の keywords リストを返してください。
+- 有用なタイトルがない場合は、空の titles リストを返してください。
+- 選択した根拠は翻訳したり書き換えたりしないでください。
+"""
+
+        payload = {
+            "keyword_candidates": keyword_candidates[:30],
+            "title_candidates": title_candidates[:20],
+        }
+
+        try:
+            result = self.gateway.llm.complete_structured(
+                prompt,
+                json.dumps(payload, ensure_ascii=False),
+                ClusterEvidenceSelection,
+            )
+        except Exception as exc:
+            # Requested behavior: if keyword/evidence selection fails, just pass titles.
+            log.warning("cluster evidence selection failed; using titles only: %s", exc)
+            return [], title_candidates[:6]
+
+        if not isinstance(result, ClusterEvidenceSelection):
+            log.warning("cluster evidence selection returned unexpected type; using titles only")
+            return [], title_candidates[:6]
+
+        allowed_keywords = set(keyword_candidates)
+        allowed_titles = set(title_candidates)
+
+        selected_keywords: list[str] = []
+        for kw in result.keywords:
+            kw = (kw or "").strip()
+
+            if kw and kw in allowed_keywords:
+                selected_keywords.append(kw)
+
+        selected_titles: list[str] = []
+        for title in result.titles:
+            title = (title or "").strip()
+
+            if title and title in allowed_titles:
+                selected_titles.append(title)
+
+        selected_keywords = list(dict.fromkeys(selected_keywords))[:8]
+        selected_titles = list(dict.fromkeys(selected_titles))[:6]
+
+        # If the LLM selected nothing useful, use titles only.
+        if not selected_keywords and not selected_titles:
+            return [], title_candidates[:6]
+
+        return selected_keywords, selected_titles
+
 
     def _name_cluster(
         self, keywords: list[str], titles: list[str], used_names: list[str]
@@ -2932,7 +3068,10 @@ class Librarian:
             "英語のみの名前は禁止です。\n"
             "少なくとも1文字以上の日本語文字、つまりひらがな、カタカナ、または漢字を含めてください。\n"
             "API名、関数名、ライブラリ名、頭字語、識別子は必要な場合のみ原文のまま残してかまいません。\n"
-            "説明、引用符、句読点、箇条書きは不要です。\n\n"
+            "説明、謝罪、質問、引用符、句読点、箇条書きは不要です。\n"
+            "情報が少なくても謝罪せず、最も妥当な短い名前を返してください。\n"
+            "判断できない場合は「クラスタ」とだけ返してください。\n"
+            "最大20文字程度にしてください。\n\n"
             "日本語クラスタ名:"
         )
 
@@ -2975,8 +3114,11 @@ class Librarian:
 
         return name
 
+
     def _ensure_japanese_clusters(self) -> dict[str, str]:
         """Ask LLM to rename clusters for Japanese UI."""
+
+        import json
 
         try:
             # Collect existing non-empty cluster names from active nodes.
@@ -2993,19 +3135,19 @@ class Librarian:
                 return {}
 
             prompt = """
-            You are reviewing knowledge-graph cluster labels for a Japanese user interface.
-            You will receive a list of existing cluster names.
-            
-            Task:
-            - Return ONLY the cluster names that should be renamed.
-            - If a name is already good, do not include it.
-            - If an English abbreviation, acronym, product name, library name, model name, or technical term is better left unchanged, do not include it.
-            - If a name is awkward English and should be localized for Japanese users, provide a concise Japanese or natural Japanese-mixed replacement.
-            - Preserve technical meaning.
-            - Do not over-translate proper nouns.
-            - New names should be short, clear, and suitable as UI cluster labels.
-            - Maximum 60 characters per new name.
-            - If no names need changes, return an empty renames list.
+                あなたは日本語ユーザーインターフェース向けの知識グラフのクラスタ名をレビューする役割です。
+                既存のクラスタ名の一覧が与えられます。
+
+                タスク:
+                - 名前を変更すべきクラスタ名のみを返してください。
+                - すでに適切な名前であれば、結果に含めないでください。
+                - 英語の略語、頭字語、製品名、ライブラリ名、モデル名、または技術用語は、そのままの方が適切な場合は変更しないでください。
+                - 不自然な英語で、日本語ユーザー向けにローカライズした方がよい場合は、簡潔な日本語、または自然な日本語と英語を組み合わせた名称を提案してください。
+                - 技術的な意味は維持してください。
+                - 固有名詞は過度に翻訳しないでください。
+                - 新しい名前は短く、分かりやすく、UIのクラスタラベルとして適したものにしてください。
+                - 新しい名前は最大60文字までとしてください。
+                - 変更が必要な名前がない場合は、空の `renames` リストを返してください。
             """
 
             result = self.gateway.llm.complete_structured(
@@ -3075,6 +3217,7 @@ class Librarian:
             # Best-effort: cluster renaming should not break the app.
             log.warning("ensure_japanese_clusters failed: %s", e)
             return {}
+
 
     def _refresh_clusters(self) -> None:
         # Best-effort refresh: recompute clusters, then localize names.

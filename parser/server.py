@@ -537,6 +537,9 @@ def worker_process(task_id: str, pdf_path: str, api_config: dict, cache_dir: str
 
     redirect_worker_output(cache_dir, task_id)
 
+    # TODO: Renable this once image description pipeline is working again
+    api_config["describe_images"] = False
+
     if MINERU_VENV_BIN and MINERU_VENV_BIN.exists():
         os.environ["PATH"] = (
             f"{MINERU_VENV_BIN}{os.pathsep}{os.environ.get('PATH', '')}"

@@ -1,8 +1,8 @@
 {
   "servers": {
-    "moove-wiki": {
+    "llm-wiki": {
       "type": "http",
-      "url": "http://10.160.152.38:8002/llm-wiki/moove_wiki/mcp"
+      "url": "http://10.160.152.38:51026/llm-wiki/wiki_moove/mcp"
     }
   }
 }

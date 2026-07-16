@@ -1,9 +1,12 @@
-import { Download } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Download } from 'lucide-react'
 
 import { useT } from '../i18n.jsx'
 import { downloadMarkdown } from '../data/download.js'
 import { STR } from './markdown/strings.js'
-import { MarkdownRenderer } from './markdown/MarkdownRenderer.jsx'
+import {
+  MarkdownRenderer,
+  stripCitedNodeIdsBlocks,
+} from './markdown/MarkdownRenderer.jsx'
 import { RichMarkdownEditor } from './markdown/RichMarkdownEditor.jsx'
 import { InlineSpinner, SmallBtn } from './markdown/ui.jsx'
 import {
@@ -21,6 +24,9 @@ export default function MarkdownView({
   busy,
   busyMessage,
   refs,
+  rawById,
+  prevNodeId,
+  nextNodeId,
   onStartEdit,
   onCancelEdit,
   onConfirm,
@@ -75,7 +81,11 @@ export default function MarkdownView({
 
   // Export exactly what is on screen: the markdown, no added metadata.
   const handleExport = () => {
-    downloadMarkdown(draft.title || doc.title, draft.markdown, t.untitled)
+    downloadMarkdown(
+      draft.title || doc.title,
+      stripCitedNodeIdsBlocks(draft.markdown, rawById),
+      t.untitled,
+    )
   }
 
   const titlePreviewInteractionProps = !isEditing
@@ -141,6 +151,32 @@ export default function MarkdownView({
               </SmallBtn>
             )}
 
+            {mode === 'doc' && !isEditing && (
+              <>
+                <SmallBtn
+                  onClick={() => onOpenNode?.(prevNodeId)}
+                  disabled={!prevNodeId || busy}
+                  title={t.prevChunk}
+                >
+                  <span className="inline-flex items-center gap-[6px]">
+                    <ChevronLeft size={13} />
+                    {t.prevChunk}
+                  </span>
+                </SmallBtn>
+
+                <SmallBtn
+                  onClick={() => onOpenNode?.(nextNodeId)}
+                  disabled={!nextNodeId || busy}
+                  title={t.nextChunk}
+                >
+                  <span className="inline-flex items-center gap-[6px]">
+                    {t.nextChunk}
+                    <ChevronRight size={13} />
+                  </span>
+                </SmallBtn>
+              </>
+            )}
+
             {isDraft ? (
               <SmallBtn onClick={onAddToGraph} disabled={addDisabled} confirm>
                 {busy ? t.adding : isAnswer ? t.addToWiki : t.addToGraph}
@@ -178,8 +214,9 @@ export default function MarkdownView({
             readOnly={readOnly}
             positions={positions}
             markdown={draft.markdown}
-            refs={refs}
+            refs={isAnswer ? [] : refs}
             onOpenNode={onOpenNode}
+            rawById={rawById}
           />
         )}
       </div>
@@ -187,8 +224,16 @@ export default function MarkdownView({
   )
 }
 
-function PreviewModeContent({ readOnly, positions, markdown, refs, onOpenNode }) {
+function PreviewModeContent({
+  readOnly,
+  positions,
+  markdown,
+  refs,
+  onOpenNode,
+  rawById,
+}) {
   const t = useT(STR)
+  const showReferences = Array.isArray(refs) && refs.length > 0
 
   return (
     <div className="h-full w-full" {...getPreviewInteractionProps()}>
@@ -209,8 +254,13 @@ function PreviewModeContent({ readOnly, positions, markdown, refs, onOpenNode })
       )}
 
       <article className="md w-full max-w-none px-[36px] pb-[90px] pt-[36px]">
-        <MarkdownRenderer markdown={markdown} />
-        <References refs={refs} onOpenNode={onOpenNode} />
+        <MarkdownRenderer
+          markdown={markdown}
+          onOpenNode={onOpenNode}
+          rawById={rawById}
+          referenceLabel={t.referenceLabel}
+        />
+        {showReferences && <References refs={refs} onOpenNode={onOpenNode} />}
       </article>
     </div>
   )

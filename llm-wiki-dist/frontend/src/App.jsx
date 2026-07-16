@@ -468,6 +468,17 @@ export default function App() {
             busy={!!workspace.busy}
             busyMessage={workspace.busyMessage}
             refs={workspace.refs}
+            rawById={rawById}
+            prevNodeId={
+              workspace.kind === 'doc'
+                ? docLibrary?.prevOf?.get?.(workspace.nodeId) || null
+                : null
+            }
+            nextNodeId={
+              workspace.kind === 'doc'
+                ? docLibrary?.nextOf?.get?.(workspace.nodeId) || null
+                : null
+            }
             onStartEdit={() => startEdit(workspace.id)}
             onCancelEdit={() => cancelEdit(workspace.id)}
             onConfirm={() => {

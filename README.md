@@ -4,7 +4,7 @@
 
 ```bash
 cd llm-wiki-dist
-DOCKER_BUILDKIT=1 docker build -t llm-wiki-rikiseisan:latest .
+docker build -t llm-wiki-rikiseisan:latest .
 ```
 
 (`--build-arg PROXY_URL=` disables the baked proxy; drop it to use it.)
@@ -13,8 +13,8 @@ DOCKER_BUILDKIT=1 docker build -t llm-wiki-rikiseisan:latest .
 
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
-  -p 8000:8000 -p 8001:8001 -p 51027:22 \
-  -v "$PWD/.wiki:/home/seigyo/llm-wiki/.wiki" \
+  -p 51025:8000 -p 51026:8001 -p 51024:22 \
+  -v "$PWD/.wiki_docker:/home/seigyo/llm-wiki/.wiki" \
   llm-wiki-rikiseisan:latest
 ```
 

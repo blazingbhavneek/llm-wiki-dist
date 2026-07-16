@@ -64,6 +64,8 @@ const STR = {
     mermaidDiagrams: 'Mermaid 図を生成',
     mermaidDiagramsHelp:
       'Mermaid 図はフロー図をテキストとして残せますが、検証と修復のため追加処理が必要です。',
+    imageProcessingSoon:
+      '画像処理が利用できない場合があります。解析結果に画像説明が含まれないことがあります。',
     usingSettings:
       'LLM 接続設定は設定ページのチャットモデル設定を使用しています。',
     currentModel: (model) => `現在のモデル: ${model || '-'}`,
@@ -117,6 +119,8 @@ const STR = {
     mermaidDiagrams: 'Generate Mermaid diagrams',
     mermaidDiagramsHelp:
       'Mermaid diagrams can capture flow diagrams in text, but validation and repair add extra processing.',
+    imageProcessingSoon:
+      'Image processing may be unavailable. Parsed results may not include image descriptions.',
     usingSettings:
       'LLM connection settings are read from the chat model settings on the Settings page.',
     currentModel: (model) => `Current model: ${model || '-'}`,
@@ -769,6 +773,10 @@ export default function PdfParserView({
 
                   <p className="m-0 text-[12px] leading-[1.45] text-muted">
                     {t.mermaidDiagramsHelp}
+                  </p>
+
+                  <p className="m-0 border border-[#facc15]/45 bg-[#fef9c3] px-[10px] py-[7px] text-[12px] leading-[1.45] text-[#854d0e]">
+                    {t.imageProcessingSoon}
                   </p>
                 </div>
               )}
