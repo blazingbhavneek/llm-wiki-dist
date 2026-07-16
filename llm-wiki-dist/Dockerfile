@@ -368,6 +368,7 @@ RUN --mount=type=cache,id=npm-cache-root-frontend,target=/root/.npm \
 WORKDIR ${APP_HOME}
 
 COPY --chown=seigyo:seigyo app.py ${APP_HOME}/app.py
+COPY --chown=seigyo:seigyo mcp_server.py ${APP_HOME}/mcp_server.py
 COPY --chown=seigyo:seigyo main.py ${APP_HOME}/main.py
 COPY --chown=seigyo:seigyo graph/ ${APP_HOME}/graph/
 COPY --chown=seigyo:seigyo frontend/ ${APP_HOME}/frontend/

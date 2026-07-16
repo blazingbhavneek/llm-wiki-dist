@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import mermaid from 'mermaid'
 import { useT } from '../i18n.jsx'
+import { Resizable } from 're-resizable'
 
 mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'strict' })
 
@@ -97,24 +98,48 @@ export default function MermaidDiagram({ code, state }) {
         <CtrlBtn onClick={() => zoom(1 / 1.2)}>−</CtrlBtn>
         <CtrlBtn onClick={reset}>⤢</CtrlBtn>
       </div>
-      <div
-        ref={frameRef}
-        className="h-[420px] cursor-grab touch-none select-none active:cursor-grabbing"
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        onDoubleClick={reset}
+      <Resizable
+        defaultSize={{ width: '100%', height: 420 }}
+        minHeight={220}
+        maxHeight="80vh"
+        enable={{
+          top: false,
+          right: false,
+          bottom: true,
+          left: false,
+          topRight: false,
+          bottomRight: false,
+          bottomLeft: false,
+          topLeft: false,
+        }}
+        className="overflow-hidden"
+        handleStyles={{
+          bottom: {
+            height: '10px',
+            bottom: 0,
+            cursor: 'ns-resize',
+          },
+        }}
       >
         <div
-          className="grid h-full place-items-center [&_svg]:max-w-none"
-          style={{
-            transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})`,
-            transformOrigin: 'center center',
-          }}
-          dangerouslySetInnerHTML={{ __html: svg }}
-        />
-      </div>
+          ref={frameRef}
+          className="h-full cursor-grab touch-none select-none active:cursor-grabbing"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+          onDoubleClick={reset}
+        >
+          <div
+            className="grid h-full place-items-center [&_svg]:max-w-none"
+            style={{
+              transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})`,
+              transformOrigin: 'center center',
+            }}
+            dangerouslySetInnerHTML={{ __html: svg }}
+          />
+        </div>
+      </Resizable>
     </div>
   )
 }

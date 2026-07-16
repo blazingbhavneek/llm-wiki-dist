@@ -3,3 +3,5 @@ llm-wiki-dist/.wiki
 **.pyc
 **.tar.gz
 .codegraph
+chrome-headless-shell-linux64/
+llm-wiki-dist/.wiki_docker/

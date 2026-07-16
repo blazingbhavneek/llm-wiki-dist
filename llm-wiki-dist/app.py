@@ -227,18 +227,112 @@ async def lifespan(_: FastAPI):
         ThreadPoolExecutor(max_workers=64, thread_name_prefix="default")
     )
 
-    # Stacks are built lazily on first request per db; nothing to pre-build.
+    # Preload existing SQLite DBs at startup so first users do not wait for
+    # lazy initialization.
+    #
+    # Optional env:
+    #   WIKI_STARTUP_BOOTSTRAP_CONCURRENCY=2
+    #   WIKI_STARTUP_REQUIRE_ALL_DBS=false
+    startup_concurrency = max(
+        1,
+        int(os.environ.get("WIKI_STARTUP_BOOTSTRAP_CONCURRENCY", "3")),
+    )
+
+    require_all_dbs_ready = os.environ.get(
+        "WIKI_STARTUP_REQUIRE_ALL_DBS",
+        "true",
+    ).lower() in {"1", "true", "yes", "on"}
+
     try:
+        existing_dbs: list[str] = []
+
+        for path in sorted(DB_DIR.glob("*.sqlite"), key=lambda p: p.name):
+            if not path.is_file():
+                continue
+
+            db = path.name[: -len(".sqlite")]
+
+            # Do not preload invalid/reserved DB names. This matches your
+            # routing/admin validation behavior.
+            if not _DB_RE.fullmatch(db) or db in _RESERVED_DB_NAMES:
+                log.warning(
+                    "startup: skipping sqlite with invalid/reserved db name: %s",
+                    path.name,
+                )
+                continue
+
+            existing_dbs.append(db)
+
+        if existing_dbs:
+            log.info(
+                "startup: preloading %d existing sqlite db(s): %s",
+                len(existing_dbs),
+                ", ".join(existing_dbs),
+            )
+
+            semaphore = asyncio.Semaphore(startup_concurrency)
+
+            async def preload_one(db: str) -> tuple[str, str | None]:
+                async with semaphore:
+                    log.info("startup: preloading db=%s", db)
+
+                    await _bootstrap_db(db)
+
+                    if stages.get(db) == "ready" and db in STACKS:
+                        log.info("startup: preloaded db=%s successfully", db)
+                        return db, None
+
+                    err = errors.get(db) or f"db did not become ready; stage={stages.get(db)}"
+                    log.error("startup: failed to preload db=%s: %s", db, err)
+                    return db, err
+
+            results = await asyncio.gather(
+                *(preload_one(db) for db in existing_dbs)
+            )
+
+            failed = {
+                db: err
+                for db, err in results
+                if err is not None
+            }
+
+            ready_count = len(existing_dbs) - len(failed)
+
+            log.info(
+                "startup: db preload complete: ready=%d failed=%d total=%d",
+                ready_count,
+                len(failed),
+                len(existing_dbs),
+            )
+
+            if failed and require_all_dbs_ready:
+                raise RuntimeError(
+                    "one or more dbs failed to preload: "
+                    + "; ".join(f"{db}: {err}" for db, err in failed.items())
+                )
+        else:
+            log.info(
+                "startup: no existing sqlite dbs found in %s; "
+                "normal wiki routes will 404 until an admin creates/uploads a db",
+                DB_DIR,
+            )
+
         yield
+
     finally:
         for stack in list(STACKS.values()):
             try:
                 await stack["librarian"].stop()
             except Exception:
                 pass
-            stack["write_store"].close()
-            stack["read_store"].close()
-            stack["gateway"].close()
+
+            with suppress(Exception):
+                stack["write_store"].close()
+            with suppress(Exception):
+                stack["read_store"].close()
+            with suppress(Exception):
+                stack["gateway"].close()
+
         STACKS.clear()
 
 

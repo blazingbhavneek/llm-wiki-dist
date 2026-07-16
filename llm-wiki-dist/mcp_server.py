@@ -30,7 +30,7 @@ log = logging.getLogger("llm_wiki_mcp")
 _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
 DEFAULT_PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")
 DEFAULT_BACKEND_ORIGIN = os.environ.get(
-    "MCP_BACKEND_ORIGIN", "http://locahost:8000" # TODO Make this sync with backend auto
+    "MCP_BACKEND_ORIGIN", "http://127.0.0.1:8000" # TODO Make this sync with backend auto
 ).rstrip("/")
 DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
 DEFAULT_DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki")).resolve()

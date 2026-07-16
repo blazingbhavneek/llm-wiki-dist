@@ -11,6 +11,7 @@ import {
   Upload,
 } from 'lucide-react'
 
+import { faviconUrl } from '../../data/utils'
 import { useT } from '../../i18n.jsx'
 import { STR } from './strings.js'
 
@@ -79,7 +80,7 @@ export function LeftSidebar({
         >
           <div className="flex w-full justify-center">
             <img
-              src="/favicon.svg"
+              src={faviconUrl()}
               alt="Logo"
               className="block h-[100px] w-[100px] max-w-full object-contain"
             />
@@ -145,7 +146,7 @@ export function LeftSidebar({
           })}
         </div>
 
-        {!collapsed && (
+        {/* {!collapsed && (
           <div className="mt-8">
             <div className="mb-3 flex items-center justify-between px-1 text-[12px] font-bold text-slate-500">
               <span>{t.shell.recentQuestions}</span>
@@ -175,7 +176,7 @@ export function LeftSidebar({
               ))}
             </div>
           </div>
-        )}
+        )} */}
       </nav>
 
       <div className="border-t border-slate-100 p-3">

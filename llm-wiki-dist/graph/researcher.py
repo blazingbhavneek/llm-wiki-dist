@@ -23,10 +23,10 @@ from typing import Any, Callable
 
 from .core import (
     GRAPH_SYSTEM_PROMPT,
-    LEAD_AGENT_PROMPT,
     ROUTER_PROMPT,
     SHALLOW_ANSWER_PROMPT,
     SUBAGENT_SYSTEM_PROMPT,
+    MAIN_AGENT_SYSTEM_PROMPT,
     AgentAnswer,
     Edge,
     EvidenceHit,
@@ -463,7 +463,7 @@ def run_lead_agent(
     agent = _compile_agent(
         session.settings,
         tools=_lead_tools(ctx),
-        prompt=LEAD_AGENT_PROMPT,
+        prompt=MAIN_AGENT_SYSTEM_PROMPT,
         stop_event=stop_event,
     )
 

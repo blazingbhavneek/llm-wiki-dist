@@ -243,18 +243,19 @@ export function useGraphWrites({
 
     try {
       const exogenousQuestion =
-        item.answer?.question ||
-        item.question ||
-        item.draft?.question ||
         item.draft?.title ||
+        item.draft?.question ||
+        item.question ||
+        item.answer?.question ||
         ''
+      const exogenousBody = item.draft?.markdown || ''
 
       const exogenousOriginPrefix = item.kind === 'answer' ? 'agent' : 'human'
 
       const node =
         item.sourceType === 'exogenous'
           ? await api.createExogenous(
-              item.draft.markdown,
+              exogenousBody,
               item.sourceIds || [],
               `${exogenousOriginPrefix}:${exogenousQuestion.slice(0, 60)}`,
               {
@@ -349,7 +350,7 @@ export function useGraphWrites({
     const title =
       answerWorkspace?.draft?.title ?? answer.title ?? answer.question ?? t.answer
 
-    const answerQuestion = answer.question || title || ''
+    const answerQuestion = title || answer.question || ''
 
     const citedIds = answerWorkspace?.sourceIds || answer.citedIds || []
 

@@ -54,7 +54,7 @@ const STR = {
     emptyTitle: 'LLM Wiki に質問する',
     emptyText: '上部の検索バーまたは下部の入力欄から、ナレッジグラフに質問できます。',
     ai: 'AI',
-    you: 'You',
+    you: 'ユーザー',
   },
   en: {
     tagline: 'A living knowledge graph, in chat',
@@ -91,7 +91,7 @@ const STR = {
     emptyTitle: 'Ask LLM Wiki',
     emptyText: 'Use the top search bar or the input below to ask the knowledge graph.',
     ai: 'AI',
-    you: 'You',
+    you: 'User',
   },
 }
 
@@ -392,6 +392,7 @@ function AssistantMessage({
                   downloadMarkdown(
                     answerMarkdown,
                     m.answer?.title || m.answer?.question || m.title || 'llm-answer',
+                    rawById,
                   )
                 }
                 title={t.downloadMarkdown}
@@ -811,46 +812,7 @@ function MarkdownMessage({
 function rewriteCitedNodeIdsBlock(markdown, rawById, citationsLabel) {
   const text = String(markdown || '')
   if (!text.trim()) return text
-
-  return text.replace(
-    /(^|\n)\s*cited_node_ids\s*:\s*\[([\s\S]*?)\]/gi,
-    (full, prefix, body) => {
-      const ids = parseCitationNodeIds(body)
-
-      if (ids.length === 0) return full
-
-      const lines = ids.map((id) => {
-        const canonicalId = resolveCanonicalNodeId(id, rawById)
-        const label =
-          getNodeLabel(canonicalId, rawById) ||
-          getNodeLabel(id, rawById) ||
-          stripNodePrefix(id)
-
-        return `[${escapeMarkdownLinkText(label)}](#llm-wiki-node:${encodeURIComponent(
-          canonicalId || id,
-        )})`
-      })
-
-      return `${prefix}**${citationsLabel}**\n\n${lines.join('\n\n')}`
-    },
-  )
-}
-
-function parseCitationNodeIds(body) {
-  return Array.from(
-    new Set(
-      String(body || '')
-        .split(/[,\n]/)
-        .map((item) =>
-          item
-            .trim()
-            .replace(/^["'`]+/, '')
-            .replace(/["'`]+$/, '')
-            .trim(),
-        )
-        .filter(Boolean),
-    ),
-  )
+  return text
 }
 
 function autoResizeTextarea(el) {
@@ -861,11 +823,12 @@ function autoResizeTextarea(el) {
   el.style.height = `${next}px`
 }
 
-function downloadMarkdown(markdown, title) {
+function downloadMarkdown(markdown, title, rawById) {
   if (typeof document === 'undefined') return
 
   const filename = `${sanitizeFilename(title || 'llm-answer')}.md`
-  const blob = new Blob([markdown || ''], {
+  const cleaned = stripCitedNodeIdsBlocks(markdown || '', rawById)
+  const blob = new Blob([cleaned], {
     type: 'text/markdown;charset=utf-8',
   })
 
@@ -887,6 +850,28 @@ function sanitizeFilename(value) {
     .replace(/[\\/:*?"<>|]+/g, '-')
     .replace(/\s+/g, ' ')
     .slice(0, 90) || 'llm-answer'
+}
+
+function stripCitedNodeIdsBlocks(markdown, rawById) {
+  const NODE_ID_EXPORT_RE =
+    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
+
+  return String(markdown || '').replace(
+    NODE_ID_EXPORT_RE,
+    (full, prefix, candidate) => {
+      const left = prefix || ''
+      const rawCandidate = String(candidate || '').trim()
+      if (!rawCandidate) return full
+
+      const canonicalId = resolveCanonicalNodeId(rawCandidate, rawById)
+      if (!hasRawNode(rawById, canonicalId)) return full
+
+      const docName = getOriginalDocumentName(canonicalId, rawById)
+      if (!docName) return full
+
+      return `${left}${docName}`
+    },
+  )
 }
 
 function getAnswerMarkdown(message) {
@@ -919,8 +904,8 @@ function collectAnswerRefs(message, rawById, markdown) {
       id: canonicalId,
       originalId,
       label:
-        getNodeLabel(canonicalId, rawById, ref) ||
-        getNodeLabel(originalId, rawById, ref) ||
+        getReferenceLabel(canonicalId, rawById, ref) ||
+        getReferenceLabel(originalId, rawById, ref) ||
         prev.label ||
         `Source chunk ${syntheticIndex++}`,
     })
@@ -983,13 +968,14 @@ function protectMarkdownSpecialRegions(markdown, replacer) {
 
 function replaceNodeIdTextWithChunkLinks(text, catalog, rawById) {
   const NODE_ID_CANDIDATE_RE =
-    /(^|[^A-Za-z0-9_:\\-])((?:node:)?[A-Za-z0-9][A-Za-z0-9_.\\-]*(?::[A-Za-z0-9][A-Za-z0-9_.\\-]*)+)(?=$|[^A-Za-z0-9_:\\-])/g
+    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
 
   let syntheticIndex = 1
 
   return String(text || '').replace(
     NODE_ID_CANDIDATE_RE,
     (full, prefix, candidate) => {
+      const left = prefix || ''
       const rawCandidate = String(candidate || '').trim()
       if (!rawCandidate) return full
 
@@ -1007,13 +993,13 @@ function replaceNodeIdTextWithChunkLinks(text, catalog, rawById) {
 
       const label =
         known?.label ||
-        getNodeLabel(canonicalId, rawById) ||
-        getNodeLabel(rawCandidate, rawById) ||
+        getReferenceLabel(canonicalId, rawById) ||
+        getReferenceLabel(rawCandidate, rawById) ||
         `Source chunk ${syntheticIndex++}`
 
       const href = `#llm-wiki-node:${encodeURIComponent(canonicalId || rawCandidate)}`
 
-      return `${prefix}[${escapeMarkdownLinkText(label)}](${href})`
+      return `${left}[${escapeMarkdownLinkText(label)}](${href})`
     },
   )
 }
@@ -1030,8 +1016,8 @@ function buildNodeLinkCatalog(refs, rawById) {
     if (!canonicalId) return
 
     const label =
-      getNodeLabel(canonicalId, rawById, ref) ||
-      getNodeLabel(originalId, rawById, ref) ||
+      getReferenceLabel(canonicalId, rawById, ref) ||
+      getReferenceLabel(originalId, rawById, ref) ||
       ref?.label ||
       ref?.title ||
       ref?.entity ||
@@ -1074,7 +1060,7 @@ function findMentionedNodeIds(markdown, refs, rawById) {
   const found = new Set()
 
   const NODE_ID_CANDIDATE_RE =
-    /(^|[^A-Za-z0-9_:\\-])((?:node:)?[A-Za-z0-9][A-Za-z0-9_.\\-]*(?::[A-Za-z0-9][A-Za-z0-9_.\\-]*)+)(?=$|[^A-Za-z0-9_:\\-])/g
+    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
 
   let match
 
@@ -1108,7 +1094,7 @@ function extractExplicitNodeIdsFromMarkdown(markdown) {
   const found = new Set()
 
   const NODE_ID_CANDIDATE_RE =
-    /(^|[^A-Za-z0-9_:\\-])((?:node:)?[A-Za-z0-9][A-Za-z0-9_.\\-]*(?::[A-Za-z0-9][A-Za-z0-9_.\\-]*)+)(?=$|[^A-Za-z0-9_:\\-])/g
+    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
 
   let match
 
@@ -1186,6 +1172,35 @@ function getNodeLabel(id, rawById, fallbackRef) {
     fallbackRef?.title ||
     fallbackRef?.entity ||
     fallbackRef?.name ||
+    ''
+  )
+}
+
+function getReferenceLabel(id, rawById, fallbackRef) {
+  return (
+    getOriginalDocumentName(id, rawById) ||
+    getNodeLabel(id, rawById, fallbackRef)
+  )
+}
+
+function getOriginalDocumentName(id, rawById) {
+  const node =
+    getRawNode(rawById, id) ||
+    getRawNode(rawById, stripNodePrefix(id)) ||
+    getRawNode(rawById, addNodePrefix(stripNodePrefix(id)))
+
+  return (
+    node?.original_document_name ||
+    node?.document_name ||
+    node?.documentName ||
+    node?.sourceName ||
+    node?.source_name ||
+    node?.source_path ||
+    node?.metadata?.original_document_name ||
+    node?.metadata?.document_name ||
+    node?.metadata?.documentName ||
+    node?.metadata?.sourceName ||
+    node?.metadata?.source ||
     ''
   )
 }

@@ -190,117 +190,160 @@ function PreviewImageUnit({ src, alt, title }) {
   )
 }
 
-const markdownComponents = {
-  img: ({ node, src = '', alt = '', title, width, height }) => (
-    <SafeImage src={src} alt={alt} title={title} width={width} height={height} />
-  ),
+const NODE_ID_CANDIDATE_RE =
+  /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
+const CITED_NODE_IDS_BLOCK_RE =
+  /(^|\n)\s*cited_node_ids\s*:\s*\[([\s\S]*?)\]/gi
+const REFERENCE_NODES_LINE_RE =
+  /(^|\n)\s*(?:参照ノード|引用ノード|reference\s*nodes?|cited\s*nodes?)\s*[:：]\s*([^\n]*)/gi
 
-  a: ({ node, href = '', children, ...props }) => {
-    const isExternal = /^https?:\/\//i.test(href)
+function buildMarkdownComponents(onOpenNode, rawById) {
+  return {
+    img: ({ node, src = '', alt = '', title, width, height }) => (
+      <SafeImage src={src} alt={alt} title={title} width={width} height={height} />
+    ),
 
-    return (
-      <a
-        href={href}
-        target={isExternal ? '_blank' : undefined}
-        rel={isExternal ? 'noreferrer noopener' : undefined}
-        className="font-semibold text-blue underline underline-offset-2 hover:opacity-80"
-        {...props}
-      >
-        {children}
-      </a>
-    )
-  },
+    a: ({ node, href = '', children, ...props }) => {
+      const rawHref = String(href || '')
+      const candidateId = parseNodeHref(rawHref)
 
-  table: ({ children }) => (
-    <div className="my-5 overflow-x-auto rounded-lg border border-line">
-      <table className="w-full border-collapse text-sm">{children}</table>
-    </div>
-  ),
+      if (candidateId) {
+        const canonicalId = resolveCanonicalNodeId(candidateId, rawById)
 
-  thead: ({ children, ...props }) => (
-    <thead className="bg-soft" {...props}>
-      {children}
-    </thead>
-  ),
+        if (!hasRawNode(rawById, canonicalId)) {
+          return null
+        }
 
-  tbody: ({ children, ...props }) => <tbody {...props}>{children}</tbody>,
+        return (
+          <button
+            type="button"
+            className="font-semibold text-blue underline underline-offset-2 hover:opacity-80"
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              onOpenNode?.(canonicalId)
+            }}
+          >
+            {children}
+          </button>
+        )
+      }
 
-  tr: ({ children, ...props }) => (
-    <tr className="border-b border-line last:border-b-0" {...props}>
-      {children}
-    </tr>
-  ),
+      const isExternal = /^https?:\/\//i.test(rawHref)
 
-  th: ({ children, ...props }) => (
-    <th
-      className="border-r border-line bg-soft px-3 py-2 text-left font-bold last:border-r-0"
-      {...props}
-    >
-      {children}
-    </th>
-  ),
-
-  td: ({ children, ...props }) => (
-    <td
-      className="border-r border-line px-3 py-2 align-top last:border-r-0"
-      {...props}
-    >
-      {children}
-    </td>
-  ),
-
-  code: ({ node, inline, className = '', children, ...props }) => {
-    if (!inline && className.includes('language-mermaid')) {
-      return <MermaidDiagram code={String(children).replace(/\n$/, '')} />
-    }
-
-    if (inline) {
       return (
-        <code
-          className="rounded bg-soft px-1.5 py-0.5 font-mono text-[0.9em]"
+        <a
+          href={href}
+          target={isExternal ? '_blank' : undefined}
+          rel={isExternal ? 'noreferrer noopener' : undefined}
+          className="font-semibold text-blue underline underline-offset-2 hover:opacity-80"
           {...props}
         >
           {children}
-        </code>
+        </a>
       )
-    }
+    },
 
-    return (
-      <code className={className} {...props}>
+    table: ({ children }) => (
+      <div className="my-5 overflow-x-auto rounded-lg border border-line">
+        <table className="w-full border-collapse text-sm">{children}</table>
+      </div>
+    ),
+
+    thead: ({ children, ...props }) => (
+      <thead className="bg-soft" {...props}>
         {children}
-      </code>
-    )
-  },
+      </thead>
+    ),
 
-  pre: ({ children, ...props }) => {
-    const child = Array.isArray(children) ? children[0] : children
+    tbody: ({ children, ...props }) => <tbody {...props}>{children}</tbody>,
 
-    if ((child?.props?.className || '').includes('language-mermaid')) {
-      return <>{children}</>
-    }
+    tr: ({ children, ...props }) => (
+      <tr className="border-b border-line last:border-b-0" {...props}>
+        {children}
+      </tr>
+    ),
 
-    return (
-      <pre
-        className="my-4 overflow-x-auto rounded-lg border border-line bg-[#0f172a] p-4 text-sm text-white"
+    th: ({ children, ...props }) => (
+      <th
+        className="border-r border-line bg-soft px-3 py-2 text-left font-bold last:border-r-0"
         {...props}
       >
         {children}
-      </pre>
-    )
-  },
+      </th>
+    ),
 
-  blockquote: ({ children, ...props }) => (
-    <blockquote
-      className="my-4 border-l-4 border-blue/40 bg-blue/5 px-4 py-2 text-muted"
-      {...props}
-    >
-      {children}
-    </blockquote>
-  ),
+    td: ({ children, ...props }) => (
+      <td
+        className="border-r border-line px-3 py-2 align-top last:border-r-0"
+        {...props}
+      >
+        {children}
+      </td>
+    ),
+
+    code: ({ node, inline, className = '', children, ...props }) => {
+      if (!inline && className.includes('language-mermaid')) {
+        return <MermaidDiagram code={String(children).replace(/\n$/, '')} />
+      }
+
+      if (inline) {
+        return (
+          <code
+            className="rounded bg-soft px-1.5 py-0.5 font-mono text-[0.9em]"
+            {...props}
+          >
+            {children}
+          </code>
+        )
+      }
+
+      return (
+        <code className={className} {...props}>
+          {children}
+        </code>
+      )
+    },
+
+    pre: ({ children, ...props }) => {
+      const child = Array.isArray(children) ? children[0] : children
+
+      if ((child?.props?.className || '').includes('language-mermaid')) {
+        return <>{children}</>
+      }
+
+      return (
+        <pre
+          className="my-4 overflow-x-auto rounded-lg border border-line bg-[#0f172a] p-4 text-sm text-white"
+          {...props}
+        >
+          {children}
+        </pre>
+      )
+    },
+
+    blockquote: ({ children, ...props }) => (
+      <blockquote
+        className="my-4 border-l-4 border-blue/40 bg-blue/5 px-4 py-2 text-muted"
+        {...props}
+      >
+        {children}
+      </blockquote>
+    ),
+  }
 }
 
-function MarkdownChunk({ markdown }) {
-  if (!markdown) return null
+function MarkdownChunk({ markdown, onOpenNode, rawById }) {
+  const safeMarkdown = String(markdown || '')
+  const linkedMarkdown = useMemo(
+    () => linkifyNodeIdsInMarkdown(safeMarkdown, rawById),
+    [safeMarkdown, rawById],
+  )
+  const markdownComponents = useMemo(
+    () => buildMarkdownComponents(onOpenNode, rawById),
+    [onOpenNode, rawById],
+  )
+  if (!safeMarkdown) return null
 
   return (
     <ReactMarkdown
@@ -319,15 +362,24 @@ function MarkdownChunk({ markdown }) {
       ]}
       components={markdownComponents}
     >
-      {markdown}
+      {linkedMarkdown}
     </ReactMarkdown>
   )
 }
 
-export function MarkdownRenderer({ markdown }) {
+export function MarkdownRenderer({
+  markdown,
+  onOpenNode,
+  rawById,
+  referenceLabel = 'Reference',
+}) {
+  const normalizedMarkdown = useMemo(
+    () => rewriteCitedNodeIdsBlock(markdown || '', rawById, referenceLabel),
+    [markdown, rawById, referenceLabel],
+  )
   const parts = useMemo(
-    () => splitMarkdownByImageUnits(markdown || ''),
-    [markdown],
+    () => splitMarkdownByImageUnits(normalizedMarkdown),
+    [normalizedMarkdown],
   )
 
   return (
@@ -344,8 +396,207 @@ export function MarkdownRenderer({ markdown }) {
           )
         }
 
-        return <MarkdownChunk key={`markdown-${index}`} markdown={part.content} />
+        return (
+          <MarkdownChunk
+            key={`markdown-${index}`}
+            markdown={part.content}
+            onOpenNode={onOpenNode}
+            rawById={rawById}
+          />
+        )
       })}
     </>
   )
+}
+
+export function stripCitedNodeIdsBlocks(markdown, rawById) {
+  return String(markdown || '').replace(
+    NODE_ID_CANDIDATE_RE,
+    (full, prefix, candidate) => {
+      const left = prefix || ''
+      const rawCandidate = String(candidate || '').trim()
+      if (!rawCandidate || !looksLikeNodeId(rawCandidate)) return full
+
+      const canonicalId = resolveCanonicalNodeId(rawCandidate, rawById)
+      if (!hasRawNode(rawById, canonicalId)) return full
+
+      const docName = getOriginalDocumentName(canonicalId, rawById)
+      if (!docName) return full
+
+      return `${left}${docName}`
+    },
+  )
+}
+
+function rewriteCitedNodeIdsBlock(markdown, rawById, referenceLabel) {
+  const text = String(markdown || '')
+  if (!text.trim()) return text
+  return text
+}
+
+function linkifyNodeIdsInMarkdown(markdown, rawById) {
+  const text = String(markdown || '')
+  if (!text.trim() || !rawById) return text
+
+  return protectMarkdownSpecialRegions(text, (plainText) => {
+    return replaceNodeIdTextWithLinks(plainText, rawById)
+  })
+}
+
+function replaceNodeIdTextWithLinks(text, rawById) {
+  return String(text || '').replace(
+    NODE_ID_CANDIDATE_RE,
+    (full, prefix, candidate) => {
+      const left = prefix || ''
+      const rawCandidate = String(candidate || '').trim()
+      if (!rawCandidate || !looksLikeNodeId(rawCandidate)) return full
+
+      const canonicalId = resolveCanonicalNodeId(rawCandidate, rawById)
+      if (!hasRawNode(rawById, canonicalId)) {
+        return rawCandidate.startsWith('node:') ? left : full
+      }
+
+      const label = getReferenceLabel(canonicalId, rawById) || stripNodePrefix(canonicalId)
+      const href = `#llm-wiki-node:${encodeURIComponent(canonicalId)}`
+
+      return `${left}[${escapeMarkdownLinkText(label)}](${href})`
+    },
+  )
+}
+
+function protectMarkdownSpecialRegions(markdown, replacer) {
+  return String(markdown || '')
+    .split(/(```[\s\S]*?```|`[^`\n]*`|!?\[[^\]]*\]\([^)]+\))/g)
+    .map((part) => {
+      if (!part) return part
+      if (part.startsWith('```')) return part
+      if (part.startsWith('`') && part.endsWith('`')) return part
+      if (/^!?\[[^\]]*\]\([^)]+\)$/.test(part)) return part
+
+      return replacer(part)
+    })
+    .join('')
+}
+
+function parseNodeHref(href) {
+  const raw = String(href || '').trim()
+  if (!raw) return ''
+
+  if (raw.startsWith('#llm-wiki-node:')) {
+    return decodeURIComponent(raw.slice('#llm-wiki-node:'.length))
+  }
+
+  if (raw.startsWith('#node:')) return raw.slice(1)
+  if (looksLikeNodeId(raw)) return raw
+
+  return ''
+}
+
+function getReferenceLabel(id, rawById) {
+  return (
+    getOriginalDocumentName(id, rawById) ||
+    getNodeLabel(id, rawById) ||
+    ''
+  )
+}
+
+function getNodeLabel(id, rawById) {
+  const node =
+    getRawNode(rawById, id) ||
+    getRawNode(rawById, stripNodePrefix(id)) ||
+    getRawNode(rawById, addNodePrefix(stripNodePrefix(id)))
+
+  return (
+    node?.title ||
+    node?.label ||
+    node?.entity ||
+    node?.name ||
+    node?.heading ||
+    node?.metadata?.title ||
+    node?.metadata?.label ||
+    ''
+  )
+}
+
+function getOriginalDocumentName(id, rawById) {
+  const node =
+    getRawNode(rawById, id) ||
+    getRawNode(rawById, stripNodePrefix(id)) ||
+    getRawNode(rawById, addNodePrefix(stripNodePrefix(id)))
+
+  return (
+    node?.original_document_name ||
+    node?.document_name ||
+    node?.documentName ||
+    node?.sourceName ||
+    node?.source_name ||
+    node?.source_path ||
+    node?.metadata?.original_document_name ||
+    node?.metadata?.document_name ||
+    node?.metadata?.documentName ||
+    node?.metadata?.sourceName ||
+    node?.metadata?.source ||
+    ''
+  )
+}
+
+function getRawNode(rawById, id) {
+  const clean = String(id || '').trim()
+  if (!clean || !rawById) return null
+
+  if (typeof rawById.get === 'function') {
+    return rawById.get(clean) || null
+  }
+
+  return rawById[clean] || null
+}
+
+function hasRawNode(rawById, id) {
+  const clean = String(id || '').trim()
+  if (!clean || !rawById) return false
+
+  if (typeof rawById.has === 'function') {
+    return rawById.has(clean)
+  }
+
+  return Object.prototype.hasOwnProperty.call(rawById, clean)
+}
+
+function stripNodePrefix(id) {
+  return String(id || '').replace(/^node:/, '')
+}
+
+function addNodePrefix(id) {
+  const clean = String(id || '').trim()
+  if (!clean) return clean
+  return clean.startsWith('node:') ? clean : `node:${clean}`
+}
+
+function resolveCanonicalNodeId(id, rawById) {
+  const clean = String(id || '').trim()
+  if (!clean) return clean
+
+  const withoutNode = stripNodePrefix(clean)
+  const withNode = addNodePrefix(withoutNode)
+
+  if (hasRawNode(rawById, clean)) return clean
+  if (hasRawNode(rawById, withoutNode)) return withoutNode
+  if (hasRawNode(rawById, withNode)) return withNode
+
+  return withoutNode || clean
+}
+
+function looksLikeNodeId(value) {
+  const text = String(value || '').trim()
+  if (!text) return false
+  return /^(?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\-]*[A-Za-z0-9])?)+$/.test(
+    text,
+  )
+}
+
+function escapeMarkdownLinkText(value) {
+  return String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
 }
