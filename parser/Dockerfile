@@ -38,9 +38,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Fonts (CJK needed for wiki content) plus headless-chrome runtime libraries.
-RUN apt-get update && \
+RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl unzip passwd \
+      ca-certificates curl unzip passwd openssh-server util-linux \
       fontconfig fonts-liberation fonts-noto-cjk fonts-noto-color-emoji fonts-noto-core \
       libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 libdbus-1-3 \
       libdrm2 libexpat1 libgbm1 libgl1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 \
@@ -62,14 +63,25 @@ RUN curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/150.0.7
 
 RUN groupadd --gid 1000 seigyo && \
     useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash seigyo && \
-    install -d -o seigyo -g seigyo \
+    echo 'seigyo:seigyo@rikiseisan' | chpasswd && \
+    install -d -m 0755 -o seigyo -g seigyo \
       "${APP_HOME}" "${APP_HOME}/cache" "${APP_HOME}/temp" \
-      /home/seigyo/.cache/huggingface
+      /home/seigyo/.cache \
+      /home/seigyo/.cache/flashinfer \
+      /home/seigyo/.cache/huggingface \
+      /home/seigyo/.cache/vllm && \
+    install -d -m 0755 -o root -g root /run/sshd /etc/ssh/sshd_config.d && \
+    printf '%s\n' \
+      'PasswordAuthentication yes' \
+      'PermitRootLogin no' \
+      > /etc/ssh/sshd_config.d/parser.conf && \
+    rm -f /etc/ssh/ssh_host_*
 
 # lmcache's transformers>=5.4 requirement conflicts with MinerU's
 # transformers<5. PyGObject is broken-but-unused in the upstream base.
 # mineru stays pinned: model_bundle.py's expected model layout tracks it.
-RUN python3 -m pip uninstall -y lmcache PyGObject && \
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip,sharing=locked \
+    python3 -m pip uninstall -y lmcache PyGObject && \
     python3 -m pip install --break-system-packages \
       "mineru[core]==3.4.4" \
       requests \
@@ -78,15 +90,14 @@ RUN python3 -m pip uninstall -y lmcache PyGObject && \
       pydantic \
       fastapi \
       "uvicorn[standard]" \
-      python-multipart && \
-    rm -rf /root/.cache/pip
+      python-multipart
 
 # Bake the MinerU models so the container runs offline.
 COPY parser/model_bundle.py /usr/local/lib/model_bundle.py
-RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 HF_HOME=/tmp/hf \
+RUN --mount=type=cache,id=hf-model-cache,target=/tmp/hf,sharing=locked \
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 HF_HOME=/tmp/hf \
       python3 /usr/local/lib/model_bundle.py download && \
-    chmod -R a=rX /opt/mineru/models && \
-    rm -rf /tmp/hf
+    chmod -R a=rX /opt/mineru/models
 
 RUN mkdir -p /opt/mermaid-cli && \
     cd /opt/mermaid-cli && \
@@ -142,6 +153,11 @@ export MINERU_EFFORT="${MINERU_EFFORT:-medium}"
 
 python3 /usr/local/lib/model_bundle.py verify
 
+mkdir -p /run/sshd
+chmod 0755 /run/sshd
+ssh-keygen -A
+/usr/sbin/sshd
+
 if [[ "${PARSER_REQUIRE_GPU:-1}" == "1" ]]; then
   if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null; then
     echo "ERROR: NVIDIA runtime is unavailable. Start with: docker run --gpus all ..." >&2
@@ -150,7 +166,7 @@ if [[ "${PARSER_REQUIRE_GPU:-1}" == "1" ]]; then
 fi
 
 echo "Starting parser: backend=${MINERU_BACKEND}; method=${MINERU_METHOD}; effort=${MINERU_EFFORT}"
-exec python3 -m uvicorn server:app --host 0.0.0.0 --port 8000
+exec runuser -u seigyo -- python3 -m uvicorn server:app --host 0.0.0.0 --port 8000
 EOF
 
 # PROXY_URL is the single source of truth at runtime. An explicitly empty
@@ -182,12 +198,12 @@ RUN chmod 0555 /usr/local/bin/start-parser /usr/local/bin/container-entrypoint /
 # disabled with --build-arg PROXY_URL=.
 ENV PROXY_URL="http://133.141.7.237:9515" \
     NO_PROXY_VALUE="localhost,127.0.0.1,::1" \
-    GPU_MEMORY_UTILIZATION="0.05" 
+    GPU_MEMORY_UTILIZATION="0.05"
 
 WORKDIR ${APP_HOME}
-USER seigyo
+USER root
 
-EXPOSE 8000
+EXPOSE 22 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/queue", timeout=3).read()' || exit 1
 
