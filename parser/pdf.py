@@ -7,10 +7,7 @@ from pathlib import Path
 
 PDF_DIR = Path(os.environ.get("PDF_DIR", "./pdfs"))
 OUTPUT_DIR = Path(os.environ.get("MINERU_OUTPUT_DIR", "./mineru"))
-MINERU_BACKEND = os.environ.get("MINERU_BACKEND", "hybrid-engine")
-MINERU_METHOD = os.environ.get("MINERU_METHOD", "auto")
-MINERU_EFFORT = os.environ.get("MINERU_EFFORT", "medium")
-
+GPU_MEMORY_UTILIZATION = "0.05"
 
 def main() -> int:
     if not PDF_DIR.exists():
@@ -53,12 +50,8 @@ def main() -> int:
             str(pdf_path),
             "-o",
             str(OUTPUT_DIR),
-            "--backend",
-            MINERU_BACKEND,
-            "--method",
-            MINERU_METHOD,
-            "--effort",
-            MINERU_EFFORT,
+            "--gpu-memory-utilization",
+            GPU_MEMORY_UTILIZATION,
         ]
 
         print("  RUN:", " ".join(cmd))

@@ -30,9 +30,6 @@ const COOKIE_KEYS = {
   llmModel: 'pdf_parser_llm_model',
 }
 
-const TINY_PNG_DATA_URL =
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
-
 const IMAGE_UNIT_EXAMPLE = `<image-unit>
   <image-media>
     <img src="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD..." alt="">
@@ -281,6 +278,8 @@ const STR = {
     imageDescriptions: '画像説明を生成する',
     imageDescriptionsHelp:
       'OpenAI 互換の画像対応モデルを使える場合のみ有効にしてください。処理時間が長くなることがあります。',
+    imageDescriptionMaintenanceBanner:
+      '画像説明パイプラインは現在メンテナンス中のため、当面は画像説明が空で返ります。',
     mermaidDiagrams: 'Mermaid 図を生成する',
     mermaidDiagramsHelp:
       'フローチャートなどを Mermaid テキストとして保持できます。ただし検証と修復のため追加時間がかかります。',
@@ -365,6 +364,8 @@ const STR = {
     imageDescriptions: 'Generate image descriptions',
     imageDescriptionsHelp:
       'Enable this only when you have an OpenAI-compatible vision model. Processing may take longer.',
+    imageDescriptionMaintenanceBanner:
+      'Image description pipeline is currently under maintenance, so image descriptions will be empty for now.',
     mermaidDiagrams: 'Generate Mermaid diagrams',
     mermaidDiagramsHelp:
       'Flowcharts can be preserved as Mermaid text, but validation and repair add extra processing time.',
@@ -716,26 +717,12 @@ function mergeQueueItems(oldItems, newItems) {
   return pruneQueueItems([...map.values()])
 }
 
-function normalizeBaseUrl(url) {
-  return String(url || '').trim().replace(/\/+$/, '')
-}
-
 const PARSER_API = {
   queue: '/queue',
   upload: '/upload',
   status: (taskId) => `/status/${encodeURIComponent(taskId)}`,
   result: (taskId) => `/result/${encodeURIComponent(taskId)}`,
   queueItem: (taskId) => `/queue/${encodeURIComponent(taskId)}`,
-}
-
-function chatCompletionsUrl(baseUrl) {
-  const base = normalizeBaseUrl(baseUrl)
-
-  if (base.endsWith('/chat/completions')) {
-    return base
-  }
-
-  return `${base}/chat/completions`
 }
 
 function statusLabel(status, t) {
@@ -826,19 +813,15 @@ export default function App() {
   )
 
   const [file, setFile] = useState(null)
-  const [generateImageDescriptions, setGenerateImageDescriptions] = useState(false)
-  const [generateMermaidDiagrams, setGenerateMermaidDiagrams] = useState(false)
 
   const [busy, setBusy] = useState(false)
   const [queueBusy, setQueueBusy] = useState(false)
-  const [checkingVision, setCheckingVision] = useState(false)
   const [downloadingTaskId, setDownloadingTaskId] = useState(null)
   const [deletingTaskId, setDeletingTaskId] = useState(null)
 
   const [status, setStatus] = useState('')
   const [taskId, setTaskId] = useState(null)
   const [error, setError] = useState(null)
-  const [visionCheck, setVisionCheck] = useState('')
 
   const [queueItems, setQueueItems] = useState(() => loadStoredQueue())
 
@@ -881,12 +864,6 @@ export default function App() {
     queueRef.current = queueItems
     saveStoredQueue(queueItems)
   }, [queueItems])
-
-  useEffect(() => {
-    if (!generateImageDescriptions) {
-      setGenerateMermaidDiagrams(false)
-    }
-  }, [generateImageDescriptions])
 
   const toggleLang = () => {
     setLang((prev) => (prev === 'ja' ? 'en' : 'ja'))
@@ -978,88 +955,10 @@ export default function App() {
     setTaskId(null)
   }
 
-  const runChatProbe = async ({ withImage }) => {
-    const body = {
-      model: llmModel.trim(),
-      messages: [
-        {
-          role: 'user',
-          content: withImage
-            ? [
-                {
-                  type: 'text',
-                  text: 'Reply with exactly OK if you can process this image.',
-                },
-                {
-                  type: 'image_url',
-                  image_url: {
-                    url: TINY_PNG_DATA_URL,
-                  },
-                },
-              ]
-            : 'Reply with exactly OK.',
-        },
-      ],
-      max_tokens: 8,
-      temperature: 0,
-      stream: false,
-    }
-
-    const res = await fetch(chatCompletionsUrl(llmBaseUrl), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${llmApiKey.trim()}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(body),
-    })
-
-    if (!res.ok) {
-      const text = await readErrorResponse(res)
-      throw new Error(text || `HTTP ${res.status}`)
-    }
-
-    return res.json()
-  }
-
-  const checkVisionEndpoint = async () => {
-    setCheckingVision(true)
-    setVisionCheck('')
-    setError(null)
-
-    try {
-      if (!llmBaseUrl.trim() || !llmApiKey.trim() || !llmModel.trim()) {
-        throw new Error(t.fillLlm)
-      }
-
-      await runChatProbe({ withImage: false })
-
-      try {
-        await runChatProbe({ withImage: true })
-        setVisionCheck(t.visionOk)
-      } catch (visionError) {
-        setVisionCheck(t.visionPartial(visionError.message || visionError))
-      }
-    } catch (e) {
-      setVisionCheck('')
-      setError(t.llmCheckFailed(e.message || e))
-    } finally {
-      setCheckingVision(false)
-    }
-  }
-
   const upload = async () => {
     if (!file) {
       setError(t.selectPdf)
       return
-    }
-
-    if (generateImageDescriptions) {
-      if (!llmBaseUrl.trim() || !llmApiKey.trim() || !llmModel.trim()) {
-        setError(t.fillLlm)
-        return
-      }
     }
 
     setBusy(true)
@@ -1074,11 +973,9 @@ export default function App() {
       fd.append('base_url', llmBaseUrl.trim())
       fd.append('api_key', llmApiKey.trim())
       fd.append('model', llmModel.trim())
-      fd.append('describe_images', generateImageDescriptions ? 'true' : 'false')
-      fd.append(
-        'generate_mermaid',
-        generateImageDescriptions && generateMermaidDiagrams ? 'true' : 'false'
-      )
+      // Temporarily forced off in frontend to match backend maintenance mode.
+      fd.append('describe_images', 'false')
+      fd.append('generate_mermaid', 'false')
 
       const uploadRes = await fetch(PARSER_API.upload, {
         method: 'POST',
@@ -1277,80 +1174,40 @@ export default function App() {
               </div>
 
               <div className="grid gap-[8px]">
-                <ToggleField
-                  label={t.imageDescriptions}
-                  checked={generateImageDescriptions}
-                  onChange={setGenerateImageDescriptions}
-                  disabled={busy}
-                />
-
-                <p className="m-0 text-[12px] leading-[1.45] text-slate-500">
-                  {t.imageDescriptionsHelp}
+                <p className="m-0 rounded-xl border border-[#facc15]/45 bg-[#fef9c3] px-[10px] py-[7px] text-[12px] leading-[1.45] text-[#854d0e]">
+                  {t.imageDescriptionMaintenanceBanner}
                 </p>
 
-                {generateImageDescriptions && (
-                  <div className="mt-[6px] rounded-2xl border border-slate-200 bg-slate-50/80 p-[12px] shadow-sm">
-                    <div className="grid grid-cols-1 gap-[12px] md:grid-cols-2">
-                      <Field
-                        label={t.llmBaseUrl}
-                        value={llmBaseUrl}
-                        onChange={setLlmBaseUrl}
-                        placeholder={import.meta.env.VITE_OPENAI_BASE_URL || ''}
-                        disabled={busy}
-                      />
+                {/* <div className="mt-[6px] rounded-2xl border border-slate-200 bg-slate-50/80 p-[12px] shadow-sm">
+                  <div className="grid grid-cols-1 gap-[12px] md:grid-cols-2">
+                    <Field
+                      label={t.llmBaseUrl}
+                      value={llmBaseUrl}
+                      onChange={setLlmBaseUrl}
+                      placeholder={import.meta.env.VITE_OPENAI_BASE_URL || ''}
+                      disabled={busy}
+                    />
 
-                      <Field
-                        label={t.model}
-                        value={llmModel}
-                        onChange={setLlmModel}
-                        placeholder={import.meta.env.VITE_MODEL || ''}
-                        disabled={busy}
-                      />
-                    </div>
-
-                    <div className="mt-[12px]">
-                      <Field
-                        label={t.apiKey}
-                        value={llmApiKey}
-                        onChange={setLlmApiKey}
-                        placeholder={import.meta.env.VITE_OPENAI_API_KEY || ''}
-                        disabled={busy}
-                        password
-                      />
-                    </div>
-
-                    <div className="mt-[12px] grid gap-[8px]">
-                      <ToggleField
-                        label={t.mermaidDiagrams}
-                        checked={generateMermaidDiagrams}
-                        onChange={setGenerateMermaidDiagrams}
-                        disabled={busy}
-                      />
-
-                      <p className="m-0 text-[12px] leading-[1.45] text-slate-500">
-                        {t.mermaidDiagramsHelp}
-                      </p>
-                    </div>
-
-                    <div className="mt-[12px] flex flex-wrap items-center gap-[10px]">
-                      <button
-                        type="button"
-                        disabled={checkingVision}
-                        onClick={checkVisionEndpoint}
-                        className={`inline-flex items-center gap-[7px] ${UI.secondaryButtonLarge}`}
-                      >
-                        <CheckCircle2 size={15} />
-                        {checkingVision ? t.checkingEndpoint : t.checkVision}
-                      </button>
-
-                      <span className="text-[12px] text-slate-500">
-                        {t.visionProbeHelp}
-                      </span>
-                    </div>
-
-                    {visionCheck && <Notice type="success">{visionCheck}</Notice>}
+                    <Field
+                      label={t.model}
+                      value={llmModel}
+                      onChange={setLlmModel}
+                      placeholder={import.meta.env.VITE_MODEL || ''}
+                      disabled={busy}
+                    />
                   </div>
-                )}
+
+                  <div className="mt-[12px]">
+                    <Field
+                      label={t.apiKey}
+                      value={llmApiKey}
+                      onChange={setLlmApiKey}
+                      placeholder={import.meta.env.VITE_OPENAI_API_KEY || ''}
+                      disabled={busy}
+                      password
+                    />
+                  </div>
+                </div> */}
               </div>
 
               <div className="mt-[4px] flex flex-wrap items-center gap-[10px]">
@@ -1584,22 +1441,6 @@ function Field({ label, value, onChange, placeholder, disabled, password = false
         onChange={(e) => onChange(e.target.value)}
         className={UI.input}
       />
-    </label>
-  )
-}
-
-function ToggleField({ label, checked, onChange, disabled }) {
-  return (
-    <label className="flex items-center gap-[9px] text-[13px] font-bold text-slate-700">
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.checked)}
-        className="h-[15px] w-[15px] accent-blue-600 transition-transform duration-150 active:scale-90 disabled:opacity-60"
-      />
-
-      <span>{label}</span>
     </label>
   )
 }
