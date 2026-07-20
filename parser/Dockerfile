@@ -70,7 +70,15 @@ RUN groupadd --gid 1000 seigyo && \
 # transformers<5. PyGObject is broken-but-unused in the upstream base.
 # mineru stays pinned: model_bundle.py's expected model layout tracks it.
 RUN python3 -m pip uninstall -y lmcache PyGObject && \
-    python3 -m pip install --break-system-packages "mineru[core]==3.4.4" requests python-dotenv && \
+    python3 -m pip install --break-system-packages \
+      "mineru[core]==3.4.4" \
+      requests \
+      python-dotenv \
+      langchain-openai \
+      pydantic \
+      fastapi \
+      "uvicorn[standard]" \
+      python-multipart && \
     rm -rf /root/.cache/pip
 
 # Bake the MinerU models so the container runs offline.
@@ -116,14 +124,13 @@ COPY --chown=seigyo:seigyo <<'EOF' ${APP_HOME}/puppeteer-config.json
 }
 EOF
 
-COPY --chown=seigyo:seigyo parser/frontend/ ${APP_HOME}/frontend/
+COPY --chown=seigyo:seigyo parser/ ${APP_HOME}/
 RUN cd "${APP_HOME}/frontend" && \
     npm ci && \
     npm run build && \
     rm -rf node_modules /root/.npm && \
     chown -R seigyo:seigyo "${APP_HOME}/frontend"
 
-COPY --chown=seigyo:seigyo parser/*.py ${APP_HOME}/
 
 COPY <<'EOF' /usr/local/bin/start-parser
 #!/usr/bin/env bash
@@ -175,9 +182,7 @@ RUN chmod 0555 /usr/local/bin/start-parser /usr/local/bin/container-entrypoint /
 # disabled with --build-arg PROXY_URL=.
 ENV PROXY_URL="http://133.141.7.237:9515" \
     NO_PROXY_VALUE="localhost,127.0.0.1,::1" \
-    MINERU_BACKEND="hybrid-engine" \
-    MINERU_METHOD="auto" \
-    MINERU_EFFORT="medium"
+    GPU_MEMORY_UTILIZATION="0.05" 
 
 WORKDIR ${APP_HOME}
 USER seigyo
