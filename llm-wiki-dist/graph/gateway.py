@@ -13,6 +13,7 @@ import urllib.request
 from typing import Any, Callable
 
 from dotenv import load_dotenv
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_openai import ChatOpenAI
 
 from .core import GRAPH_SYSTEM_PROMPT, Settings, strip_image_media
@@ -99,6 +100,10 @@ class LlmClient:
         # Persistent chat history used by invoke() and invoke_structured().
         self.message_history: list[dict[str, Any]] = []
 
+        # Usage of the most recent run_messages()/run_messages_structured() call,
+        # for callers that want to log token cost (see researcher.py _log_usage).
+        self.last_usage: dict[str, Any] = {}
+
         # Add the system prompt at the start of the conversation, if provided.
         if self.system_prompt.strip():
             self.message_history.append(
@@ -152,6 +157,7 @@ class LlmClient:
 
         def operation() -> str:
             response = self.llm.invoke(normalized_messages)
+            self.last_usage = getattr(response, "usage_metadata", None) or {}
 
             # LangChain returns an AIMessage; extract its text content.
             text = self._message_text(response)
@@ -183,9 +189,16 @@ class LlmClient:
                 method="json_schema",
             )
 
+            # Fresh handler per call: cheap way to read this call's token usage
+            # without changing structured_llm.invoke()'s return shape.
+            usage_cb = UsageMetadataCallbackHandler()
+
             # No manual JSON extraction or model_validate_json needed.
             # If this raises JSON/Pydantic errors, app-level retry catches it.
-            result = structured_llm.invoke(normalized_messages)
+            result = structured_llm.invoke(
+                normalized_messages, config={"callbacks": [usage_cb]}
+            )
+            self.last_usage = next(iter(usage_cb.usage_metadata.values()), {})
 
             # Defensive validation in case a provider/LangChain version returns
             # a dict/string instead of the already-validated Pydantic object.

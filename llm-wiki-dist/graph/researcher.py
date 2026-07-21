@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from threading import Event
 from typing import TYPE_CHECKING, Any, Callable
 
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import AIMessage
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
@@ -108,6 +109,33 @@ def _image_blocks(text: str | None, mode: str) -> list[dict[str, Any]]:
     ]
 
 
+# jsonl file where each ask() call appends one row: query, answer, steps, token usage.
+# For cost estimation only; not served to any client.
+_USAGE_LOG_PATH = os.environ.get("WIKI_USAGE_LOG_PATH", "usage_log.jsonl")
+_usage_log_lock = threading.Lock()
+
+
+def _log_usage(
+    question: str, answer: str, steps: int, usages: list[dict[str, Any]]
+) -> None:
+    """Append one usage row for a completed ask() call. Best-effort: logging must
+    never break a research query, so any failure here is swallowed and logged."""
+    totals = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}
+    for usage in usages:
+        totals["input_tokens"] += usage.get("input_tokens") or 0
+        totals["output_tokens"] += usage.get("output_tokens") or 0
+        totals["cached_tokens"] += (usage.get("input_token_details") or {}).get(
+            "cache_read", 0
+        ) or 0
+
+    row = {"query": question, "final_answer": answer, "steps": steps, **totals}
+    try:
+        with _usage_log_lock, open(_USAGE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log.info("usage log write failed: %s", exc)
+
+
 class AgentStopped(Exception):
     """Raised when a client cancels an in-flight LangGraph run."""
 
@@ -138,6 +166,7 @@ def _model(settings: Settings) -> ChatOpenAI:
         temperature=settings.chat_temperature,
         timeout=300,
         max_retries=0,
+        stream_usage=True,  # populate usage_metadata for token/cost logging (_log_usage)
         extra_body={"chat_template_kwargs": {"enable_thinking": True}},
     )
 
@@ -527,6 +556,7 @@ def run_lead_agent(
                 "recursion_limit": max(50, session.settings.agent_max_steps * 2 + 4),
                 # Keep tool execution serial to avoid SQLite/threading issues.
                 "max_concurrency": 1,
+                "callbacks": [session._usage_cb],
             },
         )
     except Exception as exc:
@@ -843,6 +873,7 @@ def run_subagent(
             "recursion_limit": max(30, session.settings.subagent_max_steps * 2 + 6),
             # Optional but useful with SQLite/tool thread issues.
             "max_concurrency": 1,
+            "callbacks": [session._usage_cb],
         },
     )
 
@@ -907,6 +938,14 @@ class ResearchSession:
         # agent does not start blind.
         self._lead_seed_context = ""
         self._lead_seed_node_ids: list[str] = []
+
+        # Shared across every agent.invoke() call this session makes (lead agent +
+        # all subagents), so ask() can log one aggregated token-usage row per query.
+        self._usage_cb = UsageMetadataCallbackHandler()
+
+        # Usage from non-agent LLM calls (early-exit router + shallow answer),
+        # which don't go through agent.invoke() / self._usage_cb above.
+        self._extra_usage: list[dict[str, Any]] = []
 
     # Per-request overrides: one /api/ask may carry a subset of tunables;
     # anything omitted falls back to the global runtime defaults. Applied to a
@@ -1432,6 +1471,9 @@ class ResearchSession:
                 answer.answer, self.llm, self.settings, emit
             )
 
+        usages = [*self._usage_cb.usage_metadata.values(), *self._extra_usage]
+        _log_usage(question, answer.answer, answer.steps, usages)
+
         emit({"type": "done"})
         return answer
 
@@ -1479,6 +1521,8 @@ class ResearchSession:
             raw = self.llm.complete_structured(
                 ROUTER_PROMPT, json.dumps(payload, ensure_ascii=False), RouteDecision
             )
+            if getattr(self.llm, "last_usage", None):
+                self._extra_usage.append(self.llm.last_usage)
             decision = (
                 raw
                 if isinstance(raw, RouteDecision)
@@ -1580,6 +1624,8 @@ class ResearchSession:
             text = self.llm.complete(
                 SHALLOW_ANSWER_PROMPT, json.dumps(context, ensure_ascii=False)
             ).strip()
+            if getattr(self.llm, "last_usage", None):
+                self._extra_usage.append(self.llm.last_usage)
         except Exception as exc:
             log.info("shallow answer failed; deep path: %s", exc, exc_info=True)
             return None

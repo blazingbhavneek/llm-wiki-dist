@@ -243,3 +243,74 @@ The system should report “not established in the indexed material” rather th
 6. Generating Literature-Driven Scientific Theories at Scale — large-corpus evaluation against later evidence.
 7. HypER — small-model evidence-grounded reasoning.
 
+## What is implemented in `proto.py`
+
+`proto.py` is a prototype of the architecture above, run against a single seed chunk rather than the whole corpus. Its regions map onto the section numbers of this document: Stage 0 → §1, Stage 1 → §2, Stage 2 → §3, Stage 3 → §4, Stage 4 → anti-triviality requirements, Stage 5 → §5.
+
+Four of the nine papers contributed implemented mechanisms. The rest are recorded below with the reason they were not implemented, so the omissions stay deliberate rather than accidental.
+
+### Implemented
+
+**GAPMAP — gap taxonomy and explicit/implicit distinction**
+
+Implemented as the `GapKind` literal in the *Taxonomy and schemas* region, retargeted from biomedical to software categories per the scope limitation above: `missing_link`, `narrow_generalization`, `unreconciled_conflict`, `undocumented_contract`, `missing_boundary`, `unclear_lifecycle`, `weak_provenance`. Every candidate must select one, so the gap type is a typed field rather than free prose.
+
+The explicit/implicit split is the `is_explicit` flag on `GapCandidate` and `GapCertificate`. A specialist may set it only when the document itself signals the gap (「未処理」「別途規定」and similar), matching GAPMAP's explicit-signal definition; everything else is treated as an inferred implicit gap.
+
+Not implemented: the TABI Claim–Grounds–Warrant structure and its bucketing procedure. `GroundedPremise` captures claim plus source node, which is roughly Claim–Grounds, but there is no separate warrant field and no bucketing step.
+
+**LimAgents — small-model specialist decomposition**
+
+Implemented as the four lenses in `SPECIALIST_LENSES` and the *Stage 1* region: coverage, conflict, bridge, boundary. Each lens runs as its own bounded call over an 8-node batch (`SPECIALIST_NODE_BUDGET`), all batches and lenses dispatched in parallel. No call ever receives the whole region or a general "find all the gaps" instruction, which is the paper's central operational claim about small models.
+
+The paper's division between cheap specialists and a stronger adjudicator is preserved in shape: specialists and the stage 2 auditor are single structured calls, whereas stage 3 invokes the full multi-subagent `ask()` agent.
+
+Not implemented: LimAgents' external peer-review agent and citation-network agent, both of which assume a citation graph that documentation corpora do not have. Also not implemented: a merge/dedup agent — `run_all_specialists` deduplicates on exact question string only, so near-duplicate phrasings from different lenses still survive.
+
+**FirstResearch — certificate and anti-generic gate**
+
+The certificate is the `GapCertificate` model, and the report writer emits it field by field. Field correspondence to the paper's Research Question Certificate:
+
+| FirstResearch field | `GapCertificate` field |
+|---|---|
+| primitive definitions / assumptions | `grounded_premises` (node id, claim, quote) |
+| tension or contradiction | `missing_structure` |
+| research question | `question` |
+| minimal decisive test | `resolution_test` |
+| expected observations | `evidence_of_absence` |
+
+The novelty-boundary gate is the `gate()` function plus `TrivialityJudgement`. All eight anti-triviality tests from this document are adjudicated as individual booleans and written into the audit JSON, so a rejection is inspectable rather than a silent threshold. Tests 1, 2 and 7 are non-waivable preconditions; the remainder must reach 6 of 8 to satisfy "most of these tests". Test 1 additionally has a deterministic pre-check in `adjudicate()`, which skips the expensive adversary call for candidates that structurally cannot pass.
+
+Not implemented: the paper's mechanism model, falsifiable hypothesis, and failure-update rule. `resolution_test` covers what evidence would settle the question, but there is no hypothesis to falsify and no rule for updating the system when a candidate is refuted. Also not implemented: question *repair* — the gate only rejects, where FirstResearch repairs a question toward thresholds and interactions and retries.
+
+**HypER — verification as a separate auditor pass**
+
+Implemented as the separation between generation and verification. The specialist that proposes a candidate never judges it. Stage 2 (`validate_candidate`) is a distinct cheap auditor over freshly retrieved evidence, and stage 3 is a separate adversarial agent. This follows the paper's finding that a small model used as a dedicated reasoning auditor outperforms asking one model to both generate and self-verify.
+
+The stage 3 adversary prompt encodes the paper's distractor-resistance idea in prompt form: chaining several passages into an inference explicitly does not count as coverage, only a decisive direct statement does. This closes the failure mode where a fluent synthesized answer reads as though the gap were already documented.
+
+Not implemented: HypER's actual contribution, which is *training* a small model on valid versus invalid reasoning chains. `proto.py` uses an off-the-shelf model with prompt constraints only, so there is no learned discrimination between sound and unsound chains.
+
+### Partially implemented
+
+**Agentic Workflows for Gap-Aware Literature Reviews**
+
+Two of its six listed components appear: graph traversal (stage 0 expands one hop through real edges via `follow_link`) and perspective-guided questioning (the four lenses). Contrastive retrieval is not implemented — stage 2 searches alternate phrasings, but does not contrast retrieved sets against each other. The source is abstract-level, so there was no method to implement more faithfully.
+
+### Not implemented
+
+**PROPER Agents.** Its selective-activation layer is the useful idea, and stage 2 serves the same purpose — suppressing a flood of candidates before they reach an expensive judge — but it is implemented as disqualifying searches rather than PROPER's calibrated activation and reranking. PROPER's core subject, per-user knowledge gaps, does not apply to a corpus-internal task.
+
+**Generating Literature-Driven Scientific Theories at Scale.** Its lesson is evaluative: judge discoveries against later evidence, not LLM-judge plausibility. This cannot be implemented against a static documentation snapshot with no future corpus to check against. It remains the standing critique of the current output, which is validated only by adversarial agreement.
+
+**ResearchBench.** An evaluation benchmark, not a detector. Nothing to implement; relevant if the ranking formula is ever calibrated against human judgement, as §5 of this document recommends.
+
+**Enriched Knowledge Representation (Alzheimer's LBD).** A warning rather than a method: pairwise entity-to-entity graphs cannot represent conditions, multi-party interactions, or nested processes, and only about 20% of discovery statements were adequately captured by pairwise relations alone. The `llm-wiki` graph is pairwise, so this limitation applies in full and acting on it would require a graph schema change, not a change to `proto.py`.
+
+### Known gaps in the implementation itself
+
+- **§1 is only partially implemented.** Stage 0 seeds from one chunk by search plus one-hop expansion. The graph-statistical candidate selection §1 describes — centrality with incomplete relation types, clusters with weak explanatory connections, claims with absent provenance — is not implemented. `GraphStore` and `RESEARCHER.health()` expose the data needed for it.
+- **§5 diversity term is missing.** `GapCertificate.priority` multiplies six factors; the diversity factor is absent because there is no dedup or clustering step over surviving certificates to compute it from.
+- **No semantic deduplication.** §4 requires deduplicating semantically similar candidates. Only exact question-string matching exists.
+- **Confidence is not a certificate field.** The §4 certificate lists Confidence; `proto.py` carries `unresolvedness` inside `PriorityScores` instead, which is related but not the same quantity.
+
