@@ -580,9 +580,9 @@ export default function SettingsView({ overrides, onApply }) {
   const [imageStatus, setImageStatus] = useState('')
   const [imageError, setImageError] = useState('')
 
-  const [depth, setDepthState] = useState(2)
-  const [net, setNetState] = useState(2)
-  const [agents, setAgentsState] = useState(3)
+  const [depth, setDepthState] = useState(3)
+  const [net, setNetState] = useState(3)
+  const [agents, setAgentsState] = useState(4)
 
   const [loadErr, setLoadErr] = useState(null)
 

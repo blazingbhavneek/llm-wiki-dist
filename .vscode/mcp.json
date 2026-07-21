@@ -2,7 +2,7 @@
   "servers": {
     "llm-wiki": {
       "type": "http",
-      "url": "http://10.160.152.38:51026/llm-wiki/wiki_moove/mcp"
+      "url": "http://10.160.152.38:51026/agent/llm-wiki/wiki_moove/mcp"
     }
   }
 }
