@@ -18,7 +18,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const QUEUE_STORAGE_KEY = 'standalone-pdf-parser-queue-v3'
 const DONE_TTL_MS = 72 * 60 * 60 * 1000
-const POLL_MS = 2500
+const POLL_MS = 5000
 const MAX_STATUS_CHECKS_PER_POLL = 10
 const COOKIE_DAYS = 180
 
@@ -717,12 +717,22 @@ function mergeQueueItems(oldItems, newItems) {
   return pruneQueueItems([...map.values()])
 }
 
+function getParserApiBase() {
+  const namespace = window.location.pathname.split('/').filter(Boolean)[0]
+
+  if (!namespace) return ''
+
+  return `/${encodeURIComponent(namespace)}`
+}
+
+const PARSER_API_BASE = getParserApiBase()
+
 const PARSER_API = {
-  queue: '/queue',
-  upload: '/upload',
-  status: (taskId) => `/status/${encodeURIComponent(taskId)}`,
-  result: (taskId) => `/result/${encodeURIComponent(taskId)}`,
-  queueItem: (taskId) => `/queue/${encodeURIComponent(taskId)}`,
+  queue: `${PARSER_API_BASE}/queue`,
+  upload: `${PARSER_API_BASE}/upload`,
+  status: (taskId) => `${PARSER_API_BASE}/status/${encodeURIComponent(taskId)}`,
+  result: (taskId) => `${PARSER_API_BASE}/result/${encodeURIComponent(taskId)}`,
+  queueItem: (taskId) => `${PARSER_API_BASE}/queue/${encodeURIComponent(taskId)}`,
 }
 
 function statusLabel(status, t) {
@@ -823,7 +833,7 @@ export default function App() {
   const [taskId, setTaskId] = useState(null)
   const [error, setError] = useState(null)
 
-  const [queueItems, setQueueItems] = useState(() => loadStoredQueue())
+  const [queueItems, setQueueItems] = useState([])
 
   const promptText = useMemo(() => buildPromptText(lang, codeLang), [lang, codeLang])
 
@@ -862,7 +872,6 @@ export default function App() {
 
   useEffect(() => {
     queueRef.current = queueItems
-    saveStoredQueue(queueItems)
   }, [queueItems])
 
   const toggleLang = () => {

@@ -138,7 +138,7 @@ def _model(settings: Settings) -> ChatOpenAI:
         temperature=settings.chat_temperature,
         timeout=300,
         max_retries=0,
-        extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+        # extra_body={"chat_template_kwargs": {"enable_thinking": True}},
     )
 
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import PdfParserView from './PdfParserView'
 import { useT } from '../i18n.jsx'
+import { detectAppPrefix } from '../data/utils.js'
 
 const COOKIE_PREFIX = 'llm_wiki_setting_'
 const PDF_API_FIELD = 'pdf_parser_api_base'
@@ -36,17 +37,53 @@ function getSettingValue(source, field, altField) {
   return undefined
 }
 
+function getCurrentDbName() {
+  if (typeof window === 'undefined') return ''
+
+  const parts = window.location.pathname.split('/').filter(Boolean)
+  const prefixParts = detectAppPrefix().split('/').filter(Boolean)
+
+  return clean(parts[prefixParts.length] ?? '')
+}
+
+function addDbNameToParserBase(apiBase, dbName) {
+  const base = clean(apiBase)
+  const db = clean(dbName).replace(/^\/+|\/+$/g, '')
+
+  if (!base || !db) return base
+
+  const safeDb = encodeURIComponent(db)
+  const trimmedBase = base.replace(/\/+$/g, '')
+  const lastSegment = trimmedBase.split('/').filter(Boolean).at(-1)
+
+  if (lastSegment === safeDb || lastSegment === db) {
+    return trimmedBase
+  }
+
+  return `${trimmedBase}/${safeDb}`
+}
+
 function readParserBase({ pdfApiBase, settingsSource }) {
   const saved =
     getCookie(PDF_API_COOKIE) ??
     getCookie(LEGACY_PDF_API_COOKIE)
 
-  if (saved !== null) return clean(saved)
+  if (saved !== null && clean(saved)) return clean(saved)
 
   return clean(
     getSettingValue(settingsSource, PDF_API_FIELD, 'pdfParserApiBase') ??
       pdfApiBase ??
       '',
+  )
+}
+
+function readParserBaseForCurrentDb({ pdfApiBase, settingsSource }) {
+  return addDbNameToParserBase(
+    readParserBase({
+      pdfApiBase,
+      settingsSource,
+    }),
+    getCurrentDbName(),
   )
 }
 
@@ -91,6 +128,7 @@ const STR = {
 //
 // The PDF parser server URL is configured in SettingsView.
 // This component only reads the saved value and passes it to PdfParserView.
+// The current DB name is appended to the parser base so parser queues are DB-scoped.
 export default function UploadView({
   pdfApiBase,
   settings,
@@ -101,7 +139,10 @@ export default function UploadView({
   const t = useT(STR)
   const mdRef = useRef(null)
 
-  const settingsSource = settings || overrides || {}
+  const settingsSource = {
+    ...(settings || {}),
+    ...(overrides || {}),
+  }
 
   const [busy, setBusy] = useState(false)
   const [name, setName] = useState('')
@@ -111,7 +152,7 @@ export default function UploadView({
   const [error, setError] = useState(null)
 
   const [parserBase, setParserBase] = useState(() =>
-    readParserBase({
+    readParserBaseForCurrentDb({
       pdfApiBase,
       settingsSource,
     }),
@@ -119,7 +160,7 @@ export default function UploadView({
 
   useEffect(() => {
     setParserBase(
-      readParserBase({
+      readParserBaseForCurrentDb({
         pdfApiBase,
         settingsSource,
       }),
@@ -129,7 +170,7 @@ export default function UploadView({
   useEffect(() => {
     const syncParserBase = () => {
       setParserBase(
-        readParserBase({
+        readParserBaseForCurrentDb({
           pdfApiBase,
           settingsSource,
         }),
@@ -140,7 +181,12 @@ export default function UploadView({
       const detail = event?.detail
 
       if (detail && detail[PDF_API_FIELD] !== undefined) {
-        setParserBase(clean(detail[PDF_API_FIELD]))
+        setParserBase(
+          addDbNameToParserBase(
+            clean(detail[PDF_API_FIELD]),
+            getCurrentDbName(),
+          ),
+        )
         return
       }
 
@@ -310,7 +356,12 @@ export default function UploadView({
         </section>
       </div>
 
-      <PdfParserView apiBase={parserBase} onMarkdownReady={onOpenDraft} />
+      <PdfParserView
+        apiBase={parserBase}
+        settings={settings}
+        overrides={overrides}
+        onMarkdownReady={onOpenDraft}
+      />
     </div>
   )
 }

@@ -77,9 +77,7 @@ def api_error(detail: str, retryable: bool, code: str) -> dict[str, Any]:
     return {"detail": detail, "retryable": retryable, "code": code}
 
 
-# Task IDs are always a sha256 hex digest (raw pdf hash or hash of options).
-# Reject anything else before it reaches a filesystem path, so a crafted
-# task_id cannot traverse outside CACHE_DIR.
+# Task IDs are always a sha256 hex digest.
 _TASK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -89,6 +87,67 @@ def validate_task_id(task_id: str) -> None:
             status_code=400,
             detail=api_error("invalid task id", False, "bad_task_id"),
         )
+
+
+# Namespace is the DB/wiki name from paths like:
+#   /meetings/upload
+#   /manuals/queue
+_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def normalize_namespace(namespace: Optional[str]) -> Optional[str]:
+    if namespace is None:
+        return None
+
+    namespace = str(namespace).strip().strip("/")
+
+    if not namespace:
+        return None
+
+    if not _NAMESPACE_RE.match(namespace):
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("invalid namespace", False, "bad_namespace"),
+        )
+
+    return namespace
+
+
+def namespace_matches(meta: Optional[dict[str, Any]], namespace: Optional[str]) -> bool:
+    if not meta:
+        return False
+
+    return (meta.get("namespace") or None) == (namespace or None)
+
+
+def cache_namespace_file(cache_path: Path) -> Path:
+    return cache_path / ".namespace"
+
+
+def write_cache_namespace(cache_path: Path, namespace: Optional[str]) -> None:
+    marker = cache_namespace_file(cache_path)
+
+    if namespace:
+        marker.write_text(namespace, encoding="utf-8")
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def read_cache_namespace(cache_path: Path) -> Optional[str]:
+    marker = cache_namespace_file(cache_path)
+
+    if not marker.exists():
+        return None
+
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+        return value or None
+    except OSError:
+        return None
+
+
+def cache_namespace_matches(cache_path: Path, namespace: Optional[str]) -> bool:
+    return read_cache_namespace(cache_path) == (namespace or None)
 
 
 class APIConfig(BaseModel):
@@ -131,9 +190,6 @@ def kill_process_forcefully(process: mp.Process, timeout: float = 5.0):
             try:
                 pgid = os.getpgid(pid)
 
-                # Safety: if the child has not called os.setsid() yet,
-                # its pgid may still be the same as the parent server.
-                # In that case, do NOT kill the whole process group.
                 if pgid != os.getpgrp():
                     os.killpg(pgid, signal.SIGTERM)
                 else:
@@ -399,16 +455,8 @@ def vision_smoke_test(api_config: dict, image_path: Path) -> bool:
                     {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "text",
-                                "text": "Reply OK.",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": data_url,
-                                },
-                            },
+                            {"type": "text", "text": "Reply OK."},
+                            {"type": "image_url", "image_url": {"url": data_url}},
                         ],
                     }
                 ],
@@ -416,7 +464,6 @@ def vision_smoke_test(api_config: dict, image_path: Path) -> bool:
                 "temperature": 0.0,
                 "top_p": 0.95,
                 "stream": False,
-                "chat_template_kwargs": {"enable_thinking": True},
             },
             timeout=30.0,
         )
@@ -430,15 +477,27 @@ def vision_smoke_test(api_config: dict, image_path: Path) -> bool:
         return False
 
 
-def build_task_id(pdf_hash: str, describe_images: bool, generate_mermaid: bool) -> str:
+def build_task_id(
+    pdf_hash: str,
+    describe_images: bool,
+    generate_mermaid: bool,
+    namespace: Optional[str] = None,
+) -> str:
     if not describe_images and not generate_mermaid:
-        return pdf_hash
+        base_task_id = pdf_hash
+    else:
+        options = (
+            f"{pdf_hash}:describe_images={int(describe_images)}:"
+            f"generate_mermaid={int(generate_mermaid)}"
+        )
+        base_task_id = hashlib.sha256(options.encode("utf-8")).hexdigest()
 
-    options = (
-        f"{pdf_hash}:describe_images={int(describe_images)}:"
-        f"generate_mermaid={int(generate_mermaid)}"
-    )
-    return hashlib.sha256(options.encode("utf-8")).hexdigest()
+    namespace = normalize_namespace(namespace)
+
+    if not namespace:
+        return base_task_id
+
+    return hashlib.sha256(f"{namespace}:{base_task_id}".encode("utf-8")).hexdigest()
 
 
 def build_empty_image_unit(data_url: str, alt: str) -> str:
@@ -505,10 +564,6 @@ def fallback_embed_images(markdown_file: Path, final_md_path: Path):
 
 
 def redirect_worker_output(cache_dir: str, task_id: str):
-    """
-    Prevent worker/subprocess logs from continuing to print into the terminal.
-    Logs go to: cache/{task_id}/worker.log
-    """
     try:
         log_path = Path(cache_dir) / "worker.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -687,11 +742,18 @@ def get_queue_position(task_id: str) -> Optional[int]:
     return None
 
 
-def public_task(task_id: str, meta: dict[str, Any], position: Optional[int] = None):
+def public_task(
+    task_id: str,
+    meta: dict[str, Any],
+    position: Optional[int] = None,
+    namespace: Optional[str] = None,
+):
     status = meta.get("status")
+    result_prefix = f"/{namespace}" if namespace else ""
 
     item = {
         "task_id": task_id,
+        "namespace": meta.get("namespace"),
         "filename": meta.get("filename"),
         "status": status,
         "queue_position": (
@@ -715,7 +777,7 @@ def public_task(task_id: str, meta: dict[str, Any], position: Optional[int] = No
         item["retryable"] = True
 
     if status == "completed":
-        item["result_url"] = f"/result/{task_id}"
+        item["result_url"] = f"{result_prefix}/result/{task_id}"
 
     return item
 
@@ -837,6 +899,7 @@ def refresh_task_status(task_id: str):
 
 
 @app.post("/upload")
+@app.post("/{namespace}/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
     base_url: str = Form(INVOKE_URL),
@@ -845,7 +908,10 @@ async def upload_pdf(
     describe_images: bool = Form(False),
     generate_mermaid: bool = Form(False),
     puppeteer_config_path: Optional[str] = Form(PUPPETEER_CONFIG_PATH),
+    namespace: Optional[str] = None,
 ):
+    namespace = normalize_namespace(namespace)
+
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
@@ -879,12 +945,17 @@ async def upload_pdf(
 
     pdf_hash = sha256.hexdigest()
     generate_mermaid = bool(describe_images and generate_mermaid)
-    task_id = build_task_id(pdf_hash, describe_images, generate_mermaid)
+    task_id = build_task_id(
+        pdf_hash,
+        describe_images,
+        generate_mermaid,
+        namespace=namespace,
+    )
 
     cache_path = CACHE_DIR / task_id
     final_md_path = cache_path / "final.md"
 
-    if final_md_path.exists():
+    if final_md_path.exists() and cache_namespace_matches(cache_path, namespace):
         pending_pdf_path.unlink(missing_ok=True)
 
         with state_lock:
@@ -894,6 +965,7 @@ async def upload_pdf(
                 "process": None,
                 "queue": None,
                 "status": "completed",
+                "namespace": namespace,
                 "filename": safe_filename,
                 "cache_path": str(cache_path),
                 "task_dir": str(TEMP_DIR / task_id),
@@ -904,14 +976,18 @@ async def upload_pdf(
                 "done_at": ts,
             }
 
+            write_cache_namespace(cache_path, namespace)
             prune_old_done_tasks()
+
+        result_prefix = f"/{namespace}" if namespace else ""
 
         return {
             "task_id": task_id,
+            "namespace": namespace,
             "filename": safe_filename,
             "status": "completed",
             "message": "Returned from cache",
-            "result_url": f"/result/{task_id}",
+            "result_url": f"{result_prefix}/result/{task_id}",
             "queue_position": None,
         }
 
@@ -921,11 +997,19 @@ async def upload_pdf(
         if task_id in tasks:
             meta = refresh_task_status(task_id)
 
+            if meta and not namespace_matches(meta, namespace):
+                pending_pdf_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=404,
+                    detail=api_error("Task not found", True, "not_ready"),
+                )
+
             if meta and meta.get("status") in {"queued", "processing"}:
                 pending_pdf_path.unlink(missing_ok=True)
 
                 return {
                     "task_id": task_id,
+                    "namespace": namespace,
                     "filename": meta.get("filename"),
                     "status": meta["status"],
                     "message": "Task already running",
@@ -935,16 +1019,18 @@ async def upload_pdf(
             if meta and meta.get("status") == "completed":
                 pending_pdf_path.unlink(missing_ok=True)
 
+                result_prefix = f"/{namespace}" if namespace else ""
+
                 return {
                     "task_id": task_id,
+                    "namespace": namespace,
                     "filename": meta.get("filename") or safe_filename,
                     "status": "completed",
                     "message": "Task already completed",
-                    "result_url": f"/result/{task_id}",
+                    "result_url": f"{result_prefix}/result/{task_id}",
                     "queue_position": None,
                 }
 
-            # Failed or stale task with same hash. Replace it.
             old_meta = tasks.pop(task_id, None)
             remove_from_queue(task_id)
 
@@ -958,6 +1044,7 @@ async def upload_pdf(
         shutil.move(str(pending_pdf_path), str(final_temp_pdf))
 
         cache_path.mkdir(parents=True, exist_ok=True)
+        write_cache_namespace(cache_path, namespace)
 
         api_config = {
             "base_url": base_url,
@@ -986,6 +1073,7 @@ async def upload_pdf(
             "process": process,
             "queue": result_queue,
             "status": "queued",
+            "namespace": namespace,
             "filename": safe_filename,
             "cache_path": str(cache_path),
             "task_dir": str(task_dir),
@@ -1004,6 +1092,7 @@ async def upload_pdf(
 
         return {
             "task_id": task_id,
+            "namespace": namespace,
             "filename": safe_filename,
             "status": meta["status"],
             "message": (
@@ -1016,21 +1105,28 @@ async def upload_pdf(
 
 
 @app.get("/status/{task_id}")
-async def get_status(task_id: str):
+@app.get("/{namespace}/status/{task_id}")
+async def get_status(task_id: str, namespace: Optional[str] = None):
+    namespace = normalize_namespace(namespace)
     validate_task_id(task_id)
-    final_md_path = CACHE_DIR / task_id / "final.md"
+
+    cache_path = CACHE_DIR / task_id
+    final_md_path = cache_path / "final.md"
 
     with state_lock:
         prune_old_done_tasks()
 
         if task_id not in tasks:
-            if final_md_path.exists():
+            if final_md_path.exists() and cache_namespace_matches(cache_path, namespace):
+                result_prefix = f"/{namespace}" if namespace else ""
+
                 return {
                     "task_id": task_id,
+                    "namespace": namespace,
                     "filename": None,
                     "status": "completed",
                     "message": "Available in cache",
-                    "result_url": f"/result/{task_id}",
+                    "result_url": f"{result_prefix}/result/{task_id}",
                     "queue_position": None,
                 }
 
@@ -1041,16 +1137,26 @@ async def get_status(task_id: str):
 
         meta = refresh_task_status(task_id)
 
-        response = public_task(task_id, meta)
+        if not namespace_matches(meta, namespace):
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("Task not found", True, "not_ready"),
+            )
+
+        response = public_task(task_id, meta, namespace=namespace)
 
         if meta["status"] == "completed":
-            response["result_url"] = f"/result/{task_id}"
+            result_prefix = f"/{namespace}" if namespace else ""
+            response["result_url"] = f"{result_prefix}/result/{task_id}"
 
         return response
 
 
 @app.get("/queue")
-async def get_queue():
+@app.get("/{namespace}/queue")
+async def get_queue(namespace: Optional[str] = None):
+    namespace = normalize_namespace(namespace)
+
     with state_lock:
         if current_task_id:
             refresh_task_status(current_task_id)
@@ -1062,12 +1168,13 @@ async def get_queue():
         if current_task_id and current_task_id in tasks:
             meta = tasks[current_task_id]
 
-            if meta.get("status") == "processing":
-                processing = public_task(current_task_id, meta)
+            if meta.get("status") == "processing" and namespace_matches(meta, namespace):
+                processing = public_task(current_task_id, meta, namespace=namespace)
 
         queued = []
+        visible_position = 0
 
-        for i, task_id in enumerate(task_queue):
+        for task_id in task_queue:
             meta = tasks.get(task_id)
 
             if not meta:
@@ -1076,23 +1183,38 @@ async def get_queue():
             if meta.get("status") != "queued":
                 continue
 
-            queued.append(public_task(task_id, meta, position=i + 1))
+            if not namespace_matches(meta, namespace):
+                continue
+
+            visible_position += 1
+            queued.append(
+                public_task(
+                    task_id,
+                    meta,
+                    position=visible_position,
+                    namespace=namespace,
+                )
+            )
 
         completed = []
         failed = []
 
         for task_id, meta in tasks.items():
+            if not namespace_matches(meta, namespace):
+                continue
+
             status = meta.get("status")
 
             if status == "completed":
-                completed.append(public_task(task_id, meta))
+                completed.append(public_task(task_id, meta, namespace=namespace))
             elif status == "failed":
-                failed.append(public_task(task_id, meta))
+                failed.append(public_task(task_id, meta, namespace=namespace))
 
         completed.sort(key=lambda x: x.get("finished_at") or 0, reverse=True)
         failed.sort(key=lambda x: x.get("finished_at") or 0, reverse=True)
 
         return {
+            "namespace": namespace,
             "retention_hours": DONE_RETENTION_SECONDS / 3600,
             "processing": processing,
             "queued_count": len(queued),
@@ -1105,21 +1227,32 @@ async def get_queue():
 
 
 @app.delete("/queue/{task_id}")
-async def delete_queue_item(task_id: str):
+@app.delete("/{namespace}/queue/{task_id}")
+async def delete_queue_item(task_id: str, namespace: Optional[str] = None):
     global current_task_id
 
+    namespace = normalize_namespace(namespace)
     validate_task_id(task_id)
 
     with state_lock:
         meta = tasks.get(task_id)
 
-        # Always remove from in-memory queue.
-        remove_from_queue(task_id)
-
-        # Always try to remove cache/temp by task_id.
-        # This matters for cache-only tasks after server restart.
         cache_path = CACHE_DIR / task_id
         task_dir = TEMP_DIR / task_id
+
+        if meta and not namespace_matches(meta, namespace):
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("Task not found", True, "not_ready"),
+            )
+
+        if not meta and not cache_namespace_matches(cache_path, namespace):
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("Task not found", True, "not_ready"),
+            )
+
+        remove_from_queue(task_id)
 
         if not meta:
             shutil.rmtree(cache_path, ignore_errors=True)
@@ -1127,6 +1260,7 @@ async def delete_queue_item(task_id: str):
 
             return {
                 "task_id": task_id,
+                "namespace": namespace,
                 "deleted": True,
                 "message": "Task/cache deleted",
             }
@@ -1141,7 +1275,6 @@ async def delete_queue_item(task_id: str):
             if current_task_id == task_id:
                 current_task_id = None
 
-        # Delete both metadata paths and canonical task paths.
         shutil.rmtree(meta.get("cache_path", ""), ignore_errors=True)
         shutil.rmtree(meta.get("task_dir", ""), ignore_errors=True)
         shutil.rmtree(cache_path, ignore_errors=True)
@@ -1153,6 +1286,7 @@ async def delete_queue_item(task_id: str):
 
         return {
             "task_id": task_id,
+            "namespace": namespace,
             "deleted": True,
             "status": status,
             "cache_deleted": True,
@@ -1160,16 +1294,41 @@ async def delete_queue_item(task_id: str):
 
 
 @app.get("/result/{task_id}")
-async def get_result(task_id: str):
+@app.get("/{namespace}/result/{task_id}")
+async def get_result(task_id: str, namespace: Optional[str] = None):
+    namespace = normalize_namespace(namespace)
     validate_task_id(task_id)
-    final_md_path = CACHE_DIR / task_id / "final.md"
+
+    cache_path = CACHE_DIR / task_id
+    final_md_path = cache_path / "final.md"
+
+    with state_lock:
+        meta = tasks.get(task_id)
+
+        if meta and not namespace_matches(meta, namespace):
+            raise HTTPException(
+                status_code=404,
+                detail=api_error("Task not found", True, "not_ready"),
+            )
+
+    if not cache_namespace_matches(cache_path, namespace):
+        raise HTTPException(
+            status_code=404,
+            detail=api_error("Result not ready or not found", True, "not_ready"),
+        )
 
     if not final_md_path.exists():
         with state_lock:
             if task_id in tasks:
                 meta = refresh_task_status(task_id)
 
-                if meta.get("status") == "failed":
+                if meta and not namespace_matches(meta, namespace):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=api_error("Task not found", True, "not_ready"),
+                    )
+
+                if meta and meta.get("status") == "failed":
                     raise HTTPException(
                         status_code=500,
                         detail=api_error(
@@ -1192,6 +1351,7 @@ async def get_result(task_id: str):
 DIST_DIR = Path(__file__).parent / "frontend" / "dist"
 
 from fastapi.staticfiles import StaticFiles
+
 app.mount(
     "/",
     StaticFiles(directory=DIST_DIR, html=True),

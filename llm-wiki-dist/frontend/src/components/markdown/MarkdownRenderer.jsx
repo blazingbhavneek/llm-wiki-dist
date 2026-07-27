@@ -8,10 +8,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 
 import MermaidDiagram from '../MermaidDiagram'
-import { useT } from '../../i18n.jsx'
-import { STR } from './strings.js'
 import {
-  isSafeImageSrc,
   normalizeImageSrc,
   splitMarkdownByImageUnits,
 } from './imageUnits.js'
@@ -138,10 +135,10 @@ const markdownSchema = {
 }
 
 export function SafeImage({ src, alt = '', title, className = '', width, height }) {
-  const t = useT(STR)
   const [failed, setFailed] = useState(false)
 
   const normalizedSrc = normalizeImageSrc(src)
+  const isRenderableSrc = /^data:image\/|^https?:\/\//i.test(normalizedSrc)
 
   useEffect(() => {
     setFailed(false)
@@ -151,20 +148,12 @@ export function SafeImage({ src, alt = '', title, className = '', width, height 
     return null
   }
 
-  if (!isSafeImageSrc(normalizedSrc)) {
-    return (
-      <div className="my-4 rounded-lg border border-red/25 bg-red/10 p-3 text-[13px] text-[#7c1230]">
-        {t.unsafeImg}
-      </div>
-    )
+  if (!isRenderableSrc) {
+    return null
   }
 
   if (failed) {
-    return (
-      <div className="my-4 rounded-lg border border-red/25 bg-red/10 p-3 text-[13px] leading-[1.45] text-[#7c1230]">
-        {t.imgFailed}
-      </div>
-    )
+    return null
   }
 
   return (

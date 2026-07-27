@@ -55,7 +55,7 @@ export default function App() {
     setTimeout(() => setToast(null), 3600)
   }
 
-  const { overrides, applyOverrides } = useOverrides()
+  const { settings, overrides, applyOverrides } = useOverrides()
   const { rawById, graph, docLibrary, health, loading, error, errorRetryable, reload, retry } =
     useGraphData()
   const { assimPending, startAssimilationPolling } = useAssimilation()
@@ -417,6 +417,8 @@ export default function App() {
         <UploadCenter>
           <UploadView
             pdfApiBase={pdfApiBase}
+            settings={settings}
+            overrides={overrides}
             onOpenDraft={openDraft}
             onUploadMarkdown={writes.uploadMarkdown}
           />
@@ -455,6 +457,7 @@ export default function App() {
           onClose={closeWorkspace}
         >
           <MarkdownView
+            key={workspace.id}
             doc={workspace.doc}
             draft={workspace.draft}
             isEditing={!!workspace.editing}

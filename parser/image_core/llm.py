@@ -68,7 +68,7 @@ def make_llm(cfg: ImageConfig, *, thinking: bool, timeout: int) -> ChatOpenAI:
         top_p=cfg.top_p,
         timeout=timeout,
         max_retries=1,
-        extra_body={"chat_template_kwargs": {"enable_thinking": thinking}},
+        # extra_body={"chat_template_kwargs": {"enable_thinking": thinking}},
     )
 
 
@@ -103,7 +103,7 @@ class Llm:
         # </think>, without one the model just answers in schema directly.
         rescue = make_llm(self.cfg, thinking=True, timeout=self.cfg.thinking_timeout).bind(
             extra_body={
-                "chat_template_kwargs": {"enable_thinking": True},
+                # "chat_template_kwargs": {"enable_thinking": True},
                 "guided_json": schema.model_json_schema(),
             }
         )

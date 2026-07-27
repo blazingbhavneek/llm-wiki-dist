@@ -3,18 +3,20 @@ import { useT } from '../i18n.jsx'
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-const QUEUE_STORAGE_KEY = 'pdf-parser-queue-v1'
 const DONE_TTL_MS = 72 * 60 * 60 * 1000
-const POLL_MS = 2500
-const MAX_STATUS_CHECKS_PER_POLL = 10
-
-const COOKIE_PREFIX = 'llm_wiki_setting_'
+const POLL_MS = 5000
 
 const PDF_SETTING_FIELDS = [
   'chat_base_url',
   'chat_api_key',
   'chat_model',
 ]
+
+const PDF_LLM_FALLBACKS = {
+  chat_base_url: 'http://10.160.144.101:51029/v1',
+  chat_api_key: 'sk-dummy',
+  chat_model: 'gemma-4-31B',
+}
 
 const STR = {
   ja: {
@@ -144,39 +146,17 @@ function parseTimeMs(value) {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-function getCookie(name) {
-  if (typeof document === 'undefined') return null
-
-  const prefix = `${name}=`
-  const row = document.cookie
-    .split('; ')
-    .find((item) => item.startsWith(prefix))
-
-  if (!row) return null
-
-  return decodeURIComponent(row.slice(prefix.length))
-}
-
-function settingCookieName(field) {
-  return `${COOKIE_PREFIX}${field}`
-}
-
-function getPdfCookieOverrides() {
-  const out = {}
-
-  for (const field of PDF_SETTING_FIELDS) {
-    const value = getCookie(settingCookieName(field))
-
-    if (value !== null) {
-      out[field] = value
-    }
-  }
-
-  return out
-}
-
 function clean(value) {
   return String(value ?? '').trim()
+}
+
+function apiUrl(apiBase = '', path = '') {
+  const base = String(apiBase || '').replace(/\/+$/, '')
+  const nextPath = String(path || '').startsWith('/')
+    ? String(path || '')
+    : `/${path || ''}`
+
+  return `${base}${nextPath}`
 }
 
 function getSettingValue(source, field, altField) {
@@ -189,54 +169,25 @@ function getSettingValue(source, field, altField) {
 }
 
 function readPdfLlmSettings(source = {}) {
-  const cookieOverrides = getPdfCookieOverrides()
-
   const baseUrl =
-    cookieOverrides.chat_base_url ??
     getSettingValue(source, 'chat_base_url', 'baseUrl') ??
     import.meta.env.VITE_OPENAI_BASE_URL ??
     ''
 
   const apiKey =
-    cookieOverrides.chat_api_key ??
     getSettingValue(source, 'chat_api_key', 'apiKey') ??
     import.meta.env.VITE_OPENAI_API_KEY ??
     ''
 
   const model =
-    cookieOverrides.chat_model ??
     getSettingValue(source, 'chat_model', 'model') ??
     import.meta.env.VITE_MODEL ??
     ''
 
   return {
-    baseUrl: clean(baseUrl),
-    apiKey: clean(apiKey),
-    model: clean(model),
-  }
-}
-
-function loadStoredQueue() {
-  if (typeof localStorage === 'undefined') return []
-
-  try {
-    const raw = localStorage.getItem(QUEUE_STORAGE_KEY)
-    if (!raw) return []
-
-    const items = JSON.parse(raw)
-    return Array.isArray(items) ? pruneQueueItems(items) : []
-  } catch {
-    return []
-  }
-}
-
-function saveStoredQueue(items) {
-  if (typeof localStorage === 'undefined') return
-
-  try {
-    localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(pruneQueueItems(items)))
-  } catch {
-    // ignore localStorage errors
+    baseUrl: clean(baseUrl) || PDF_LLM_FALLBACKS.chat_base_url,
+    apiKey: clean(apiKey) || PDF_LLM_FALLBACKS.chat_api_key,
+    model: clean(model) || PDF_LLM_FALLBACKS.chat_model,
   }
 }
 
@@ -295,6 +246,7 @@ function normalizeQueueItem(raw, fallback = {}) {
 
   return {
     task_id: taskId,
+    namespace: raw.namespace ?? fallback.namespace ?? null,
     filename: raw.filename || fallback.filename || raw.name || fallback.name || '',
     status,
     position: raw.position ?? raw.queue_position ?? fallback.position ?? null,
@@ -332,7 +284,6 @@ function normalizeQueueResponse(data) {
     if (item) items.push(item)
   }
 
-  // Future backend compatibility.
   for (const raw of data?.completed || data?.completed_items || []) {
     const item = normalizeQueueItem(raw, {
       status: 'completed',
@@ -355,14 +306,25 @@ function normalizeQueueResponse(data) {
     if (item) items.push(item)
   }
 
-  return items
+  const deduped = new Map()
+
+  for (const item of items) {
+    deduped.set(item.task_id, {
+      ...(deduped.get(item.task_id) || {}),
+      ...item,
+    })
+  }
+
+  return pruneQueueItems([...deduped.values()])
 }
 
-function mergeQueueItems(oldItems, newItems) {
+function mergeInMemoryItems(oldItems, newItems) {
   const map = new Map()
 
-  for (const oldItem of pruneQueueItems(oldItems)) {
-    map.set(oldItem.task_id, oldItem)
+  for (const oldItem of oldItems) {
+    if (oldItem?.task_id) {
+      map.set(oldItem.task_id, oldItem)
+    }
   }
 
   for (const newItem of newItems) {
@@ -396,7 +358,7 @@ function statusLabel(status, t) {
 
 export default function PdfParserView({
   apiBase = '',
-  onMarkdownReady,
+  onMarkdownReady = () => {},
   settings,
   overrides,
 }) {
@@ -404,7 +366,11 @@ export default function PdfParserView({
   const fileRef = useRef(null)
   const queueRef = useRef([])
 
-  const settingsSource = settings || overrides || {}
+  const settingsSource = {
+    ...PDF_LLM_FALLBACKS,
+    ...(settings || {}),
+    ...(overrides || {}),
+  }
 
   const [file, setFile] = useState(null)
 
@@ -423,11 +389,15 @@ export default function PdfParserView({
   const [status, setStatus] = useState('')
   const [taskId, setTaskId] = useState(null)
   const [error, setError] = useState(null)
-  const [queueItems, setQueueItems] = useState(() => loadStoredQueue())
+
+  // Live-only queue state.
+  // No localStorage.
+  // No sessionStorage.
+  // No cookies.
+  const [queueItems, setQueueItems] = useState([])
 
   useEffect(() => {
     queueRef.current = queueItems
-    saveStoredQueue(queueItems)
   }, [queueItems])
 
   useEffect(() => {
@@ -454,54 +424,27 @@ export default function PdfParserView({
     }
   }, [settings, overrides])
 
-  const upsertQueueItems = (items) => {
-    setQueueItems((prev) => mergeQueueItems(prev, items))
-  }
-
   const refreshQueue = async ({ silent = true } = {}) => {
     if (!silent) setQueueBusy(true)
 
     try {
-      const incoming = []
+      const queueRes = await fetch(apiUrl(apiBase, '/queue'), {
+        method: 'GET',
+        cache: 'no-store',
+      })
 
-      const queueRes = await fetch(`${apiBase}/queue`)
-
-      if (queueRes.ok) {
-        const queueData = await queueRes.json()
-        incoming.push(...normalizeQueueResponse(queueData))
+      if (!queueRes.ok) {
+        const text = await queueRes.text()
+        throw new Error(text || `Queue fetch failed: ${queueRes.status}`)
       }
 
-      const pending = queueRef.current
-        .filter((item) => item.status === 'queued' || item.status === 'processing')
-        .slice(0, MAX_STATUS_CHECKS_PER_POLL)
+      const queueData = await queueRes.json()
+      const liveItems = normalizeQueueResponse(queueData)
 
-      const statusItems = await Promise.all(
-        pending.map(async (item) => {
-          try {
-            const res = await fetch(`${apiBase}/status/${encodeURIComponent(item.task_id)}`)
-
-            if (!res.ok) return null
-
-            const data = await res.json()
-
-            return normalizeQueueItem(data, {
-              task_id: item.task_id,
-              filename: item.filename,
-              status: item.status,
-            })
-          } catch {
-            return null
-          }
-        })
-      )
-
-      incoming.push(...statusItems.filter(Boolean))
-
-      if (incoming.length > 0) {
-        upsertQueueItems(incoming)
-      } else {
-        setQueueItems((prev) => pruneQueueItems(prev))
-      }
+      // Important:
+      // Replace with live server state.
+      // Do not merge with old browser-stored data.
+      setQueueItems(liveItems)
     } catch (e) {
       if (!silent) {
         setError(e.message || String(e))
@@ -518,6 +461,10 @@ export default function PdfParserView({
       if (cancelled) return
       await refreshQueue({ silent: true })
     }
+
+    // Clear previous apiBase view immediately, then fetch live server queue.
+    setQueueItems([])
+    queueRef.current = []
 
     tick()
 
@@ -570,7 +517,7 @@ export default function PdfParserView({
         generateImageDescriptions && generateMermaidDiagrams ? 'true' : 'false'
       )
 
-      const uploadRes = await fetch(`${apiBase}/upload`, {
+      const uploadRes = await fetch(apiUrl(apiBase, '/upload'), {
         method: 'POST',
         body: fd,
       })
@@ -596,7 +543,9 @@ export default function PdfParserView({
       })
 
       if (item) {
-        upsertQueueItems([item])
+        // In-memory only, so the user sees the submitted task immediately.
+        // The next /queue poll replaces this with server truth.
+        setQueueItems((prev) => mergeInMemoryItems(prev, [item]))
       }
 
       if (uploaded.status === 'queued') {
@@ -629,7 +578,13 @@ export default function PdfParserView({
     setError(null)
 
     try {
-      const resultRes = await fetch(`${apiBase}/result/${encodeURIComponent(item.task_id)}`)
+      const resultRes = await fetch(
+        apiUrl(apiBase, `/result/${encodeURIComponent(item.task_id)}`),
+        {
+          method: 'GET',
+          cache: 'no-store',
+        }
+      )
 
       if (!resultRes.ok) {
         const text = await resultRes.text()
@@ -665,16 +620,30 @@ export default function PdfParserView({
     setError(null)
 
     try {
+      const previousItems = queueRef.current
+
+      // Optimistic in-memory removal only.
+      // Not persisted anywhere.
       setQueueItems((prev) => prev.filter((x) => x.task_id !== item.task_id))
 
-      // Future backend endpoint. Safe to ignore until implemented.
-      try {
-        await fetch(`${apiBase}/queue/${encodeURIComponent(item.task_id)}`, {
+      const deleteRes = await fetch(
+        apiUrl(apiBase, `/queue/${encodeURIComponent(item.task_id)}`),
+        {
           method: 'DELETE',
-        })
-      } catch {
-        // frontend delete is enough for now
+        }
+      )
+
+      if (!deleteRes.ok && deleteRes.status !== 404) {
+        const text = await deleteRes.text()
+        throw new Error(text || `Delete failed: ${deleteRes.status}`)
       }
+
+      await refreshQueue({ silent: true })
+    } catch (e) {
+      setError(e.message || String(e))
+
+      // Restore from in-memory snapshot if delete failed.
+      setQueueItems(queueRef.current.length ? queueRef.current : previousItems)
     } finally {
       setDeletingTaskId(null)
     }
@@ -933,6 +902,12 @@ function QueueItem({
             {item.position && (
               <span className="text-[11px] text-muted">
                 {t.position}: {item.position}
+              </span>
+            )}
+
+            {item.namespace && (
+              <span className="text-[11px] text-muted">
+                DB: {item.namespace}
               </span>
             )}
           </div>

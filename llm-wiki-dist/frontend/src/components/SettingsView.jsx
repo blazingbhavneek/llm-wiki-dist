@@ -105,7 +105,7 @@ function getCookieOverrides() {
       value = getCookie(LEGACY_PDF_API_COOKIE)
     }
 
-    if (value !== null) {
+    if (value !== null && clean(value)) {
       out[field] = value
     }
   }
