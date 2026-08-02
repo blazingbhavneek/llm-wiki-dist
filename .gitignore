@@ -5,3 +5,6 @@ llm-wiki-dist/.wiki
 .codegraph
 chrome-headless-shell-linux64/
 llm-wiki-dist/.wiki_docker/
+benchmark-results/
+benchmark-data/
+models/

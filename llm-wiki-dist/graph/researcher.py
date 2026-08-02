@@ -218,6 +218,56 @@ def _count_steps(state: Any) -> int:
     return max(1, len(messages))
 
 
+def _state_token_usage(state: Any) -> dict[str, int]:
+    """Sum provider-reported usage from every model response in an agent run."""
+    total = {
+        "requests": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+    messages = state.get("messages", []) if isinstance(state, dict) else []
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None)
+        if isinstance(usage, dict):
+            prompt = int(
+                usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+            )
+            completion = int(
+                usage.get("output_tokens")
+                or usage.get("completion_tokens")
+                or 0
+            )
+            tokens = int(
+                usage.get("total_tokens") or prompt + completion
+            )
+        else:
+            metadata = getattr(message, "response_metadata", None)
+            usage = (
+                metadata.get("token_usage")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(usage, dict):
+                continue
+            prompt = int(
+                usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+            )
+            completion = int(
+                usage.get("completion_tokens")
+                or usage.get("output_tokens")
+                or 0
+            )
+            tokens = int(
+                usage.get("total_tokens") or prompt + completion
+            )
+        total["requests"] += 1
+        total["prompt_tokens"] += prompt
+        total["completion_tokens"] += completion
+        total["total_tokens"] += tokens
+    return total
+
+
 def _clean_ids(ids: list[Any] | None) -> list[str]:
     """Sanitize and normalize a model-supplied list of node IDs."""
 
@@ -294,6 +344,29 @@ def _format_search_results(results: list[dict[str, Any]]) -> str:
 # region Lead Explorer
 
 
+# Sub-queries used to widen retrieval before the router sees candidates.
+class SubQueries(BaseModel):
+    queries: list[str] = Field(default_factory=list)
+
+
+DECOMPOSE_PROMPT = (
+    "You prepare retrieval queries for a knowledge-graph search engine.\n"
+    "Given one question, return the separate lookups needed to answer it.\n"
+    "Rules:\n"
+    "- Return one query per fact that must be looked up separately.\n"
+    "- For a comparison, return one query per thing being compared.\n"
+    "- For a multi-step question, return one query per step, including the "
+    "intermediate facts that the question does not name but that connect its "
+    "steps. These intermediate lookups matter most: the question already "
+    "names its endpoints, so a search for the question alone finds those and "
+    "misses whatever links them.\n"
+    "- Write each query as the terms you would search for, not as a sentence.\n"
+    "- Return between 1 and 4 queries. Return an empty list for a question "
+    "that is a single direct lookup.\n"
+    "- Do not repeat the original question."
+)
+
+
 # args for what we are searching the leads for
 class LeadSearchArgs(BaseModel):
     """Search the knowledge graph for relevant nodes."""
@@ -308,6 +381,16 @@ class LeadExploreArgs(BaseModel):
     node_ids: list[str] = Field(
         ...,
         description="Exact node IDs to explore. Use node IDs returned by search.",
+    )
+    questions: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional sub-question for each node ID, in the same order. Give "
+            "each subagent the single step of the question its region should "
+            "answer, for example one entity, one comparison side, or one hop "
+            "of a chain, rather than the whole question. Omit to have every "
+            "subagent work on the full question."
+        ),
     )
 
 
@@ -374,16 +457,38 @@ def _lead_search(ctx: LeadContext, text: str) -> str:
 
 
 # same as above, atomic version of the tool which would be wrapped later with pre-determined context
-def _lead_explore(ctx: LeadContext, node_ids: list[str]) -> str:
+def _lead_explore(
+    ctx: LeadContext, node_ids: list[str], questions: list[str] | None = None
+) -> str:
     _check_stop(ctx.stop_event)
     cleaned = _clean_ids(node_ids)
     if not cleaned:
         return "no valid node_ids supplied. Search first, then call explore with exact node IDs."
 
+    # Keep sub-questions aligned with the ids that survived cleaning. Anything
+    # missing or blank leaves that subagent on the full question.
+    sub_questions: list[str] = []
+    if questions:
+        by_id = dict(zip(_clean_ids(node_ids), questions))
+        sub_questions = [
+            _sanitize_string_for_llm(str(by_id.get(node_id) or "")).strip()
+            for node_id in cleaned
+        ]
+
     result = ctx.session._run_subagents(
-        cleaned, ctx.question, ctx.evidence, ctx.emit, stop_event=ctx.stop_event
+        cleaned,
+        ctx.question,
+        ctx.evidence,
+        ctx.emit,
+        stop_event=ctx.stop_event,
+        sub_questions=sub_questions,
     )
-    log.debug("lead.explore node_ids=%s evidence=%s", cleaned, ctx.evidence)
+    log.debug(
+        "lead.explore node_ids=%s sub_questions=%s evidence=%s",
+        cleaned,
+        sub_questions,
+        ctx.evidence,
+    )
     return _sanitize_tool_output(result)
 
 
@@ -407,8 +512,8 @@ def _lead_tools(ctx: LeadContext) -> list[StructuredTool]:
     def search_tool(text: str) -> str:
         return _lead_search(ctx, text)
 
-    def explore_tool(node_ids: list[str]) -> str:
-        return _lead_explore(ctx, node_ids)
+    def explore_tool(node_ids: list[str], questions: list[str] | None = None) -> str:
+        return _lead_explore(ctx, node_ids, questions)
 
     def finish_tool(answer: str, cited_node_ids: list[str] | None = None) -> str:
         return _lead_finish(ctx, answer, cited_node_ids)
@@ -449,32 +554,39 @@ def _seeded_user_content(
 
     return (
         f"{question}\n\n"
-        "重要: この質問に対して、初期検索ですでに候補ノードが見つかっています。\n"
-        "これらのノードは有用な出発点として扱ってください。ただし、これらだけで十分だとは決めつけないでください。\n\n"
-        "利用可能な進め方:\n"
-        "- search(text=...) は、グラフ内から追加の関連ノードを探すために使います。\n"
-        "- explore(node_ids=[...]) は、選択したノードIDについてサブエージェントによる詳しい調査を開始するために使います。\n"
-        "- finish(answer=..., cited_node_ids=[...]) は、十分な調査と根拠確認が終わった後に最終回答を出すために使います。\n\n"
-        "初期候補ノードを注意深く確認してください:\n"
-        "- それらが関連性があり、質問全体に答えるために十分だと思われる場合は、"
-        "下記の正確なノードIDを使って explore(node_ids=[...]) を呼び出してください。\n"
-        "- それらが関連性はあるが不十分だと思われる場合は、explore を呼び出してサブエージェントを開始する前に、"
-        "まず search(text=...) を使って追加の関連ノードを探してください。"
-        "その後、関連する初期候補ノードIDと、新しく見つかった関連ノードIDの両方を使って "
-        "explore(node_ids=[...]) を呼び出してください。\n"
-        "- 候補ノードが関連していないように見える場合は、無理に使わないでください。"
-        "explore を呼び出す前に、search(text=...) でより適切なノードを探してください。\n\n"
-        "explore を呼び出す前に、候補ノードがユーザーの質問に完全に答えるために必要な"
-        "重要なエンティティ、概念、制約、比較対象、期間、条件、例外、またはサブ質問をすべてカバーしているか確認してください。"
-        "重要な情報が不足しているように見える場合は、必ず search(text=...) で追加検索してください。\n\n"
-        "search を使う場合は、質問全体をそのまま検索するだけでなく、足りないと思われる観点ごとに検索してください。"
-        "たとえば、不足している人物名、組織名、技術名、条件、時期、比較対象、原因、結果などを個別に検索してください。\n\n"
-        "初期候補を確認せずに捨てないでください。"
-        "初期候補を使う場合は、正確なノードIDを使用してください。"
-        "ただし、初期候補だけで不十分な場合は、必ず追加検索してから explore を呼び出してください。\n\n"
-        "初期候補ノード:\n"
+        "Important: The initial search has already found candidate nodes for this question.\n"
+        "Treat these nodes as useful starting points, but do not assume they are sufficient on their own.\n\n"
+        "Available approaches:\n"
+        "- Use search(text=...) to find additional relevant nodes in the graph.\n"
+        "- Use explore(node_ids=[...]) to start detailed subagent research on the selected node IDs.\n"
+        "- Prefer explore(node_ids=[...], questions=[...]), giving each node ID the one step of "
+        "the question its region should answer, in the same order. Break the question into its "
+        "steps first: each entity, each side of a comparison, each hop of a chain, each condition. "
+        "A subagent that is handed one step answers it precisely; subagents all handed the whole "
+        "question duplicate each other and none of them finishes a step.\n"
+        "- Use finish(answer=..., cited_node_ids=[...]) to provide the final answer after sufficient "
+        "research and evidence checking.\n\n"
+        "Review the initial candidate nodes carefully:\n"
+        "- If they are relevant and appear sufficient to answer the entire question, call "
+        "explore(node_ids=[...]) using the exact node IDs below.\n"
+        "- If they are relevant but insufficient, use search(text=...) to find additional relevant "
+        "nodes before calling explore and starting the subagents. Then call explore(node_ids=[...]) "
+        "with both the relevant initial candidate node IDs and the newly found relevant node IDs.\n"
+        "- If the candidate nodes appear irrelevant, do not force their use. Search for more suitable "
+        "nodes with search(text=...) before calling explore.\n\n"
+        "Before calling explore, check whether the candidates cover every important entity, concept, "
+        "constraint, comparison, time period, condition, exception, or subquestion needed to answer the "
+        "user's question completely. If important information appears to be missing, always perform "
+        "additional searches with search(text=...).\n\n"
+        "When using search, do not search only for the full question verbatim. Search separately for "
+        "each apparently missing angle, such as a missing person, organization, technology, condition, "
+        "time period, comparison, cause, or effect.\n\n"
+        "Do not discard the initial candidates without reviewing them. If you use an initial candidate, "
+        "use its exact node ID. If the initial candidates alone are insufficient, always search for "
+        "additional nodes before calling explore.\n\n"
+        "Initial candidate nodes:\n"
         f"{seed_context}\n\n"
-        f"候補ノードID: {', '.join(seed_node_ids)}\n"
+        f"Candidate node IDs: {', '.join(seed_node_ids)}\n"
     )
 
 
@@ -532,6 +644,13 @@ def run_lead_agent(
     except Exception as exc:
         log.info("lead.invoke.failed error=%s", exc, exc_info=True)
         raise
+    emit(
+        {
+            "type": "token_usage",
+            "category": "native_agent_chat",
+            "usage": _state_token_usage(state),
+        }
+    )
 
     finished = ctx.finished
 
@@ -845,6 +964,13 @@ def run_subagent(
             "max_concurrency": 1,
         },
     )
+    emit(
+        {
+            "type": "token_usage",
+            "category": "native_agent_chat",
+            "usage": _state_token_usage(state),
+        }
+    )
 
     # Prefer the explicit finish() answer, otherwise fall back to the last message.
     answer = _sanitize_string_for_llm(
@@ -931,10 +1057,16 @@ class ResearchSession:
             "subagent_max_reads",
             "early_exit_candidates",
             "shallow_answer_max_nodes",
+            "decompose_max_queries",
         }
         float_keys = {"chat_temperature"}
         str_keys = {"chat_base_url", "chat_api_key", "chat_model"}
-        bool_keys = {"entity_dedup", "enable_mermaid", "agent_early_exit"}
+        bool_keys = {
+            "entity_dedup",
+            "enable_mermaid",
+            "agent_early_exit",
+            "decompose_query",
+        }
         clean: dict[str, Any] = {}
         for key, value in overrides.items():
             if value is None:
@@ -1435,6 +1567,61 @@ class ResearchSession:
         emit({"type": "done"})
         return answer
 
+    # Retrieval for the router and for the deep path's seed nodes.
+    #
+    # One embedding of a compositional question retrieves what the question
+    # mentions, not what answering it requires. "Which film has the older
+    # director, A or B?" surfaces both film nodes and neither director's
+    # birth date, so the deep path starts without the nodes that hold the
+    # answer. Asking the model for the sub-queries first and merging their
+    # retrievals brings the intermediate nodes into the seed set.
+    #
+    # Costs one extra completion per question. Any failure falls back to the
+    # plain single-query search, so this can only add candidates.
+    def _decomposed_search(
+        self, question: str, emit: Callable
+    ) -> list[dict[str, Any]]:
+        limit = self.settings.early_exit_candidates
+        results = self.search_with_evidence(question, limit=limit)
+
+        if not self.settings.decompose_query:
+            return results
+
+        try:
+            raw = self.llm.complete_structured(
+                DECOMPOSE_PROMPT, question, SubQueries
+            )
+            plan = raw if isinstance(raw, SubQueries) else SubQueries.model_validate(raw)
+            sub_queries = [
+                text
+                for text in (q.strip() for q in plan.queries)
+                if text and text.casefold() != question.strip().casefold()
+            ][: self.settings.decompose_max_queries]
+        except Exception as exc:
+            log.info("query decomposition failed; single-query search: %s", exc)
+            return results
+
+        if not sub_queries:
+            return results
+
+        emit({"type": "decompose", "queries": sub_queries})
+        log.debug("decompose question=%s queries=%s", question, sub_queries)
+
+        # Merge on node id, keeping each node's best score across queries, so a
+        # node that only one sub-query could find still ranks on its own merit.
+        merged: dict[str, dict[str, Any]] = {r["node"].id: r for r in results}
+        for sub_query in sub_queries:
+            try:
+                for hit in self.search_with_evidence(sub_query, limit=limit):
+                    node_id = hit["node"].id
+                    if node_id not in merged or hit["score"] > merged[node_id]["score"]:
+                        merged[node_id] = hit
+            except Exception as exc:
+                log.info("sub-query search failed for %r: %s", sub_query, exc)
+
+        ranked = sorted(merged.values(), key=lambda r: r["score"], reverse=True)
+        return ranked[:limit]
+
     # Early-exit router. Three outcomes: reuse an existing agent note verbatim,
     # compose a shallow RAG answer from retrieved evidence, or return None to
     # fall through to deep multi-subagent research. Any failure falls through.
@@ -1452,9 +1639,7 @@ class ResearchSession:
             raise AgentStopped("agent run cancelled")
 
         try:
-            results = self.search_with_evidence(
-                question, limit=self.settings.early_exit_candidates
-            )
+            results = self._decomposed_search(question, emit)
         except Exception as exc:
             log.info("early-exit retrieval failed; deep path: %s", exc, exc_info=True)
             return None
@@ -1619,6 +1804,7 @@ class ResearchSession:
         evidence: list[str],
         emit: Callable,
         stop_event: threading.Event | None = None,
+        sub_questions: list[str] | None = None,
     ) -> str:
         starts = self._resolve_distinct_starts(raw_node_ids)
         if not starts:
@@ -1640,7 +1826,21 @@ class ResearchSession:
             }
         )
 
-        assignments = [(start, [o for o in starts if o != start]) for start in starts]
+        # Map each resolved start node to the sub-question the lead assigned it.
+        # _resolve_distinct_starts drops and dedupes ids, so re-resolve here
+        # rather than trusting positions to line up.
+        question_by_id: dict[str, str] = {}
+        for raw, sub in zip(raw_node_ids or [], sub_questions or []):
+            if not str(sub or "").strip():
+                continue
+            node = self.read_node(clean_node_ref(str(raw)))
+            if node:
+                question_by_id[node.id] = str(sub).strip()
+
+        assignments = [
+            (start, [o for o in starts if o != start], question_by_id.get(start, ""))
+            for start in starts
+        ]
 
         reports: list[dict[str, Any] | None] = [None] * len(assignments)
 
@@ -1654,7 +1854,9 @@ class ResearchSession:
             with emit_lock:
                 emit(event)
 
-        def run_one(pos: int, start: str, siblings: list[str]) -> dict[str, Any]:
+        def run_one(
+            pos: int, start: str, siblings: list[str], sub_question: str
+        ) -> dict[str, Any]:
             if stop_event is not None and stop_event.is_set():
                 raise AgentStopped("agent run cancelled")
 
@@ -1665,12 +1867,13 @@ class ResearchSession:
                 pos + 1,
                 safe_emit,
                 stop_event=stop_event,
+                sub_question=sub_question,
             )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(run_one, pos, start, siblings): (pos, start)
-                for pos, (start, siblings) in enumerate(assignments)
+                executor.submit(run_one, pos, start, siblings, sub): (pos, start)
+                for pos, (start, siblings, sub) in enumerate(assignments)
             }
 
             for future in as_completed(futures):
@@ -1736,26 +1939,59 @@ class ResearchSession:
         index: int,
         emit: Callable,
         stop_event: threading.Event | None = None,
+        sub_question: str = "",
     ) -> dict[str, Any]:
         run = Subrun(start_id=start_id, index=index)
 
         start_node = self.read_node(start_id)
         if start_node:
             emit(
-                {"type": "subagent_start", "agent": index, "node": node_ref(start_node)}
+                {
+                    "type": "subagent_start",
+                    "agent": index,
+                    "node": node_ref(start_node),
+                    "sub_question": sub_question,
+                }
             )
 
         siblings_str = ", ".join(sibling_ids) if sibling_ids else "(none)"
+
+        # When the lead assigned this region one step of the question, that step
+        # is the subagent's job. The full question stays visible so it knows how
+        # its piece will be used, but answering the step is what is asked of it.
+        # Without this every subagent chases the whole question from a different
+        # start, and a multi-step question never gets its steps divided up.
+        if sub_question:
+            task = (
+                f"Overall question (for context only): {question}\n\n"
+                f"Your assigned part of it: {sub_question}\n\n"
+            )
+            closing = (
+                "Report what this area says about your assigned part. Answer "
+                "that part as completely and specifically as you can, and say "
+                "so plainly if this area does not contain the answer."
+            )
+        else:
+            task = f"Question: {question}\n\n"
+            closing = "Report what this area says about the question."
+
         user_prompt = (
-            f"質問: {question}\n\n"
-            f"あなたに割り当てられた開始ノード: {start_id}\n"
-            f"他のエージェントが担当している領域（探索しないこと）: {siblings_str}\n\n"
-            "まず開始ノードを読み、その後リンクをたどるか、あなたの担当領域内で検索してください。"
-            "この領域がその質問について何を述べているかを報告してください。"
+            f"{task}"
+            f"Your assigned starting node: {start_id}\n"
+            f"Areas assigned to other agents (do not explore): {siblings_str}\n\n"
+            "Read the starting node first, then follow links or search within your assigned area. "
+            f"{closing}"
         )
 
+        # The subagent's own search/finish tools are scoped to what it is asked
+        # to answer, so hand them the sub-question when there is one.
         return run_subagent(
-            self, run, question, user_prompt, emit, stop_event=stop_event
+            self,
+            run,
+            sub_question or question,
+            user_prompt,
+            emit,
+            stop_event=stop_event,
         )
 
     # Expands from the seed nodes through connected edges for the given number of hops

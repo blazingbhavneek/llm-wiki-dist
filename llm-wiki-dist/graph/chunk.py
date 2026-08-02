@@ -38,11 +38,17 @@ GENERATION_LINES = 10
 VERIFICATION_LINES = 25
 MAX_CHUNK_EXTRA = 50
 
-# Concurrency inside verification for one file.
-CONCURRENCY = 20
-
-# Number of input markdown files processed at the same time.
-FILE_CONCURRENCY = 4
+# Shared request budget for every independent stage of native conceptual
+# chunking. WIKI_CHUNK_CONCURRENCY remains a backwards-compatible alias.
+CONCURRENCY = max(
+    1,
+    int(
+        os.environ.get(
+            "WIKI_INGEST_CONCURRENCY",
+            os.environ.get("WIKI_CHUNK_CONCURRENCY", "20"),
+        )
+    ),
+)
 
 TEMPERATURE = 0.7
 TIMEOUT = 300
@@ -397,13 +403,10 @@ def chunk_source_lines_preserving_tables(
     n = len(lines)
     start = 0
 
-    # Precompute states to correctly handle blocks spanning across chunk boundaries
-    fence_state = []
-    in_f = False
-    for line in lines:
-        if is_fence_line(line):
-            in_f = not in_f
-        fence_state.append(in_f)
+    # Use the same CommonMark-aware scanner as boundary validation.  In
+    # particular, an unmatched fence-looking prose line is literal text rather
+    # than an opening block that poisons every later boundary in the document.
+    fence_state = scan_markdown_fences(lines).inside_after_line
 
     img_state = []
     in_i = False
@@ -762,6 +765,16 @@ def scan_markdown_fences(source_lines: list[str]) -> MarkdownFenceScan:
 
         inside_after_line.append(in_fence)
 
+    # An unmatched marker is not enough evidence that the rest of an arbitrary
+    # uploaded source is a code block.  Raw books and OCR text can legitimately
+    # contain lines beginning with three backticks (for example a decorative
+    # quotation marker followed by prose).  Keep the diagnostic information,
+    # but roll back that candidate opening's state so callers treat it as
+    # literal text.  Properly paired fenced blocks before it remain protected.
+    if in_fence and open_info is not None:
+        for index in range(open_info.line_number - 1, len(inside_after_line)):
+            inside_after_line[index] = False
+
     return MarkdownFenceScan(
         inside_after_line=inside_after_line,
         openings=openings,
@@ -775,10 +788,11 @@ def assert_no_unclosed_markdown_fences(
     label: str = "source",
 ) -> None:
     """
-    Fail early if the whole file has an unclosed fenced code block.
+    Report an unmatched fence candidate without aborting ingestion.
 
-    This catches the "odd number of fences globally" situation before the LLM
-    gets stuck retrying impossible/poisoned boundaries.
+    The scanner treats the unmatched candidate as literal source text.  This
+    function remains as the single up-front diagnostic hook for callers that
+    used to rely on the old fatal assertion.
     """
 
     scan = scan_markdown_fences(source_lines)
@@ -786,11 +800,11 @@ def assert_no_unclosed_markdown_fences(
     if scan.unclosed is None:
         return
 
-    raise RuntimeError(
-        f"{label}: unclosed fenced code block. "
-        f"Opening fence at line {scan.unclosed.line_number}: "
-        f"{scan.unclosed.raw_line!r}. "
-        f"Fence openings={len(scan.openings)}, closings={len(scan.closings)}."
+    print(
+        f"[Planning] {label}: treating unmatched Markdown fence candidate at "
+        f"line {scan.unclosed.line_number} as literal text: "
+        f"{scan.unclosed.raw_line!r}",
+        flush=True,
     )
 
 
@@ -808,12 +822,6 @@ def cut_is_inside_fence_by_scan(
         return False
 
     scan = scan_markdown_fences(source_lines)
-
-    if scan.unclosed is not None:
-        raise RuntimeError(
-            f"Source has an unclosed fenced code block starting at line "
-            f"{scan.unclosed.line_number}: {scan.unclosed.raw_line!r}."
-        )
 
     cut_after_line = split_line - 1
 
@@ -1114,6 +1122,14 @@ def normalize_filename(filename: str, title: str) -> str:
 
     if not clean_stem:
         clean_stem = "ドキュメント"
+
+    # Keep the complete directory entry comfortably below common NAME_MAX=255
+    # byte limits after the renderer adds its numeric prefix and .md suffix.
+    # Decode with ignore so a multibyte Japanese character is never cut in half.
+    encoded_stem = clean_stem.encode("utf-8")
+    if len(encoded_stem) > 180:
+        clean_stem = encoded_stem[:180].decode("utf-8", errors="ignore")
+        clean_stem = clean_stem.rstrip("._- ") or "ドキュメント"
 
     return f"{clean_stem}.md"
 
@@ -1785,15 +1801,9 @@ async def split_window_until_valid(
     Calls the model until it returns exact coverage for source_start-source_end.
 
     This version keeps your existing retry behavior, but adds:
-    - global unclosed fence detection before retry loop
     - deterministic boundary repair before asking the LLM again
     - safe boundary suggestions only if repair fails
     """
-
-    assert_no_unclosed_markdown_fences(
-        source_lines,
-        label="planning source",
-    )
 
     source_block = numbered_source_lines(
         source_lines[source_start - 1 : source_end],
@@ -1906,19 +1916,16 @@ async def plan_concept_files_streaming(
     source_lines: list[str],
     target_lines: int = 100,
     max_extra: int = 30,
+    concurrency: int | None = None,
     stop_check: Callable[[], bool] | None = None,
 ) -> list[ConceptFilePlan]:
     """
-    Main planner.
+    Plan syntax-safe source windows concurrently and preserve their order.
 
-    Behavior:
-    - Break source into approximately target_lines chunks.
-    - Existing chunker avoids cutting tables/fences/image blocks.
-    - For each chunk, ask the model to split into concept files.
-    - Commit every returned file except the last one.
-    - Keep the last one pending and include it in the next prompt.
-    - At the final chunk, commit everything.
-    - Validate complete 1-N coverage at the end.
+    Every window is an exact, independently validated partition. This removes
+    the old cross-window pending-item dependency that serialized the entire
+    planner. A semantic concept may end at a window boundary, but coverage and
+    Markdown/table/fence boundary guarantees remain unchanged.
     """
 
     source_line_count = len(source_lines)
@@ -1942,51 +1949,58 @@ async def plan_concept_files_streaming(
         (start_idx + 1, end_idx)
         for start_idx, end_idx in chunk_ranges
     ]
+    worker_count = max(1, int(CONCURRENCY if concurrency is None else concurrency))
+    print(
+        "[Planning] Starting semantic chunk planning: "
+        f"{source_line_count} lines, {len(global_chunks)} windows "
+        f"(target {target_lines} lines/window), concurrency={worker_count}",
+        flush=True,
+    )
 
-    committed: list[ConceptFilePlan] = []
-    pending: ConceptFilePlan | None = None
+    semaphore = asyncio.Semaphore(worker_count)
 
-    for chunk_index, (chunk_start, chunk_end) in enumerate(global_chunks, start=1):
-        if stop_check and stop_check():
-            raise JobCancelled("chunk planning cancelled")
+    async def plan_window(
+        chunk_index: int, chunk_start: int, chunk_end: int
+    ) -> list[ConceptFilePlan]:
+        async with semaphore:
+            if stop_check and stop_check():
+                raise JobCancelled("chunk planning cancelled")
 
-        is_final_chunk = chunk_index == len(global_chunks)
-
-        if pending is not None:
-            prompt_start = pending.source_start
-        else:
-            prompt_start = chunk_start
-
-        prompt_end = chunk_end
-        label = f"chunk {chunk_index}/{len(global_chunks)}"
-
-        split = await split_window_until_valid(
-            llm=llm,
-            source_lines=source_lines,
-            source_start=prompt_start,
-            source_end=prompt_end,
-            pending=pending,
-            label=label,
-            stop_check=stop_check,
-        )
-
-        if not split:
-            raise RuntimeError(f"{label}: valid split unexpectedly returned no files.")
-
-        if is_final_chunk:
-            committed.extend(split)
-            pending = None
-        else:
-            committed.extend(split[:-1])
-            pending = split[-1]
-
+            label = f"chunk {chunk_index}/{len(global_chunks)}"
             print(
-                "[Planning] Carrying pending concept forward: "
-                f"{pending.title} [{pending.source_start}-{pending.source_end}]"
+                f"[Planning] Requesting window {chunk_index}/{len(global_chunks)}: "
+                f"source lines {chunk_start}-{chunk_end}",
+                flush=True,
             )
+            split = await split_window_until_valid(
+                llm=llm,
+                source_lines=source_lines,
+                source_start=chunk_start,
+                source_end=chunk_end,
+                pending=None,
+                label=label,
+                stop_check=stop_check,
+            )
+            if not split:
+                raise RuntimeError(
+                    f"{label}: valid split unexpectedly returned no files."
+                )
+            print(
+                f"[Planning] Window {chunk_index}/{len(global_chunks)} complete: "
+                f"{len(split)} concepts returned",
+                flush=True,
+            )
+            return split
 
-    if pending is not None:
-        committed.append(pending)
+    planned_windows = await asyncio.gather(
+        *(
+            plan_window(chunk_index, chunk_start, chunk_end)
+            for chunk_index, (chunk_start, chunk_end) in enumerate(
+                global_chunks, start=1
+            )
+        )
+    )
+    committed = [item for window in planned_windows for item in window]
 
     accepted, error = validate_concept_partition(
         files=committed,
@@ -2002,6 +2016,10 @@ async def plan_concept_files_streaming(
     assert_concept_coverage(
         files=accepted,
         source_line_count=source_line_count,
+    )
+    print(
+        f"[Planning] Semantic plan complete: {len(accepted)} final chunks",
+        flush=True,
     )
 
     return accepted
@@ -2195,7 +2213,12 @@ def render_concept_files(
             filename=base_filename,
         )
 
-        output_path = make_unique_output_path(docs_dir, final_filename)
+        # Numeric source-order prefixes make this path unique by construction.
+        # Fail explicitly instead of searching an unbounded suffix sequence if
+        # stale output somehow survived CLEAN_OUTPUT.
+        output_path = docs_dir / final_filename
+        if output_path.exists():
+            raise RuntimeError(f"render output collision: {output_path}")
         relative_filename = output_path.relative_to(output_root).as_posix()
 
         selected_lines = source_lines[
@@ -2243,11 +2266,17 @@ def render_concept_files(
             }
         )
 
+        if index == total or index % 25 == 0:
+            print(
+                f"[Rendering] Wrote {index}/{total} concept files",
+                flush=True,
+            )
+
     return coverage
 
 
 # ---------------------------------------------------------------------
-# Enrichment Schemas & Prompts (Sequential Headers & Global Filename)
+# Enrichment Schemas & Prompts (Concurrent Header Decisions & Global Filename)
 # ---------------------------------------------------------------------
 
 
@@ -2268,7 +2297,19 @@ class EnrichmentResult(BaseModel):
 
 class ChunkHeader(BaseModel):
     header: str = Field(
-        description="このチャンクの日本語の論理見出し。前のセクションの続きなら前回と完全に同じ見出しを返す。新しいセクションなら新しい日本語見出しを返す。最大2階層程度。"
+        description="最初のチャンクの日本語の論理見出し。最大2階層程度。"
+    )
+
+
+class ChunkHeaderDecision(BaseModel):
+    continues_previous: bool = Field(
+        description="現在のチャンクが直前のチャンクと同じ論理セクションの続きか。"
+    )
+    header: str = Field(
+        default="",
+        description=(
+            "新しい論理セクションの場合の日本語見出し。続きの場合は空文字でよい。"
+        ),
     )
 
 
@@ -2308,7 +2349,6 @@ def build_subsequent_chunk_prompt(
     original_filename: str,
     current: ConceptFilePlan,
     prev: ConceptFilePlan,
-    prev_header: str,
 ) -> list[Any]:
     return [
         SystemMessage(
@@ -2323,16 +2363,17 @@ def build_subsequent_chunk_prompt(
                 f"前のチャンク情報:\n"
                 f"- タイトル: {prev.title}\n"
                 f"- 要約: {prev.summary}\n"
-                f"- 割り当て済み見出し: {prev_header}\n\n"
+                "\n"
                 f"現在のチャンク情報:\n"
                 f"- ファイル名: {current.filename}\n"
                 f"- タイトル: {current.title}\n"
                 f"- 要約: {current.summary}\n\n"
-                "タスク: 現在のチャンクの論理見出しを決定してください。\n"
+                "タスク: 現在のチャンクと前のチャンクの関係を決定してください。\n"
                 "1. 現在のチャンクが前のチャンクと同じ論理セクションの続きである場合、"
-                "前回と完全に同じ見出しを出力してください。"
+                "continues_previous=true とし、header は空文字にしてください。"
                 "例: 同じAPIリファレンス内の別関数、同じ定義ファイル群、同一章の続きなど。\n"
-                "2. 新しい論理セクションが始まる場合は、新しい説明的な日本語見出しを出力してください。"
+                "2. 新しい論理セクションが始まる場合は continues_previous=false とし、"
+                "新しい説明的な日本語見出しを header に出力してください。"
                 "見出しは最大2階層程度にしてください。\n"
                 "3. '1.' や '2.' のような連番は使わないでください。"
             )
@@ -2371,71 +2412,121 @@ async def enrich_concept_plan(
     llm: ChatOpenAI,
     original_filename: str,
     files: list[ConceptFilePlan],
+    concurrency: int | None = None,
     stop_check: Callable[[], bool] | None = None,
 ) -> EnrichmentResult:
     """
-    Sequentially infers headers for each file and a global filename.
+    Infer the global name and all per-chunk header decisions concurrently.
+
+    Follow-up calls return only whether they continue the preceding section or
+    start a new named section. The cheap final reduction then propagates the
+    preceding resolved header, retaining exact continuation semantics without
+    imposing an LLM-call dependency chain.
     """
     if not files:
         return EnrichmentResult(inferred_file_name="document.md", files=[])
 
-    print(f"[Enrichment] Inferring global name...")
-    try:
-        global_name_raw = await structured_ainvoke(
-            llm,
-            GlobalName,
-            build_global_name_prompt(original_filename, files),
-            max_output_tokens=100,
-        )
-        global_name = GlobalName.model_validate(global_name_raw).inferred_file_name
-    except Exception as e:
-        print(f"[Enrichment] Failed to infer global name: {e}. Using fallback.")
-        global_name = "ドキュメント.md"
+    worker_count = max(1, int(CONCURRENCY if concurrency is None else concurrency))
+    semaphore = asyncio.Semaphore(worker_count)
+    print(
+        f"[Enrichment] Starting {len(files) + 1} metadata requests: "
+        f"concurrency={worker_count}",
+        flush=True,
+    )
+
+    async def infer_global_name() -> str:
+        async with semaphore:
+            if stop_check and stop_check():
+                raise JobCancelled("chunk enrichment cancelled")
+            print("[Enrichment] Inferring global name...", flush=True)
+            try:
+                raw = await structured_ainvoke(
+                    llm,
+                    GlobalName,
+                    build_global_name_prompt(original_filename, files),
+                    max_output_tokens=100,
+                )
+                return GlobalName.model_validate(raw).inferred_file_name
+            except Exception as exc:
+                print(
+                    f"[Enrichment] Failed to infer global name: {exc}. "
+                    "Using fallback.",
+                    flush=True,
+                )
+                return "ドキュメント.md"
+
+    async def infer_first_header() -> str:
+        async with semaphore:
+            if stop_check and stop_check():
+                raise JobCancelled("chunk enrichment cancelled")
+            print(
+                f"[Enrichment] Inferring header for chunk 1/{len(files)}...",
+                flush=True,
+            )
+            try:
+                raw = await structured_ainvoke(
+                    llm,
+                    ChunkHeader,
+                    build_first_chunk_prompt(original_filename, files[0]),
+                    max_output_tokens=100,
+                )
+                return ChunkHeader.model_validate(raw).header
+            except Exception as exc:
+                print(
+                    f"[Enrichment] Failed to infer header for chunk 1: {exc}. "
+                    "Using fallback.",
+                    flush=True,
+                )
+                return "一般"
+
+    async def infer_following_header(index: int) -> ChunkHeaderDecision:
+        async with semaphore:
+            if stop_check and stop_check():
+                raise JobCancelled("chunk enrichment cancelled")
+            print(
+                f"[Enrichment] Inferring header for chunk {index + 1}/"
+                f"{len(files)}...",
+                flush=True,
+            )
+            prompt = build_subsequent_chunk_prompt(
+                original_filename=original_filename,
+                current=files[index],
+                prev=files[index - 1],
+            )
+            try:
+                raw = await structured_ainvoke(
+                    llm,
+                    ChunkHeaderDecision,
+                    prompt,
+                    max_output_tokens=100,
+                )
+                return ChunkHeaderDecision.model_validate(raw)
+            except Exception as exc:
+                print(
+                    f"[Enrichment] Failed to infer header for chunk {index + 1}: "
+                    f"{exc}. Using fallback.",
+                    flush=True,
+                )
+                return ChunkHeaderDecision(
+                    continues_previous=False, header="一般"
+                )
+
+    global_name, first_header, *decisions = await asyncio.gather(
+        infer_global_name(),
+        infer_first_header(),
+        *(infer_following_header(index) for index in range(1, len(files))),
+    )
 
     if not global_name.endswith(".md"):
         global_name += ".md"
     global_name = normalize_filename(global_name, "ドキュメント")
 
-    inferred_headers = []
-
-    # First chunk
-    print(f"[Enrichment] Inferring header for chunk 1/{len(files)}...")
-    if stop_check and stop_check():
-        raise JobCancelled("chunk enrichment cancelled")
-    try:
-        first_raw = await structured_ainvoke(
-            llm,
-            ChunkHeader,
-            build_first_chunk_prompt(original_filename, files[0]),
-            max_output_tokens=100,
-        )
-        first_header = ChunkHeader.model_validate(first_raw).header
-    except Exception as e:
-        print(f"[Enrichment] Failed to infer header for chunk 1: {e}. Using fallback.")
-        first_header = "一般"
-    inferred_headers.append(first_header)
-
-    # Subsequent chunks
-    for i in range(1, len(files)):
-        if stop_check and stop_check():
-            raise JobCancelled("chunk enrichment cancelled")
-        print(f"[Enrichment] Inferring header for chunk {i+1}/{len(files)}...")
-        prompt = build_subsequent_chunk_prompt(
-            original_filename=original_filename,
-            current=files[i],
-            prev=files[i - 1],
-            prev_header=inferred_headers[-1],
-        )
-        try:
-            raw = await structured_ainvoke(llm, ChunkHeader, prompt, max_output_tokens=100)
-            header = ChunkHeader.model_validate(raw).header
-        except Exception as e:
-            print(
-                f"[Enrichment] Failed to infer header for chunk {i+1}: {e}. "
-                "Using fallback."
-            )
-            header = "一般"
-        inferred_headers.append(header)
+    inferred_headers = [first_header.strip() or "一般"]
+    for decision in decisions:
+        if decision.continues_previous:
+            inferred_headers.append(inferred_headers[-1])
+        else:
+            inferred_headers.append(decision.header.strip() or "一般")
 
     return EnrichmentResult(
         inferred_file_name=global_name,
@@ -2592,6 +2683,7 @@ def run_chunk_pipeline(
     document_name: str,
     out_dir: Path,
     llm: Any = None,
+    concurrency: int | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
 ) -> SimpleNamespace:
@@ -2601,6 +2693,7 @@ def run_chunk_pipeline(
             document_name=document_name,
             out_dir=out_dir,
             llm=llm,
+            concurrency=concurrency,
             on_progress=on_progress,
             stop_check=stop_check,
         )
@@ -2613,6 +2706,7 @@ async def arun_chunk_pipeline(
     document_name: str,
     out_dir: Path,
     llm: Any = None,
+    concurrency: int | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
 ) -> SimpleNamespace:
@@ -2668,19 +2762,30 @@ async def arun_chunk_pipeline(
         )
 
     else:
+        print("[Chunking] Stage 1/3: planning semantic chunks", flush=True)
         concept_files = await plan_concept_files_streaming(
             llm=llm,
             source_lines=source_lines,
             target_lines=100,
             max_extra=MAX_CHUNK_EXTRA,
+            concurrency=concurrency,
             stop_check=stop_check,
         )
+        print(
+            f"[Chunking] Stage 1/3 complete: {len(concept_files)} chunks",
+            flush=True,
+        )
 
+        print("[Chunking] Validating semantic plan coverage", flush=True)
         assert_concept_coverage(
             files=concept_files,
             source_line_count=source_line_count,
         )
 
+        print(
+            f"[Chunking] Rendering {len(concept_files)} concept files",
+            flush=True,
+        )
         coverage = render_concept_files(
             docs_dir=docs_dir,
             source_lines=source_lines,
@@ -2689,11 +2794,13 @@ async def arun_chunk_pipeline(
             output_root=out_dir,
         )
 
+        print("[Chunking] Verifying rendered source coverage", flush=True)
         assert_rendered_docs_match_source(
             source_lines=source_lines,
             coverage=coverage,
             output_root=out_dir,
         )
+        print("[Chunking] Render verification complete", flush=True)
 
         if on_progress:
             on_progress(
@@ -2704,12 +2811,18 @@ async def arun_chunk_pipeline(
                 }
             )
 
+        print(
+            f"[Chunking] Stage 2/3: enriching {len(concept_files)} chunk headers",
+            flush=True,
+        )
         enrichment_result = await enrich_concept_plan(
             llm=llm,
             original_filename=source_path.name,
             files=concept_files,
+            concurrency=concurrency,
             stop_check=stop_check,
         )
+        print("[Chunking] Stage 2/3 complete", flush=True)
 
         inferred_headers = [f.header for f in enrichment_result.files]
         inferred_global_name = enrichment_result.inferred_file_name

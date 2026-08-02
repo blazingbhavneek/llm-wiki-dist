@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -98,6 +99,9 @@ class LlmClient:
 
         # Persistent chat history used by invoke() and invoke_structured().
         self.message_history: list[dict[str, Any]] = []
+        # Query workers share this client, so benchmark usage must be isolated
+        # per worker thread rather than kept in one global counter.
+        self._usage_local = threading.local()
 
         # Add the system prompt at the start of the conversation, if provided.
         if self.system_prompt.strip():
@@ -152,6 +156,7 @@ class LlmClient:
 
         def operation() -> str:
             response = self.llm.invoke(normalized_messages)
+            self._record_response_usage(response)
 
             # LangChain returns an AIMessage; extract its text content.
             text = self._message_text(response)
@@ -181,11 +186,17 @@ class LlmClient:
             structured_llm = self.llm.with_structured_output(
                 output_model,
                 method="json_schema",
+                include_raw=True,
             )
 
-            # No manual JSON extraction or model_validate_json needed.
-            # If this raises JSON/Pydantic errors, app-level retry catches it.
-            result = structured_llm.invoke(normalized_messages)
+            envelope = structured_llm.invoke(normalized_messages)
+            if not isinstance(envelope, dict):
+                raise TypeError("structured output did not return an envelope")
+            self._record_response_usage(envelope.get("raw"))
+            parsing_error = envelope.get("parsing_error")
+            if parsing_error is not None:
+                raise parsing_error
+            result = envelope.get("parsed")
 
             # Defensive validation in case a provider/LangChain version returns
             # a dict/string instead of the already-validated Pydantic object.
@@ -238,6 +249,76 @@ class LlmClient:
             self.message_history.append(
                 {"role": "system", "content": self.system_prompt.strip()}
             )
+
+    def reset_thread_usage(self) -> None:
+        self._usage_local.usage = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def consume_thread_usage(self) -> dict[str, int]:
+        usage = dict(
+            getattr(
+                self._usage_local,
+                "usage",
+                {
+                    "requests": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+        )
+        self.reset_thread_usage()
+        return usage
+
+    def _record_response_usage(self, response: Any) -> None:
+        if response is None:
+            return
+        raw = getattr(response, "usage_metadata", None)
+        if isinstance(raw, dict):
+            prompt_tokens = int(
+                raw.get("input_tokens") or raw.get("prompt_tokens") or 0
+            )
+            completion_tokens = int(
+                raw.get("output_tokens") or raw.get("completion_tokens") or 0
+            )
+            total_tokens = int(
+                raw.get("total_tokens")
+                or prompt_tokens + completion_tokens
+            )
+        else:
+            metadata = getattr(response, "response_metadata", None)
+            token_usage = (
+                metadata.get("token_usage")
+                if isinstance(metadata, dict)
+                else None
+            )
+            token_usage = token_usage if isinstance(token_usage, dict) else {}
+            prompt_tokens = int(
+                token_usage.get("prompt_tokens")
+                or token_usage.get("input_tokens")
+                or 0
+            )
+            completion_tokens = int(
+                token_usage.get("completion_tokens")
+                or token_usage.get("output_tokens")
+                or 0
+            )
+            total_tokens = int(
+                token_usage.get("total_tokens")
+                or prompt_tokens + completion_tokens
+            )
+        usage = getattr(self._usage_local, "usage", None)
+        if not isinstance(usage, dict):
+            self.reset_thread_usage()
+            usage = self._usage_local.usage
+        usage["requests"] += 1
+        usage["prompt_tokens"] += prompt_tokens
+        usage["completion_tokens"] += completion_tokens
+        usage["total_tokens"] += total_tokens
 
     def _make_llm(self) -> Any:
         # Create a fresh LangChain OpenAI-compatible chat client.
