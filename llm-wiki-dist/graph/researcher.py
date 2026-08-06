@@ -1839,8 +1839,9 @@ class ResearchSession:
 class Researcher:
     """Concurrent, read-only question answering over the graph.
 
-    Bounded concurrency via two semaphores: cheap reads and (expensive)
-    agent runs. Every public method builds a fresh ResearchSession.
+    Bounded concurrency via separate semaphores for cheap reads, long-form
+    agents, and latency-sensitive realtime runs. Every public method builds a
+    fresh ResearchSession.
     """
 
     def __init__(
@@ -1855,6 +1856,9 @@ class Researcher:
         s = gateway.settings
         self.read_sem = asyncio.Semaphore(max_reads or s.service_max_reads)
         self.agent_sem = asyncio.Semaphore(max_agents or s.service_max_agents)
+        # Realtime requests have their own capacity so long documentation agents
+        # cannot prevent a speaking client from reaching its first level.
+        self.realtime_sem = asyncio.Semaphore(max_agents or s.service_max_agents)
 
     def _session(self, overrides: dict[str, Any] | None = None) -> ResearchSession:
         session = ResearchSession(self.gateway, self.store)
@@ -1911,4 +1915,65 @@ class Researcher:
             on_event({"type": "queued_for_agent"})
 
         async with self.agent_sem:
+            return await asyncio.to_thread(work)
+
+    async def ask_realtime(
+        self,
+        question: str,
+        *,
+        on_event: Callable[[dict], None],
+        overrides: dict[str, Any] | None = None,
+        stop_event: threading.Event | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run the level-wise realtime RAG pipeline in one worker thread.
+
+        The callback receives the full plan first, then each completed level.
+        It returns immediately after enqueueing a level event and starts the
+        next level, allowing the HTTP client to speak one level while the next
+        one is being researched.
+        """
+
+        from .realtime import RealtimeOptions, RealtimePipeline, RealtimeStopped
+
+        def work() -> dict[str, Any]:
+            session = self._session(overrides)
+            # Realtime retrieval still casts the configured wide hybrid net,
+            # but only reranks a bounded evidence pool before generation.
+            session.settings = session.settings.model_copy(
+                update={
+                    "evidence_rerank_pool": min(
+                        session.settings.evidence_rerank_pool, 40
+                    ),
+                    "evidence_max_per_node": min(
+                        session.settings.evidence_max_per_node, 2
+                    ),
+                }
+            )
+
+            def llm_factory() -> OpenAiLlmClient:
+                return OpenAiLlmClient(
+                    model=session.settings.chat_model,
+                    base_url=session.settings.chat_base_url,
+                    api_key=session.settings.chat_api_key,
+                    temperature=0.0,
+                    timeout=30,
+                    retry_attempts=0,
+                )
+
+            pipeline = RealtimePipeline(
+                llm_factory=llm_factory,
+                search=session.search_with_evidence,
+            )
+            try:
+                return pipeline.run(
+                    question,
+                    emit=on_event,
+                    options=RealtimeOptions(**(options or {})),
+                    stop_event=stop_event,
+                )
+            except RealtimeStopped as exc:
+                raise AgentStopped(str(exc)) from exc
+
+        async with self.realtime_sem:
             return await asyncio.to_thread(work)

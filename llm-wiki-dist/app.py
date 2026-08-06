@@ -378,6 +378,13 @@ def _dump(obj: Any) -> Any:
     return obj
 
 
+def _sse_frame(event: dict[str, Any]) -> str:
+    """Encode one named SSE event while retaining ``type`` in its JSON body."""
+    event_type = re.sub(r"[^a-zA-Z0-9_-]", "_", str(event.get("type") or "message"))
+    data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event_type}\ndata: {data}\n\n"
+
+
 def _compact_node(obj: Any) -> dict[str, Any]:
     data = _dump(obj)
     if not isinstance(data, dict):
@@ -1359,6 +1366,20 @@ class AskBody(BaseModel):
     overrides: dict[str, Any] | None = None
 
 
+class RealtimeAskBody(AskBody):
+    question: str = Field(min_length=1, max_length=20_000)
+    # Logical dependency depth. Recovery levels are additional and only appear
+    # when a completed level reports that evidence is insufficient.
+    max_levels: int = Field(default=4, ge=1, le=6)
+    max_queries_per_level: int = Field(default=4, ge=1, le=6)
+    max_recovery_levels: int = Field(default=2, ge=0, le=3)
+    # Final evidence nodes exposed to one shallow answer call. The underlying
+    # hybrid retrieval pools remain broad and are reranked down to this number.
+    search_limit: int = Field(default=8, ge=2, le=16)
+    max_context_chars: int = Field(default=14_000, ge=2_000, le=40_000)
+    min_search_results: int = Field(default=3, ge=1, le=8)
+
+
 class UpdateBody(BaseModel):
     body: str
 
@@ -1698,6 +1719,100 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
         stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/ask/realtime/stream")
+async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
+    """Stream a complete level plan followed by immediately speakable levels.
+
+    The ``plan`` event always precedes ``level`` events. If adaptive recovery
+    inserts or reorders work, a ``plan_update`` is emitted before processing
+    the changed remainder of the plan.
+    """
+
+    loop = asyncio.get_running_loop()
+    events: queue.Queue = queue.Queue()
+    sentinel = object()
+    run_id = str(uuid.uuid4())
+    stop_event = threading.Event()
+    options = {
+        "max_levels": payload.max_levels,
+        "max_queries_per_level": payload.max_queries_per_level,
+        "max_recovery_levels": payload.max_recovery_levels,
+        "search_limit": payload.search_limit,
+        "max_context_chars": payload.max_context_chars,
+        "min_search_results": payload.min_search_results,
+    }
+
+    async def run_realtime() -> None:
+        def emit(event: dict) -> None:
+            events.put(event)
+
+        try:
+            await reads().ask_realtime(
+                payload.question.strip(),
+                on_event=emit,
+                overrides=payload.overrides,
+                stop_event=stop_event,
+                options=options,
+            )
+        except asyncio.CancelledError:
+            stop_event.set()
+            events.put({"type": "cancelled", "run_id": run_id})
+            raise
+        except AgentStopped:
+            events.put({"type": "cancelled", "run_id": run_id})
+        except Exception as exc:
+            events.put(
+                {
+                    "type": "error",
+                    "message": str(exc),
+                    "retryable": True,
+                    "code": "realtime_failed",
+                }
+            )
+        finally:
+            agent_runs.remove(run_id)
+            events.put(sentinel)
+
+    task = asyncio.create_task(run_realtime())
+    agent_runs.register(run_id, task, stop_event)
+
+    async def stream():
+        try:
+            yield ": connected\n\n"
+            # Transport metadata comes first so callers can cancel immediately;
+            # the first semantic event produced by the pipeline is always plan.
+            yield _sse_frame({"type": "run", "run_id": run_id})
+            while True:
+                try:
+                    event = await loop.run_in_executor(
+                        SSE_EXECUTOR, lambda: events.get(timeout=10)
+                    )
+                except queue.Empty:
+                    yield ": ping\n\n"
+                    continue
+                if event is sentinel:
+                    break
+                yield _sse_frame(event)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            if not task.done():
+                stop_event.set()
+                task.cancel()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
