@@ -1858,7 +1858,18 @@ class Researcher:
         self.agent_sem = asyncio.Semaphore(max_agents or s.service_max_agents)
         # Realtime requests have their own capacity so long documentation agents
         # cannot prevent a speaking client from reaching its first level.
-        self.realtime_sem = asyncio.Semaphore(max_agents or s.service_max_agents)
+        realtime_slots = max(1, max_agents or s.service_max_agents)
+        self.realtime_sem = asyncio.Semaphore(realtime_slots)
+        # ...and their own threads. asyncio.to_thread() shares one small default
+        # executor with every read and agent run, so a burst of long-form work
+        # would otherwise queue the latency-critical path behind it.
+        self._realtime_executor = ThreadPoolExecutor(
+            max_workers=realtime_slots, thread_name_prefix="realtime-run"
+        )
+
+    def close(self) -> None:
+        """Release the realtime worker threads. Safe to call more than once."""
+        self._realtime_executor.shutdown(wait=False, cancel_futures=True)
 
     def _session(self, overrides: dict[str, Any] | None = None) -> ResearchSession:
         session = ResearchSession(self.gateway, self.store)
@@ -1934,7 +1945,16 @@ class Researcher:
         one is being researched.
         """
 
+        from dataclasses import fields as _dataclass_fields
+
         from .realtime import RealtimeOptions, RealtimePipeline, RealtimeStopped
+
+        # Ignore unknown keys instead of failing the run: the transport layer
+        # and the pipeline options can drift independently.
+        known = {f.name for f in _dataclass_fields(RealtimeOptions)}
+        realtime_options = RealtimeOptions(
+            **{k: v for k, v in (options or {}).items() if k in known and v is not None}
+        )
 
         def work() -> dict[str, Any]:
             session = self._session(overrides)
@@ -1952,6 +1972,10 @@ class Researcher:
             )
 
             def llm_factory() -> OpenAiLlmClient:
+                # No retries on the latency-critical path. LlmClient wires this
+                # value into both ChatOpenAI and its own retry loop, so setting
+                # it to one can otherwise multiply a 30-second failure several
+                # times before the speaker receives anything.
                 return OpenAiLlmClient(
                     model=session.settings.chat_model,
                     base_url=session.settings.chat_base_url,
@@ -1959,6 +1983,7 @@ class Researcher:
                     temperature=0.0,
                     timeout=30,
                     retry_attempts=0,
+                    retry_delay_seconds=0.0,
                 )
 
             pipeline = RealtimePipeline(
@@ -1969,11 +1994,12 @@ class Researcher:
                 return pipeline.run(
                     question,
                     emit=on_event,
-                    options=RealtimeOptions(**(options or {})),
+                    options=realtime_options,
                     stop_event=stop_event,
                 )
             except RealtimeStopped as exc:
                 raise AgentStopped(str(exc)) from exc
 
+        loop = asyncio.get_running_loop()
         async with self.realtime_sem:
-            return await asyncio.to_thread(work)
+            return await loop.run_in_executor(self._realtime_executor, work)

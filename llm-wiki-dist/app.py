@@ -43,7 +43,7 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from graph.core import Settings
 from graph.gateway import ModelGateway
@@ -193,6 +193,8 @@ async def _close_stack(db: str) -> None:
     with suppress(Exception):
         await stack["librarian"].stop()
     with suppress(Exception):
+        stack["researcher"].close()
+    with suppress(Exception):
         stack["write_store"].close()
     with suppress(Exception):
         stack["read_store"].close()
@@ -327,6 +329,8 @@ async def lifespan(_: FastAPI):
                 pass
 
             with suppress(Exception):
+                stack["researcher"].close()
+            with suppress(Exception):
                 stack["write_store"].close()
             with suppress(Exception):
                 stack["read_store"].close()
@@ -379,9 +383,29 @@ def _dump(obj: Any) -> Any:
 
 
 def _sse_frame(event: dict[str, Any]) -> str:
-    """Encode one named SSE event while retaining ``type`` in its JSON body."""
+    """Encode one named SSE event while retaining ``type`` in its JSON body.
+
+    Encoding never raises: the response status is already committed by the time
+    events flow, so one unserializable payload must degrade to an error frame
+    instead of truncating the stream mid-answer.
+    """
     event_type = re.sub(r"[^a-zA-Z0-9_-]", "_", str(event.get("type") or "message"))
-    data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    try:
+        data = json.dumps(
+            event, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+    except Exception as exc:
+        log.warning("sse encode failed type=%s: %s", event_type, exc)
+        event_type = "error"
+        data = json.dumps(
+            {
+                "type": "error",
+                "message": "event could not be encoded",
+                "retryable": False,
+                "code": "sse_encode_failed",
+            },
+            separators=(",", ":"),
+        )
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
@@ -1368,6 +1392,9 @@ class AskBody(BaseModel):
 
 class RealtimeAskBody(AskBody):
     question: str = Field(min_length=1, max_length=20_000)
+    # Wall-clock budget for the whole run. Past it the pipeline stops scheduling
+    # levels and terminates with status=partial rather than streaming forever.
+    deadline_seconds: float = Field(default=90.0, ge=10.0, le=300.0)
     # Logical dependency depth. Recovery levels are additional and only appear
     # when a completed level reports that evidence is insufficient.
     max_levels: int = Field(default=4, ge=1, le=6)
@@ -1378,6 +1405,16 @@ class RealtimeAskBody(AskBody):
     search_limit: int = Field(default=8, ge=2, le=16)
     max_context_chars: int = Field(default=14_000, ge=2_000, le=40_000)
     min_search_results: int = Field(default=3, ge=1, le=8)
+
+    @field_validator("question")
+    @classmethod
+    def _require_text(cls, value: str) -> str:
+        # min_length alone accepts "   ", which would plan against an empty
+        # question and burn a model call for nothing.
+        question = value.strip()
+        if not question:
+            raise ValueError("question must not be blank")
+        return question
 
 
 class UpdateBody(BaseModel):
@@ -1743,6 +1780,7 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
         "search_limit": payload.search_limit,
         "max_context_chars": payload.max_context_chars,
         "min_search_results": payload.min_search_results,
+        "deadline_seconds": payload.deadline_seconds,
     }
 
     async def run_realtime() -> None:
@@ -1751,7 +1789,7 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
 
         try:
             await reads().ask_realtime(
-                payload.question.strip(),
+                payload.question,
                 on_event=emit,
                 overrides=payload.overrides,
                 stop_event=stop_event,
@@ -1764,10 +1802,12 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
         except AgentStopped:
             events.put({"type": "cancelled", "run_id": run_id})
         except Exception as exc:
+            log.exception("realtime run failed run_id=%s", run_id)
             events.put(
                 {
                     "type": "error",
-                    "message": str(exc),
+                    # Bounded and single-line: this reaches a speaking client.
+                    "message": f"{type(exc).__name__}: {exc}".replace("\n", " ")[:300],
                     "retryable": True,
                     "code": "realtime_failed",
                 }

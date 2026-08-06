@@ -56,6 +56,7 @@ Full request:
   "search_limit": 8,
   "max_context_chars": 14000,
   "min_search_results": 3,
+  "deadline_seconds": 90,
   "overrides": null
 }
 ```
@@ -69,9 +70,11 @@ Full request:
 | `search_limit` | `8` | 2–16 | Maximum ranked evidence nodes given to one shallow answer call. |
 | `max_context_chars` | `14000` | 2,000–40,000 | Maximum retrieved context given to one shallow answer call. |
 | `min_search_results` | `3` | 1–8 | Results below this count trigger one broader search automatically. |
+| `deadline_seconds` | `90` | 10–300 | Wall-clock budget for the run. Past it no new level starts and the run ends `partial`. |
 | `overrides` | `null` | existing `/api/ask` overrides | Optional chat-model/API settings for this request. |
 
 Invalid request bodies receive an HTTP `422` response before streaming starts.
+A blank or whitespace-only `question` is also rejected with `422`.
 
 ## Processing model
 
@@ -87,7 +90,13 @@ Invalid request bodies receive an HTTP `422` response before streaming starts.
 9. The server starts the next level immediately; it does not wait for the
    client to finish speaking the previous level.
 10. If evidence is insufficient, a recovery level is inserted and a
-    `plan_update` event announces the new order.
+    `plan_update` event announces the new order. A recovery level is only
+    inserted for searches the run has not already performed, since repeating a
+    query retrieves the same evidence and only costs time. When no new search
+    is available, the gap is reported through `done.status` instead.
+11. Once `deadline_seconds` passes, no further level is started. Levels already
+    emitted stay valid; the run terminates with `status="partial"` and
+    `incomplete_reason="deadline"`.
 
 Levels are sequential because later levels may depend on earlier facts. Work
 inside one level is parallel. This lets the client speak Level 1 while the
@@ -220,7 +229,8 @@ coming. The plan itself should not be spoken.
 ### `plan_update`
 
 Sent whenever adaptive processing changes the remaining order. The event
-contains the complete current plan, not a partial patch.
+contains the complete current plan, not a partial patch. It is also emitted
+when the deadline causes pending levels to become `skipped`.
 
 ```json
 {
@@ -266,6 +276,16 @@ contains the complete current plan, not a partial patch.
 
 Clients must use the highest `version` received. Replace the locally stored
 pending plan atomically when this event arrives.
+
+For `reason="insufficient_evidence"`, `inserted_level_id` and
+`after_level_id` identify the new recovery level. For `reason="deadline"`,
+those fields are omitted because the order did not change; the `levels` array
+contains the final `skipped` statuses.
+
+Level `status` values in `plan` and `plan_update`: `pending`, `running`,
+`complete`, `partial`, and `skipped` (never started, only after the deadline
+passed). A level's status is a snapshot at emit time; the `level` event is the
+authoritative result for that level.
 
 ### `level_start`
 
@@ -323,7 +343,10 @@ Client behavior:
 - Do not wait for `done`.
 - Do not speak `reference_node_ids`; store them with the spoken segment.
 - Treat `facts` as the source map for the segment. Every accepted fact has at
-  least one backend-allowlisted node ID.
+  least one backend-allowlisted node ID. Node IDs are stripped from spoken
+  `text`, so a TTS client never reads a reference out loud.
+- `queries[].error` is a single-line diagnostic truncated to 200 characters, or
+  `null`. It marks one failed subquery, not a failed run.
 - Deduplicate speech by `level_id`. A level is emitted at most once during a
   normal connection.
 - `complete=false` means the level found some supported facts but not everything
@@ -341,8 +364,10 @@ answer and should not be spoken again.
 {
   "type": "done",
   "status": "complete",
+  "incomplete_reason": null,
   "plan_version": 1,
   "levels_completed": 2,
+  "levels_planned": 2,
   "facts": [
     {
       "text": "X is the component that coordinates upload retries.",
@@ -360,9 +385,19 @@ answer and should not be spoken again.
 
 `status` values:
 
-- `complete`: every final level completed or was resolved by recovery.
-- `partial`: the recovery budget was exhausted while information was still
-  missing. Previously emitted facts remain source-backed and usable.
+- `complete`: every level completed or was resolved by recovery.
+- `partial`: something the question asked for was not supported by the
+  database. Previously emitted facts remain source-backed and usable; the
+  missing part must not be filled in by the speaking client.
+
+`incomplete_reason` explains a `partial` run and is `null` when `status` is
+`complete`:
+
+- `evidence_missing`: the recovery budget was exhausted, or no new search
+  remained that could close the gap.
+- `deadline`: `deadline_seconds` passed before every planned level ran. Levels
+  never started are reported with `status: "skipped"` in the last plan the
+  client received; `levels_completed` is lower than `levels_planned`.
 
 After `done`, allow the existing TTS buffer to finish and close the stream.
 
@@ -559,6 +594,11 @@ data: {"type":"done","status":"complete","plan_version":1,"levels_completed":2,.
 
 - The full initial plan is emitted before answer levels.
 - Plan changes are versioned and emitted before the changed future level starts.
+- A run always terminates: with `done` inside `deadline_seconds` plus the
+  duration of the calls already in flight, or with `error`/`cancelled`.
+- A run that could not support every part of the question always terminates
+  with `status="partial"`; unsupported parts are omitted, never filled in.
+- The same subquery is never issued twice, except to retry one that failed.
 - Shallow queries inside a level run concurrently.
 - The next level starts without waiting for speech playback.
 - Every streamed fact has at least one node ID from retrieved evidence or an
