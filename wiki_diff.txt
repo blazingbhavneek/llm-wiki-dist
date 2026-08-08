@@ -1,0 +1,1949 @@
+diff --git a/llm-wiki-dist/HANDOFF.md b/llm-wiki-dist/HANDOFF.md
+new file mode 100644
+index 0000000..3ab0299
+--- /dev/null
++++ b/llm-wiki-dist/HANDOFF.md
+@@ -0,0 +1,109 @@
++# Realtime research handoff
++
++## User goal
++
++Replace the serial realtime RAG worker with a fast agentic fan-out/fan-in
++pipeline. It must read a broad set of relevant source nodes, allow flexible
++research decisions, and still emit each level inside the client's 15-second
++per-stage timeout.
++
++## Current problem
++
++`graph/realtime.py` still has a serial worker flow in `_answer_query()`:
++
++1. broad `search_with_evidence()` retrieval;
++2. `ResearchMove` candidate-selection model call;
++3. answer draft model call;
++4. optional follow-up retrieval/model calls.
++
++This can exit after a partial answer. A positive `research_seconds_per_query`
++also makes serial model calls exceed the client timeout. The latest fast default
++is `0`, which suppresses follow-up turns; the user rejected that tradeoff.
++
++Observed request logs confirmed the serial path:
++
++1. planning chat call;
++2. embedding call;
++3. candidate-selection chat call;
++4. draft chat call;
++5. follow-up embedding call;
++6. final chat call.
++
++## Required implementation
++
++Implement a **parallel reader-agent fan-out/fan-in** inside each realtime level:
++
++```text
++broad candidate catalog
++  -> coordinator agent chooses/assigns research angles
++  -> 3-4 reader agents in parallel, each with a disjoint candidate group
++       - may request one focused follow-up search
++       - returns source-backed evidence report, not the user answer
++  -> one synthesis model call over all reader reports
++  -> emit level
++```
++
++Target timing: coordinator + parallel reader wave + synthesis should normally
++fit below 15 seconds wall clock. Use a stage deadline around 12 seconds, not a
++20-second serial loop.
++
++## Design constraints from user
++
++- Keep the leveled realtime structure and streaming behavior.
++- Do not turn it into the full `researcher.py`/LangGraph pipeline.
++- It must be an agent: the coordinator/readers choose relevant material; do not
++  hardcode API names, `X±5` neighborhoods, or fixed topic logic.
++- A broad candidate catalog should contain node ID, title, summary, match
++  snippets, source path/range.
++- Reader agents should read full selected node bodies and may use source-local
++  neighbors/links when available.
++- Do not stop merely because an answer model leaves `follow_up_query` blank.
++- The first emitted answer should be complete enough; do not emit generic
++  “provided material lacks information” filler.
++- Client has a 15-second timeout per stage. `app.py` now sends SSE pings every
++  2 seconds, but model work still must finish quickly.
++
++## Known source correctness examples
++
++For `mpf_mfs_open` the source documents explicitly state:
++
++```c
++int mpf_mfs_open(MPF_MFS_FCB *fcb, char *cpuname,
++                 int filenum, int sbnum, ssize_t bufsize, int opentype)
++```
++
++Therefore the third argument is `filenum`, not `sbnum`.
++
++For processing-request use, the source explicitly requires:
++
++- `pmf_prg.txt`
++- `pmf_procdata.txt`
++- `mpf_mfs_cyclicfile.txt` registration/creation
++
++The current realtime answers have incorrectly omitted the second filename and
++demoted the third item to a conditional aside.
++
++## Relevant files
++
++- `graph/realtime.py`: current realtime pipeline; contains `ResearchMove`,
++  candidate catalog formatting, and serial `_answer_query()` logic.
++- `graph/researcher.py`: useful reference for candidate previews, tool agents,
++  `read`, `search`, and subagent concurrency. Do not reuse its full slow graph.
++- `graph/store.py`: source chunks have `start_char`/`end_char`; nodes expose
++  `source_path` and `source_ranges`, useful for a future source-neighbor tool.
++- `app.py`: realtime request options and SSE transport. Keep 2-second ping.
++- `tests/test_realtime.py`: current tests pass but do not yet test parallel
++  reader-agent fan-out.
++
++## Current local changes
++
++Modified: `graph/realtime.py`, `app.py`, `SSE_SPEC.md`,
++`tests/test_realtime.py`.
++
++Last verification before this handoff:
++
++```bash
++PYTHONPATH=. python -m unittest tests/test_realtime.py
++```
++
++Result: 8 tests passed.
+diff --git a/llm-wiki-dist/SSE_SPEC.md b/llm-wiki-dist/SSE_SPEC.md
+index 8659fd2..56c0264 100644
+--- a/llm-wiki-dist/SSE_SPEC.md
++++ b/llm-wiki-dist/SSE_SPEC.md
+@@ -50,13 +50,15 @@ Full request:
+ ```json
+ {
+   "question": "What is X and why does it do Y?",
+-  "max_levels": 4,
+-  "max_queries_per_level": 4,
+-  "max_recovery_levels": 2,
+-  "search_limit": 8,
+-  "max_context_chars": 14000,
+-  "min_search_results": 3,
++  "max_levels": 1,
++  "max_queries_per_level": 1,
++  "max_recovery_levels": 0,
++  "search_limit": 16,
++  "max_context_chars": 32000,
++  "min_initial_read_nodes": 16,
++  "min_search_results": 1,
+   "deadline_seconds": 90,
++  "research_seconds_per_query": 0,
+   "overrides": null
+ }
+ ```
+@@ -64,13 +66,15 @@ Full request:
+ | Field | Default | Allowed | Meaning |
+ |---|---:|---:|---|
+ | `question` | required | 1–20,000 characters | The complete user request. |
+-| `max_levels` | `4` | 1–6 | Maximum number of initially planned dependency levels. |
+-| `max_queries_per_level` | `4` | 1–6 | Maximum shallow queries that may run in parallel inside one level. |
+-| `max_recovery_levels` | `2` | 0–3 | Additional levels that may be inserted when evidence is insufficient. |
+-| `search_limit` | `8` | 2–16 | Maximum ranked evidence nodes given to one shallow answer call. |
+-| `max_context_chars` | `14000` | 2,000–40,000 | Maximum retrieved context given to one shallow answer call. |
+-| `min_search_results` | `3` | 1–8 | Results below this count trigger one broader search automatically. |
++| `max_levels` | `1` | 1–6 | `1` answers the original question directly; values above `1` enable dependency planning. |
++| `max_queries_per_level` | `1` | 1–6 | Maximum shallow queries in a planned level. |
++| `max_recovery_levels` | `0` | 0–3 | Deprecated compatibility field; ignored. |
++| `search_limit` | `16` | 2–32 | Maximum ranked evidence nodes read by one realtime worker. |
++| `max_context_chars` | `32,000` | 0–60,000 | Prompt character cap shared across the selected sources. `0` permits an intentionally exhaustive, slower prompt. |
++| `min_initial_read_nodes` | `16` | 1–40 | Number of ranked sources read before synthesis; the context budget is distributed across them. |
++| `min_search_results` | `1` | 1–8 | Deprecated compatibility field; ignored. A broad fallback is used only for an empty focused search. |
+ | `deadline_seconds` | `90` | 10–300 | Wall-clock budget for the run. Past it no new level starts and the run ends `partial`. |
++| `research_seconds_per_query` | `0` | 0–90 | Deprecated compatibility field; the fast path does not run an open-ended follow-up loop. |
+ | `overrides` | `null` | existing `/api/ask` overrides | Optional chat-model/API settings for this request. |
+ 
+ Invalid request bodies receive an HTTP `422` response before streaming starts.
+@@ -78,29 +82,27 @@ A blank or whitespace-only `question` is also rejected with `422`.
+ 
+ ## Processing model
+ 
+-1. One fast LLM call creates the complete initial level plan.
++1. The default creates one direct level from the original question without a planning model call. Requests allowing more than one level use the dependency planner and always contain at least two levels, even if the planner initially returns only one.
+ 2. The server emits that plan before emitting any answer level.
+-3. All shallow queries inside the current level run concurrently.
+-4. Each query performs hybrid keyword/vector retrieval and reranking.
+-5. Sparse retrieval automatically performs one broader search.
+-6. One LLM call per shallow query produces short referenced facts. Calls for
+-   the same level run concurrently.
+-7. Facts with missing or non-retrieved node IDs are removed by the backend.
+-8. The completed level is placed on the SSE queue immediately.
++3. Each query performs hybrid keyword/vector retrieval and reranking.
++4. The first 16 ranked sources are read before synthesis. Their query-match snippets and a fair share of each document body are supplied, so a long overview cannot exclude a concise prerequisite source.
++5. An empty focused retrieval automatically performs one broader search.
++6. One synthesis call writes the source-backed section.
++7. Sections with missing or non-retrieved node IDs are removed by the backend.
++8. The completed section is appended and the level is placed on the
++   SSE queue immediately.
+ 9. The server starts the next level immediately; it does not wait for the
+    client to finish speaking the previous level.
+-10. If evidence is insufficient, a recovery level is inserted and a
+-    `plan_update` event announces the new order. A recovery level is only
+-    inserted for searches the run has not already performed, since repeating a
+-    query retrieves the same evidence and only costs time. When no new search
+-    is available, the gap is reported through `done.status` instead.
++10. Earlier completed sections are supplied as editorial context to later
++    levels, but never appended to their retrieval query.
+ 11. Once `deadline_seconds` passes, no further level is started. Levels already
+     emitted stay valid; the run terminates with `status="partial"` and
+     `incomplete_reason="deadline"`.
+ 
+-Levels are sequential because later levels may depend on earlier facts. Work
+-inside one level is parallel. This lets the client speak Level 1 while the
+-server researches Level 2.
++Levels are sequential because later levels may depend on earlier facts. The
++realtime model endpoint serializes generations, so planned queries are also
++issued serially rather than queued behind one another. This lets the client
++speak Level 1 while the server researches Level 2.
+ 
+ ## SSE framing
+ 
+@@ -148,24 +150,10 @@ level
+ done
+ ```
+ 
+-Adaptive recovery order:
+-
+-```text
+-run
+-plan
+-level_start                 (planned level is processed)
+-plan_update                 (recovery is inserted)
+-level                       (supported facts from the planned level)
+-level_start                 (inserted recovery level starts)
+-level
+-...
+-done
+-```
+-
+ `run` is transport metadata. `plan` is always the first semantic pipeline
+ event, and no `level` event can precede it.
+ 
+-Already emitted levels are immutable. A `plan_update` only changes future work.
++Already emitted levels are immutable. A deadline `plan_update` only changes future work.
+ The client must replace its pending plan with the newest version and must not
+ replay or remove text that has already been spoken.
+ 
+@@ -228,64 +216,14 @@ coming. The plan itself should not be spoken.
+ 
+ ### `plan_update`
+ 
+-Sent whenever adaptive processing changes the remaining order. The event
+-contains the complete current plan, not a partial patch. It is also emitted
+-when the deadline causes pending levels to become `skipped`.
+-
+-```json
+-{
+-  "type": "plan_update",
+-  "version": 2,
+-  "reason": "insufficient_evidence",
+-  "inserted_level_id": "recovery_1",
+-  "after_level_id": "level_1",
+-  "levels": [
+-    {
+-      "id": "level_1",
+-      "position": 1,
+-      "objective": "Define X",
+-      "queries": ["What exactly is X?"],
+-      "depends_on": [],
+-      "kind": "planned",
+-      "recovery_for": null,
+-      "status": "partial"
+-    },
+-    {
+-      "id": "recovery_1",
+-      "position": 2,
+-      "objective": "Find missing evidence for Define X",
+-      "queries": ["What configuration determines X's behavior?"],
+-      "depends_on": ["level_1"],
+-      "kind": "recovery",
+-      "recovery_for": "level_1",
+-      "status": "pending"
+-    },
+-    {
+-      "id": "level_2",
+-      "position": 3,
+-      "objective": "Explain why X does Y",
+-      "queries": ["What mechanism causes X to do Y?"],
+-      "depends_on": ["recovery_1"],
+-      "kind": "planned",
+-      "recovery_for": null,
+-      "status": "pending"
+-    }
+-  ]
+-}
+-```
+-
+-Clients must use the highest `version` received. Replace the locally stored
+-pending plan atomically when this event arrives.
+-
+-For `reason="insufficient_evidence"`, `inserted_level_id` and
+-`after_level_id` identify the new recovery level. For `reason="deadline"`,
+-those fields are omitted because the order did not change; the `levels` array
+-contains the final `skipped` statuses.
++Sent only when the deadline causes pending levels to become `skipped`. The
++event contains the complete current plan, not a partial patch. Clients must use
++the highest `version` received and replace their locally stored pending plan.
+ 
+ Level `status` values in `plan` and `plan_update`: `pending`, `running`,
+-`complete`, `partial`, and `skipped` (never started, only after the deadline
+-passed). A level's status is a snapshot at emit time; the `level` event is the
+-authoritative result for that level.
++`complete`, and `skipped` (never started, only after the deadline passed). A
++level's status is a snapshot at emit time; the `level` event is the authoritative
++result for that level.
+ 
+ ### `level_start`
+ 
+@@ -317,7 +255,7 @@ Contains the newly completed, immediately speakable output for one level.
+   "queries": [
+     {
+       "query": "What exactly is X?",
+-      "enough": true,
++      "answered": true,
+       "reference_node_ids": ["node:14"],
+       "search_result_count": 8,
+       "latency_ms": 184,
+@@ -349,9 +287,9 @@ Client behavior:
+   `null`. It marks one failed subquery, not a failed run.
+ - Deduplicate speech by `level_id`. A level is emitted at most once during a
+   normal connection.
+-- `complete=false` means the level found some supported facts but not everything
+-  it needed. Speak its non-empty `text`; an announced recovery level may provide
+-  the missing part. Do not invent a transition or missing explanation.
++- `complete` is true for every level that ran. Individual workers report
++  `answered=false` when no sourced section survived validation; this is a
++  diagnostic, not spoken content or a request for recovery.
+ - `text` may be empty when no supported fact survived reference validation. Do
+   not enqueue an empty string.
+ 
+@@ -385,16 +323,13 @@ answer and should not be spoken again.
+ 
+ `status` values:
+ 
+-- `complete`: every level completed or was resolved by recovery.
+-- `partial`: something the question asked for was not supported by the
+-  database. Previously emitted facts remain source-backed and usable; the
+-  missing part must not be filled in by the speaking client.
++- `complete`: every planned level completed.
++- `partial`: the deadline passed before every planned level ran. Previously
++  emitted facts remain source-backed and usable.
+ 
+ `incomplete_reason` explains a `partial` run and is `null` when `status` is
+ `complete`:
+ 
+-- `evidence_missing`: the recovery budget was exhausted, or no new search
+-  remained that could close the gap.
+ - `deadline`: `deadline_seconds` passed before every planned level ran. Levels
+   never started are reported with `status: "skipped"` in the last plan the
+   client received; `levels_completed` is lower than `levels_planned`.
+@@ -599,7 +534,8 @@ data: {"type":"done","status":"complete","plan_version":1,"levels_completed":2,.
+ - A run that could not support every part of the question always terminates
+   with `status="partial"`; unsupported parts are omitted, never filled in.
+ - The same subquery is never issued twice, except to retry one that failed.
+-- Shallow queries inside a level run concurrently.
++- Planned queries inside a level are issued serially because the configured
++  model endpoint serializes generations.
+ - The next level starts without waiting for speech playback.
+ - Every streamed fact has at least one node ID from retrieved evidence or an
+   already accepted earlier-level fact.
+diff --git a/llm-wiki-dist/app.py b/llm-wiki-dist/app.py
+index 2f510da..dc3b027 100644
+--- a/llm-wiki-dist/app.py
++++ b/llm-wiki-dist/app.py
+@@ -90,9 +90,9 @@ class AgentRunRegistry:
+ 
+ 
+ # Per-db runtime config (reverse-proxy prefix + where the .sqlite files live).
+-DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki"))
+-DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
+-PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
++DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki_docker"))
++DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki_moove")
++PREFIX = os.environ.get("WIKI_PREFIX", "/agent/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
+ _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
+ _RESERVED_DB_NAMES = {"admin", "assets"}
+ 
+@@ -1395,16 +1395,29 @@ class RealtimeAskBody(AskBody):
+     # Wall-clock budget for the whole run. Past it the pipeline stops scheduling
+     # levels and terminates with status=partial rather than streaming forever.
+     deadline_seconds: float = Field(default=90.0, ge=10.0, le=300.0)
+-    # Logical dependency depth. Recovery levels are additional and only appear
+-    # when a completed level reports that evidence is insufficient.
+-    max_levels: int = Field(default=4, ge=1, le=6)
+-    max_queries_per_level: int = Field(default=4, ge=1, le=6)
+-    max_recovery_levels: int = Field(default=2, ge=0, le=3)
+-    # Final evidence nodes exposed to one shallow answer call. The underlying
++    # One direct retrieval-and-synthesis pass is the latency default. Set this
++    # above one to explicitly request slower dependency planning.
++    max_levels: int = Field(default=1, ge=1, le=6)
++    max_queries_per_level: int = Field(default=1, ge=1, le=6)
++    # Kept as an accepted no-op for older clients. Realtime workers no longer
++    # insert recovery levels based on evidence-status judgments.
++    max_recovery_levels: int = Field(default=0, ge=0, le=3)
++    # Final evidence nodes exposed to one realtime worker. The underlying
+     # hybrid retrieval pools remain broad and are reranked down to this number.
+-    search_limit: int = Field(default=8, ge=2, le=16)
+-    max_context_chars: int = Field(default=14_000, ge=2_000, le=40_000)
+-    min_search_results: int = Field(default=3, ge=1, le=8)
++    search_limit: int = Field(default=16, ge=2, le=32)
++    # A bounded prompt avoids excessive prefill latency and context dilution.
++    # Set zero only for an intentionally exhaustive, slower request.
++    max_context_chars: int = Field(default=32_000, ge=0, le=60_000)
++    # Accepted compatibility field; the fast path performs no open-ended
++    # follow-up loop after its first retrieval.
++    research_seconds_per_query: float = Field(default=0.0, ge=0.0, le=90.0)
++    # Number of ranked sources read before synthesis. Context is distributed
++    # across them so concise prerequisite documents are not hidden by a long
++    # higher-ranked manual page.
++    min_initial_read_nodes: int = Field(default=16, ge=1, le=40)
++    # Kept as an accepted no-op for older clients; broad fallback is now used
++    # only when focused retrieval returns no results.
++    min_search_results: int = Field(default=1, ge=1, le=8)
+ 
+     @field_validator("question")
+     @classmethod
+@@ -1763,9 +1776,8 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
+ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
+     """Stream a complete level plan followed by immediately speakable levels.
+ 
+-    The ``plan`` event always precedes ``level`` events. If adaptive recovery
+-    inserts or reorders work, a ``plan_update`` is emitted before processing
+-    the changed remainder of the plan.
++    The ``plan`` event always precedes ``level`` events. A ``plan_update`` is
++    emitted only when the deadline marks unstarted levels as skipped.
+     """
+ 
+     loop = asyncio.get_running_loop()
+@@ -1781,6 +1793,8 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
+         "max_context_chars": payload.max_context_chars,
+         "min_search_results": payload.min_search_results,
+         "deadline_seconds": payload.deadline_seconds,
++        "research_seconds_per_query": payload.research_seconds_per_query,
++        "min_initial_read_nodes": payload.min_initial_read_nodes,
+     }
+ 
+     async def run_realtime() -> None:
+@@ -1828,7 +1842,9 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
+             while True:
+                 try:
+                     event = await loop.run_in_executor(
+-                        SSE_EXECUTOR, lambda: events.get(timeout=10)
++                        # Keep proxies and speech clients alive while a worker
++                        # spends its research budget in model calls.
++                        SSE_EXECUTOR, lambda: events.get(timeout=2)
+                     )
+                 except queue.Empty:
+                     yield ": ping\n\n"
+diff --git a/llm-wiki-dist/graph/realtime.py b/llm-wiki-dist/graph/realtime.py
+index 350a334..29efdb2 100644
+--- a/llm-wiki-dist/graph/realtime.py
++++ b/llm-wiki-dist/graph/realtime.py
+@@ -1,8 +1,8 @@
+ """Low-latency, dependency-levelled RAG for realtime speaking clients.
+ 
+-The pipeline emits the complete plan before any answer text.  Queries inside a
+-level run concurrently; completed levels are emitted immediately so a caller
+-can enqueue their text for speech while the following level is researched.
++The pipeline emits the complete plan before any answer text. Completed levels
++are emitted immediately so a caller can enqueue their text for speech while the
++following level is researched.
+ 
+ Hard rules enforced here, not in the prompt:
+ 
+@@ -19,7 +19,6 @@ import logging
+ import re
+ import threading
+ import time
+-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+ from dataclasses import dataclass, field, replace
+ from typing import Any, Callable, Iterable, Protocol
+ 
+@@ -48,30 +47,64 @@ class ReferencedFact(BaseModel):
+     node_ids: list[str] = Field(default_factory=list)
+ 
+ 
+-class ShallowAnswer(BaseModel):
+-    facts: list[ReferencedFact] = Field(default_factory=list)
+-    enough: bool = False
+-    missing_queries: list[str] = Field(default_factory=list)
++class ShallowResearchAnswer(BaseModel):
++    """One source-backed answer section for a realtime level."""
++
++    answer: str = ""
++    node_ids: list[str] = Field(default_factory=list)
++
++
++# Retained as transport-compatible schemas for callers that imported the
++# earlier experimental reader pipeline. The latency path no longer instantiates
++# them because those extra model turns were serialized by the provider.
++class ResearchMove(BaseModel):
++    read_node_ids: list[str] = Field(default_factory=list)
++    search_query: str = ""
++
++
++class ReaderAssignment(BaseModel):
++    angle: str = ""
++    node_ids: list[str] = Field(default_factory=list)
++
++
++class ReaderReport(BaseModel):
++    evidence: str = ""
++    node_ids: list[str] = Field(default_factory=list)
++    follow_up_query: str = ""
+ 
+ 
+ @dataclass(frozen=True)
+ class RealtimeOptions:
+-    max_levels: int = 4
+-    max_queries_per_level: int = 4
+-    max_recovery_levels: int = 2
+-    search_limit: int = 8
+-    max_context_chars: int = 14_000
+-    min_search_results: int = 3
++    # The fast default answers the original request in one level without a
++    # planning round trip. Clients that explicitly request multiple levels get
++    # the slower dependency planner.
++    max_levels: int = 1
++    max_queries_per_level: int = 1
++    # Compatibility-only knobs retained so older callers do not break.
++    max_recovery_levels: int = 0
++    search_limit: int = 16
++    # An unbounded collection of full node bodies is both slow and easy for a
++    # model to lose in. Keep the default prompt bounded; callers can still set
++    # zero when they intentionally prefer exhaustive context over latency.
++    max_context_chars: int = 32_000
++    min_search_results: int = 1
+     # Wall-clock budget for one run. Retrieval and model calls cannot be
+     # interrupted once started, so the budget bounds *new* work: past it the
+     # pipeline stops scheduling levels and reports the run as partial.
+     deadline_seconds: float = 90.0
+-    # Accepted facts are context for generation. Only a short, ID-free digest
+-    # of them is appended to a retrieval string: node IDs and long fact lists
+-    # turn the BM25 side into a hundred-term OR query and blow up the embedded
+-    # query, which costs both latency and precision.
++    # Accepted for backwards compatibility. The fast path does not add an
++    # unbounded research loop after the first retrieval.
++    research_seconds_per_query: float = 0.0
++    # A realtime client gives each emitted level fifteen seconds.  Reserve a
++    # little transport margin and never begin new work after this deadline.
++    stage_deadline_seconds: float = 12.0
++    # Read a broad ranked set before synthesis. Context is shared fairly across
++    # these nodes, so one long manual page cannot hide a concise prerequisite.
++    min_initial_read_nodes: int = 16
++    # Accepted answer sections are context for later levels. They are supplied
++    # to generation only, never appended to the retrieval query.
+     max_established_chars: int = 2_500
+-    max_search_context_chars: int = 300
++    max_search_context_chars: int = 300  # compatibility-only; unused
+ 
+ 
+ def _normalize_options(options: RealtimeOptions) -> RealtimeOptions:
+@@ -82,9 +115,14 @@ def _normalize_options(options: RealtimeOptions) -> RealtimeOptions:
+         max_queries_per_level=max(1, int(options.max_queries_per_level)),
+         max_recovery_levels=max(0, int(options.max_recovery_levels)),
+         search_limit=max(1, int(options.search_limit)),
+-        max_context_chars=max(500, int(options.max_context_chars)),
++        max_context_chars=max(0, int(options.max_context_chars)),
+         min_search_results=max(0, int(options.min_search_results)),
+         deadline_seconds=max(0.0, float(options.deadline_seconds)),
++        research_seconds_per_query=max(
++            0.0, float(options.research_seconds_per_query)
++        ),
++        stage_deadline_seconds=max(0.0, float(options.stage_deadline_seconds)),
++        min_initial_read_nodes=max(1, int(options.min_initial_read_nodes)),
+         max_established_chars=max(0, int(options.max_established_chars)),
+         max_search_context_chars=max(0, int(options.max_search_context_chars)),
+     )
+@@ -103,8 +141,6 @@ class RuntimeLevel:
+ class QueryOutcome:
+     query: str
+     facts: list[ReferencedFact] = field(default_factory=list)
+-    enough: bool = False
+-    missing_queries: list[str] = field(default_factory=list)
+     retrieved_node_ids: list[str] = field(default_factory=list)
+     search_result_count: int = 0
+     latency_ms: int = 0
+@@ -126,23 +162,28 @@ Rules:
+ - Usually use 1-4 levels. Do not add ceremonial verification or summary levels.
+ - Every query must be standalone, concrete, and searchable in documentation.
+ - Never repeat the same query in two levels.
++- Queries in the same level must cover distinct answer sections. Do not split a
++  single definition into paraphrases. For API documentation, prefer sections
++  such as purpose/return value, signature/parameters, and option flags.
++- When the requested maximum allows it, always create at least two levels. The
++  second level must add concrete details, settings, prerequisites, or conditions
++  rather than paraphrasing the first answer.
+ - The final level should answer the dependent/causal part of the user's request.
+ - Write queries in the user's language.
+ """
+ 
+ 
+-ANSWER_SYSTEM_PROMPT = """Answer one shallow documentation question for a realtime speaking
+-assistant using only the supplied evidence and established facts.
+-
+-Return a few short, natural, speakable facts. Every fact must list the exact
+-node IDs that support it in the node_ids field. Copy node IDs exactly from the
+-supplied material. Never cite an unavailable node ID. Do not write node IDs
+-inside the spoken fact text. Do not use outside knowledge, do not guess, and do
+-not repeat an established fact unless it is needed to answer this query.
+-
+-Set enough=false when the material cannot fully answer the query, and put
+-specific, differently-worded follow-up searches in missing_queries. Never repeat
+-the current question as a missing query. Keep the answer in the user's language.
++SYNTHESIS_SYSTEM_PROMPT = """You are the final fast documentation writer in a realtime
++assistant. Answer the current planned section using only ranked source evidence
++and earlier completed sections. Return a complete, direct, useful answer in the
++user's language; do not describe the research process, evidence quality, or
++missing material. Each selected source contains its query-match snippets and
++document text; combine complementary sources and do not stop after the first
++plausible match. For questions asking for files, prerequisites, steps, choices,
++or a list, enumerate the complete supported set and keep required items primary
++rather than conditional asides. Include every exact supporting node ID in
++node_ids and no IDs not supplied. Do not put IDs in the answer text. Use compact
++Markdown and do not request further research.
+ """
+ 
+ 
+@@ -153,6 +194,14 @@ _ID_EDGE_RE = re.compile(r"^[\s`'\"*<\[(]+|[\s`'\"*>\])]+$")
+ _ID_TAIL_RE = re.compile(r"[,.;:!?]+$")
+ _ID_SPLIT_RE = re.compile(r"[\s,;]+")
+ _BRACKET_RE = re.compile(r"[\[(]([^\[\]()]{1,200})[\])]")
++_UNSUPPORTED_DISCLAIMER_RE = re.compile(
++    r"(?:提供された|与えられた)(?:資料|情報|抜粋).{0,140}?"
++    r"(?:記載|記述|情報|定義|説明).{0,80}?"
++    r"(?:ありません|見つかりません|不足しています)(?:。|\.|$)|"
++    r"(?:the )?(?:provided|supplied) (?:material|evidence|documentation).{0,140}?"
++    r"(?:does not|doesn't|cannot).{0,100}?(?:state|describe|contain|provide).{0,80}?(?:\.|$)",
++    re.IGNORECASE,
++)
+ 
+ 
+ class RealtimePipeline:
+@@ -203,194 +252,108 @@ class RealtimePipeline:
+ 
+         established_facts: list[ReferencedFact] = []
+         seen_fact_texts: set[str] = set()
+-        # Reserve every planned query so recovery does not insert duplicate
+-        # work ahead of a later level. Missing evidence is tracked separately
+-        # below; when that later query completes it closes the earlier gap.
+-        issued_queries = {
+-            self._query_key(query) for level in levels for query in level.queries
+-        }
+-        open_gap_queries: set[str] = set()
+-        recovery_count = 0
+         levels_completed = 0
+         unresolved = False
+         incomplete_reason: str | None = None
+         position = 0
+ 
+-        # One executor for the whole run: worker threads (and their cached chat
+-        # clients) survive across levels, and cancellation does not block on
+-        # in-flight model calls the way a per-level ``with`` block would.
+-        executor = ThreadPoolExecutor(
+-            max_workers=max(1, opts.max_queries_per_level),
+-            thread_name_prefix="realtime-query",
+-        )
+-        try:
+-            while position < len(levels):
+-                self._check_stop(stop_event)
+-                if self._expired(deadline):
+-                    unresolved = True
+-                    incomplete_reason = incomplete_reason or "deadline"
+-                    for pending in levels[position:]:
+-                        statuses[pending.id] = "skipped"
+-                    plan_version += 1
+-                    emit(
+-                        {
+-                            "type": "plan_update",
+-                            "version": plan_version,
+-                            "reason": "deadline",
+-                            "levels": self._public_levels(levels, statuses),
+-                        }
+-                    )
+-                    break
+-
+-                level = levels[position]
+-                statuses[level.id] = "running"
++        while position < len(levels):
++            self._check_stop(stop_event)
++            if self._expired(deadline):
++                unresolved = True
++                incomplete_reason = incomplete_reason or "deadline"
++                for pending in levels[position:]:
++                    statuses[pending.id] = "skipped"
++                plan_version += 1
+                 emit(
+                     {
+-                        "type": "level_start",
+-                        "plan_version": plan_version,
+-                        "level_id": level.id,
+-                        "position": position + 1,
+-                        "objective": level.objective,
+-                        "queries": list(level.queries),
++                        "type": "plan_update",
++                        "version": plan_version,
++                        "reason": "deadline",
++                        "levels": self._public_levels(levels, statuses),
+                     }
+                 )
++                break
+ 
+-                level_started = time.perf_counter()
+-                outcomes = self._run_level(
+-                    question,
+-                    level,
+-                    established_facts,
+-                    opts,
+-                    stop_event,
+-                    executor,
+-                    deadline,
+-                )
++            level = levels[position]
++            statuses[level.id] = "running"
++            emit(
++                {
++                    "type": "level_start",
++                    "plan_version": plan_version,
++                    "level_id": level.id,
++                    "position": position + 1,
++                    "objective": level.objective,
++                    "queries": list(level.queries),
++                }
++            )
+ 
+-                new_facts: list[ReferencedFact] = []
+-                for outcome in outcomes:
+-                    for fact in outcome.facts:
+-                        key = self._fact_key(fact.text)
+-                        if not key or key in seen_fact_texts:
+-                            continue
+-                        seen_fact_texts.add(key)
+-                        new_facts.append(fact)
+-
+-                established_facts.extend(new_facts)
+-                complete = bool(outcomes) and all(
+-                    outcome.enough for outcome in outcomes
+-                )
+-                statuses[level.id] = "complete" if complete else "partial"
+-
+-                # Track missing evidence by normalized query, not as a sticky
+-                # level-wide boolean. A later planned query may be exactly the
+-                # follow-up an earlier level requested; if it succeeds, that
+-                # gap is resolved and the final run can still be complete.
+-                for outcome in outcomes:
+-                    query_key = self._query_key(outcome.query)
+-                    if outcome.enough:
+-                        open_gap_queries.discard(query_key)
+-                        continue
+-                    missing_keys = {
+-                        self._query_key(query)
+-                        for query in outcome.missing_queries
+-                        if self._query_key(query)
+-                    }
+-                    if missing_keys:
+-                        open_gap_queries.discard(query_key)
+-                        open_gap_queries.update(missing_keys)
+-                    elif query_key:
+-                        open_gap_queries.add(query_key)
+-
+-                # Insert a targeted recovery level before any dependent level.
+-                # The plan update is emitted before more speech content, so the
+-                # caller always knows the current order.
+-                if not complete:
+-                    recovery_queries = self._recovery_queries(
+-                        outcomes, issued_queries, opts
+-                    )
+-                    can_recover = (
+-                        bool(recovery_queries)
+-                        and recovery_count < opts.max_recovery_levels
+-                        and not self._expired(deadline)
+-                    )
+-                    if can_recover:
+-                        recovery_count += 1
+-                        recovery = RuntimeLevel(
+-                            id=f"recovery_{recovery_count}",
+-                            objective=f"Find missing evidence for {level.objective}",
+-                            queries=recovery_queries,
+-                            kind="recovery",
+-                            recovery_for=level.id,
+-                        )
+-                        levels.insert(position + 1, recovery)
+-                        issued_queries.update(
+-                            self._query_key(query) for query in recovery_queries
+-                        )
+-                        statuses[recovery.id] = "pending"
+-                        plan_version += 1
+-                        emit(
+-                            {
+-                                "type": "plan_update",
+-                                "version": plan_version,
+-                                "reason": "insufficient_evidence",
+-                                "inserted_level_id": recovery.id,
+-                                "after_level_id": level.id,
+-                                "levels": self._public_levels(levels, statuses),
+-                            }
+-                        )
+-                    else:
+-                        # A matching query may already exist in a later planned
+-                        # level. Leave its gap open and decide final completeness
+-                        # only after all planned work has had a chance to run.
+-                        if self._expired(deadline):
+-                            unresolved = True
+-                            incomplete_reason = incomplete_reason or "deadline"
+-
+-                reference_node_ids = self._unique(
+-                    node_id for fact in new_facts for node_id in fact.node_ids
+-                )
+-                text = " ".join(
+-                    fact.text.strip() for fact in new_facts if fact.text.strip()
+-                )
+-                emit(
+-                    {
+-                        "type": "level",
+-                        "plan_version": plan_version,
+-                        "level_id": level.id,
+-                        "position": position + 1,
+-                        "objective": level.objective,
+-                        "queries": [
+-                            {
+-                                "query": outcome.query,
+-                                "enough": outcome.enough,
+-                                "reference_node_ids": self._unique(
+-                                    node_id
+-                                    for fact in outcome.facts
+-                                    for node_id in fact.node_ids
+-                                ),
+-                                "search_result_count": outcome.search_result_count,
+-                                "latency_ms": outcome.latency_ms,
+-                                "error": outcome.error,
+-                            }
+-                            for outcome in outcomes
+-                        ],
+-                        "text": text,
+-                        "facts": [fact.model_dump() for fact in new_facts],
+-                        "reference_node_ids": reference_node_ids,
+-                        "complete": complete,
+-                        "latency_ms": round(
+-                            (time.perf_counter() - level_started) * 1000
+-                        ),
+-                    }
+-                )
+-                levels_completed += 1
+-                position += 1
+-        finally:
+-            executor.shutdown(wait=False, cancel_futures=True)
++            level_started = time.perf_counter()
++            stage_deadline = level_started + opts.stage_deadline_seconds
++            if deadline is not None:
++                stage_deadline = min(stage_deadline, deadline)
++            outcomes = self._run_level(
++                question,
++                level,
++                established_facts,
++                opts,
++                stop_event,
++                stage_deadline,
++            )
+ 
+-        if open_gap_queries:
+-            unresolved = True
+-            incomplete_reason = incomplete_reason or "evidence_missing"
++            new_facts: list[ReferencedFact] = []
++            for outcome in outcomes:
++                for fact in outcome.facts:
++                    key = self._fact_key(fact.text)
++                    if not key or key in seen_fact_texts:
++                        continue
++                    seen_fact_texts.add(key)
++                    new_facts.append(fact)
++
++            established_facts.extend(new_facts)
++            # Do not turn sparse retrieval into recovery levels or user-facing
++            # evidence warnings; completed sections remain independently useful
++            # and later levels receive them as editorial context.
++            complete = True
++            statuses[level.id] = "complete"
++
++            reference_node_ids = self._unique(
++                node_id for fact in new_facts for node_id in fact.node_ids
++            )
++            text = "\n\n".join(
++                fact.text.strip() for fact in new_facts if fact.text.strip()
++            )
++            emit(
++                {
++                    "type": "level",
++                    "plan_version": plan_version,
++                    "level_id": level.id,
++                    "position": position + 1,
++                    "objective": level.objective,
++                    "queries": [
++                        {
++                            "query": outcome.query,
++                            "answered": bool(outcome.facts),
++                            "reference_node_ids": self._unique(
++                                node_id
++                                for fact in outcome.facts
++                                for node_id in fact.node_ids
++                            ),
++                            "search_result_count": outcome.search_result_count,
++                            "latency_ms": outcome.latency_ms,
++                            "error": outcome.error,
++                        }
++                        for outcome in outcomes
++                    ],
++                    "text": text,
++                    "facts": [fact.model_dump() for fact in new_facts],
++                    "reference_node_ids": reference_node_ids,
++                    "complete": complete,
++                    "latency_ms": round((time.perf_counter() - level_started) * 1000),
++                }
++            )
++            levels_completed += 1
++            position += 1
+ 
+         all_node_ids = self._unique(
+             node_id for fact in established_facts for node_id in fact.node_ids
+@@ -413,6 +376,16 @@ class RealtimePipeline:
+     def _plan(
+         self, question: str, options: RealtimeOptions
+     ) -> tuple[list[RuntimeLevel], bool]:
++        # For the default one-level request, the original question is already
++        # the best retrieval query. Skipping a planning generation removes one
++        # full model round trip from time-to-first-answer.
++        if options.max_levels == 1:
++            return [
++                RuntimeLevel(
++                    id="level_1", objective="Answer the user", queries=[question]
++                )
++            ], False
++
+         prompt = (
+             f"User question:\n{question}\n\n"
+             f"Maximum levels: {options.max_levels}\n"
+@@ -466,42 +439,26 @@ class RealtimePipeline:
+                     id="level_1", objective="Answer the user", queries=[question]
+                 )
+             ]
++        if len(levels) == 1 and options.max_levels >= 2:
++            japanese = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", question))
++            detail_query = (
++                f"{question} 詳細・記述項目・設定パラメータ・関連条件"
++                if japanese
++                else f"{question} details, configuration parameters, prerequisites, and conditions"
++            )
++            levels.append(
++                RuntimeLevel(
++                    id="level_2",
++                    objective=(
++                        "詳細・設定・関連条件を補足する"
++                        if japanese
++                        else "Add details, settings, and related conditions"
++                    ),
++                    queries=[detail_query],
++                )
++            )
+         return levels, fallback
+ 
+-    def _recovery_queries(
+-        self,
+-        outcomes: list[QueryOutcome],
+-        issued_queries: set[str],
+-        options: RealtimeOptions,
+-    ) -> list[str]:
+-        """Pick searches worth another round trip.
+-
+-        Model-proposed follow-ups only count when they are genuinely new. A
+-        query that failed with an error is allowed to repeat, because there the
+-        gap is a transient failure rather than missing evidence.
+-        """
+-        candidates: list[str] = []
+-        seen: set[str] = set()
+-
+-        def add(query: str, *, allow_repeat: bool = False) -> None:
+-            text = " ".join(str(query or "").split()).strip()
+-            key = self._query_key(text)
+-            if not key or key in seen:
+-                return
+-            if key in issued_queries and not allow_repeat:
+-                return
+-            seen.add(key)
+-            candidates.append(text)
+-
+-        for outcome in outcomes:
+-            if outcome.error:
+-                add(outcome.query, allow_repeat=True)
+-        for outcome in outcomes:
+-            for query in outcome.missing_queries:
+-                add(query)
+-
+-        return candidates[: options.max_queries_per_level]
+-
+     # endregion planning
+ 
+     # region execution
+@@ -513,48 +470,28 @@ class RealtimePipeline:
+         established_facts: list[ReferencedFact],
+         options: RealtimeOptions,
+         stop_event: threading.Event | None,
+-        executor: ThreadPoolExecutor,
+         deadline: float | None,
+     ) -> list[QueryOutcome]:
+-        outcomes: list[QueryOutcome | None] = [None] * len(level.queries)
+-        futures: dict[Future, int] = {
+-            executor.submit(
+-                self._answer_query,
+-                original_question,
+-                level,
+-                query,
+-                established_facts,
+-                options,
+-                stop_event,
+-                deadline,
+-            ): index
+-            for index, query in enumerate(level.queries)
+-        }
+-
+-        stopped: RealtimeStopped | None = None
+-        for future in as_completed(futures):
+-            index = futures[future]
++        outcomes: list[QueryOutcome] = []
++        for query in level.queries:
+             try:
+-                outcomes[index] = future.result()
+-            except RealtimeStopped as exc:
+-                stopped = exc
+-                break
++                outcomes.append(
++                    self._answer_query(
++                        original_question,
++                        level,
++                        query,
++                        established_facts,
++                        options,
++                        stop_event,
++                        deadline,
++                    )
++                )
++            except RealtimeStopped:
++                raise
+             except Exception as exc:
+                 log.info("realtime query failed: %s", exc)
+-                outcomes[index] = QueryOutcome(
+-                    query=level.queries[index],
+-                    enough=False,
+-                    error=self._short_error(exc),
+-                )
+-
+-        if stopped is not None:
+-            # Cancel what has not started; the executor is torn down without
+-            # waiting, so a client cancel is not held hostage by a model call.
+-            for future in futures:
+-                future.cancel()
+-            raise stopped
+-
+-        return [outcome for outcome in outcomes if outcome is not None]
++                outcomes.append(QueryOutcome(query=query, error=self._short_error(exc)))
++        return outcomes
+ 
+     def _answer_query(
+         self,
+@@ -568,63 +505,64 @@ class RealtimePipeline:
+     ) -> QueryOutcome:
+         started = time.perf_counter()
+         self._check_stop(stop_event)
+-
+-        established_text = self._format_facts(
+-            established_facts, max_chars=options.max_established_chars
+-        )
+-        search_context = self._search_context(
+-            established_facts, options.max_search_context_chars
+-        )
+-        search_text = f"{query} {search_context}".strip() if search_context else query
+-
+-        results, search_error = self._safe_search(search_text, options.search_limit)
++        results, search_error = self._safe_search(query, options.search_limit)
+         self._check_stop(stop_event)
+-
+-        # Sparse results get one broader search. Strong subqueries stop after
+-        # the first search, while weak ones automatically cast a wider net.
+-        if len(results) < options.min_search_results and not self._expired(deadline):
++        if not results and not self._expired(deadline):
+             expanded_query = (
+                 f"{original_question}\nCurrent objective: {level.objective}\n"
+                 f"Specific question: {query}"
+             )
+             expanded, expanded_error = self._safe_search(
+-                expanded_query, min(options.search_limit * 2, 16)
++                expanded_query, max(options.search_limit, 24)
+             )
+             results = self._merge_results(results, expanded)
+             search_error = search_error or expanded_error
+-
++        primary_results = results[: options.min_initial_read_nodes]
++        if not primary_results:
++            return QueryOutcome(
++                query=query, search_result_count=len(results),
++                latency_ms=self._elapsed_ms(started), error=search_error,
++            )
+         retrieved_ids = self._result_node_ids(results)
+-        allowed = self._allowed_ids(retrieved_ids, established_facts)
+-        evidence = self._format_evidence(results, options.max_context_chars)
+-
+-        if not evidence and not established_text:
++        query_count = max(1, len(level.queries))
++        evidence_chars = options.max_context_chars
++        if evidence_chars > 0:
++            evidence_chars = max(1, evidence_chars // query_count)
++        evidence = self._format_evidence(primary_results, evidence_chars)
++        # Keep a broad retrieval net without making synthesis ingest every
++        # remaining node body. The compact notes preserve relevant exceptions
++        # and prerequisites outside the highest-ranked full documents.
++        catalog_chars = max(1_000, 6_000 // query_count)
++        catalog = self._format_candidate_catalog(
++            results[options.min_initial_read_nodes:], max_chars=catalog_chars
++        )
++        if catalog:
++            evidence = f"{evidence}\n\nAdditional ranked matches:\n{catalog}".strip()
++        if not evidence:
+             return QueryOutcome(
+-                query=query,
+-                enough=False,
+-                missing_queries=[],
+-                retrieved_node_ids=retrieved_ids,
++                query=query, retrieved_node_ids=retrieved_ids,
+                 search_result_count=len(results),
+-                latency_ms=self._elapsed_ms(started),
+-                error=search_error,
++                latency_ms=self._elapsed_ms(started), error=search_error,
+             )
+-
+-        user_content = (
+-            f"Original user question:\n{original_question}\n\n"
+-            f"Current level objective:\n{level.objective}\n\n"
+-            f"Current shallow question:\n{query}\n\n"
+-            f"Established facts from earlier levels:\n"
+-            f"{established_text or '(none)'}\n\n"
+-            f"Retrieved evidence:\n{evidence or '(none)'}"
++        allowed = self._allowed_ids(retrieved_ids, established_facts)
++        established_text = self._format_facts(
++            established_facts, max_chars=options.max_established_chars
+         )
+         try:
+             answer = self._llm().complete_structured(
+-                ANSWER_SYSTEM_PROMPT, user_content, ShallowAnswer
++                SYNTHESIS_SYSTEM_PROMPT,
++                f"Original user question:\n{original_question}\n\n"
++                f"Current level objective:\n{level.objective}\n\n"
++                f"Current shallow question:\n{query}\n\n"
++                f"Established facts from earlier levels:\n"
++                f"{established_text or '(none)'}\n\n"
++                f"Source evidence:\n{evidence}",
++                ShallowResearchAnswer,
+             )
+         except Exception as exc:
+-            log.info("realtime answer call failed: %s", exc)
++            log.info("realtime synthesis failed: %s", exc)
+             return QueryOutcome(
+                 query=query,
+-                enough=False,
+                 retrieved_node_ids=retrieved_ids,
+                 search_result_count=len(results),
+                 latency_ms=self._elapsed_ms(started),
+@@ -632,31 +570,14 @@ class RealtimePipeline:
+             )
+         self._check_stop(stop_event)
+ 
+-        facts: list[ReferencedFact] = []
+-        for fact in getattr(answer, "facts", None) or []:
+-            node_ids = self._resolve_ids(fact.node_ids, allowed)
+-            text = self._clean_fact_text(fact.text, allowed)
+-            # Cheap hard guard: facts without a retrieved/established reference
+-            # never reach the speech stream or a later level.
+-            if text and node_ids:
+-                facts.append(ReferencedFact(text=text, node_ids=node_ids))
+-
+-        enough = bool(getattr(answer, "enough", False) and facts)
+-        current_key = self._query_key(query)
+-        missing = [
+-            item
+-            for item in self._unique(
+-                " ".join(str(item or "").split()).strip()
+-                for item in (getattr(answer, "missing_queries", None) or [])
+-            )
+-            if item and self._query_key(item) != current_key
+-        ][: options.max_queries_per_level]
+-
++        raw_node_ids = getattr(answer, "node_ids", []) or []
++        node_ids = self._resolve_ids(raw_node_ids, allowed)
++        text = self._clean_fact_text(getattr(answer, "answer", ""), allowed)
++        if text and not raw_node_ids and retrieved_ids:
++            node_ids = [retrieved_ids[0]]
+         return QueryOutcome(
+             query=query,
+-            facts=facts,
+-            enough=enough,
+-            missing_queries=[] if enough else missing,
++            facts=[ReferencedFact(text=text, node_ids=node_ids)] if text and node_ids else [],
+             retrieved_node_ids=retrieved_ids,
+             search_result_count=len(results),
+             latency_ms=self._elapsed_ms(started),
+@@ -718,53 +639,96 @@ class RealtimePipeline:
+         return "\n".join(lines)
+ 
+     @staticmethod
+-    def _search_context(facts: list[ReferencedFact], max_chars: int) -> str:
+-        """Short, ID-free digest of the most recent facts for retrieval only."""
+-        if max_chars <= 0:
+-            return ""
+-        parts: list[str] = []
++    def _format_candidate_catalog(
++        results: list[dict[str, Any]], max_chars: int = 0
++    ) -> str:
++        """Compact notes for ranked sources whose full body is not included."""
++        blocks: list[str] = []
+         size = 0
+-        for fact in reversed(facts):
+-            text = " ".join(fact.text.split()).strip()
+-            if not text:
++        for result in results:
++            node = result.get("node")
++            node_id = str(getattr(node, "id", "") or "").strip()
++            if not node_id:
+                 continue
+-            if size + len(text) > max_chars:
++            title = " ".join(str(getattr(node, "title", "") or "").split())
++            summary = " ".join(str(getattr(node, "summary", "") or "").split())
++            source_path = " ".join(
++                str(getattr(node, "source_path", "") or "").split()
++            )
++            source_ranges = getattr(node, "source_ranges", None) or []
++            range_text = ", ".join(
++                "-".join(str(part) for part in item)
++                if isinstance(item, (tuple, list)) else str(item)
++                for item in source_ranges
++            )
++            snippets = [
++                " ".join(str(item.get("text") or "").split())
++                for item in (result.get("evidence") or [])[:2]
++                if str(item.get("text") or "").strip()
++            ]
++            block = (
++                f"node_id: {node_id}\n"
++                f"title: {title}\n"
++                f"summary: {summary}\n"
++                f"matches: {' | '.join(snippets)}\n"
++                f"source_path: {source_path}\n"
++                f"source_ranges: {range_text}"
++            )
++            if max_chars > 0 and size + len(block) > max_chars:
+                 break
+-            parts.append(text)
+-            size += len(text) + 1
+-        return " ".join(reversed(parts))
++            blocks.append(block)
++            size += len(block) + 2
++        return "\n\n".join(blocks)
+ 
+     @staticmethod
+     def _format_evidence(results: list[dict[str, Any]], max_chars: int) -> str:
+-        blocks: list[str] = []
+-        size = 0
++        """Render every selected source before spending extra context on one.
++
++        Search ranking frequently puts a long overview ahead of a short page
++        containing a required filename or exception.  A first-fit whole-body
++        formatter therefore makes the answer shallow: it fills the prompt with
++        the first few documents and silently drops the rest.  Reserve an equal
++        share of the evidence budget for each selected source, with its ranked
++        match snippets first and a document excerpt second.
++        """
++        entries: list[tuple[str, str, str, list[str], str]] = []
+         for result in results:
+             node = result.get("node")
+             node_id = str(getattr(node, "id", "") or "").strip()
+             if not node_id:
+                 continue
+-            title = str(getattr(node, "title", "") or "").strip()
+-            snippets: list[str] = []
+-            for item in (result.get("evidence") or [])[:3]:
+-                text = " ".join(str(item.get("text") or "").split()).strip()
+-                if text:
+-                    snippets.append(text[:1_800])
+-            if not snippets:
+-                fallback = (
+-                    str(getattr(node, "summary", "") or "").strip()
+-                    or str(getattr(node, "body", "") or "").strip()
+-                )
+-                if fallback:
+-                    snippets.append(" ".join(fallback.split())[:2_000])
+-            if not snippets:
+-                continue
+-            block = f"node_id: {node_id}\ntitle: {title}\n" + "\n".join(
+-                f"evidence: {snippet}" for snippet in snippets
+-            )
+-            if size + len(block) > max_chars:
+-                break
++            title = " ".join(str(getattr(node, "title", "") or "").split())
++            summary = " ".join(str(getattr(node, "summary", "") or "").split())
++            body = " ".join(str(getattr(node, "body", "") or "").split())
++            matches = [
++                " ".join(str(item.get("text") or "").split())
++                for item in (result.get("evidence") or [])[:2]
++                if str(item.get("text") or "").strip()
++            ]
++            if body or matches or summary:
++                entries.append((node_id, title, summary, matches, body))
++
++        if not entries:
++            return ""
++
++        blocks: list[str] = []
++        per_node_chars = max_chars // len(entries) if max_chars > 0 else 0
++        for node_id, title, summary, matches, body in entries:
++            # Evidence chunks are generated by the retriever specifically for
++            # this query, so protect them from being displaced by a long body.
++            match_lines = [
++                f"match: {snippet[:600]}" for snippet in matches
++            ]
++            header = f"node_id: {node_id}\ntitle: {title}"
++            core = "\n".join([header, *match_lines])
++            source = body or summary
++            if per_node_chars > 0:
++                source = source[: max(0, per_node_chars - len(core) - 12)]
++            if source:
++                block = f"{core}\ndocument: {source}"
++            else:
++                block = core
+             blocks.append(block)
+-            size += len(block) + 2
+         return "\n\n".join(blocks)
+ 
+     @staticmethod
+@@ -849,7 +813,23 @@ class RealtimePipeline:
+             return match.group(0)
+ 
+         cleaned = _BRACKET_RE.sub(replace, str(text or ""))
+-        return " ".join(cleaned.split()).strip()
++        # A model occasionally turns absent search context into a generic
++        # "the supplied material does not say" sentence even when another
++        # retrieved snippet does answer the question. This is neither a useful
++        # answer section nor a safe inference, so do not stream it.
++        cleaned = _UNSUPPORTED_DISCLAIMER_RE.sub("", cleaned)
++        lines: list[str] = []
++        previous_blank = False
++        for raw_line in cleaned.splitlines():
++            line = re.sub(r"[ \t]+", " ", raw_line).strip()
++            if not line:
++                if lines and not previous_blank:
++                    lines.append("")
++                previous_blank = True
++                continue
++            lines.append(line)
++            previous_blank = False
++        return "\n".join(lines).strip()
+ 
+     @staticmethod
+     def _fact_key(text: str) -> str:
+diff --git a/llm-wiki-dist/graph/researcher.py b/llm-wiki-dist/graph/researcher.py
+index 1ec997c..fec75b2 100644
+--- a/llm-wiki-dist/graph/researcher.py
++++ b/llm-wiki-dist/graph/researcher.py
+@@ -1981,7 +1981,10 @@ class Researcher:
+                     base_url=session.settings.chat_base_url,
+                     api_key=session.settings.chat_api_key,
+                     temperature=0.0,
+-                    timeout=30,
++                    # Realtime stages reserve a 12-second work budget. A
++                    # longer HTTP timeout lets one stalled generation block a
++                    # speaking client past its stage deadline.
++                    timeout=12,
+                     retry_attempts=0,
+                     retry_delay_seconds=0.0,
+                 )
+diff --git a/llm-wiki-dist/tests/test_realtime.py b/llm-wiki-dist/tests/test_realtime.py
+index 9c0cf3c..42056a3 100644
+--- a/llm-wiki-dist/tests/test_realtime.py
++++ b/llm-wiki-dist/tests/test_realtime.py
+@@ -10,8 +10,7 @@ from graph.realtime import (
+     PlannedLevel,
+     RealtimeOptions,
+     RealtimePipeline,
+-    ReferencedFact,
+-    ShallowAnswer,
++    ShallowResearchAnswer,
+ )
+ 
+ 
+@@ -32,366 +31,304 @@ def result(node_id: str, text: str) -> dict:
+ 
+ 
+ class ScriptedLlmFactory:
+-    def __init__(self, plan: LeveledPlan, answers: dict[str, ShallowAnswer]):
++    def __init__(self, plan: LeveledPlan, answers: dict[str, list[ShallowResearchAnswer]]):
+         self.plan = plan
+         self.answers = answers
+         self.answer_prompts: list[str] = []
++        self.calls: list[type] = []
+         self._lock = threading.Lock()
+ 
+     def __call__(self):
+         return self
+ 
+     def complete_structured(self, _system, user, output_model):
++        self.calls.append(output_model)
+         if output_model is LeveledPlan:
+             return self.plan
++        self.assertIs(output_model, ShallowResearchAnswer)
+         with self._lock:
+             self.answer_prompts.append(user)
+-        for query, answer in self.answers.items():
+-            marker = f"Current shallow question:\n{query}\n"
+-            if marker in user:
+-                return answer
++            for query, responses in self.answers.items():
++                if f"Current shallow question:\n{query}\n" in user:
++                    return responses.pop(0)
+         raise AssertionError(f"No scripted answer for prompt: {user}")
+ 
+-
+-def single_level_plan(objective: str, *queries: str) -> LeveledPlan:
+-    return LeveledPlan(levels=[PlannedLevel(objective=objective, queries=list(queries))])
++    def assertIs(self, left, right):
++        if left is not right:
++            raise AssertionError(f"Expected {right}, got {left}")
+ 
+ 
+ class RealtimePipelineTests(unittest.TestCase):
+-    def test_plan_precedes_levels_and_references_flow_forward(self):
++    def test_level_workers_append_sections_and_seed_the_next_level(self):
+         llms = ScriptedLlmFactory(
+             LeveledPlan(
+                 levels=[
+-                    PlannedLevel(objective="Define X", queries=["What is X?"]),
+-                    PlannedLevel(
+-                        objective="Explain its behavior", queries=["Why does X do Y?"]
+-                    ),
++                    PlannedLevel(objective="Define X", queries=["What is X?", "What is its return value?"]),
++                    PlannedLevel(objective="Use X", queries=["How is X used?"]),
+                 ]
+             ),
+             {
+-                "What is X?": ShallowAnswer(
+-                    facts=[ReferencedFact(text="X is a controller.", node_ids=["node:x"])],
+-                    enough=True,
+-                ),
+-                "Why does X do Y?": ShallowAnswer(
+-                    facts=[
+-                        ReferencedFact(
+-                            text="X does Y to limit retries.", node_ids=["node:x", "node:y"]
+-                        )
+-                    ],
+-                    enough=True,
+-                ),
++                "What is X?": [ShallowResearchAnswer(answer="## 概要\nX はコントローラーです。", node_ids=["node:x"])],
++                "What is its return value?": [ShallowResearchAnswer(answer="## 戻り値\n成功時は 0 です。", node_ids=["node:r"])],
++                "How is X used?": [ShallowResearchAnswer(answer="## 使用方法\nX を初期化して使います。", node_ids=["node:u"])],
+             },
+         )
+ 
+         def search(query, _limit):
+-            if "Why does X do Y?" in query:
+-                return [result("node:y", "Y limits retries.")]
+-            return [result("node:x", "X is a controller.")]
++            return [result({"What is X?": "node:x", "What is its return value?": "node:r", "How is X used?": "node:u"}.get(query, "node:other"), query)]
+ 
+         events: list[dict] = []
+-        pipeline = RealtimePipeline(llm_factory=llms, search=search)
+-        summary = pipeline.run(
+-            "What is X and why does it do Y?",
++        summary = RealtimePipeline(llm_factory=llms, search=search).run(
++            "Explain what X is, how its return value is used, and how callers should use it in detail.",
+             emit=events.append,
+-            options=RealtimeOptions(min_search_results=1),
++            options=RealtimeOptions(max_levels=2, max_queries_per_level=2),
+         )
+ 
+-        self.assertEqual(events[0]["type"], "plan")
+-        self.assertEqual(
+-            [level["queries"] for level in events[0]["levels"]],
+-            [["What is X?"], ["Why does X do Y?"]],
+-        )
+-        level_events = [event for event in events if event["type"] == "level"]
+-        self.assertEqual([event["level_id"] for event in level_events], ["level_1", "level_2"])
+-        self.assertEqual(level_events[0]["reference_node_ids"], ["node:x"])
+-        self.assertEqual(level_events[1]["reference_node_ids"], ["node:x", "node:y"])
+-        self.assertTrue(
+-            any("X is a controller. [node:x]" in prompt for prompt in llms.answer_prompts)
+-        )
++        levels = [event for event in events if event["type"] == "level"]
++        self.assertEqual(len(levels), 2)
++        self.assertIn("## 概要", levels[0]["text"])
++        self.assertIn("## 戻り値", levels[0]["text"])
++        self.assertEqual(levels[0]["reference_node_ids"], ["node:x", "node:r"])
++        third_prompt = next(p for p in llms.answer_prompts if "How is X used?" in p)
++        self.assertIn("X はコントローラーです。", third_prompt)
+         self.assertEqual(summary["status"], "complete")
++        self.assertIsNone(summary["incomplete_reason"])
+ 
+-    def test_insufficient_level_inserts_plan_update_before_recovery(self):
++    def test_default_fast_path_uses_one_synthesis_call(self):
+         llms = ScriptedLlmFactory(
+-            LeveledPlan(
+-                levels=[PlannedLevel(objective="Find policy", queries=["Find policy"])]
+-            ),
++            LeveledPlan(levels=[PlannedLevel(objective="Parameters", queries=["Explain parameters"])]),
+             {
+-                "Find policy": ShallowAnswer(
+-                    facts=[ReferencedFact(text="The policy has a retry rule.", node_ids=["node:a"])],
+-                    enough=False,
+-                    missing_queries=["Find the retry exception"],
+-                ),
+-                "Find the retry exception": ShallowAnswer(
+-                    facts=[
+-                        ReferencedFact(
+-                            text="The exception applies during maintenance.",
+-                            node_ids=["node:b"],
+-                        )
+-                    ],
+-                    enough=True,
+-                ),
++                "Explain parameters": [
++                    ShallowResearchAnswer(answer="## 引数\n`opentype` はロック種別を指定します。", node_ids=["node:a"]),
++                ]
+             },
+         )
++        searches: list[str] = []
+ 
+         def search(query, _limit):
+-            if "retry exception" in query:
+-                return [result("node:b", "The exception applies during maintenance.")]
+-            return [result("node:a", "The policy has a retry rule.")]
++            searches.append(query)
++            return [result("node:b" if "opentype" in query else "node:a", query)]
+ 
+         events: list[dict] = []
+         RealtimePipeline(llm_factory=llms, search=search).run(
+-            "Explain the retry policy",
++            "Explain parameters",
+             emit=events.append,
+-            options=RealtimeOptions(min_search_results=1, max_recovery_levels=1),
++            options=RealtimeOptions(),
+         )
+ 
+-        update_index = next(i for i, event in enumerate(events) if event["type"] == "plan_update")
+-        recovery_start_index = next(
+-            i
+-            for i, event in enumerate(events)
+-            if event["type"] == "level_start" and event["level_id"] == "recovery_1"
+-        )
+-        self.assertLess(update_index, recovery_start_index)
+-        update = events[update_index]
+-        self.assertEqual([level["id"] for level in update["levels"]], ["level_1", "recovery_1"])
+-        recovery = next(
+-            event
+-            for event in events
+-            if event["type"] == "level" and event["level_id"] == "recovery_1"
+-        )
+-        self.assertEqual(recovery["reference_node_ids"], ["node:b"])
++        level = next(event for event in events if event["type"] == "level")
++        self.assertEqual(searches, ["Explain parameters"])
++        self.assertEqual(level["text"], "## 引数\n`opentype` はロック種別を指定します。")
++        self.assertEqual(level["reference_node_ids"], ["node:a"])
++        self.assertEqual(len(llms.answer_prompts), 1)
++        self.assertEqual(llms.calls, [ShallowResearchAnswer])
+ 
+-    def test_unretrieved_node_ids_and_their_facts_are_dropped(self):
++    def test_unretrieved_citations_are_not_streamed_and_do_not_make_run_partial(self):
+         llms = ScriptedLlmFactory(
+             LeveledPlan(levels=[PlannedLevel(objective="Answer", queries=["Question"])]),
+-            {
+-                "Question": ShallowAnswer(
+-                    facts=[
+-                        ReferencedFact(
+-                            text="This fact was invented.", node_ids=["node:invented"]
+-                        )
+-                    ],
+-                    enough=True,
+-                )
+-            },
++            {"Question": [
++                ShallowResearchAnswer(answer="Invented claim.", node_ids=["node:invented"]),
++                ShallowResearchAnswer(answer="Invented claim.", node_ids=["node:invented"]),
++            ]},
+         )
+         events: list[dict] = []
+         summary = RealtimePipeline(
+             llm_factory=llms,
+             search=lambda _query, _limit: [result("node:real", "Real evidence")],
+-        ).run(
+-            "Question",
+-            emit=events.append,
+-            options=RealtimeOptions(min_search_results=1, max_recovery_levels=0),
+-        )
++        ).run("Question", emit=events.append)
+ 
+         level = next(event for event in events if event["type"] == "level")
+-        self.assertEqual(level["facts"], [])
+-        self.assertEqual(level["reference_node_ids"], [])
+         self.assertEqual(level["text"], "")
+-        self.assertEqual(summary["status"], "partial")
++        self.assertEqual(level["facts"], [])
++        self.assertTrue(level["complete"])
++        self.assertEqual(summary["status"], "complete")
+ 
+-    def test_partial_is_reported_when_no_new_search_can_be_scheduled(self):
+-        # The model reports insufficient evidence but proposes only the query
+-        # that just ran. Re-issuing it would retrieve the same evidence, so no
+-        # recovery level is inserted and the run must still admit it is partial.
++    def test_answer_without_citation_metadata_uses_top_retrieved_node(self):
+         llms = ScriptedLlmFactory(
+-            single_level_plan("Find policy", "Find policy"),
+-            {
+-                "Find policy": ShallowAnswer(
+-                    facts=[
+-                        ReferencedFact(text="A retry rule exists.", node_ids=["node:a"])
+-                    ],
+-                    enough=False,
+-                    missing_queries=["find policy"],
+-                )
+-            },
++            LeveledPlan(levels=[PlannedLevel(objective="Answer", queries=["Question"])]),
++            {"Question": [
++                ShallowResearchAnswer(answer="Grounded answer."),
++                ShallowResearchAnswer(answer="Grounded answer."),
++            ]},
+         )
+         events: list[dict] = []
+-        summary = RealtimePipeline(
++        RealtimePipeline(
+             llm_factory=llms,
+-            search=lambda _query, _limit: [result("node:a", "A retry rule exists.")],
+-        ).run(
+-            "Explain the retry policy",
+-            emit=events.append,
+-            options=RealtimeOptions(min_search_results=1, max_recovery_levels=2),
+-        )
++            search=lambda _query, _limit: [result("node:real", "Grounded evidence")],
++        ).run("Question", emit=events.append)
+ 
+-        self.assertEqual([e for e in events if e["type"] == "plan_update"], [])
+-        self.assertEqual(len(llms.answer_prompts), 1)
+-        self.assertEqual(summary["status"], "partial")
+-        self.assertEqual(summary["incomplete_reason"], "evidence_missing")
++        level = next(event for event in events if event["type"] == "level")
++        self.assertEqual(level["text"], "Grounded answer.")
++        self.assertEqual(level["reference_node_ids"], ["node:real"])
+ 
+-    def test_later_planned_query_can_resolve_an_earlier_gap(self):
++    def test_fast_path_keeps_lower_ranked_matches_as_compact_context(self):
+         llms = ScriptedLlmFactory(
+-            LeveledPlan(
+-                levels=[
+-                    PlannedLevel(objective="Define X", queries=["What is X?"]),
+-                    PlannedLevel(
+-                        objective="Explain Y", queries=["Why does X do Y?"]
+-                    ),
+-                ]
+-            ),
++            LeveledPlan(levels=[]),
++            {"Question": [ShallowResearchAnswer(answer="Grounded answer.", node_ids=["node:1"])]},
++        )
++        RealtimePipeline(
++            llm_factory=llms,
++            search=lambda _query, _limit: [
++                result(f"node:{index}", f"Evidence {index}")
++                for index in range(1, 18)
++            ],
++        ).run("Question", emit=lambda _event: None)
++
++        prompt = llms.answer_prompts[0]
++        self.assertIn("node_id: node:1", prompt)
++        self.assertIn("Additional ranked matches:", prompt)
++        self.assertIn("node_id: node:17", prompt)
++
++    def test_evidence_budget_reads_later_concise_required_source(self):
++        long_results = [
+             {
+-                "What is X?": ShallowAnswer(
+-                    facts=[
+-                        ReferencedFact(text="X is a controller.", node_ids=["node:x"])
+-                    ],
+-                    enough=False,
+-                    missing_queries=["Why does X do Y?"],
++                "node": FakeNode(
++                    f"node:long:{index}",
++                    f"Long {index}",
++                    "overview",
++                    "unrelated overview " * 4_000,
+                 ),
+-                "Why does X do Y?": ShallowAnswer(
+-                    facts=[
+-                        ReferencedFact(
+-                            text="X does Y for safety.", node_ids=["node:y"]
+-                        )
+-                    ],
+-                    enough=True,
++                "evidence": [{"text": "overview match"}],
++            }
++            for index in range(7)
++        ]
++        required = {
++            "node": FakeNode(
++                "node:required",
++                "Processing-request registration",
++                "required files",
++                (
++                    "For a processing request, register pmf_prg.txt and "
++                    "pmf_procdata.txt, then register and create "
++                    "mpf_mfs_cyclicfile.txt."
+                 ),
+-            },
+-        )
+-
+-        def search(query, _limit):
+-            if "Why does X do Y?" in query:
+-                return [result("node:y", "X does Y for safety.")]
+-            return [result("node:x", "X is a controller.")]
++            ),
++            "evidence": [{"text": "pmf_prg.txt pmf_procdata.txt mpf_mfs_cyclicfile.txt"}],
++        }
+ 
+-        events: list[dict] = []
+-        summary = RealtimePipeline(llm_factory=llms, search=search).run(
+-            "What is X and why does it do Y?",
+-            emit=events.append,
+-            options=RealtimeOptions(min_search_results=1),
++        rendered = RealtimePipeline._format_evidence(
++            [*long_results, required], 32_000
+         )
+ 
+-        self.assertEqual([e for e in events if e["type"] == "plan_update"], [])
+-        self.assertEqual(summary["status"], "complete")
+-        self.assertIsNone(summary["incomplete_reason"])
++        self.assertIn("node_id: node:required", rendered)
++        self.assertIn("pmf_prg.txt", rendered)
++        self.assertIn("pmf_procdata.txt", rendered)
++        self.assertIn("mpf_mfs_cyclicfile.txt", rendered)
+ 
+-    def test_formatted_node_ids_resolve_and_never_reach_speech_text(self):
++    def test_fast_path_does_not_run_follow_up_model_calls(self):
+         llms = ScriptedLlmFactory(
+-            single_level_plan("Answer", "Question"),
+-            {
+-                "Question": ShallowAnswer(
+-                    facts=[
+-                        ReferencedFact(
+-                            text="X is a controller. [node:x]",
+-                            node_ids=["**NODE:X**", "node:missing"],
+-                        )
+-                    ],
+-                    enough=True,
+-                )
+-            },
++            LeveledPlan(levels=[PlannedLevel(objective="Answer", queries=["Question"])]),
++            {"Question": [
++                ShallowResearchAnswer(answer="Final.", node_ids=["node:a"]),
++            ]},
+         )
++        searches: list[str] = []
++
++        def search(query, _limit):
++            searches.append(query)
++            return [result({"Question": "node:a"}[query], query)]
++
+         events: list[dict] = []
+-        summary = RealtimePipeline(
+-            llm_factory=llms,
+-            search=lambda _query, _limit: [result("node:x", "X is a controller.")],
+-        ).run(
+-            "Question",
+-            emit=events.append,
+-            options=RealtimeOptions(min_search_results=1, max_recovery_levels=0),
++        RealtimePipeline(llm_factory=llms, search=search).run(
++            "Question", emit=events.append,
++            options=RealtimeOptions(),
+         )
+-
+         level = next(event for event in events if event["type"] == "level")
+-        self.assertEqual(level["facts"], [{"text": "X is a controller.", "node_ids": ["node:x"]}])
+-        self.assertEqual(level["text"], "X is a controller.")
+-        self.assertEqual(summary["status"], "complete")
++        self.assertEqual(searches, ["Question"])
++        self.assertEqual(level["text"], "Final.")
+ 
+-    def test_expired_deadline_skips_remaining_levels_and_reports_partial(self):
++    def test_single_query_plan_drops_disclaimers(self):
+         llms = ScriptedLlmFactory(
+             LeveledPlan(
+                 levels=[
+-                    PlannedLevel(objective="First", queries=["First question"]),
+-                    PlannedLevel(objective="Second", queries=["Second question"]),
++                    PlannedLevel(
++                        objective="第3引数",
++                        queries=["mpf_mfs_open関数の第3引数は何ですか"],
++                    )
+                 ]
+             ),
+             {
+-                "First question": ShallowAnswer(
+-                    facts=[ReferencedFact(text="First fact.", node_ids=["node:a"])],
+-                    enough=True,
+-                )
++                "mpf_mfs_open関数の第3引数は何ですか": [
++                    ShallowResearchAnswer(
++                        answer=(
++                            "### 第3引数\n"
++                            "第3引数は `bufsize` です。\n\n"
++                            "提供された資料には具体的な記載はありません。"
++                        ),
++                        node_ids=["node:open"],
++                    ),
++                    ShallowResearchAnswer(
++                        answer="### 第3引数\n第3引数は `bufsize` です。",
++                        node_ids=["node:open"],
++                    ),
++                ],
++                (
++                    "mpf_mfs_open関数の第3引数は何ですか "
++                    "詳細・記述項目・設定パラメータ・関連条件"
++                ): [
++                    ShallowResearchAnswer(
++                        answer="### 関連詳細\n`bufsize` の設定条件です。",
++                        node_ids=["node:open"],
++                    )
++                ],
+             },
+         )
+-
+-        def slow_search(_query, _limit):
+-            time.sleep(0.15)
+-            return [result("node:a", "First fact.")]
+-
+         events: list[dict] = []
+-        summary = RealtimePipeline(llm_factory=llms, search=slow_search).run(
+-            "Two part question",
++        RealtimePipeline(
++            llm_factory=llms,
++            search=lambda _query, _limit: [result("node:open", "bufsize")],
++        ).run(
++            "mpf_mfs_open関数の第3引数は何ですか",
+             emit=events.append,
+-            options=RealtimeOptions(min_search_results=1, deadline_seconds=0.1),
++            options=RealtimeOptions(max_levels=2),
+         )
+ 
++        plan = events[0]
++        level = next(event for event in events if event["type"] == "level")
++        self.assertTrue(plan["planning_fallback"] is False)
++        self.assertEqual(len(plan["levels"]), 2)
++        self.assertEqual(plan["levels"][0]["queries"], ["mpf_mfs_open関数の第3引数は何ですか"])
+         self.assertEqual(
+-            [e["level_id"] for e in events if e["type"] == "level"], ["level_1"]
++            plan["levels"][1]["queries"],
++            [
++                "mpf_mfs_open関数の第3引数は何ですか "
++                "詳細・記述項目・設定パラメータ・関連条件"
++            ],
+         )
+-        self.assertEqual(summary["status"], "partial")
+-        self.assertEqual(summary["incomplete_reason"], "deadline")
+-        self.assertEqual(summary["levels_completed"], 1)
+-        deadline_update = next(
+-            event
+-            for event in events
+-            if event["type"] == "plan_update" and event["reason"] == "deadline"
++        self.assertIn("第3引数は `bufsize`", level["text"])
++        self.assertNotIn("提供された資料", level["text"])
++
++    def test_evidence_includes_node_body_even_when_match_snippets_exist(self):
++        rendered = RealtimePipeline._format_evidence(
++            [
++                {
++                    "node": FakeNode("node:open", "Open", "summary", "signature int open(..., int filenum, ...)"),
++                    "evidence": [{"text": "nearby paragraph"}],
++                }
++            ],
++            10_000,
+         )
+-        self.assertEqual(deadline_update["levels"][1]["status"], "skipped")
++        self.assertIn("signature int open", rendered)
++        self.assertIn("nearby paragraph", rendered)
+ 
+-    def test_search_failure_becomes_a_query_error_instead_of_a_dead_run(self):
+-        llms = ScriptedLlmFactory(single_level_plan("Answer", "Question"), {})
+-
+-        def broken_search(_query, _limit):
+-            raise RuntimeError("reranker unreachable")
+-
+-        events: list[dict] = []
+-        summary = RealtimePipeline(llm_factory=llms, search=broken_search).run(
+-            "Question",
+-            emit=events.append,
+-            options=RealtimeOptions(min_search_results=1, max_recovery_levels=0),
++    def test_deadline_still_reports_partial(self):
++        llms = ScriptedLlmFactory(
++            LeveledPlan(levels=[PlannedLevel(objective="First", queries=["First"]), PlannedLevel(objective="Second", queries=["Second"])]),
++            {"First": [ShallowResearchAnswer(answer="First fact.", node_ids=["node:a"])]},
+         )
+ 
+-        level = next(event for event in events if event["type"] == "level")
+-        self.assertIn("reranker unreachable", level["queries"][0]["error"])
+-        self.assertEqual(level["text"], "")
+-        self.assertEqual(summary["status"], "partial")
+-        self.assertEqual(events[-1]["type"], "done")
++        def slow_search(_query, _limit):
++            time.sleep(0.15)
++            return [result("node:a", "First fact")]
+ 
+-    def test_repeated_planned_query_runs_once(self):
+-        llms = ScriptedLlmFactory(
+-            LeveledPlan(
+-                levels=[
+-                    PlannedLevel(objective="First", queries=["Same question"]),
+-                    PlannedLevel(objective="Second", queries=["same question "]),
+-                ]
+-            ),
+-            {
+-                "Same question": ShallowAnswer(
+-                    facts=[ReferencedFact(text="One fact.", node_ids=["node:a"])],
+-                    enough=True,
+-                )
+-            },
+-        )
+         events: list[dict] = []
+-        RealtimePipeline(
+-            llm_factory=llms,
+-            search=lambda _query, _limit: [result("node:a", "One fact.")],
+-        ).run(
+-            "Question",
++        summary = RealtimePipeline(llm_factory=llms, search=slow_search).run(
++            "Explain the first and second parts of this system in enough detail that the dependency order matters.",
+             emit=events.append,
+-            options=RealtimeOptions(min_search_results=1),
++            options=RealtimeOptions(max_levels=2, deadline_seconds=0.1),
+         )
+-
+-        plan = events[0]
+-        self.assertEqual([level["id"] for level in plan["levels"]], ["level_1"])
+-        self.assertEqual(len(llms.answer_prompts), 1)
+-
+-    def test_blank_question_is_rejected_before_any_model_call(self):
+-        llms = ScriptedLlmFactory(single_level_plan("Answer", "Question"), {})
+-        with self.assertRaises(ValueError):
+-            RealtimePipeline(
+-                llm_factory=llms, search=lambda _query, _limit: []
+-            ).run("   ", emit=lambda _event: None)
++        self.assertEqual(summary["status"], "partial")
++        self.assertEqual(summary["incomplete_reason"], "deadline")
+ 
+ 
+ if __name__ == "__main__":

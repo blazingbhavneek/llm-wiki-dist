@@ -90,9 +90,9 @@ class AgentRunRegistry:
 
 
 # Per-db runtime config (reverse-proxy prefix + where the .sqlite files live).
-DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki"))
-DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
-PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
+DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki_docker"))
+DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki_moove")
+PREFIX = os.environ.get("WIKI_PREFIX", "/agent/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
 _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
 _RESERVED_DB_NAMES = {"admin", "assets"}
 
@@ -1395,16 +1395,29 @@ class RealtimeAskBody(AskBody):
     # Wall-clock budget for the whole run. Past it the pipeline stops scheduling
     # levels and terminates with status=partial rather than streaming forever.
     deadline_seconds: float = Field(default=90.0, ge=10.0, le=300.0)
-    # Logical dependency depth. Recovery levels are additional and only appear
-    # when a completed level reports that evidence is insufficient.
-    max_levels: int = Field(default=4, ge=1, le=6)
-    max_queries_per_level: int = Field(default=4, ge=1, le=6)
-    max_recovery_levels: int = Field(default=2, ge=0, le=3)
-    # Final evidence nodes exposed to one shallow answer call. The underlying
+    # One direct retrieval-and-synthesis pass is the latency default. Set this
+    # above one to explicitly request slower dependency planning.
+    max_levels: int = Field(default=1, ge=1, le=6)
+    max_queries_per_level: int = Field(default=1, ge=1, le=6)
+    # Kept as an accepted no-op for older clients. Realtime workers no longer
+    # insert recovery levels based on evidence-status judgments.
+    max_recovery_levels: int = Field(default=0, ge=0, le=3)
+    # Final evidence nodes exposed to one realtime worker. The underlying
     # hybrid retrieval pools remain broad and are reranked down to this number.
-    search_limit: int = Field(default=8, ge=2, le=16)
-    max_context_chars: int = Field(default=14_000, ge=2_000, le=40_000)
-    min_search_results: int = Field(default=3, ge=1, le=8)
+    search_limit: int = Field(default=16, ge=2, le=32)
+    # A bounded prompt avoids excessive prefill latency and context dilution.
+    # Set zero only for an intentionally exhaustive, slower request.
+    max_context_chars: int = Field(default=32_000, ge=0, le=60_000)
+    # Accepted compatibility field; the fast path performs no open-ended
+    # follow-up loop after its first retrieval.
+    research_seconds_per_query: float = Field(default=0.0, ge=0.0, le=90.0)
+    # Number of ranked sources read before synthesis. Context is distributed
+    # across them so concise prerequisite documents are not hidden by a long
+    # higher-ranked manual page.
+    min_initial_read_nodes: int = Field(default=16, ge=1, le=40)
+    # Kept as an accepted no-op for older clients; broad fallback is now used
+    # only when focused retrieval returns no results.
+    min_search_results: int = Field(default=1, ge=1, le=8)
 
     @field_validator("question")
     @classmethod
@@ -1763,9 +1776,8 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
 async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
     """Stream a complete level plan followed by immediately speakable levels.
 
-    The ``plan`` event always precedes ``level`` events. If adaptive recovery
-    inserts or reorders work, a ``plan_update`` is emitted before processing
-    the changed remainder of the plan.
+    The ``plan`` event always precedes ``level`` events. A ``plan_update`` is
+    emitted only when the deadline marks unstarted levels as skipped.
     """
 
     loop = asyncio.get_running_loop()
@@ -1781,6 +1793,8 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
         "max_context_chars": payload.max_context_chars,
         "min_search_results": payload.min_search_results,
         "deadline_seconds": payload.deadline_seconds,
+        "research_seconds_per_query": payload.research_seconds_per_query,
+        "min_initial_read_nodes": payload.min_initial_read_nodes,
     }
 
     async def run_realtime() -> None:
@@ -1828,7 +1842,9 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
             while True:
                 try:
                     event = await loop.run_in_executor(
-                        SSE_EXECUTOR, lambda: events.get(timeout=10)
+                        # Keep proxies and speech clients alive while a worker
+                        # spends its research budget in model calls.
+                        SSE_EXECUTOR, lambda: events.get(timeout=2)
                     )
                 except queue.Empty:
                     yield ": ping\n\n"
