@@ -1981,7 +1981,10 @@ class Researcher:
                     base_url=session.settings.chat_base_url,
                     api_key=session.settings.chat_api_key,
                     temperature=0.0,
-                    timeout=30,
+                    # Realtime stages reserve a 12-second work budget. A
+                    # longer HTTP timeout lets one stalled generation block a
+                    # speaking client past its stage deadline.
+                    timeout=12,
                     retry_attempts=0,
                     retry_delay_seconds=0.0,
                 )

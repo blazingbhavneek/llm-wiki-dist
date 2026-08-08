@@ -50,13 +50,15 @@ Full request:
 ```json
 {
   "question": "What is X and why does it do Y?",
-  "max_levels": 4,
-  "max_queries_per_level": 4,
-  "max_recovery_levels": 2,
-  "search_limit": 8,
-  "max_context_chars": 14000,
-  "min_search_results": 3,
+  "max_levels": 1,
+  "max_queries_per_level": 1,
+  "max_recovery_levels": 0,
+  "search_limit": 16,
+  "max_context_chars": 32000,
+  "min_initial_read_nodes": 16,
+  "min_search_results": 1,
   "deadline_seconds": 90,
+  "research_seconds_per_query": 0,
   "overrides": null
 }
 ```
@@ -64,13 +66,15 @@ Full request:
 | Field | Default | Allowed | Meaning |
 |---|---:|---:|---|
 | `question` | required | 1–20,000 characters | The complete user request. |
-| `max_levels` | `4` | 1–6 | Maximum number of initially planned dependency levels. |
-| `max_queries_per_level` | `4` | 1–6 | Maximum shallow queries that may run in parallel inside one level. |
-| `max_recovery_levels` | `2` | 0–3 | Additional levels that may be inserted when evidence is insufficient. |
-| `search_limit` | `8` | 2–16 | Maximum ranked evidence nodes given to one shallow answer call. |
-| `max_context_chars` | `14000` | 2,000–40,000 | Maximum retrieved context given to one shallow answer call. |
-| `min_search_results` | `3` | 1–8 | Results below this count trigger one broader search automatically. |
+| `max_levels` | `1` | 1–6 | `1` answers the original question directly; values above `1` enable dependency planning. |
+| `max_queries_per_level` | `1` | 1–6 | Maximum shallow queries in a planned level. |
+| `max_recovery_levels` | `0` | 0–3 | Deprecated compatibility field; ignored. |
+| `search_limit` | `16` | 2–32 | Maximum ranked evidence nodes read by one realtime worker. |
+| `max_context_chars` | `32,000` | 0–60,000 | Prompt character cap shared across the selected sources. `0` permits an intentionally exhaustive, slower prompt. |
+| `min_initial_read_nodes` | `16` | 1–40 | Number of ranked sources read before synthesis; the context budget is distributed across them. |
+| `min_search_results` | `1` | 1–8 | Deprecated compatibility field; ignored. A broad fallback is used only for an empty focused search. |
 | `deadline_seconds` | `90` | 10–300 | Wall-clock budget for the run. Past it no new level starts and the run ends `partial`. |
+| `research_seconds_per_query` | `0` | 0–90 | Deprecated compatibility field; the fast path does not run an open-ended follow-up loop. |
 | `overrides` | `null` | existing `/api/ask` overrides | Optional chat-model/API settings for this request. |
 
 Invalid request bodies receive an HTTP `422` response before streaming starts.
@@ -78,29 +82,27 @@ A blank or whitespace-only `question` is also rejected with `422`.
 
 ## Processing model
 
-1. One fast LLM call creates the complete initial level plan.
+1. The default creates one direct level from the original question without a planning model call. Requests allowing more than one level use the dependency planner and always contain at least two levels, even if the planner initially returns only one.
 2. The server emits that plan before emitting any answer level.
-3. All shallow queries inside the current level run concurrently.
-4. Each query performs hybrid keyword/vector retrieval and reranking.
-5. Sparse retrieval automatically performs one broader search.
-6. One LLM call per shallow query produces short referenced facts. Calls for
-   the same level run concurrently.
-7. Facts with missing or non-retrieved node IDs are removed by the backend.
-8. The completed level is placed on the SSE queue immediately.
+3. Each query performs hybrid keyword/vector retrieval and reranking.
+4. The first 16 ranked sources are read before synthesis. Their query-match snippets and a fair share of each document body are supplied, so a long overview cannot exclude a concise prerequisite source.
+5. An empty focused retrieval automatically performs one broader search.
+6. One synthesis call writes the source-backed section.
+7. Sections with missing or non-retrieved node IDs are removed by the backend.
+8. The completed section is appended and the level is placed on the
+   SSE queue immediately.
 9. The server starts the next level immediately; it does not wait for the
    client to finish speaking the previous level.
-10. If evidence is insufficient, a recovery level is inserted and a
-    `plan_update` event announces the new order. A recovery level is only
-    inserted for searches the run has not already performed, since repeating a
-    query retrieves the same evidence and only costs time. When no new search
-    is available, the gap is reported through `done.status` instead.
+10. Earlier completed sections are supplied as editorial context to later
+    levels, but never appended to their retrieval query.
 11. Once `deadline_seconds` passes, no further level is started. Levels already
     emitted stay valid; the run terminates with `status="partial"` and
     `incomplete_reason="deadline"`.
 
-Levels are sequential because later levels may depend on earlier facts. Work
-inside one level is parallel. This lets the client speak Level 1 while the
-server researches Level 2.
+Levels are sequential because later levels may depend on earlier facts. The
+realtime model endpoint serializes generations, so planned queries are also
+issued serially rather than queued behind one another. This lets the client
+speak Level 1 while the server researches Level 2.
 
 ## SSE framing
 
@@ -148,24 +150,10 @@ level
 done
 ```
 
-Adaptive recovery order:
-
-```text
-run
-plan
-level_start                 (planned level is processed)
-plan_update                 (recovery is inserted)
-level                       (supported facts from the planned level)
-level_start                 (inserted recovery level starts)
-level
-...
-done
-```
-
 `run` is transport metadata. `plan` is always the first semantic pipeline
 event, and no `level` event can precede it.
 
-Already emitted levels are immutable. A `plan_update` only changes future work.
+Already emitted levels are immutable. A deadline `plan_update` only changes future work.
 The client must replace its pending plan with the newest version and must not
 replay or remove text that has already been spoken.
 
@@ -228,64 +216,14 @@ coming. The plan itself should not be spoken.
 
 ### `plan_update`
 
-Sent whenever adaptive processing changes the remaining order. The event
-contains the complete current plan, not a partial patch. It is also emitted
-when the deadline causes pending levels to become `skipped`.
-
-```json
-{
-  "type": "plan_update",
-  "version": 2,
-  "reason": "insufficient_evidence",
-  "inserted_level_id": "recovery_1",
-  "after_level_id": "level_1",
-  "levels": [
-    {
-      "id": "level_1",
-      "position": 1,
-      "objective": "Define X",
-      "queries": ["What exactly is X?"],
-      "depends_on": [],
-      "kind": "planned",
-      "recovery_for": null,
-      "status": "partial"
-    },
-    {
-      "id": "recovery_1",
-      "position": 2,
-      "objective": "Find missing evidence for Define X",
-      "queries": ["What configuration determines X's behavior?"],
-      "depends_on": ["level_1"],
-      "kind": "recovery",
-      "recovery_for": "level_1",
-      "status": "pending"
-    },
-    {
-      "id": "level_2",
-      "position": 3,
-      "objective": "Explain why X does Y",
-      "queries": ["What mechanism causes X to do Y?"],
-      "depends_on": ["recovery_1"],
-      "kind": "planned",
-      "recovery_for": null,
-      "status": "pending"
-    }
-  ]
-}
-```
-
-Clients must use the highest `version` received. Replace the locally stored
-pending plan atomically when this event arrives.
-
-For `reason="insufficient_evidence"`, `inserted_level_id` and
-`after_level_id` identify the new recovery level. For `reason="deadline"`,
-those fields are omitted because the order did not change; the `levels` array
-contains the final `skipped` statuses.
+Sent only when the deadline causes pending levels to become `skipped`. The
+event contains the complete current plan, not a partial patch. Clients must use
+the highest `version` received and replace their locally stored pending plan.
 
 Level `status` values in `plan` and `plan_update`: `pending`, `running`,
-`complete`, `partial`, and `skipped` (never started, only after the deadline
-passed). A level's status is a snapshot at emit time; the `level` event is the
-authoritative result for that level.
+`complete`, and `skipped` (never started, only after the deadline passed). A
+level's status is a snapshot at emit time; the `level` event is the authoritative
+result for that level.
 
 ### `level_start`
 
@@ -317,7 +255,7 @@ Contains the newly completed, immediately speakable output for one level.
   "queries": [
     {
       "query": "What exactly is X?",
-      "enough": true,
+      "answered": true,
       "reference_node_ids": ["node:14"],
       "search_result_count": 8,
       "latency_ms": 184,
@@ -349,9 +287,9 @@ Client behavior:
   `null`. It marks one failed subquery, not a failed run.
 - Deduplicate speech by `level_id`. A level is emitted at most once during a
   normal connection.
-- `complete=false` means the level found some supported facts but not everything
-  it needed. Speak its non-empty `text`; an announced recovery level may provide
-  the missing part. Do not invent a transition or missing explanation.
+- `complete` is true for every level that ran. Individual workers report
+  `answered=false` when no sourced section survived validation; this is a
+  diagnostic, not spoken content or a request for recovery.
 - `text` may be empty when no supported fact survived reference validation. Do
   not enqueue an empty string.
 
@@ -385,16 +323,13 @@ answer and should not be spoken again.
 
 `status` values:
 
-- `complete`: every level completed or was resolved by recovery.
-- `partial`: something the question asked for was not supported by the
-  database. Previously emitted facts remain source-backed and usable; the
-  missing part must not be filled in by the speaking client.
+- `complete`: every planned level completed.
+- `partial`: the deadline passed before every planned level ran. Previously
+  emitted facts remain source-backed and usable.
 
 `incomplete_reason` explains a `partial` run and is `null` when `status` is
 `complete`:
 
-- `evidence_missing`: the recovery budget was exhausted, or no new search
-  remained that could close the gap.
 - `deadline`: `deadline_seconds` passed before every planned level ran. Levels
   never started are reported with `status: "skipped"` in the last plan the
   client received; `levels_completed` is lower than `levels_planned`.
@@ -599,7 +534,8 @@ data: {"type":"done","status":"complete","plan_version":1,"levels_completed":2,.
 - A run that could not support every part of the question always terminates
   with `status="partial"`; unsupported parts are omitted, never filled in.
 - The same subquery is never issued twice, except to retry one that failed.
-- Shallow queries inside a level run concurrently.
+- Planned queries inside a level are issued serially because the configured
+  model endpoint serializes generations.
 - The next level starts without waiting for speech playback.
 - Every streamed fact has at least one node ID from retrieved evidence or an
   already accepted earlier-level fact.

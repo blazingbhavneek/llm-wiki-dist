@@ -5,3 +5,4 @@ llm-wiki-dist/.wiki
 .codegraph
 chrome-headless-shell-linux64/
 llm-wiki-dist/.wiki_docker/
+.DS_Store
