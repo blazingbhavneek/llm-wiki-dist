@@ -1039,6 +1039,15 @@ class Librarian:
         """Best-effort cluster naming. Only recluster when the graph topology
         changed since last time, or some active node still lacks a cluster."""
 
+        # 0 means the caller owns clustering and will run one explicit
+        # refresh_clusters() itself (see _maybe_recluster). Without this,
+        # every bootstrap() call - e.g. one per document in a batch ingest -
+        # sees a changed graph signature and reclusters+renames from scratch,
+        # making cluster naming O(n^2) in corpus size.
+        if self._recluster_every <= 0:
+            log.info("bootstrap.recluster_disabled_skip")
+            return
+
         # Build a simple graph signature from active node IDs and edge IDs.
         # If this signature is unchanged, the graph topology likely did not change.
         edges = self.store.get_all_edges()

@@ -146,3 +146,32 @@ docker save -o doc-parser-rikiseisan-3.4.4-cuda13.tar \
 # Copy the tar to the server, then:
 docker load -i doc-parser-rikiseisan-3.4.4-cuda13.tar
 ```
+
+## Benchmark
+
+The benchmark has two stable, resumable phases. Both phases use every
+answerable question in the selected dataset; there is no sampling mode.
+
+```bash
+python -m benchmark.runner ingest novel
+python -m benchmark.runner bench novel
+```
+
+The supported dataset names are `novel`, `fanout`, `multihop`, and `musique`.
+Ingestion always targets `benchmark-results/datastores/<dataset>/`; rerunning
+the same command reuses completed dataset, vanilla embedding-batch, llm-wiki
+document, and GraphRAG workflow-cache checkpoints. Benchmark output always
+lives at `benchmark-results/benchmark/<dataset>/` and failed questions are
+retried on the next identical `bench` invocation.
+
+The three clients are the autonomous dense+BM25 hybrid baseline, native
+llm-wiki, and Microsoft GraphRAG's native DRIFT query flow. Per-question input,
+output, and total query tokens are written to `token-usage.csv`; `summary.json`
+keeps query tokens separate from judge tokens and flags queries for which a
+provider did not expose complete usage metrics.
+
+Model endpoints can be changed with `BENCH_CHAT_BASE_URL`,
+`BENCH_EMBED_BASE_URL`, and `BENCH_RERANK_BASE_URL`. Corresponding model and key
+overrides use the `BENCH_CHAT_MODEL`, `BENCH_EMBED_MODEL`,
+`BENCH_RERANK_MODEL`, `BENCH_CHAT_API_KEY`, and `BENCH_EMBED_API_KEY`
+environment variables.

@@ -102,6 +102,16 @@ class LlmClient:
         # Query workers share this client, so benchmark usage must be isolated
         # per worker thread rather than kept in one global counter.
         self._usage_local = threading.local()
+        # Ingestion fans requests out across several worker threads.  Keep a
+        # second process-wide ledger so benchmark ingestion can account for
+        # every response without weakening the per-query thread isolation.
+        self._usage_lock = threading.Lock()
+        self._global_usage = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
         # Add the system prompt at the start of the conversation, if provided.
         if self.system_prompt.strip():
@@ -274,6 +284,26 @@ class LlmClient:
         self.reset_thread_usage()
         return usage
 
+    def reset_global_usage(self) -> None:
+        with self._usage_lock:
+            self._global_usage = {
+                "requests": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+
+    def consume_global_usage(self) -> dict[str, int]:
+        with self._usage_lock:
+            usage = dict(self._global_usage)
+            self._global_usage = {
+                "requests": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+        return usage
+
     def _record_response_usage(self, response: Any) -> None:
         if response is None:
             return
@@ -319,6 +349,11 @@ class LlmClient:
         usage["prompt_tokens"] += prompt_tokens
         usage["completion_tokens"] += completion_tokens
         usage["total_tokens"] += total_tokens
+        with self._usage_lock:
+            self._global_usage["requests"] += 1
+            self._global_usage["prompt_tokens"] += prompt_tokens
+            self._global_usage["completion_tokens"] += completion_tokens
+            self._global_usage["total_tokens"] += total_tokens
 
     def _make_llm(self) -> Any:
         # Create a fresh LangChain OpenAI-compatible chat client.
@@ -469,6 +504,22 @@ class LlmClient:
         return str(result)
 
 
+class _UsageCapturingEmbeddingsClient:
+    """Transparent proxy retaining usage discarded by OpenAIEmbeddings."""
+
+    def __init__(self, client: Any, record: Callable[[Any], None]) -> None:
+        self._client = client
+        self._record = record
+
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        response = self._client.create(*args, **kwargs)
+        self._record(response)
+        return response
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
 class Embedder:
     def __init__(self, settings: Settings) -> None:
         # Store settings and selected backend from config.
@@ -477,6 +528,9 @@ class Embedder:
 
         # Embedding dimension is discovered from the first successful embed call.
         self._dim: int | None = None
+        self._usage_local = threading.local()
+        self._usage_lock = threading.Lock()
+        self._global_usage = self._empty_usage()
 
         # Only these two backends are supported.
         if self._backend not in {"server", "hf"}:
@@ -551,13 +605,18 @@ class Embedder:
         if backend == "server":
             from langchain_openai import OpenAIEmbeddings
 
-            return OpenAIEmbeddings(
+            embeddings = OpenAIEmbeddings(
                 model=self.settings.embed_model,
                 base_url=self.settings.embed_base_url,
                 api_key=self.settings.embed_api_key,
                 # Disabled because we handle over-long stored documents ourselves.
                 check_embedding_ctx_length=False,
             )
+            embeddings.client = _UsageCapturingEmbeddingsClient(
+                embeddings.client,
+                self._record_provider_usage,
+            )
+            return embeddings
 
         # Build the local HuggingFace embedding client.
         from langchain_huggingface import HuggingFaceEmbeddings
@@ -595,6 +654,8 @@ class Embedder:
 
         # Embed all documents using the active backend.
         vectors = self._client.embed_documents(texts)
+        if self._backend == "hf":
+            self._record_estimated_usage(texts)
 
         # Cache dimension from the first returned vector.
         if vectors:
@@ -605,11 +666,79 @@ class Embedder:
     def embed_query(self, text: str) -> list[float]:
         # Embed one query/text string using the active backend.
         vector = self._client.embed_query(text)
+        if self._backend == "hf":
+            self._record_estimated_usage([text])
 
         # Keep dimension updated from the actual returned vector.
         self._dim = len(vector)
 
         return vector
+
+    @staticmethod
+    def _empty_usage() -> dict[str, int]:
+        return {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_requests": 0,
+        }
+
+    def reset_thread_usage(self) -> None:
+        self._usage_local.usage = self._empty_usage()
+
+    def consume_thread_usage(self) -> dict[str, int]:
+        usage = dict(getattr(self._usage_local, "usage", self._empty_usage()))
+        self.reset_thread_usage()
+        return usage
+
+    def reset_global_usage(self) -> None:
+        with self._usage_lock:
+            self._global_usage = self._empty_usage()
+
+    def consume_global_usage(self) -> dict[str, int]:
+        with self._usage_lock:
+            usage = dict(self._global_usage)
+            self._global_usage = self._empty_usage()
+        return usage
+
+    def _record_provider_usage(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage")
+        missing = usage is None
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        if not isinstance(usage, dict):
+            usage = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                "total_tokens": getattr(usage, "total_tokens", 0),
+            }
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        total = int(usage.get("total_tokens") or prompt)
+        self._record_usage(prompt, total, estimated=missing)
+
+    def _record_estimated_usage(self, texts: list[str]) -> None:
+        prompt = sum(
+            max(1, len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)))
+            for text in texts
+        )
+        self._record_usage(prompt, prompt, estimated=True)
+
+    def _record_usage(self, prompt: int, total: int, *, estimated: bool) -> None:
+        usage = getattr(self._usage_local, "usage", None)
+        if not isinstance(usage, dict):
+            self.reset_thread_usage()
+            usage = self._usage_local.usage
+        usage["requests"] += 1
+        usage["prompt_tokens"] += prompt
+        usage["total_tokens"] += total
+        usage["estimated_requests"] += int(estimated)
+        with self._usage_lock:
+            self._global_usage["requests"] += 1
+            self._global_usage["prompt_tokens"] += prompt
+            self._global_usage["total_tokens"] += total
+            self._global_usage["estimated_requests"] += int(estimated)
 
     def embed_document(self, text: str) -> list[float]:
         # Stored documents may contain image markup/base64.

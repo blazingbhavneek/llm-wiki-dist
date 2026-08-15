@@ -61,7 +61,12 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
+
+try:  # Optional: the harness core stays importable on a bare interpreter.
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover - exercised by the stdlib fallback
+    _tqdm = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -72,7 +77,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 # Fixed benchmark presets. The only optional public input is the chat server URL.
-DEFAULT_CHAT_BASE_URL = "http://43.235.149.172:43029/v1"
+DEFAULT_CHAT_BASE_URL = "http://170.64.243.132:26572/v1"
 CHAT_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
 NVIDIA_API_KEY = "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"
 EMBED_BASE_URL = "http://localhost:8000/v1"
@@ -99,6 +104,34 @@ FANOUT_QUESTIONS_URL = (
     "https://raw.githubusercontent.com/zhudotexe/fanoutqa/main/"
     "fanoutqa/data/fanout-final-dev.json"
 )
+# The published dev set leaves the literal string ###TBD### in place of the
+# page and revision IDs of 83 evidence records across 28 of its 310 questions.
+# Upstream FanOutQA resolves those by title against its dataset epoch -- the
+# newest revision on or before this instant -- which keeps the corpus pinned
+# to article text as it read when the answers were annotated.
+FANOUT_DATASET_EPOCH = "2023-11-20T00:00:00Z"
+FANOUT_REVISIONS_PATH = FANOUT_DIR / "resolved-revisions.json"
+FANOUT_PLACEHOLDER = "###TBD###"
+# Building the FanOutQA corpus means fetching well over a thousand revisions
+# back to back, so Wikipedia will throttle at some point in every full run.
+# Retries have to outlast a throttle window rather than merely survive a blip:
+# one exhausted budget aborts an ingest that is otherwise hours in. Wikimedia's
+# User-Agent policy asks for a contact URL, and anonymous traffic without one
+# is throttled harder.
+WIKIPEDIA_USER_AGENT = (
+    "llm-wiki-benchmark/1.0 (https://github.com/blazingbhavneek/llm-wiki-dist)"
+)
+WIKIPEDIA_MAX_ATTEMPTS = 8
+WIKIPEDIA_MAX_RETRY_SECONDS = 120.0
+# API error codes that no amount of waiting will clear. Retrying these once
+# cost ninety seconds per record and reported permanent data rot as throttling.
+WIKIPEDIA_PERMANENT_ERRORS = frozenset(
+    {"nosuchrevid", "missingtitle", "nosuchpageid", "invalidtitle"}
+)
+# Wikimedia asks bulk readers to stay serial and unhurried rather than to back
+# off only once throttled. One short pause per request costs a few minutes over
+# a full corpus and keeps the run under the limiter instead of bouncing off it.
+WIKIPEDIA_REQUEST_SPACING_SECONDS = 0.2
 MULTIHOP_DIR = DATA_DIR / "multihop"
 MULTIHOP_CORPUS_PATH = MULTIHOP_DIR / "corpus.json"
 MULTIHOP_QUESTIONS_PATH = MULTIHOP_DIR / "MultiHopRAG.json"
@@ -149,7 +182,10 @@ NOVEL_LIMIT: int | None = None
 # requests one of its workers actually issues, so workers x requests-per-worker
 # never exceeds the cap. Sized for a rented GPU; drop it to 1 when running
 # against a metered API with a low RPM ceiling.
-MAX_CONCURRENT_REQUESTS = 20
+#
+# Halved from 10 so two datasets can ingest in parallel from separate
+# terminals without exceeding the server's original single-run budget.
+MAX_CONCURRENT_REQUESTS = 10
 
 # GraphRAG indexing fans out internally up to concurrent_requests, so the cap
 # is the driver here rather than a worker count.
@@ -159,7 +195,10 @@ GRAPHRAG_REQUEST_CONCURRENCY = MAX_CONCURRENT_REQUESTS
 # concurrent_requests on its own. Keeping DRIFT's internal fan-out at one makes
 # a question worker worth exactly one in-flight request.
 GRAPHRAG_QUERY_WORKERS = MAX_CONCURRENT_REQUESTS
-GRAPHRAG_DRIFT_CONCURRENCY = 1
+# DRIFT fans its follow-ups out internally. The runner already pins query
+# workers to 1 so each question's metrics stay attributable, which leaves the
+# whole cap for one question's own fan-out.
+GRAPHRAG_DRIFT_CONCURRENCY = 3
 # Provider requests-per-minute cap. None disables the limiter entirely, which
 # is what a local or rented GPU wants; set an integer for a metered API (35
 # left headroom under the NVIDIA endpoint's 40 RPM cap).
@@ -170,17 +209,30 @@ GRAPHRAG_RPM_LIMIT: int | None = None
 # independent chunking/graph-ingest phase. A phase barrier separates node
 # preparation from linking so results do not depend on thread completion order.
 OURS_INGEST_CONCURRENCY = MAX_CONCURRENT_REQUESTS
-# ours queries: subagents run serially within one question (subagent_concurrency
-# defaults to 1 and nothing here overrides it), so one question worker is one
-# in-flight request.
-OURS_QUESTION_WORKERS = MAX_CONCURRENT_REQUESTS
+# ours queries: a lead agent dispatches a team of exploration subagents, and
+# OURS_SUBAGENT_CONCURRENCY of them run at once inside a single question. One
+# question worker is therefore worth that many in-flight requests, not one, so
+# the question workers are divided down to keep the global cap honest.
+OURS_SUBAGENT_COUNT = 5
+OURS_SUBAGENT_CONCURRENCY = 5
+OURS_QUESTION_WORKERS = max(
+    1, MAX_CONCURRENT_REQUESTS // OURS_SUBAGENT_CONCURRENCY
+)
+# Search width the lead and every subagent see: the reranked result count, and
+# the candidate pool the reranker draws that from.
+OURS_RERANK_TOP_K = 40
+OURS_SEARCH_POOL = 100
 # vanilla answers and the LLM judge: one request per worker.
 CHAT_CONCURRENCY = MAX_CONCURRENT_REQUESTS
 # Bounded native DRIFT: retain its global-to-local iterative search without
 # the installed defaults (5 primer folds, 20 follow-ups, 3 depths) exploding
 # into dozens or hundreds of calls for one question.
-GRAPHRAG_DRIFT_PRIMER_FOLDS = 1
-GRAPHRAG_DRIFT_FOLLOWUPS = 3
+#
+# DRIFT issues roughly primer_folds + followups x depth + reduce calls, so this
+# is ~12 per question against the ~9 the first bounded settings produced.
+# Concurrency 3 keeps the added breadth off the wall clock.
+GRAPHRAG_DRIFT_PRIMER_FOLDS = 2
+GRAPHRAG_DRIFT_FOLLOWUPS = 4
 GRAPHRAG_DRIFT_DEPTH = 2
 RUN_AGENTIC_GRAPHRAG = True
 RUN_AGENTIC_OURS = True  # native ResearchSession.ask() vs DRIFT in agentic mode
@@ -202,6 +254,15 @@ PROSE_LINE_WIDTH = 200
 
 class BenchmarkError(RuntimeError):
     """A user-actionable benchmark failure."""
+
+
+class WikipediaContentGone(BenchmarkError):
+    """A revision or page a dataset pins no longer exists on Wikipedia.
+
+    FanOutQA pins revisions from 2023, and articles deleted since then take
+    every one of their revisions out of the live API. Retrying cannot fix
+    that, so it is raised past the retry policy and handled by the caller.
+    """
 
 
 @dataclass(frozen=True)
@@ -251,9 +312,13 @@ class ApiUsage:
         self.requests += 1
         if not isinstance(usage, dict):
             return
-        self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
-        self.completion_tokens += int(usage.get("completion_tokens") or 0)
-        self.total_tokens += int(usage.get("total_tokens") or 0)
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion = int(
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        )
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        self.total_tokens += int(usage.get("total_tokens") or prompt + completion)
 
 
 def summed_usage(values: Iterable[dict[str, Any] | None]) -> dict[str, int]:
@@ -264,10 +329,41 @@ def summed_usage(values: Iterable[dict[str, Any] | None]) -> dict[str, int]:
         total.requests += int(
             value["requests"] if "requests" in value else 1
         )
-        total.prompt_tokens += int(value.get("prompt_tokens") or 0)
-        total.completion_tokens += int(value.get("completion_tokens") or 0)
-        total.total_tokens += int(value.get("total_tokens") or 0)
+        prompt = int(value.get("prompt_tokens") or value.get("input_tokens") or 0)
+        completion = int(
+            value.get("completion_tokens") or value.get("output_tokens") or 0
+        )
+        total.prompt_tokens += prompt
+        total.completion_tokens += completion
+        total.total_tokens += int(value.get("total_tokens") or prompt + completion)
     return asdict(total)
+
+
+def graphrag_metrics_coverage(text: str, args: SimpleNamespace) -> tuple[int, int]:
+    """Return (calls that reported tokens, calls attempted) for chat metrics.
+
+    GraphRAG streams its internal DRIFT sub-calls even under ``--no-streaming``,
+    which only governs the final answer. A streamed response carries no usage
+    payload, so its tokens never reach the metrics log while its request is
+    still counted. Comparing the two makes that shortfall visible instead of
+    letting a partial sum pass as a complete one.
+    """
+
+    decoder = json.JSONDecoder()
+    measured = attempted = 0
+    for match in re.finditer(r"Metrics for ([^:]+):\s*", text):
+        try:
+            usage, _end = decoder.raw_decode(text[match.end() :].lstrip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        label = match.group(1)
+        if not isinstance(usage, dict):
+            continue
+        if args.embed_model in label or "embed" in label.casefold():
+            continue
+        attempted += int(usage.get("attempted_request_count") or 0)
+        measured += int(usage.get("responses_with_tokens") or 0)
+    return measured, attempted
 
 
 def parse_graphrag_token_metrics(
@@ -277,21 +373,35 @@ def parse_graphrag_token_metrics(
         "retrieval_chat": [],
         "retrieval_embedding": [],
     }
-    for match in re.finditer(
-        r"Metrics for ([^:]+):\s*(\{.*?\n\})",
-        text,
-        flags=re.DOTALL,
-    ):
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"Metrics for ([^:]+):\s*", text):
         try:
-            usage = json.loads(match.group(2))
-        except json.JSONDecodeError:
+            usage, _end = decoder.raw_decode(text[match.end() :].lstrip())
+        except (json.JSONDecodeError, TypeError):
             continue
+        if not isinstance(usage, dict):
+            continue
+        label = match.group(1)
         category = (
             "retrieval_embedding"
-            if args.embed_model in match.group(1)
+            if args.embed_model in label or "embed" in label.casefold()
             else "retrieval_chat"
         )
-        usage["requests"] = int(usage.get("attempted_request_count") or 0)
+        requests = int(
+            usage.get("attempted_request_count") or usage.get("requests") or 0
+        )
+        if requests == 0 and any(
+            int(usage.get(key) or 0)
+            for key in (
+                "prompt_tokens",
+                "input_tokens",
+                "completion_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+        ):
+            requests = 1
+        usage["requests"] = requests
         categories[category].append(usage)
     return {
         category: summed_usage(values)
@@ -406,6 +516,46 @@ def utc_stamp() -> str:
 
 def log(message: str) -> None:
     print(f"[benchmark] {message}", flush=True)
+
+
+@contextlib.contextmanager
+def progress_reporter(
+    total: int, description: str, *, every: int = 25
+) -> Any:
+    """Report progress through a long loop that is otherwise silent.
+
+    An interactive run gets a tqdm bar; a redirected or piped run gets a
+    periodic line through ``log`` instead, so a captured ingest log stays
+    readable rather than filling with carriage returns. Yields a callable
+    that advances the report by one item.
+    """
+
+    bar = None
+    if _tqdm is not None and sys.stderr.isatty():
+        bar = _tqdm(
+            total=total,
+            desc=f"[benchmark] {description}",
+            unit="doc",
+            file=sys.stderr,
+            leave=False,
+        )
+    completed = 0
+
+    def advance(note: str | None = None) -> None:
+        nonlocal completed
+        completed += 1
+        if bar is not None:
+            if note:
+                bar.set_postfix_str(note[:48], refresh=False)
+            bar.update(1)
+        elif completed % every == 0 or completed == total:
+            log(f"{description}: {completed}/{total}")
+
+    try:
+        yield advance
+    finally:
+        if bar is not None:
+            bar.close()
 
 
 def download_if_missing(
@@ -847,6 +997,14 @@ def fanout_evidence_records(item: dict[str, Any]) -> list[dict[str, Any]]:
             return
         page_id = str(value.get("pageid") or "")
         revision_id = str(value.get("revid") or "")
+        title = str(value.get("title") or "")
+        # Placeholders must be resolved here rather than at fetch time: every
+        # unresolved record shares one (###TBD###, ###TBD###) key, so distinct
+        # articles would otherwise collapse into a single corpus document.
+        if title and FANOUT_PLACEHOLDER in {page_id, revision_id}:
+            value = {**value, **fanout_epoch_revision(title)}
+            page_id = value["pageid"]
+            revision_id = value["revid"]
         if page_id and revision_id:
             evidence[(page_id, revision_id)] = dict(value)
 
@@ -926,6 +1084,155 @@ def wikipedia_html_text(value: str) -> str:
     return parser.text()
 
 
+def wikipedia_api_json(params: dict[str, str]) -> dict[str, Any]:
+    query = urllib.parse.urlencode(
+        {**params, "format": "json", "formatversion": "2"}
+    )
+    request = urllib.request.Request(
+        f"https://en.wikipedia.org/w/api.php?{query}",
+        headers={"User-Agent": WIKIPEDIA_USER_AGENT},
+    )
+    time.sleep(WIKIPEDIA_REQUEST_SPACING_SECONDS)
+    with urllib.request.urlopen(request, timeout=120) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code") or "")
+        detail = f"Wikipedia API error {code!r}: {error.get('info')}"
+        if code in WIKIPEDIA_PERMANENT_ERRORS:
+            raise WikipediaContentGone(detail)
+        raise BenchmarkError(detail)
+    return payload
+
+
+def wikipedia_retry_delay(exc: Exception, attempt: int) -> float:
+    """Seconds to wait before retrying one failed Wikipedia call.
+
+    A throttle is answered with the server's own Retry-After when it sends
+    one, and otherwise with an exponential backoff long enough to outlast a
+    limiter window. Ordinary transport errors back off far more briefly.
+    """
+
+    throttled = (
+        isinstance(exc, urllib.error.HTTPError)
+        and exc.code in {429, 503}
+    )
+    if not throttled:
+        return min(2.0 ** (attempt - 1), 30.0)
+    delay = 15.0 * (2.0 ** (attempt - 1))
+    if isinstance(exc, urllib.error.HTTPError) and exc.headers:
+        with contextlib.suppress(TypeError, ValueError):
+            delay = max(delay, float(exc.headers.get("Retry-After")))
+    return min(delay, WIKIPEDIA_MAX_RETRY_SECONDS)
+
+
+def with_wikipedia_retry(
+    operation: Callable[[], Any], *, label: str, failure: str
+) -> Any:
+    """Run one Wikipedia call under the shared retry and rate-limit policy.
+
+    An empty or malformed result raises from inside ``operation``, so a
+    transient bad response is retried on the same terms as a transport error.
+    """
+
+    last_error: Exception | None = None
+    for attempt in range(1, WIKIPEDIA_MAX_ATTEMPTS + 1):
+        try:
+            return operation()
+        except WikipediaContentGone:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < WIKIPEDIA_MAX_ATTEMPTS:
+                delay = wikipedia_retry_delay(exc, attempt)
+                log(
+                    f"Wikipedia call for {label!r} failed "
+                    f"({attempt}/{WIKIPEDIA_MAX_ATTEMPTS}); "
+                    f"retrying in {delay:.0f}s: {exc}"
+                )
+                time.sleep(delay)
+    raise BenchmarkError(
+        f"{failure} after {WIKIPEDIA_MAX_ATTEMPTS} attempts: {last_error}; "
+        "every revision already fetched is cached, so rerunning the same "
+        "ingest command resumes where this stopped"
+    )
+
+
+_FANOUT_REVISION_LOCK = threading.Lock()
+_FANOUT_REVISIONS: dict[str, dict[str, str]] | None = None
+
+
+def fanout_epoch_revision(title: str) -> dict[str, str]:
+    """Resolve a placeholder evidence record to its revision at the epoch.
+
+    Resolutions are cached on disk because the placeholders are shared across
+    questions, and because a stopped ingest should not re-query titles it has
+    already pinned.
+    """
+
+    global _FANOUT_REVISIONS
+    with _FANOUT_REVISION_LOCK:
+        if _FANOUT_REVISIONS is None:
+            try:
+                value = json.loads(FANOUT_REVISIONS_PATH.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                value = {}
+            _FANOUT_REVISIONS = value if isinstance(value, dict) else {}
+        cached = _FANOUT_REVISIONS.get(title)
+        if isinstance(cached, dict):
+            return dict(cached)
+
+    def fetch() -> dict[str, str]:
+        payload = wikipedia_api_json(
+            {
+                "action": "query",
+                "prop": "revisions",
+                "titles": title,
+                "rvstart": FANOUT_DATASET_EPOCH,
+                "rvdir": "older",
+                "rvlimit": "1",
+                "rvprop": "ids",
+                "redirects": "1",
+            }
+        )
+        pages = (payload.get("query") or {}).get("pages") or []
+        for page in pages if isinstance(pages, list) else []:
+            if not isinstance(page, dict):
+                continue
+            # A deleted article answers as "missing" rather than as an error.
+            if page.get("missing"):
+                raise WikipediaContentGone(
+                    f"Wikipedia article {title!r} no longer exists"
+                )
+            revisions = page.get("revisions")
+            first = revisions[0] if isinstance(revisions, list) and revisions else None
+            if isinstance(first, dict) and page.get("pageid") and first.get("revid"):
+                return {
+                    "pageid": str(page["pageid"]),
+                    "revid": str(first["revid"]),
+                    "title": str(page.get("title") or title),
+                }
+        raise BenchmarkError(
+            f"Wikipedia has no revision of {title!r} at {FANOUT_DATASET_EPOCH}"
+        )
+
+    resolved = with_wikipedia_retry(
+        fetch,
+        label=title,
+        failure=(
+            f"could not resolve the FanOutQA placeholder evidence {title!r} to a "
+            f"revision at {FANOUT_DATASET_EPOCH}"
+        ),
+    )
+    with _FANOUT_REVISION_LOCK:
+        assert _FANOUT_REVISIONS is not None
+        _FANOUT_REVISIONS[title] = resolved
+        json_dump(FANOUT_REVISIONS_PATH, _FANOUT_REVISIONS)
+    return dict(resolved)
+
+
 def load_fanout_revision_text(
     evidence: dict[str, Any], cache_dir: Path
 ) -> str:
@@ -938,58 +1245,32 @@ def load_fanout_revision_text(
     if path.exists():
         return path.read_text(encoding="utf-8")
 
-    params = urllib.parse.urlencode(
-        {
-            "action": "parse",
-            "oldid": revision_id,
-            "prop": "text",
-            "format": "json",
-            "formatversion": "2",
-        }
-    )
-    url = f"https://en.wikipedia.org/w/api.php?{params}"
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "llm-wiki-benchmark/1.0"},
-    )
-    last_error: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            parsed = payload.get("parse") if isinstance(payload, dict) else None
-            html = parsed.get("text") if isinstance(parsed, dict) else None
-            if isinstance(html, dict):
-                html = html.get("*")
-            text = wikipedia_html_text(html) if isinstance(html, str) else ""
-            if not text.strip():
-                raise BenchmarkError(
-                    f"Wikipedia returned no text for {title} revision {revision_id}"
-                )
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-            temporary.write_text(text, encoding="utf-8")
-            temporary.replace(path)
-            return text
-        except Exception as exc:
-            last_error = exc
-            if attempt < 3:
-                delay = float(attempt)
-                if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
-                    retry_after = (
-                        exc.headers.get("Retry-After") if exc.headers else None
-                    )
-                    with contextlib.suppress(TypeError, ValueError):
-                        delay = max(delay, float(retry_after))
-                    delay = min(max(delay, 10.0 * attempt), 30.0)
-                    log(
-                        f"Wikipedia rate-limited {title!r}; "
-                        f"retrying in {delay:.0f}s"
-                    )
-                time.sleep(delay)
-    raise BenchmarkError(
-        f"could not retrieve FanOutQA evidence {title!r} at revision "
-        f"{revision_id}: {last_error}"
+    def fetch() -> str:
+        payload = wikipedia_api_json(
+            {"action": "parse", "oldid": revision_id, "prop": "text"}
+        )
+        parsed = payload.get("parse")
+        html = parsed.get("text") if isinstance(parsed, dict) else None
+        if isinstance(html, dict):
+            html = html.get("*")
+        text = wikipedia_html_text(html) if isinstance(html, str) else ""
+        if not text.strip():
+            raise BenchmarkError(
+                f"Wikipedia returned no text for {title} revision {revision_id}"
+            )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+        return text
+
+    return with_wikipedia_retry(
+        fetch,
+        label=title,
+        failure=(
+            f"could not retrieve FanOutQA evidence {title!r} at revision "
+            f"{revision_id}"
+        ),
     )
 
 
@@ -1988,6 +2269,222 @@ def run_logged(
     return completed
 
 
+class UsageRecordingProxy:
+    """Local OpenAI-compatible proxy that records provider token usage.
+
+    GraphRAG hardcodes ``stream=True`` for every search call and reads its
+    metrics off the response before the iterator is consumed, so a streamed
+    call contributes no usage at all: on the novel corpus only 22% of its chat
+    calls were ever counted, and the reported input tokens were low by roughly
+    4.5x. Counting at the transport makes the tally independent of what the
+    client does with the stream. The proxy asks the provider for usage on every
+    stream, records what comes back, and withholds that trailing usage-only
+    chunk so the client still sees exactly the stream it expected.
+    """
+
+    def __init__(self, upstream: str, record_path: Path, *, timeout: float):
+        self.upstream = upstream.rstrip("/")
+        self.record_path = record_path
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._server: Any = None
+        self._thread: threading.Thread | None = None
+        self._inflight = 0
+        self._idle = threading.Condition()
+
+    def _enter_request(self) -> None:
+        with self._idle:
+            self._inflight += 1
+
+    def _leave_request(self) -> None:
+        with self._idle:
+            self._inflight -= 1
+            if self._inflight <= 0:
+                self._idle.notify_all()
+
+    def drain(self, timeout: float = 30.0) -> None:
+        """Block until no proxied request is still being written.
+
+        A client can exit while its last responses are still draining through
+        the proxy. Without this the trailing calls land after the usage journal
+        has been sliced and are billed to the following question.
+        """
+
+        deadline = time.monotonic() + timeout
+        with self._idle:
+            while self._inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._idle.wait(timeout=min(remaining, 0.5))
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://127.0.0.1:{port}"
+
+    def _record(self, usage: dict[str, Any], stream: bool, path: str = "") -> None:
+        row = {
+            "requests": 1,
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "streamed": stream,
+            "category": (
+                "retrieval_embedding"
+                if "embedding" in path.casefold()
+                else "retrieval_chat"
+            ),
+        }
+        with self._lock:
+            with self.record_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def __enter__(self) -> "UsageRecordingProxy":
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        proxy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+            def handle_one_request(self) -> None:  # noqa: N802 - stdlib naming
+                # A client that exits mid-response resets the socket. That is
+                # normal here and must not print a stack trace per call.
+                with contextlib.suppress(ConnectionResetError, BrokenPipeError):
+                    super().handle_one_request()
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+                proxy._enter_request()
+                try:
+                    self._proxy_post()
+                finally:
+                    proxy._leave_request()
+
+            def _proxy_post(self) -> None:
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                try:
+                    payload = json.loads(body or b"{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                streaming = bool(payload.get("stream"))
+                if streaming:
+                    # The provider only reports usage for a stream when asked.
+                    payload["stream_options"] = {"include_usage": True}
+                    body = json.dumps(payload).encode("utf-8")
+                request = urllib.request.Request(
+                    f"{proxy.upstream}{self.path}",
+                    data=body,
+                    headers={
+                        key: value
+                        for key, value in self.headers.items()
+                        if key.lower()
+                        in {"authorization", "content-type", "accept"}
+                    },
+                    method="POST",
+                )
+                try:
+                    upstream = urllib.request.urlopen(request, timeout=proxy.timeout)
+                except urllib.error.HTTPError as exc:
+                    detail = exc.read()
+                    self.send_response(exc.code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(detail)))
+                    self.end_headers()
+                    self.wfile.write(detail)
+                    return
+                except Exception:
+                    self.send_error(502, "upstream unavailable")
+                    return
+                with upstream:
+                    if not streaming:
+                        raw = upstream.read()
+                        with contextlib.suppress(json.JSONDecodeError, TypeError):
+                            usage = json.loads(raw).get("usage")
+                            if isinstance(usage, dict):
+                                proxy._record(usage, False, self.path)
+                        self.send_response(upstream.status)
+                        self.send_header(
+                            "Content-Type",
+                            upstream.headers.get("Content-Type", "application/json"),
+                        )
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        return
+                    self.send_response(upstream.status)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    for line in upstream:
+                        if line.startswith(b"data: "):
+                            chunk = line[6:].strip()
+                            if chunk and chunk != b"[DONE]":
+                                with contextlib.suppress(json.JSONDecodeError):
+                                    value = json.loads(chunk)
+                                    usage = value.get("usage")
+                                    if isinstance(usage, dict):
+                                        proxy._record(usage, True, self.path)
+                                    # A usage-only trailer has no choices. The
+                                    # client never asked for it; do not forward.
+                                    if not value.get("choices"):
+                                        continue
+                        self._write_chunk(line)
+                    self._write_chunk(b"")
+
+            def _write_chunk(self, data: bytes) -> None:
+                self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+                self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+
+        self.record_path.parent.mkdir(parents=True, exist_ok=True)
+        self.record_path.touch()
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def usage_since(
+        self, offset: int
+    ) -> tuple[dict[str, dict[str, int]], int]:
+        """Usage recorded after ``offset`` bytes, by category, and the new offset.
+
+        GraphRAG queries run one at a time, so slicing this journal around a
+        single query attributes every call it made to that question exactly.
+        """
+        with self._lock:
+            text = self.record_path.read_text(encoding="utf-8")
+        grouped: dict[str, list[dict[str, Any]]] = {
+            "retrieval_chat": [],
+            "retrieval_embedding": [],
+        }
+        for line in text[offset:].splitlines():
+            with contextlib.suppress(json.JSONDecodeError):
+                row = json.loads(line)
+                grouped.setdefault(
+                    str(row.get("category") or "retrieval_chat"), []
+                ).append(row)
+        return (
+            {name: summed_usage(rows) for name, rows in grouped.items()},
+            len(text),
+        )
+
+
 def _update_model_mapping(
     mapping: dict[str, Any],
     *,
@@ -2293,6 +2790,29 @@ def worker_repair_graphrag_embeddings(request_path: Path) -> int:
     return 0
 
 
+def point_graphrag_chat_at(workspace: Path, api_base: str) -> None:
+    """Send only GraphRAG's completion traffic through ``api_base``.
+
+    Embeddings already report usage on every call, so they keep talking to the
+    provider directly and the proxy carries just the traffic whose accounting
+    is broken.
+    """
+
+    import yaml  # type: ignore
+
+    settings_path = workspace / "settings.yaml"
+    data = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise BenchmarkError(f"invalid GraphRAG settings: {settings_path}")
+    for value in (data.get("completion_models") or {}).values():
+        if isinstance(value, dict):
+            value["api_base"] = api_base
+    settings_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
 def ensure_graphrag_embedding_layout(
     workspace: Path, args: SimpleNamespace
 ) -> None:
@@ -2464,6 +2984,20 @@ def ours_environment(args: SimpleNamespace) -> dict[str, str]:
             "WIKI_RECLUSTER_EVERY": "0",
         }
     )
+    if hasattr(args, "agent_max_steps"):
+        env["WIKI_AGENT_MAX_STEPS"] = str(args.agent_max_steps)
+    if hasattr(args, "subagent_max_steps"):
+        env["WIKI_SUBAGENT_MAX_STEPS"] = str(args.subagent_max_steps)
+    # Left unset these fall back to the app's own defaults, which makes the
+    # benchmark's search breadth an accident of the shipped product config.
+    if hasattr(args, "subagent_count"):
+        env["WIKI_SUBAGENT_COUNT"] = str(args.subagent_count)
+    if hasattr(args, "subagent_concurrency"):
+        env["WIKI_SUBAGENT_CONCURRENCY"] = str(args.subagent_concurrency)
+    if hasattr(args, "rerank_top_k"):
+        env["WIKI_RERANK_TOP_K"] = str(args.rerank_top_k)
+    if hasattr(args, "search_candidate_pool"):
+        env["WIKI_SEARCH_POOL"] = str(args.search_candidate_pool)
     if args.rerank_base_url:
         env["WIKI_RERANK_BASE_URL"] = args.rerank_base_url
     if args.rerank_model:
@@ -2483,6 +3017,10 @@ def run_ours_worker(
     request_path = workspace / f"{action}-request.json"
     result_path = workspace / f"{action}-result.json"
     json_dump(request_path, {**request, "result_path": str(result_path.resolve())})
+    # Never mistake a prior successful worker result for the output of a new
+    # subprocess that failed before it could publish its own result.
+    with contextlib.suppress(FileNotFoundError):
+        result_path.unlink()
     command = [
         str(Path(args.ours_python).absolute()),
         str(Path(__file__).resolve()),
@@ -2642,6 +3180,8 @@ def worker_ours_ingest(request_path: Path) -> int:
     results: list[dict[str, Any]] = []
     started = time.perf_counter()
     try:
+        gateway.llm.reset_global_usage()
+        gateway.embedder.reset_global_usage()
         librarian.bootstrap()
         threshold = int(
             os.environ.get(
@@ -2754,10 +3294,11 @@ def worker_ours_ingest(request_path: Path) -> int:
             if len(pending) >= group_size:
                 flush(pending)
         flush(pending)
-        # Per-document reclustering is throttled, so the last few documents may
-        # not be clustered yet. One final pass leaves the index query-ready.
-        log("ours final recluster")
-        librarian.refresh_clusters()
+        # The resumable benchmark sends one document per worker and performs a
+        # single explicit finalization after all document checkpoints exist.
+        if bool(request.get("refresh_clusters", True)):
+            log("ours final recluster")
+            librarian.refresh_clusters()
         stats = ResearchSession(gateway, store).health().model_dump()
         elapsed = time.perf_counter() - started
         json_dump(
@@ -2766,6 +3307,10 @@ def worker_ours_ingest(request_path: Path) -> int:
                 "elapsed_seconds": elapsed,
                 "graph": stats,
                 "document_results": results,
+                "token_usage": {
+                    "ingestion_chat": gateway.llm.consume_global_usage(),
+                    "ingestion_embedding": gateway.embedder.consume_global_usage(),
+                },
             },
         )
     finally:
@@ -2798,6 +3343,7 @@ def worker_ours_answer(request_path: Path) -> int:
         events: list[dict[str, Any]] = []
         started = time.perf_counter()
         gateway.llm.reset_thread_usage()
+        gateway.embedder.reset_thread_usage()
         try:
             answer = ResearchSession(gateway, store).ask(
                 question.question,
@@ -2822,6 +3368,7 @@ def worker_ours_answer(request_path: Path) -> int:
             result["error"] = f"{type(exc).__name__}: {exc}"
             events.append({"type": "error", "error": result["error"]})
         gateway_usage = gateway.llm.consume_thread_usage()
+        embedding_usage = gateway.embedder.consume_thread_usage()
         agent_event_usage = [
             event.get("usage")
             for event in events
@@ -2831,8 +3378,17 @@ def worker_ours_answer(request_path: Path) -> int:
         result["token_usage"] = {
             "agent_chat": summed_usage(
                 [gateway_usage, *agent_event_usage]
-            )
+            ),
+            "retrieval_embedding": embedding_usage,
         }
+        result["token_accounting_complete"] = (
+            int(embedding_usage.get("estimated_requests") or 0) == 0
+            and (
+                int(result["token_usage"]["agent_chat"].get("requests") or 0) == 0
+                or int(result["token_usage"]["agent_chat"].get("total_tokens") or 0)
+                > 0
+            )
+        )
         result["latency_seconds"] = time.perf_counter() - started
         json_dump(trace_dir / f"{safe_name(question.id)}.json", events)
         return result
@@ -2848,6 +3404,17 @@ def worker_ours_answer(request_path: Path) -> int:
             }
             for completed, future in enumerate(as_completed(futures), start=1):
                 predictions[futures[future]] = future.result()
+                # This is the worker-to-parent recovery journal.  Atomic
+                # replacement means a killed benchmark loses at most the
+                # currently running questions, never all completed answers.
+                jsonl_dump(
+                    Path(request["predictions_path"]),
+                    (
+                        prediction
+                        for prediction in predictions
+                        if prediction is not None
+                    ),
+                )
                 log(f"ours answered {completed}/{len(raw_questions)}")
         final_predictions = [
             prediction for prediction in predictions if prediction is not None
@@ -3702,7 +4269,8 @@ def validate_runtime(args: SimpleNamespace, systems: Sequence[str]) -> None:
     unknown = sorted(set(systems) - set(SYSTEMS))
     if unknown:
         raise BenchmarkError(f"unknown systems: {', '.join(unknown)}")
-    if getattr(args, "sample", 0) < 0:
+    sample = getattr(args, "sample", None)
+    if sample is not None and sample < 0:
         raise BenchmarkError("--sample must be zero or positive")
     if getattr(args, "ingestion_runs", 1) < 1:
         raise BenchmarkError("--ingestion-runs must be at least one")
@@ -4773,6 +5341,10 @@ def fixed_args(chat_base_url: str, dataset: str = "novel") -> SimpleNamespace:
         max_answer_tokens=512,
         timeout=REQUEST_TIMEOUT_SECONDS,
         command_timeout=MAX_RUNTIME_SECONDS,
+        subagent_count=OURS_SUBAGENT_COUNT,
+        subagent_concurrency=OURS_SUBAGENT_CONCURRENCY,
+        rerank_top_k=OURS_RERANK_TOP_K,
+        search_candidate_pool=OURS_SEARCH_POOL,
         judge="llm",
         judge_base_url=chat_base_url,
         judge_api_key=NVIDIA_API_KEY,
