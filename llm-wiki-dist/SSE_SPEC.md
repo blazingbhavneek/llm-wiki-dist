@@ -50,59 +50,143 @@ Full request:
 ```json
 {
   "question": "What is X and why does it do Y?",
-  "max_levels": 1,
-  "max_queries_per_level": 1,
-  "max_recovery_levels": 0,
-  "search_limit": 16,
+  "max_levels": 3,
+  "shard_count": 4,
+  "shard_detail_nodes": 5,
+  "shard_wide_nodes": 10,
+  "shard_deadline_seconds": 5,
+  "neighbor_min_admit": 2,
+  "neighbor_max_admit": 8,
+  "neighbor_hops_fast": 1,
+  "neighbor_hops_deep": 3,
+  "neighbor_hops_typed": 1,
+  "search_limit": 100,
+  "rerank_top_k": 30,
   "max_context_chars": 32000,
-  "min_initial_read_nodes": 16,
-  "min_search_results": 1,
+  "subagent_count": 3,
+  "subagent_concurrency": 3,
+  "subagent_max_steps": 5,
+  "subagent_min_reads": 1,
+  "subagent_max_reads": 4,
+  "deep_deadline_seconds": 9,
+  "deep_node_limit": 24,
+  "anticipation_deadline_seconds": 8,
+  "anticipation_terms": 3,
+  "emit_discovery": true,
   "deadline_seconds": 90,
-  "research_seconds_per_query": 0,
   "overrides": null
 }
 ```
 
+Every field is optional; the defaults are the shipped configuration.
+
 | Field | Default | Allowed | Meaning |
 |---|---:|---:|---|
 | `question` | required | 1–20,000 characters | The complete user request. |
-| `max_levels` | `1` | 1–6 | `1` answers the original question directly; values above `1` enable dependency planning. |
-| `max_queries_per_level` | `1` | 1–6 | Maximum shallow queries in a planned level. |
-| `max_recovery_levels` | `0` | 0–3 | Deprecated compatibility field; ignored. |
-| `search_limit` | `16` | 2–32 | Maximum ranked evidence nodes read by one realtime worker. |
-| `max_context_chars` | `32,000` | 0–60,000 | Prompt character cap shared across the selected sources. `0` permits an intentionally exhaustive, slower prompt. |
-| `min_initial_read_nodes` | `16` | 1–40 | Number of ranked sources read before synthesis; the context budget is distributed across them. |
-| `min_search_results` | `1` | 1–8 | Deprecated compatibility field; ignored. A broad fallback is used only for an empty focused search. |
+| `max_levels` | `3` | 1–3 | `1` = fast answer only, `2` adds deep research over the structural subgraph, `3` adds the anticipation stage. |
 | `deadline_seconds` | `90` | 10–300 | Wall-clock budget for the run. Past it no new level starts and the run ends `partial`. |
-| `research_seconds_per_query` | `0` | 0–90 | Deprecated compatibility field; the fast path does not run an open-ended follow-up loop. |
 | `overrides` | `null` | existing `/api/ask` overrides | Optional chat-model/API settings for this request. |
+
+Fast answer (level 1):
+
+| Field | Default | Allowed | Meaning |
+|---|---:|---:|---|
+| `shard_count` | `4` | 1–8 | Parallel readers over the reranked set. The first two read their slice in full; the rest read a wide, shallow view. Drop to `2` if the model endpoint cannot serve four generations at once. |
+| `shard_detail_nodes` | `5` | 1–20 | Sources per full-body shard. |
+| `shard_wide_nodes` | `10` | 1–40 | Sources per wide shard. |
+| `shard_deadline_seconds` | `5` | 1–30 | Harvest point. Whatever finished is emitted; a late shard shortens the answer rather than delaying it. |
+| `max_context_chars` | `32,000` | 0–120,000 | Prompt character cap per shard family. `0` permits an intentionally exhaustive, slower prompt. |
+
+Retrieval:
+
+| Field | Default | Allowed | Meaning |
+|---|---:|---:|---|
+| `search_limit` | `100` | 2–300 | Width of the single hybrid net cast per question. |
+| `rerank_top_k` | `30` | 1–100 | Working set after cross-encoder reranking. |
+
+Structural exploring (speed ↔ accuracy):
+
+| Field | Default | Allowed | Meaning |
+|---|---:|---:|---|
+| `neighbor_min_admit` | `2` | 0–20 | Neighbours always offered to a shard, so the fast answer sees some structure even at the fastest setting. |
+| `neighbor_max_admit` | `8` | 0–40 | Ceiling on neighbours per shard and per subgraph seed. |
+| `neighbor_hops_fast` | `1` | 0–3 | Hops walked for the shard neighbours. |
+| `neighbor_hops_deep` | `3` | 0–6 | Hops walked along the document chain for the deep subgraph. Chunks of one page are chained, and this is how the rest of a list is found. |
+| `neighbor_hops_typed` | `1` | 0–3 | Hops walked along non-chain edge labels. |
+
+Deep stage (level 2) and anticipation (level 3):
+
+| Field | Default | Allowed | Meaning |
+|---|---:|---:|---|
+| `subagent_count` | `3` | 0–6 | Research agents started over the subgraph. `0` skips agent research. |
+| `subagent_concurrency` | `3` | 1–6 | How many run at once. |
+| `subagent_max_steps` | `5` | 1–20 | Per-agent step budget. Realtime-sized on purpose. |
+| `subagent_min_reads` | `1` | 0–10 | Reads required before an agent may answer. A higher gate makes the stage miss its deadline. |
+| `subagent_max_reads` | `4` | 1–20 | Per-agent read budget. |
+| `deep_deadline_seconds` | `9` | 1–60 | Harvest point for level 2. |
+| `deep_node_limit` | `24` | 1–120 | Subgraph nodes considered by the stage. |
+| `anticipation_deadline_seconds` | `8` | 1–60 | Harvest point for level 3. |
+| `anticipation_terms` | `3` | 0–6 | Terms looked up that the earlier answer used but never explained. |
+| `emit_discovery` | `true` | boolean | Whether `discovery` events are sent. |
+
+Accepted but no longer meaningful, kept so older clients do not break:
+`max_queries_per_level`, `max_recovery_levels`, `min_search_results`,
+`research_seconds_per_query`, `min_initial_read_nodes`.
 
 Invalid request bodies receive an HTTP `422` response before streaming starts.
 A blank or whitespace-only `question` is also rejected with `422`.
 
 ## Processing model
 
-1. The default creates one direct level from the original question without a planning model call. Requests allowing more than one level use the dependency planner and always contain at least two levels, even if the planner initially returns only one.
-2. The server emits that plan before emitting any answer level.
-3. Each query performs hybrid keyword/vector retrieval and reranking.
-4. The first 16 ranked sources are read before synthesis. Their query-match snippets and a fair share of each document body are supplied, so a long overview cannot exclude a concise prerequisite source.
-5. An empty focused retrieval automatically performs one broader search.
-6. One synthesis call writes the source-backed section.
-7. Sections with missing or non-retrieved node IDs are removed by the backend.
-8. The completed section is appended and the level is placed on the
-   SSE queue immediately.
-9. The server starts the next level immediately; it does not wait for the
-   client to finish speaking the previous level.
-10. Earlier completed sections are supplied as editorial context to later
-    levels, but never appended to their retrieval query.
-11. Once `deadline_seconds` passes, no further level is started. Levels already
+The three levels are fixed. There is no planning model call: what the server
+says it will look up comes from retrieval, which is why `plan` arrives in about
+half a second.
+
+1. **Repair the words.** Speech recognition does not know the corpus. The
+   question is matched against corpus vocabulary — cluster names, node
+   keywords, and identifiers harvested from titles, claims and bodies — so
+   「エムピーエフ エムエフエス オープン」 reaches retrieval as `mpf_mfs_open`.
+   The original wording is never removed, only augmented.
+2. **One wide search.** Hybrid keyword/vector retrieval over `search_limit`
+   candidates. The RRF field weights are leaned by question shape: a question
+   naming an exact thing weights the lexical and claim channels, a concept
+   question weights summaries and titles, a list question widens the item pool.
+   Weights, never filters: a filter discards material the answer may need.
+3. **Rerank** the net down to `rerank_top_k` with the cross-encoder. If the
+   reranker is unavailable the RRF order is used unchanged.
+4. **Emit `plan`** — structured data, not a sentence. It carries the objectives,
+   the repaired query, the matched cluster names, the pinned identifier and the
+   candidate titles. The client's speaker model turns that into speech.
+5. **Level 1: the fast answer.** `shard_count` readers run in parallel over
+   different slices of the reranked set: the first two read their sources in
+   full, the rest read a wide, shallow view (summaries, claims, keywords,
+   matched snippets). Each shard is also given the best structural neighbours
+   of its own sources. At `shard_deadline_seconds` the finished shards are
+   concatenated — not merged by a further model call, because the client's
+   speaker model rewrites the text into speech anyway.
+6. **In parallel, the structural subgraph is built.** Pure database work with
+   no GPU cost: the document chain around the ranked sources for
+   `neighbor_hops_deep` hops, typed edges for `neighbor_hops_typed`, and the
+   rest of each source's page. It is ready before level 1 is even sent.
+   No level-2 generation starts before level 1 is emitted, so deep research
+   cannot delay first audio.
+7. **Level 2: deep research** over that subgraph while the client speaks level
+   1, harvested at `deep_deadline_seconds`. `subagent_count` research agents
+   choose what to open next, and one plain reader runs beside them over the
+   same subgraph, so an agent loop that overruns the harvest cannot leave the
+   level empty.
+8. **Level 3: anticipation.** Terms the earlier levels used but never explained
+   are looked up, harvested at `anticipation_deadline_seconds`.
+9. Sections with missing or non-retrieved node IDs are removed by the backend,
+   and every level is queued for the client the moment it is harvested.
+10. Once `deadline_seconds` passes, no further level is started. Levels already
     emitted stay valid; the run terminates with `status="partial"` and
     `incomplete_reason="deadline"`.
 
-Levels are sequential because later levels may depend on earlier facts. The
-realtime model endpoint serializes generations, so planned queries are also
-issued serially rather than queued behind one another. This lets the client
-speak Level 1 while the server researches Level 2.
+No stage waits for all of its branches. Fan-out finishes at the slowest branch,
+so each stage takes what completed by its deadline and drops the rest: a late
+shard makes the answer shorter, which is recoverable, while a late shard that
+blocks the stream is not.
 
 ## SSE framing
 
@@ -145,6 +229,7 @@ plan
 level_start
 level
 level_start
+discovery        (optional, only while a level is being researched)
 level
 ...
 done
@@ -175,32 +260,64 @@ Store `run_id` until the stream terminates.
 
 ### `plan`
 
-Contains every initially planned level and shallow query.
+Emitted from retrieval alone, with no model call, at roughly 0.5 s. It is
+**structured data, not a sentence**: it names what is about to be looked up so
+the client's speaker model can phrase that in its own words.
 
 ```json
 {
   "type": "plan",
   "version": 1,
-  "question": "What is X and why does it do Y?",
+  "question": "エムピーエフ エムエフエス オープン の第3引数は？",
   "planning_fallback": false,
+  "search_query": "エムピーエフ エムエフエス オープン の第3引数は？ mpf_mfs_open",
+  "question_type": "named",
+  "pinned_identifier": "mpf_mfs_open",
+  "vocabulary": {
+    "query": "エムピーエフ エムエフエス オープン の第3引数は？ mpf_mfs_open",
+    "identifiers": ["mpf_mfs_open"],
+    "clusters": ["MFSファイル管理"],
+    "keywords": [],
+    "repairs": [
+      {
+        "heard": "エムピーエフ エムエフエス オープン",
+        "matched": "mpf_mfs_open",
+        "kind": "identifier",
+        "score": 0.9
+      }
+    ]
+  },
+  "candidates": [
+    {"node_id": "node:14", "title": "mpf_mfs_open", "summary": "ファイルを開く"}
+  ],
   "levels": [
     {
       "id": "level_1",
       "position": 1,
-      "objective": "Define X",
-      "queries": ["What exactly is X?"],
+      "objective": "mpf_mfs_open を直接答える",
+      "queries": ["..."],
       "depends_on": [],
-      "kind": "planned",
+      "kind": "fast",
       "recovery_for": null,
       "status": "pending"
     },
     {
       "id": "level_2",
       "position": 2,
-      "objective": "Explain why X does Y",
-      "queries": ["What mechanism causes X to do Y?"],
+      "objective": "資料の続きと関連ノードを読み、詳細を補う",
+      "queries": ["..."],
       "depends_on": ["level_1"],
-      "kind": "planned",
+      "kind": "deep",
+      "recovery_for": null,
+      "status": "pending"
+    },
+    {
+      "id": "level_3",
+      "position": 3,
+      "objective": "回答で触れた用語を先回りして調べる",
+      "queries": ["..."],
+      "depends_on": ["level_2"],
+      "kind": "anticipation",
       "recovery_for": null,
       "status": "pending"
     }
@@ -208,11 +325,19 @@ Contains every initially planned level and shallow query.
 }
 ```
 
-`planning_fallback=true` means the planning call failed and the server safely
-fell back to a single level containing the original question.
+| Field | Meaning |
+|---|---|
+| `search_query` | What was actually searched, after vocabulary repair. |
+| `question_type` | `named`, `concept` or `list`. Selects the retrieval weight profile. |
+| `pinned_identifier` | The corpus identifier the answer is scoped to, or `""`. |
+| `vocabulary.repairs` | Each mishearing the server corrected: what it heard, what the corpus calls it, and the match score. |
+| `candidates` | Highest-ranked node IDs with titles, for anticipating what is coming. |
+| `levels[].kind` | `fast`, `deep` or `anticipation`. |
 
-The speaking agent should inspect this event to anticipate what information is
-coming. The plan itself should not be spoken.
+`planning_fallback` is always `false` and is retained for compatibility: this
+path no longer has a planning model call that could fail.
+
+The plan itself should not be spoken verbatim.
 
 ### `plan_update`
 
@@ -292,6 +417,32 @@ Client behavior:
   diagnostic, not spoken content or a request for recovery.
 - `text` may be empty when no supported fact survived reference validation. Do
   not enqueue an empty string.
+- `queries` holds one entry per parallel branch of that level — one per shard
+  in level 1, one per agent or reader in level 2, one per looked-up term in
+  level 3. A branch that did not finish before the level's deadline is absent,
+  which is normal and not an error.
+- `kind` repeats the plan's `fast` / `deep` / `anticipation` label.
+
+### `discovery`
+
+Optional. Sent while a level is being researched, to say what is being read
+right now. A client that does not render progress may ignore it entirely.
+
+```json
+{
+  "type": "discovery",
+  "level_id": "level_2",
+  "text": "mpf_mfs_cyclicfile の登録手順を読んでいます",
+  "node_ids": ["node:412"],
+  "speakable": true
+}
+```
+
+A `discovery` is emitted only when it carries a node ID this run has not
+mentioned yet, which keeps it real information rather than a progress bar. It
+is never a substitute for a `level`: nothing in it is a verified answer, and
+the facts from the node it names arrive later in the level event. Set
+`emit_discovery: false` to turn these off.
 
 ### `done`
 
@@ -483,6 +634,12 @@ function onEvent(event) {
       }
       break;
 
+    case "discovery":
+      // Optional: what is being read right now. Never an answer, and safe to
+      // ignore entirely.
+      speaker.mentionProgress(event.text);
+      break;
+
     case "done":
       speechBuffer.finishAfterDrain();
       break;
@@ -504,7 +661,7 @@ event: run
 data: {"type":"run","run_id":"31cb54f2-bcf3-439d-9ad4-e7737e988908"}
 
 event: plan
-data: {"type":"plan","version":1,"question":"What is X and why does it do Y?","planning_fallback":false,"levels":[...]}
+data: {"type":"plan","version":1,"question":"What is X and why does it do Y?","planning_fallback":false,"question_type":"named","pinned_identifier":"X","candidates":[...],"levels":[...]}
 
 event: level_start
 data: {"type":"level_start","plan_version":1,"level_id":"level_1","position":1,"objective":"Define X","queries":["What exactly is X?"]}
@@ -533,9 +690,16 @@ data: {"type":"done","status":"complete","plan_version":1,"levels_completed":2,.
   duration of the calls already in flight, or with `error`/`cancelled`.
 - A run that could not support every part of the question always terminates
   with `status="partial"`; unsupported parts are omitted, never filled in.
-- The same subquery is never issued twice, except to retry one that failed.
-- Planned queries inside a level are issued serially because the configured
-  model endpoint serializes generations.
+- Every stage harvests at its own deadline and emits what finished. Branches
+  that did not finish are dropped, never waited for.
+- Generations inside one level run in parallel: the model endpoint serves
+  concurrent generations, which is what makes a four-shard fast answer cost
+  roughly one generation of wall clock. (An earlier revision of this document
+  claimed the endpoint serializes generations. It does not — the documentation
+  path has run three agents concurrently against it in production.)
+- No generation belonging to a later level starts before the current level is
+  emitted, so deep research cannot delay first audio. Database work does
+  overlap, because it uses no GPU.
 - The next level starts without waiting for speech playback.
 - Every streamed fact has at least one node ID from retrieved evidence or an
   already accepted earlier-level fact.

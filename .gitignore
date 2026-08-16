@@ -6,3 +6,5 @@ llm-wiki-dist/.wiki
 chrome-headless-shell-linux64/
 llm-wiki-dist/.wiki_docker/
 .DS_Store
+benchmark-data/
+benchmark-results/

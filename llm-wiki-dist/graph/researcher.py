@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import re
 import threading
+import time
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -65,6 +67,8 @@ from .core import sanitize_text as _sanitize_string_for_llm
 from .core import sanitize_tool_output as _sanitize_tool_output
 from .core import search as SearchArgs
 from .gateway import LlmClient as OpenAiLlmClient
+from .neighborhood import neighbors_for_seeds
+from .vocab import Vocabulary
 
 if TYPE_CHECKING:
     from .gateway import ModelGateway
@@ -75,6 +79,11 @@ if TYPE_CHECKING:
 # region Global vars/Helpers
 
 log = logging.getLogger("graph_researcher")
+
+# How often a realtime run re-checks whether the corpus changed under the
+# cached vocabulary sheet. Short enough that a demo ingest is picked up, long
+# enough that a burst of questions does not re-fingerprint per request.
+_VOCAB_CHECK_SECONDS = 30.0
 
 _IMAGE_SRC_RE = re.compile(
     r"""<img\b[^>]*\bsrc=["'](?P<src>data:image/[^"']+)["'][^>]*>""",
@@ -1782,6 +1791,7 @@ class ResearchSession:
         index: int,
         emit: Callable,
         stop_event: threading.Event | None = None,
+        extra_instructions: str = "",
     ) -> dict[str, Any]:
         run = Subrun(start_id=start_id, index=index)
 
@@ -1798,6 +1808,7 @@ class ResearchSession:
             f"他のエージェントが担当している領域（探索しないこと）: {siblings_str}\n\n"
             "まず開始ノードを読み、その後リンクをたどるか、あなたの担当領域内で検索してください。"
             "この領域がその質問について何を述べているかを報告してください。"
+            + (f"\n\n{extra_instructions}" if extra_instructions else "")
         )
 
         return run_subagent(
@@ -1860,6 +1871,12 @@ class Researcher:
         # cannot prevent a speaking client from reaching its first level.
         realtime_slots = max(1, max_agents or s.service_max_agents)
         self.realtime_sem = asyncio.Semaphore(realtime_slots)
+        # Corpus vocabulary sheet, shared by every realtime run and rebuilt
+        # only when the corpus changes.
+        self._vocab: Vocabulary | None = None
+        self._vocab_fingerprint = ""
+        self._vocab_checked = 0.0
+        self._vocab_lock = threading.Lock()
         # ...and their own threads. asyncio.to_thread() shares one small default
         # executor with every read and agent run, so a burst of long-form work
         # would otherwise queue the latency-critical path behind it.
@@ -1928,6 +1945,49 @@ class Researcher:
         async with self.agent_sem:
             return await asyncio.to_thread(work)
 
+    def vocabulary(self, force: bool = False) -> Vocabulary:
+        """Corpus vocabulary sheet, rebuilt only when the corpus changed.
+
+        Building scans every active node, so it is cached behind a fingerprint
+        (count plus newest ``updated_at``) and a short check interval. Call
+        this once at startup so no user request pays for the first build.
+        """
+        now = time.monotonic()
+        with self._vocab_lock:
+            fresh = (
+                self._vocab is not None
+                and not force
+                and (now - self._vocab_checked) < _VOCAB_CHECK_SECONDS
+            )
+            if fresh:
+                return self._vocab  # type: ignore[return-value]
+
+            try:
+                fingerprint = self.store.nodes_fingerprint()
+            except Exception as exc:  # noqa: BLE001 - vocabulary is optional
+                log.info("vocabulary fingerprint failed: %s", exc)
+                fingerprint = ""
+
+            self._vocab_checked = now
+            if self._vocab is not None and fingerprint == self._vocab_fingerprint:
+                return self._vocab
+
+            started = time.perf_counter()
+            try:
+                vocabulary = Vocabulary.from_rows(self.store.vocabulary_rows())
+            except Exception as exc:  # noqa: BLE001 - degrade to no repair
+                log.info("vocabulary build failed: %s", exc)
+                vocabulary = Vocabulary.empty()
+
+            self._vocab = vocabulary
+            self._vocab_fingerprint = fingerprint
+            log.info(
+                "realtime vocabulary built: terms=%s ms=%s",
+                len(vocabulary),
+                round((time.perf_counter() - started) * 1000),
+            )
+            return vocabulary
+
     async def ask_realtime(
         self,
         question: str,
@@ -1937,12 +1997,11 @@ class Researcher:
         stop_event: threading.Event | None = None,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run the level-wise realtime RAG pipeline in one worker thread.
+        """Run the staged realtime RAG pipeline in one worker thread.
 
-        The callback receives the full plan first, then each completed level.
-        It returns immediately after enqueueing a level event and starts the
-        next level, allowing the HTTP client to speak one level while the next
-        one is being researched.
+        The callback receives the plan first, then each completed level. It
+        returns immediately after enqueueing a level event, so the HTTP client
+        can speak one level while the next is being researched.
         """
 
         from dataclasses import fields as _dataclass_fields
@@ -1955,20 +2014,113 @@ class Researcher:
         realtime_options = RealtimeOptions(
             **{k: v for k, v in (options or {}).items() if k in known and v is not None}
         )
-
         def work() -> dict[str, Any]:
+            # Inside the worker thread: a corpus change makes this rebuild the
+            # sheet, and that must never run on the event loop.
+            vocabulary = self.vocabulary()
             session = self._session(overrides)
-            # Realtime retrieval still casts the configured wide hybrid net,
-            # but only reranks a bounded evidence pool before generation.
-            session.settings = session.settings.model_copy(
+            # Realtime retrieval keeps the full configured evidence pool: the
+            # earlier clamp to 40 snippets and 2 per node was throttling recall
+            # on exactly the questions this path exists for. Subagent budgets,
+            # by contrast, must be realtime-sized.
+            base_settings = session.settings.model_copy(
                 update={
-                    "evidence_rerank_pool": min(
-                        session.settings.evidence_rerank_pool, 40
-                    ),
-                    "evidence_max_per_node": min(
-                        session.settings.evidence_max_per_node, 2
-                    ),
+                    "rerank_top_k": realtime_options.rerank_top_k,
+                    "subagent_count": realtime_options.subagent_count,
+                    "subagent_concurrency": realtime_options.subagent_concurrency,
+                    "subagent_max_steps": realtime_options.subagent_max_steps,
+                    "subagent_min_reads": realtime_options.subagent_min_reads,
+                    "subagent_max_reads": realtime_options.subagent_max_reads,
                 }
+            )
+            session.settings = base_settings
+
+            # One session per weight profile. Profiles are applied to a copy
+            # instead of mutating shared settings, because anticipation
+            # searches run on worker threads while the main thread may still
+            # be retrieving.
+            profiled: dict[str, ResearchSession] = {"": session}
+            profile_lock = threading.Lock()
+
+            def profiled_session(profile: dict[str, float] | None) -> ResearchSession:
+                if not profile:
+                    return session
+                key = ",".join(f"{name}={value}" for name, value in sorted(profile.items()))
+                with profile_lock:
+                    existing = profiled.get(key)
+                    if existing is None:
+                        existing = copy.copy(session)
+                        existing.settings = base_settings.model_copy(
+                            update=_profile_updates(base_settings, profile)
+                        )
+                        profiled[key] = existing
+                    return existing
+
+            def search(
+                text: str, limit: int, profile: dict[str, float] | None = None
+            ) -> list[dict[str, Any]]:
+                return profiled_session(profile).search_with_evidence(text, limit)
+
+            def rerank(
+                query: str, items: list[tuple[str, Any]], k: int
+            ) -> list[tuple[Any, float]]:
+                reranker = self.gateway.reranker
+                if reranker is None:
+                    raise RuntimeError("no reranker configured")
+                return reranker.top_k(query, list(items), k)
+
+            def neighbors(
+                node_ids,
+                *,
+                chain_hops: int,
+                typed_hops: int,
+                siblings: bool,
+                limit: int,
+            ):
+                return neighbors_for_seeds(
+                    self.store,
+                    node_ids,
+                    chain_hops=chain_hops,
+                    typed_hops=typed_hops,
+                    siblings=siblings,
+                    limit=limit,
+                )
+
+            def deep_agent(
+                *,
+                question: str,
+                node_id: str,
+                sibling_ids,
+                index: int,
+                stop_event: threading.Event | None,
+                extra_instructions: str = "",
+            ) -> dict[str, Any]:
+                # Tool traces belong to the documentation path. A speaking
+                # client has one vocabulary of events, so swallow them here.
+                return session._run_single_subagent(
+                    node_id,
+                    list(sibling_ids),
+                    question,
+                    index,
+                    lambda _event: None,
+                    stop_event=stop_event,
+                    extra_instructions=extra_instructions,
+                )
+
+            # The HTTP timeout must never be the thing that fires first. It used
+            # to be a hardcoded 12 s, which silently became shorter than the
+            # stage deadlines the moment those were raised for a slow endpoint:
+            # every shard then failed outright instead of being harvested late,
+            # and the level arrived empty rather than short. Deriving it from
+            # the deadlines keeps the harvest — which knows which stage wanted
+            # the generation — as the only thing that gives up.
+            chat_timeout = int(
+                max(
+                    realtime_options.shard_deadline_seconds,
+                    realtime_options.deep_deadline_seconds,
+                    realtime_options.anticipation_deadline_seconds,
+                )
+                + 5
             )
 
             def llm_factory() -> OpenAiLlmClient:
@@ -1981,17 +2133,19 @@ class Researcher:
                     base_url=session.settings.chat_base_url,
                     api_key=session.settings.chat_api_key,
                     temperature=0.0,
-                    # Realtime stages reserve a 12-second work budget. A
-                    # longer HTTP timeout lets one stalled generation block a
-                    # speaking client past its stage deadline.
-                    timeout=12,
+                    timeout=chat_timeout,
                     retry_attempts=0,
                     retry_delay_seconds=0.0,
                 )
 
             pipeline = RealtimePipeline(
                 llm_factory=llm_factory,
-                search=session.search_with_evidence,
+                search=search,
+                rerank=rerank if self.gateway.reranker else None,
+                neighbors=neighbors,
+                load_nodes=self.store.get_nodes_by_ids,
+                deep_agent=deep_agent,
+                vocabulary=vocabulary,
             )
             try:
                 return pipeline.run(
@@ -2006,3 +2160,20 @@ class Researcher:
         loop = asyncio.get_running_loop()
         async with self.realtime_sem:
             return await loop.run_in_executor(self._realtime_executor, work)
+
+
+def _profile_updates(settings: Settings, profile: dict[str, float]) -> dict[str, Any]:
+    """Turn RRF weight multipliers into a settings patch.
+
+    Multipliers rather than absolute values: the tuned defaults stay the
+    baseline, and a profile only says which channel matters more for this
+    shape of question.
+    """
+    updates: dict[str, Any] = {}
+    for name, multiplier in (profile or {}).items():
+        current = getattr(settings, name, None)
+        if isinstance(current, bool) or not isinstance(current, (int, float)):
+            continue
+        value = float(current) * float(multiplier)
+        updates[name] = max(1, round(value)) if isinstance(current, int) else value
+    return updates

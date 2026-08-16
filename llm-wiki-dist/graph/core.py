@@ -66,6 +66,10 @@ class Settings(BaseModel):
     rerank_model: str = "cl-nagoya/ruri-v3-reranker-310m"
     hf_rerank_model: str = "cl-nagoya/ruri-v3-reranker-310m"
     rerank_device: str = "cpu"
+    # A realtime answer budgets ~5 seconds end to end. A rerank call that has
+    # not returned in this long has already lost its stage, and waiting only
+    # delays the RRF-ordered fallback the pipeline would use anyway.
+    rerank_timeout_seconds: int = 15
 
     # db
     database_path: str = ".wiki/moove_wiki.sqlite"
@@ -155,6 +159,9 @@ class Settings(BaseModel):
             rerank_model=env("WIKI_RERANK_MODEL", cls.rerank_model),
             hf_rerank_model=env("WIKI_HF_RERANK_MODEL", cls.hf_rerank_model),
             rerank_device=env("WIKI_RERANK_DEVICE", cls.rerank_device),
+            rerank_timeout_seconds=int(
+                env("WIKI_RERANK_TIMEOUT", cls.rerank_timeout_seconds)
+            ),
             database_path=env("WIKI_DB", cls.database_path),
             edge_candidate_k=int(env("WIKI_EDGE_K", cls.edge_candidate_k)),
             vector_query_k=int(env("WIKI_VECTOR_K", cls.vector_query_k)),
@@ -567,6 +574,9 @@ class EnrichmentWorker(Protocol):
         self, replacements: dict[str, str], stale_sources: list[str]
     ) -> None: ...
     def refresh_clusters(self) -> None: ...
+    def refresh_neighborhood(
+        self, node_id: str | None = None, document_name: str | None = None
+    ) -> int: ...
 
     # meta accessors (already on GraphWriteSession as _db_get_meta/_db_set_meta;
     # a thin public alias will be added when wiring)
@@ -576,10 +586,15 @@ class EnrichmentWorker(Protocol):
 
 @dataclass(frozen=True)
 class EnrichJob:
-    kind: str  # "summary" | "entity_dedup" | "cascade" | "maybe_recluster" | "cluster_bridge"
+    # "summary" | "entity_dedup" | "cascade" | "maybe_recluster"
+    # | "cluster_bridge" | "neighborhood"
+    kind: str
     node_id: str | None = None
     replacements: dict[str, str] = field(default_factory=dict)
     stale_sources: list[str] = field(default_factory=list)
+    # Neighborhood refresh addresses a whole document: every chunk's stored walk
+    # changes when the chain between them is rewritten.
+    document_name: str | None = None
 
 
 # endregion Models

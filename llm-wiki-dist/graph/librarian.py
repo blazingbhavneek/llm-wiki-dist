@@ -15,7 +15,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal
 
 from tqdm import tqdm
 
@@ -51,6 +51,7 @@ from .core import (
     short_hash,
     source_hash,
 )
+from .neighborhood import build_payload as build_neighborhood_payload
 
 if TYPE_CHECKING:
     from .gateway import ModelGateway
@@ -634,6 +635,18 @@ class Librarian:
             )
         )
 
+    def enqueue_neighborhood(
+        self, node_id: str | None = None, document_name: str | None = None
+    ) -> None:
+        # Queue a background rebuild of the precomputed structural walk. Pure
+        # database work, so it never competes with generation for the GPU.
+        if not node_id and not document_name:
+            return
+
+        self._enrich_put(
+            EnrichJob("neighborhood", node_id=node_id, document_name=document_name)
+        )
+
     def note_endogenous_added(self) -> None:
 
         # Queue a lightweight "maybe recluster" job. The actual recluster only
@@ -710,6 +723,12 @@ class Librarian:
             elif job.kind == "cluster_bridge":
                 # Scan cluster-pairs for non-obvious cross-topic connections.
                 self.discover_cluster_bridges()
+
+            elif job.kind == "neighborhood":
+                # Recompute the stored chain/typed/sibling walk for these nodes.
+                self.refresh_neighborhood(
+                    node_id=job.node_id, document_name=job.document_name
+                )
 
             else:
                 # Ignore jobs with missing/invalid fields instead of crashing the worker.
@@ -827,9 +846,41 @@ class Librarian:
 
             # Recompute/nickname clusters if graph changed or nodes are unclustered.
             self._bootstrap_clusters(active_nodes)
+
+            # Catch up the realtime neighbourhood cache for databases created
+            # before it existed. Pure SQLite, and only when it is empty.
+            self._bootstrap_neighborhoods(active_nodes)
         finally:
             # Always log completion, even if one bootstrap step raises.
             log.info("bootstrap.done")
+
+    def _bootstrap_neighborhoods(self, active_nodes: list[Node]) -> None:
+        """Backfill the structural walk when the cache is empty.
+
+        Realtime retrieval falls back to walking live, so this is a latency
+        catch-up rather than a correctness one: an old database keeps working,
+        it just pays per request until this runs.
+        """
+        if not active_nodes:
+            return
+
+        try:
+            existing = self.store.count_node_neighborhoods()
+        except Exception as exc:  # noqa: BLE001 - cache is optional
+            log.info("bootstrap.neighborhood_probe_failed %s", exc)
+            return
+
+        if existing:
+            log.info("bootstrap.neighborhood_ok rows=%d", existing)
+            return
+
+        started = time.time()
+        written = self.refresh_neighborhood(node_ids=[n.id for n in active_nodes])
+        log.info(
+            "bootstrap.neighborhood_built rows=%d seconds=%.1f",
+            written,
+            time.time() - started,
+        )
 
     def _bootstrap_vectors(self) -> tuple[list[Node], bool]:
         """Create vector tables if missing, re-embed active nodes if the embed
@@ -2567,6 +2618,59 @@ class Librarian:
         actions: list[str] = []
         self._cascade_dependents(replacements, set(stale_sources), actions)
 
+    def refresh_neighborhood(
+        self,
+        node_id: str | None = None,
+        document_name: str | None = None,
+        node_ids: Iterable[str] | None = None,
+    ) -> int:
+        """Recompute and store the structural walk for the given nodes.
+
+        Realtime retrieval reads this table instead of walking edges per
+        request. It is a cache: a stale or missing row only costs recall,
+        because the pipeline falls back to walking live.
+        """
+        targets: list[str] = []
+
+        if node_id:
+            targets.append(node_id)
+
+        if node_ids:
+            targets.extend(str(value) for value in node_ids if value)
+
+        if document_name:
+            targets.extend(
+                node.id
+                for node in self.store.get_nodes_by_document(
+                    document_name, active_only=True
+                )
+            )
+
+        written = 0
+        for target in dict.fromkeys(targets):
+            try:
+                self.store.set_node_neighborhood(
+                    target, build_neighborhood_payload(self.store, target)
+                )
+                written += 1
+            except Exception as exc:  # noqa: BLE001 - cache write is best effort
+                log.info("neighborhood refresh failed for %s: %s", target, exc)
+
+        return written
+
+    def rebuild_neighborhoods(self, limit: int = 0) -> int:
+        """Backfill the whole corpus. Used once after upgrading an old database."""
+        node_ids = [
+            node.id
+            for node in self.store.get_all_nodes()
+            if node.status == NodeStatus.active
+        ]
+
+        if limit > 0:
+            node_ids = node_ids[:limit]
+
+        return self.refresh_neighborhood(node_ids=node_ids)
+
     # endregion Metadata / Enrichment Public Wrappers
 
     # region Revision Metadata / Structural Edges
@@ -2636,6 +2740,15 @@ class Librarian:
                 and target.status == NodeStatus.active
             ):
                 self.store.upsert_edge(edge)
+
+        # The chain between chunks just changed, so every stored walk for this
+        # document is stale. Rebuilding is pure SQLite work and runs on the
+        # background drip, never on an ingest response.
+        if document_name:
+            if self._inline_enrichment:
+                self.refresh_neighborhood(document_name=document_name)
+            else:
+                self.enqueue_neighborhood(document_name=document_name)
 
     # endregion Revision Metadata / Structural Edges
 

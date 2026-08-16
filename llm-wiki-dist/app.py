@@ -142,6 +142,9 @@ def _build_stack(db_path: str) -> dict:
         new_librarian.bootstrap()  # empty db -> no-op, same as first-run
         new_read_store = GraphStore(settings.database_path, readonly=True)
         new_researcher = Researcher(new_gateway, new_read_store)
+        # Build the realtime vocabulary sheet here, on the startup thread, so
+        # the first spoken question is not the one that pays for it.
+        new_researcher.vocabulary()
     except BaseException:
         try:
             new_librarian._enrich_stopping.set()
@@ -1391,32 +1394,67 @@ class AskBody(BaseModel):
 
 
 class RealtimeAskBody(AskBody):
+    """Every realtime knob is per request, so a demo can be tuned live.
+
+    Defaults are the shipped configuration: plan at ~0.5 s, first speakable
+    level at ~5 s, then two further levels while the client is still speaking.
+    """
+
     question: str = Field(min_length=1, max_length=20_000)
     # Wall-clock budget for the whole run. Past it the pipeline stops scheduling
     # levels and terminates with status=partial rather than streaming forever.
-    deadline_seconds: float = Field(default=90.0, ge=10.0, le=300.0)
-    # One direct retrieval-and-synthesis pass is the latency default. Set this
-    # above one to explicitly request slower dependency planning.
-    max_levels: int = Field(default=1, ge=1, le=6)
-    max_queries_per_level: int = Field(default=1, ge=1, le=6)
-    # Kept as an accepted no-op for older clients. Realtime workers no longer
-    # insert recovery levels based on evidence-status judgments.
-    max_recovery_levels: int = Field(default=0, ge=0, le=3)
-    # Final evidence nodes exposed to one realtime worker. The underlying
-    # hybrid retrieval pools remain broad and are reranked down to this number.
-    search_limit: int = Field(default=16, ge=2, le=32)
+    deadline_seconds: float = Field(default=600.0, ge=10.0, le=600.0)
+    # 1 = fast answer only, 2 adds deep research over the structural subgraph,
+    # 3 adds the anticipation stage.
+    max_levels: int = Field(default=3, ge=1, le=3)
+
+    # --- fast answer: parallel readers over slices of the ranked set --------
+    shard_count: int = Field(default=4, ge=1, le=8)
+    shard_detail_nodes: int = Field(default=5, ge=1, le=20)
+    shard_wide_nodes: int = Field(default=10, ge=1, le=40)
+    # Harvest point for the first level. Whatever finished is sent.
+    shard_deadline_seconds: float = Field(default=90.0, ge=1.0, le=90.0)
+
+    # --- how much structural exploring is allowed (speed <-> accuracy) -----
+    neighbor_min_admit: int = Field(default=2, ge=0, le=20)
+    neighbor_max_admit: int = Field(default=8, ge=0, le=40)
+    neighbor_hops_fast: int = Field(default=1, ge=0, le=3)
+    # Chunks of one document are chained; this is how the rest of a list is
+    # found, so the chain direction is walked further than typed edges.
+    neighbor_hops_deep: int = Field(default=3, ge=0, le=6)
+    neighbor_hops_typed: int = Field(default=1, ge=0, le=3)
+
+    # --- retrieval ---------------------------------------------------------
+    # One wide hybrid net, reranked down to the working set.
+    search_limit: int = Field(default=100, ge=2, le=300)
+    rerank_top_k: int = Field(default=30, ge=1, le=100)
     # A bounded prompt avoids excessive prefill latency and context dilution.
     # Set zero only for an intentionally exhaustive, slower request.
-    max_context_chars: int = Field(default=32_000, ge=0, le=60_000)
-    # Accepted compatibility field; the fast path performs no open-ended
-    # follow-up loop after its first retrieval.
+    max_context_chars: int = Field(default=32_000, ge=0, le=120_000)
+
+    # --- deep stage --------------------------------------------------------
+    subagent_count: int = Field(default=3, ge=0, le=6)
+    subagent_concurrency: int = Field(default=3, ge=1, le=6)
+    # Deliberately far below the documentation agent's budgets: a five-read
+    # gate guarantees this stage misses its deadline and adds nothing.
+    subagent_max_steps: int = Field(default=5, ge=1, le=20)
+    subagent_min_reads: int = Field(default=1, ge=0, le=10)
+    subagent_max_reads: int = Field(default=4, ge=1, le=20)
+    deep_deadline_seconds: float = Field(default=120.0, ge=1.0, le=120.0)
+    deep_node_limit: int = Field(default=24, ge=1, le=120)
+
+    # --- anticipation stage ------------------------------------------------
+    anticipation_deadline_seconds: float = Field(default=120.0, ge=1.0, le=120.0)
+    anticipation_terms: int = Field(default=3, ge=0, le=6)
+    # `discovery` events carry a node the run has not mentioned yet. Clients
+    # that do not render them can turn them off.
+    emit_discovery: bool = True
+
+    # --- accepted for older clients, no longer meaningful ------------------
+    max_queries_per_level: int = Field(default=1, ge=1, le=6)
+    max_recovery_levels: int = Field(default=0, ge=0, le=3)
     research_seconds_per_query: float = Field(default=0.0, ge=0.0, le=90.0)
-    # Number of ranked sources read before synthesis. Context is distributed
-    # across them so concise prerequisite documents are not hidden by a long
-    # higher-ranked manual page.
     min_initial_read_nodes: int = Field(default=16, ge=1, le=40)
-    # Kept as an accepted no-op for older clients; broad fallback is now used
-    # only when focused retrieval returns no results.
     min_search_results: int = Field(default=1, ge=1, le=8)
 
     @field_validator("question")
@@ -1785,17 +1823,10 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
     sentinel = object()
     run_id = str(uuid.uuid4())
     stop_event = threading.Event()
-    options = {
-        "max_levels": payload.max_levels,
-        "max_queries_per_level": payload.max_queries_per_level,
-        "max_recovery_levels": payload.max_recovery_levels,
-        "search_limit": payload.search_limit,
-        "max_context_chars": payload.max_context_chars,
-        "min_search_results": payload.min_search_results,
-        "deadline_seconds": payload.deadline_seconds,
-        "research_seconds_per_query": payload.research_seconds_per_query,
-        "min_initial_read_nodes": payload.min_initial_read_nodes,
-    }
+    # Every field except the payload envelope is a pipeline knob; ask_realtime
+    # keeps the ones RealtimeOptions still declares and ignores the rest, so
+    # the two can drift without breaking a client.
+    options = payload.model_dump(exclude={"question", "overrides"})
 
     async def run_realtime() -> None:
         def emit(event: dict) -> None:

@@ -368,6 +368,17 @@ class GraphStore:
                 field UNINDEXED,
                 text
             );
+
+            -- Precomputed neighbourhood of one node: the chain of chunks it
+            -- belongs to, its typed edges, and its document siblings.
+            -- Walking the graph at request time costs one query per hop per
+            -- seed; a realtime answer cannot pay that, so enrichment writes
+            -- the walk down and retrieval does one indexed lookup.
+            CREATE TABLE IF NOT EXISTS node_neighborhood (
+                node_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """)
 
         # Add missing columns for older databases if the schema changed over time.
@@ -803,6 +814,14 @@ class GraphStore:
                 (node_id,),
             )
 
+            # Drop the precomputed walk. Rows for nodes that still point at it
+            # are refreshed by enrichment; a dangling target is skipped at read
+            # time because the node lookup returns nothing.
+            conn.execute(
+                "DELETE FROM node_neighborhood WHERE node_id=?",
+                (node_id,),
+            )
+
             # Get search item IDs before deleting search_items.
             # These IDs are needed to also delete related vector rows.
             item_ids = [
@@ -882,6 +901,9 @@ class GraphStore:
                 conn.execute(f"DELETE FROM nodes WHERE id IN ({marks})", batch)
                 conn.execute(
                     f"DELETE FROM nodes_fts WHERE node_id IN ({marks})", batch
+                )
+                conn.execute(
+                    f"DELETE FROM node_neighborhood WHERE node_id IN ({marks})", batch
                 )
                 conn.execute(
                     f"DELETE FROM search_items_fts WHERE node_id IN ({marks})", batch
@@ -1122,6 +1144,27 @@ class GraphStore:
             _row_to_edge(r) for r in self.connection.execute(sql, params).fetchall()
         ]
 
+    def get_edges_for_nodes(self, node_ids: Iterable[str]) -> list[Edge]:
+        # Bulk get_edges_for_node. A realtime subgraph starts from ~30 seeds and
+        # walks several hops; one indexed query per batch keeps that inside the
+        # latency budget where one query per node would not.
+        ids = list(dict.fromkeys(str(n) for n in node_ids if n))
+        edges: dict[str, Edge] = {}
+
+        for batch in _id_batches(ids):
+            marks = ",".join("?" * len(batch))
+            rows = self.connection.execute(
+                f"SELECT * FROM edges WHERE source_node_id IN ({marks}) "
+                f"OR target_node_id IN ({marks})",
+                [*batch, *batch],
+            ).fetchall()
+
+            for row in rows:
+                edge = _row_to_edge(row)
+                edges[edge.id] = edge
+
+        return list(edges.values())
+
     def delete_edge(self, edge_id: str) -> None:
         # Deleting modifies the database, so block it in readonly mode.
         if self.readonly:
@@ -1170,6 +1213,139 @@ class GraphStore:
 
         # Persist the deletion.
         self._commit()
+
+    # region Neighborhood cache
+
+    def set_node_neighborhood(self, node_id: str, payload: dict) -> None:
+        # Precomputed walk for one node, written by background enrichment.
+        if self.readonly:
+            raise RuntimeError("cannot write neighborhood on readonly database")
+
+        import json
+
+        self.connection.execute(
+            """
+            INSERT INTO node_neighborhood(node_id, payload_json, updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                payload_json=excluded.payload_json,
+                updated_at=excluded.updated_at
+            """,
+            (node_id, json.dumps(payload, ensure_ascii=False), now_iso()),
+        )
+
+        self._commit()
+
+    def get_node_neighborhoods(self, node_ids: Iterable[str]) -> dict[str, dict]:
+        # One indexed lookup for every seed. Missing rows are simply absent:
+        # callers fall back to walking the graph live.
+        import json
+
+        ids = list(dict.fromkeys(str(n) for n in node_ids if n))
+        found: dict[str, dict] = {}
+
+        for batch in _id_batches(ids):
+            marks = ",".join("?" * len(batch))
+            rows = self.connection.execute(
+                f"SELECT node_id, payload_json FROM node_neighborhood "
+                f"WHERE node_id IN ({marks})",
+                batch,
+            ).fetchall()
+
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except ValueError:
+                    continue
+                if isinstance(payload, dict):
+                    found[row["node_id"]] = payload
+
+        return found
+
+    def delete_node_neighborhoods(self, node_ids: Iterable[str]) -> None:
+        if self.readonly:
+            raise RuntimeError("cannot delete neighborhood on readonly database")
+
+        ids = list(dict.fromkeys(str(n) for n in node_ids if n))
+
+        for batch in _id_batches(ids):
+            marks = ",".join("?" * len(batch))
+            self.connection.execute(
+                f"DELETE FROM node_neighborhood WHERE node_id IN ({marks})", batch
+            )
+
+        self._commit()
+
+    def count_node_neighborhoods(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS n FROM node_neighborhood"
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def get_nodes_by_source_path(
+        self, source_path: str, limit: int = 40
+    ) -> list[Node]:
+        # Chunks of one page share a source_path. Two facts that belong to the
+        # same list are frequently split across them, and ranking alone never
+        # brings the second one back.
+        if not source_path:
+            return []
+
+        rows = self.connection.execute(
+            "SELECT * FROM nodes WHERE source_path=? AND status='active' LIMIT ?",
+            (source_path, max(1, int(limit))),
+        ).fetchall()
+
+        return [_row_to_node(r) for r in rows]
+
+    def nodes_fingerprint(self) -> str:
+        # Cheap "has the corpus changed" probe for caches built over every node
+        # (the realtime vocabulary sheet). Two indexed aggregates beat
+        # rebuilding a sheet that is still current.
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS total, MAX(updated_at) AS newest "
+            "FROM nodes WHERE status='active'"
+        ).fetchone()
+
+        if not row:
+            return "0:"
+
+        return f"{int(row['total'] or 0)}:{row['newest'] or ''}"
+
+    def vocabulary_rows(self, limit: int = 20_000) -> Iterator[dict]:
+        # Streamed, column-restricted scan for the realtime vocabulary sheet.
+        # get_all_nodes() would materialize every Node object in the corpus for
+        # what is ultimately a regex pass over a few text fields.
+        import json
+
+        cursor = self.connection.execute(
+            "SELECT id, title, summary, keywords_json, claims_json, cluster, "
+            "source_path, original_document_name, body FROM nodes "
+            "WHERE status='active' LIMIT ?",
+            (max(1, int(limit)),),
+        )
+
+        for row in cursor:
+            def _json_list(value: str | None) -> list:
+                try:
+                    parsed = json.loads(value or "[]")
+                except ValueError:
+                    return []
+                return parsed if isinstance(parsed, list) else []
+
+            yield {
+                "id": row["id"],
+                "title": row["title"] or "",
+                "summary": row["summary"] or "",
+                "keywords": _json_list(row["keywords_json"]),
+                "claims": _json_list(row["claims_json"]),
+                "cluster": row["cluster"] or "",
+                "source_path": row["source_path"] or "",
+                "original_document_name": row["original_document_name"] or "",
+                "body": row["body"] or "",
+            }
+
+    # endregion Neighborhood cache
 
     def record_source(self, document_name: str, source_hash: str) -> None:
         # Recording source info writes to the database,

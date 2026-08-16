@@ -821,8 +821,14 @@ class Reranker:
             )
 
             try:
-                # Send the request and parse the JSON response.
-                with urllib.request.urlopen(request, timeout=120) as response:
+                # Send the request and parse the JSON response. The timeout is
+                # short on purpose: callers on the realtime path have a whole
+                # answer to deliver in about the time a slow rerank would take,
+                # and every caller degrades to RRF order when this raises.
+                timeout = max(
+                    1, int(getattr(self.settings, "rerank_timeout_seconds", 15) or 15)
+                )
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
 
                 # Normalize response into scores matching the original document order.
