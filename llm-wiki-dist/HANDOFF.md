@@ -1,109 +1,122 @@
 # Realtime research handoff
 
-## User goal
+State of `graph/realtime.py` and its callers after implementing `plan.md`
+(*Realtime RAG — v2 Design*). The design document remains the statement of
+intent; this file records what exists, what was measured, and what is still
+open.
 
-Replace the serial realtime RAG worker with a fast agentic fan-out/fan-in
-pipeline. It must read a broad set of relevant source nodes, allow flexible
-research decisions, and still emit each level inside the client's 15-second
-per-stage timeout.
+## What was built
 
-## Current problem
+All nine steps of the build order in `plan.md` §11 are implemented.
 
-`graph/realtime.py` still has a serial worker flow in `_answer_query()`:
+| Step | Where |
+|---|---|
+| 1. Retrieval clamp removed, working set raised to 30 | `researcher.py` `ask_realtime` |
+| 2. Vocabulary sheet and word fixing | `graph/vocab.py`, `store.vocabulary_rows` |
+| 3. `plan` with no model call | `realtime.py` `_retrieve` / `_plan` |
+| 4. Sharded fast answer, harvest at deadline | `realtime.py` `_fast_answer`, `_harvest` |
+| 5. `node_neighborhood` table and librarian job | `store.py`, `librarian.py` `refresh_neighborhood` |
+| 6. Subgraph build parallel to the shards | `realtime.py` `_build_subgraph` |
+| 7. Deep subagents on realtime budgets | `realtime.py` `_deep_answer`, wired in `researcher.py` |
+| 8. Anticipation stage | `realtime.py` `_anticipate` |
+| 9. `discovery` events | `realtime.py` `_emit_discovery` |
 
-1. broad `search_with_evidence()` retrieval;
-2. `ResearchMove` candidate-selection model call;
-3. answer draft model call;
-4. optional follow-up retrieval/model calls.
+The pipeline takes injected ports (`search`, `rerank`, `neighbors`,
+`load_nodes`, `deep_agent`, `vocabulary`) and degrades one stage at a time when
+one is missing or fails, so the module is testable without a model server and a
+dead reranker or an empty neighbourhood cache costs quality, never the run.
 
-This can exit after a partial answer. A positive `research_seconds_per_query`
-also makes serial model calls exceed the client timeout. The latest fast default
-is `0`, which suppresses follow-up turns; the user rejected that tradeoff.
+One deliberate departure from the design document: level 2 runs the plan's
+research agents **and** one plain reader over the same subgraph. An agent loop
+is several model turns and can miss the harvest entirely, which would make the
+speaker fall silent between levels; the reader is one generation and reliably
+lands inside the stage. If the agents turn out to fit their budget comfortably
+against the real endpoint, the reader is one line to remove in `_deep_answer`.
 
-Observed request logs confirmed the serial path:
+## Verified during implementation
 
-1. planning chat call;
-2. embedding call;
-3. candidate-selection chat call;
-4. draft chat call;
-5. follow-up embedding call;
-6. final chat call.
+Measured against the two real corpora on this machine
+(`llm-wiki/.wiki/wiki.sqlite`, 102 nodes; `wiki-backup/test.sqlite`, 971
+nodes), which resolves three of the "unverified" items in `plan.md` §12:
 
-## Required implementation
+- **`keywords_json` is fully populated** — 102/102 and 970/971 active nodes.
+  The vocabulary sheet does not have to lean on body scanning, though it does
+  harvest identifiers from titles, claims, code spans and bodies anyway so it
+  cannot be empty exactly when enrichment has not run.
+- **`follows` is the chunk chain** — 101 edges over 102 nodes, 970 over 971.
+  Chain walking is keyed on that label. Other labels observed: `same-as`,
+  `uses`, `precedes`, `references`, `complements`, `related-to`,
+  `prerequisite-for`, `part-of`. `precedes` is semantic ordering produced by
+  the edge model, not document order, so it is treated as a typed edge.
+- **Vocabulary cost** — 6.8k terms built in ~160 ms for 971 nodes, and 0.3–5 ms
+  per question match. It is built once at stack startup and rebuilt only when
+  the corpus fingerprint changes, so no request pays for it.
 
-Implement a **parallel reader-agent fan-out/fan-in** inside each realtime level:
+Spoken-form matching on that corpus: 「エヌブイシーシー」→ `NVCC`,
+「シムティー」→ `SIMT`, 「クーダ」→ `CUDA` (the last one only through the
+phonetic fallback: katakana カ行 cannot spell a leading `c`). An unrelated
+question pins nothing.
 
-```text
-broad candidate catalog
-  -> coordinator agent chooses/assigns research angles
-  -> 3-4 reader agents in parallel, each with a disjoint candidate group
-       - may request one focused follow-up search
-       - returns source-backed evidence report, not the user answer
-  -> one synthesis model call over all reader reports
-  -> emit level
-```
+## Still unverified
 
-Target timing: coordinator + parallel reader wave + synthesis should normally
-fit below 15 seconds wall clock. Use a stage deadline around 12 seconds, not a
-20-second serial loop.
+- **What serves port 51029.** Both model endpoints were unreachable from the
+  development machine, so the four-way fan-out has not been measured against
+  the real server. If it turns out to be a single-slot llama.cpp, set
+  `shard_count: 2` in the request; nothing else has to change.
+- **Peak in-flight generations.** `realtime_slots` is `service_max_agents`
+  (4). One request now issues up to `shard_count` concurrent generations, so a
+  saturated server sees up to 16. If that is too many, lower
+  `WIKI_SERVICE_MAX_AGENTS` or `shard_count`.
+- **What ASR actually emits for identifiers.** The matcher handles katakana
+  letter names, katakana loanwords, hiragana and romaji, and it folds `c`/`k`,
+  `l`/`r`, `v`/`b` for anything heard in kana. Whether that covers the real
+  transcriber is a question for the first live session.
 
-## Design constraints from user
+## Correctness examples this path must get right
 
-- Keep the leveled realtime structure and streaming behavior.
-- Do not turn it into the full `researcher.py`/LangGraph pipeline.
-- It must be an agent: the coordinator/readers choose relevant material; do not
-  hardcode API names, `X±5` neighborhoods, or fixed topic logic.
-- A broad candidate catalog should contain node ID, title, summary, match
-  snippets, source path/range.
-- Reader agents should read full selected node bodies and may use source-local
-  neighbors/links when available.
-- Do not stop merely because an answer model leaves `follow_up_query` blank.
-- The first emitted answer should be complete enough; do not emit generic
-  “provided material lacks information” filler.
-- Client has a 15-second timeout per stage. `app.py` now sends SSE pings every
-  2 seconds, but model work still must finish quickly.
-
-## Known source correctness examples
-
-For `mpf_mfs_open` the source documents explicitly state:
+From the source documents:
 
 ```c
 int mpf_mfs_open(MPF_MFS_FCB *fcb, char *cpuname,
                  int filenum, int sbnum, ssize_t bufsize, int opentype)
 ```
 
-Therefore the third argument is `filenum`, not `sbnum`.
+The third argument is `filenum`, not `sbnum`. The `named` weight profile plus
+the pinned identifier in every shard prompt exist for this.
 
-For processing-request use, the source explicitly requires:
+Processing-request use requires all three of `pmf_prg.txt`, `pmf_procdata.txt`
+and `mpf_mfs_cyclicfile.txt`. Earlier answers dropped the second and demoted
+the third. The chain walk exists for this: those chunks are the same page, and
+`tests/test_ask_realtime.py` pins the behaviour — a node sharing no vocabulary
+with the question is still reached, through `follows`, by the deep stage.
 
-- `pmf_prg.txt`
-- `pmf_procdata.txt`
-- `mpf_mfs_cyclicfile.txt` registration/creation
-
-The current realtime answers have incorrectly omitted the second filename and
-demoted the third item to a conditional aside.
-
-## Relevant files
-
-- `graph/realtime.py`: current realtime pipeline; contains `ResearchMove`,
-  candidate catalog formatting, and serial `_answer_query()` logic.
-- `graph/researcher.py`: useful reference for candidate previews, tool agents,
-  `read`, `search`, and subagent concurrency. Do not reuse its full slow graph.
-- `graph/store.py`: source chunks have `start_char`/`end_char`; nodes expose
-  `source_path` and `source_ranges`, useful for a future source-neighbor tool.
-- `app.py`: realtime request options and SSE transport. Keep 2-second ping.
-- `tests/test_realtime.py`: current tests pass but do not yet test parallel
-  reader-agent fan-out.
-
-## Current local changes
-
-Modified: `graph/realtime.py`, `app.py`, `SSE_SPEC.md`,
-`tests/test_realtime.py`.
-
-Last verification before this handoff:
+## Tests
 
 ```bash
-PYTHONPATH=. python -m unittest tests/test_realtime.py
+cd llm-wiki-dist
+.venv/bin/python -m unittest tests.test_realtime tests.test_vocab \
+    tests.test_neighborhood tests.test_ask_realtime
 ```
 
-Result: 8 tests passed.
+- `test_vocab.py` — transliteration, harvesting, matching, no false pins.
+- `test_neighborhood.py` — real SQLite: chain vs typed hop budgets, siblings,
+  cache hit/miss, deletion cleanup.
+- `test_realtime.py` — plan before generation, shard fan-out and concatenation,
+  deadline harvesting, neighbour admission floor and ceiling, grounding rules,
+  deep and anticipation stages, discovery rules.
+- `test_ask_realtime.py` — real store and real hybrid retrieval with fake
+  generation: vocabulary repair through to a grounded answer, the clamp being
+  gone, realtime subagent budgets, chain discovery.
+
+No model server is needed for any of them.
+
+## Next
+
+- Run it against the real endpoints and record the actual stage timings; the
+  deadlines (5 s / 9 s / 8 s) are budgets, not measurements.
+- `Qwen3-Reranker-0.6B` for instruction-aware neighbour scoring is still
+  optional and unbuilt (`plan.md` §7). Neighbours are currently admitted by
+  structural distance, chain before page before typed. Add the model only if
+  neighbour quality proves to be the limiting factor.
+- The frontend does not consume `discovery` yet; the event is documented in
+  `SSE_SPEC.md` and safe to ignore.
