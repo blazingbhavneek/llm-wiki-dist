@@ -1433,7 +1433,12 @@ class RealtimeAskBody(AskBody):
     max_context_chars: int = Field(default=32_000, ge=0, le=120_000)
 
     # --- deep stage --------------------------------------------------------
-    subagent_count: int = Field(default=3, ge=0, le=6)
+    subagent_count: int = Field(default=4, ge=0, le=6)
+    # Floor on how many agents the selector may keep.
+    subagent_min_count: int = Field(default=2, ge=1, le=4)
+    # Soft deadline for the agent branch: compile whoever has answered by
+    # then rather than waiting for all of them.
+    subagent_compile_wait_seconds: float = Field(default=30.0, ge=1.0, le=60.0)
     subagent_concurrency: int = Field(default=3, ge=1, le=6)
     # Deliberately far below the documentation agent's budgets: a five-read
     # gate guarantees this stage misses its deadline and adds nothing.
@@ -1449,6 +1454,13 @@ class RealtimeAskBody(AskBody):
     # `discovery` events carry a node the run has not mentioned yet. Clients
     # that do not render them can turn them off.
     emit_discovery: bool = True
+
+    # --- sufficiency gate --------------------------------------------------
+    # When a level's answer is already closed by its own sources, the levels
+    # below can only restate it, so they are marked skipped and the run ends.
+    # Set false to always run every planned level, as before the gate existed.
+    sufficiency_gate: bool = True
+    sufficiency_timeout_seconds: float = Field(default=6.0, ge=0.5, le=30.0)
 
     # --- accepted for older clients, no longer meaningful ------------------
     max_queries_per_level: int = Field(default=1, ge=1, le=6)
@@ -1814,8 +1826,9 @@ async def ask_stream(payload: AskBody) -> StreamingResponse:
 async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
     """Stream a complete level plan followed by immediately speakable levels.
 
-    The ``plan`` event always precedes ``level`` events. A ``plan_update`` is
-    emitted only when the deadline marks unstarted levels as skipped.
+    The ``plan`` event always precedes ``level`` events. A ``plan_update``
+    marks unstarted levels skipped -- when the deadline passes, or when a
+    level's answer is already complete and the rest could only restate it.
     """
 
     loop = asyncio.get_running_loop()
