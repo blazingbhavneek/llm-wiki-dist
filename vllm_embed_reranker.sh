@@ -6,15 +6,15 @@ source "$PROJECT_DIR/.venv/bin/activate"
 
 EMBED_MODEL_NAME="Qwen/Qwen3-Embedding-0.6B"
 RERANK_MODEL_NAME="BAAI/bge-reranker-v2-m3"
-EMBED_MODEL_PATH="$PROJECT_DIR/models/Qwen/Qwen3-Embedding-0.6B"
-RERANK_MODEL_PATH="$PROJECT_DIR/models/BAAI/bge-reranker-v2-m3"
+EMBED_MODEL_PATH="Qwen/Qwen3-Embedding-0.6B"
+RERANK_MODEL_PATH="BAAI/bge-reranker-v2-m3"
 
-for model_path in "$EMBED_MODEL_PATH" "$RERANK_MODEL_PATH"; do
-  if [[ ! -f "$model_path/config.json" ]]; then
-    echo "Missing local model: $model_path" >&2
-    exit 1
-  fi
-done
+# for model_path in "$EMBED_MODEL_PATH" "$RERANK_MODEL_PATH"; do
+#   if [[ ! -f "$model_path/config.json" ]]; then
+#     echo "Missing local model: $model_path" >&2
+#     exit 1
+#   fi
+# done
 
 pkill -f "vllm serve $EMBED_MODEL_NAME" 2>/dev/null || true
 pkill -f "vllm serve $RERANK_MODEL_NAME" 2>/dev/null || true
