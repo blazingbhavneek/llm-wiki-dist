@@ -8,10 +8,15 @@ from dataclasses import dataclass, field
 
 from graph.neighborhood import NeighborRef
 from graph.realtime import (
+    DEEP_AGENT_COMPILE_SYSTEM_PROMPT,
+    DEEP_AGENT_SELECT_SYSTEM_PROMPT,
     PROFILE_MULTIPLIERS,
+    SUFFICIENCY_SYSTEM_PROMPT,
+    DeepAgentSelection,
     RealtimeOptions,
     RealtimePipeline,
     ShallowResearchAnswer,
+    SufficiencyVerdict,
     classify_question,
 )
 from graph.vocab import Vocabulary
@@ -145,13 +150,23 @@ class PlanTests(unittest.TestCase):
 
         plan = events[0]
         self.assertEqual(plan["type"], "plan")
-        self.assertEqual(
-            [level["kind"] for level in plan["levels"]],
-            ["fast", "deep", "anticipation"],
-        )
+        # Only the stage certain to run is announced. Whether the deeper ones
+        # are needed is not knowable yet, and a preview that promised them
+        # would have to be taken back.
+        self.assertEqual([level["kind"] for level in plan["levels"]], ["fast"])
         # Planning is retrieval, not generation: one search, no model call.
         self.assertEqual(at_plan, {"searches": 1, "generations": 0})
         self.assertEqual(plan["planning_fallback"], False)
+
+        # The stages that were needed arrive as a revision, before level one.
+        kinds = [event["type"] for event in events]
+        update = events[kinds.index("plan_update")]
+        self.assertEqual(update["reason"], "deeper")
+        self.assertEqual(
+            [level["kind"] for level in update["levels"]],
+            ["fast", "deep", "anticipation"],
+        )
+        self.assertLess(kinds.index("plan_update"), kinds.index("level"))
 
     def test_plan_carries_candidates_and_the_pinned_identifier(self):
         vocabulary = Vocabulary.from_rows(
@@ -408,9 +423,35 @@ class DisclaimerTests(unittest.TestCase):
             "compute capability 6.0未満はオンデマンド移行をサポートしていません。",
             "GPUメモリのサイズを超えるManaged Memoryを割り当てることはできません。",
             "デバイスコードから直接呼び出すことはできません。",
+            "デバイスコードから malloc で確保したメモリは cudaFree で解放できません。",
         ):
             with self.subTest(sentence=sentence):
                 self.assertEqual(self.clean(sentence), sentence)
+
+    def test_a_refusal_that_gives_its_reason_first_is_still_dropped(self):
+        # Observed in production, twice in one level: the negation sits in a
+        # 〜ないため clause and the sentence ends in a refusal, so a stripper
+        # anchored on ありません/いません let the whole apology through. Two of
+        # the three shards said this, and the client spoke one of them instead
+        # of the answer the third shard had.
+        for sentence in (
+            "提供された資料には tex1DLayered 関数の定義が含まれていないため、"
+            "その3番目の引数について回答できません。",
+            "提供された資料には tex1DLayered 関数の引数に関する記述が"
+            "含まれていないため、お答えすることができません。",
+            "資料にはその言及がないため、お答えできません。",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertEqual(self.clean(sentence), "")
+
+    def test_the_answering_shard_survives_its_apologetic_neighbours(self):
+        answer = "tex1DLayered() の3番目の引数は int layer です。"
+        cleaned = self.clean(
+            answer
+            + "提供された資料には tex1DLayered 関数の定義が含まれていないため、"
+            "その3番目の引数について回答できません。"
+        )
+        self.assertEqual(cleaned, answer)
 
 
 class GroundingTests(unittest.TestCase):
@@ -598,6 +639,77 @@ class DeepStageTests(unittest.TestCase):
         # An agent cites what it opened, which becomes citable for this run.
         self.assertIn("node:agentread", levels[1]["reference_node_ids"])
 
+    def test_an_agents_reasoning_preamble_is_not_spoken(self):
+        # An agent that runs out of steps reports its last raw message, which
+        # is its scratchpad with the answer glued on the end. Spoken, the user
+        # hears the model think.
+        refs = [NeighborRef(node_id="node:page2", title="p2", relation="chain")]
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            return {
+                "answer": (
+                    "The user wants to know about memory allocation. "
+                    "Wait, I should check node:page2 first."
+                    "デバイスメモリの解放を行う関数があります。"
+                ),
+                "cited": ["node:page2"],
+                "finished": False,
+            }
+
+        events, _summary, _llm, _search = run_pipeline(
+            question="メモリの割り当てに使える関数は",
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            options=RealtimeOptions(max_levels=2, subagent_count=1),
+        )
+
+        text = [event for event in events if event["type"] == "level"][1]["text"]
+        self.assertIn("デバイスメモリの解放を行う関数があります。", text)
+        self.assertNotIn("The user wants", text)
+        self.assertNotIn("Wait, I should check", text)
+
+    def test_an_agent_that_never_concluded_reports_nothing(self):
+        # Deliberation end to end, in a language the answer was never going to
+        # be in. There is no answer buried in it to rescue.
+        refs = [NeighborRef(node_id="node:page2", title="p2", relation="chain")]
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            return {
+                "answer": "The user wants X. Let me check node:page2 and see.",
+                "cited": ["node:page2"],
+                "finished": False,
+            }
+
+        events, _summary, _llm, _search = run_pipeline(
+            question="メモリの割り当てに使える関数は",
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            options=RealtimeOptions(max_levels=2, subagent_count=1),
+        )
+
+        level = [event for event in events if event["type"] == "level"][1]
+        self.assertNotIn("The user wants X", level["text"])
+        agent = next(q for q in level["queries"] if q["query"] == "agent_1")
+        self.assertFalse(agent["answered"])
+
+    def test_an_english_answer_to_an_english_question_is_left_alone(self):
+        # Nothing distinguishes reasoning from content in one script, so the
+        # strip must not run at all rather than guess.
+        refs = [NeighborRef(node_id="node:page2", title="p2", relation="chain")]
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            return {"answer": "The third argument is pred.", "cited": ["node:page2"]}
+
+        events, _summary, _llm, _search = run_pipeline(
+            question="What is the third argument",
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            options=RealtimeOptions(max_levels=2, subagent_count=1),
+        )
+
+        text = [event for event in events if event["type"] == "level"][1]["text"]
+        self.assertIn("The third argument is pred.", text)
+
     def test_one_plain_reader_runs_beside_the_agents(self):
         # An agent loop can miss the harvest; the reader is one generation and
         # keeps the level from being empty when that happens.
@@ -625,6 +737,177 @@ class DeepStageTests(unittest.TestCase):
         self.assertTrue(
             any("Neighbouring sources" in prompt for prompt in llm.user_prompts)
         )
+
+    def _lettered_refs(self, letters: str = "abcde") -> list[NeighborRef]:
+        return [
+            NeighborRef(
+                node_id=f"node:{letter}",
+                title=f"Title {letter}",
+                summary=f"Summary {letter}",
+                relation="chain",
+            )
+            for letter in letters
+        ]
+
+    def test_dynamic_selection_spawns_only_distinct_candidates(self):
+        refs = self._lettered_refs()
+        calls: list[str] = []
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            calls.append(node_id)
+            return {"answer": f"finding {node_id}", "cited": [node_id]}
+
+        def responder(system, user):
+            if system == DEEP_AGENT_SELECT_SYSTEM_PROMPT:
+                return DeepAgentSelection(node_ids=["node:b", "node:d"])
+            return FakeLlm._echo(system, user)
+
+        events, _summary, _llm, _search = run_pipeline(
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            llm=FakeLlm(responder),
+            options=RealtimeOptions(max_levels=2),
+        )
+
+        self.assertEqual(sorted(calls), ["node:b", "node:d"])
+
+    def test_selection_falls_back_to_blind_slice_when_the_selector_errs(self):
+        refs = self._lettered_refs()
+        calls: list[str] = []
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            calls.append(node_id)
+            return {"answer": f"finding {node_id}", "cited": [node_id]}
+
+        def responder(system, user):
+            if system == DEEP_AGENT_SELECT_SYSTEM_PROMPT:
+                raise RuntimeError("selector boom")
+            return FakeLlm._echo(system, user)
+
+        events, _summary, _llm, _search = run_pipeline(
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            llm=FakeLlm(responder),
+            options=RealtimeOptions(max_levels=2, subagent_count=3, subagent_min_count=2),
+        )
+
+        # A failed selector must never lose an agent the stage would
+        # otherwise have had — it just falls back to the blind top-N slice.
+        # Agents run concurrently, so only the set/count is deterministic.
+        self.assertEqual(sorted(calls), ["node:a", "node:b", "node:c"])
+
+    def test_selection_pads_to_the_floor_when_the_model_returns_too_few(self):
+        refs = self._lettered_refs()
+        calls: list[str] = []
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            calls.append(node_id)
+            return {"answer": f"finding {node_id}", "cited": [node_id]}
+
+        def responder(system, user):
+            if system == DEEP_AGENT_SELECT_SYSTEM_PROMPT:
+                return DeepAgentSelection(node_ids=["node:c"])
+            return FakeLlm._echo(system, user)
+
+        events, _summary, _llm, _search = run_pipeline(
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            llm=FakeLlm(responder),
+            options=RealtimeOptions(max_levels=2, subagent_count=4, subagent_min_count=2),
+        )
+
+        # The model's one genuine choice is kept, padded from the next-ranked
+        # candidate to reach the floor. Agents run concurrently, so only the
+        # set/count is deterministic.
+        self.assertEqual(sorted(calls), ["node:a", "node:c"])
+
+    def test_compile_call_runs_when_at_least_two_agents_respond_in_time(self):
+        refs = self._lettered_refs()
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            text = {"node:b": "Fact B", "node:d": "Fact D"}[node_id]
+            return {"answer": text, "cited": [node_id]}
+
+        def responder(system, user):
+            if system == DEEP_AGENT_SELECT_SYSTEM_PROMPT:
+                return DeepAgentSelection(node_ids=["node:b", "node:d"])
+            if system == DEEP_AGENT_COMPILE_SYSTEM_PROMPT:
+                return ShallowResearchAnswer(
+                    answer="Merged B and D", node_ids=["node:b", "node:d"]
+                )
+            return FakeLlm._echo(system, user)
+
+        events, _summary, _llm, _search = run_pipeline(
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            llm=FakeLlm(responder),
+            options=RealtimeOptions(max_levels=2),
+        )
+
+        levels = [event for event in events if event["type"] == "level"]
+        self.assertIn("Merged B and D", levels[1]["text"])
+        self.assertNotIn("Fact B", levels[1]["text"])
+        self.assertNotIn("Fact D", levels[1]["text"])
+        agent_queries = [
+            query["query"]
+            for query in levels[1]["queries"]
+            if query["query"].startswith("agent")
+        ]
+        self.assertEqual(agent_queries, ["agent_compiled"])
+
+    def test_single_agent_response_skips_the_compile_call_and_passes_through_raw(self):
+        refs = self._lettered_refs()
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            return {"answer": f"solo finding {node_id}", "cited": [node_id]}
+
+        def responder(system, user):
+            if system == DEEP_AGENT_SELECT_SYSTEM_PROMPT:
+                return DeepAgentSelection(node_ids=["node:c"])
+            return FakeLlm._echo(system, user)
+
+        llm = FakeLlm(responder)
+        events, _summary, _llm, _search = run_pipeline(
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            llm=llm,
+            options=RealtimeOptions(max_levels=2, subagent_count=4, subagent_min_count=1),
+        )
+
+        levels = [event for event in events if event["type"] == "level"]
+        self.assertIn("solo finding node:c", levels[1]["text"])
+        self.assertTrue(
+            all(system != DEEP_AGENT_COMPILE_SYSTEM_PROMPT for system, _ in llm.prompts)
+        )
+
+    def test_zero_by_soft_deadline_waits_uncapped_for_the_first_agent(self):
+        refs = [
+            NeighborRef(node_id="node:fast", title="fast", relation="chain"),
+            NeighborRef(node_id="node:slow", title="slow", relation="chain"),
+        ]
+
+        def deep_agent(*, question, node_id, sibling_ids, index, stop_event, extra_instructions=""):
+            time.sleep(0.6 if node_id == "node:fast" else 10.0)
+            return {"answer": f"answer from {node_id}", "cited": [node_id]}
+
+        events, _summary, _llm, _search = run_pipeline(
+            neighbors=self._neighbors(refs),
+            deep_agent=deep_agent,
+            options=RealtimeOptions(
+                max_levels=2,
+                subagent_count=2,
+                subagent_min_count=2,
+                # Clamped up to the 0.5s floor in `_normalize_options` — still
+                # well under the fast agent's 0.6s, so at the soft deadline
+                # neither agent has finished and the fallback wait kicks in.
+                subagent_compile_wait_seconds=0.05,
+                deep_deadline_seconds=3.0,
+            ),
+        )
+
+        levels = [event for event in events if event["type"] == "level"]
+        self.assertIn("node:fast", levels[1]["reference_node_ids"])
+        self.assertNotIn("node:slow", levels[1]["reference_node_ids"])
 
     def test_deep_stage_emits_discovery_only_for_unseen_nodes(self):
         refs = [
@@ -852,6 +1135,145 @@ class AnticipationTests(unittest.TestCase):
                 for node_id in levels[2]["reference_node_ids"]
             )
         )
+
+
+class DepthDecisionTests(unittest.TestCase):
+    """The plan starts at the shallow answer and grows only if it has to."""
+
+    def _gate(self, verdict: SufficiencyVerdict | None, *, raises: bool = False):
+        """A responder that answers shards normally and the depth check as told."""
+
+        def responder(system: str, user: str):
+            if system == SUFFICIENCY_SYSTEM_PROMPT:
+                if raises:
+                    raise RuntimeError("depth endpoint down")
+                return verdict
+            return FakeLlm._echo(system, user)
+
+        return FakeLlm(responder)
+
+    @staticmethod
+    def _gate_calls(llm: FakeLlm) -> int:
+        return sum(1 for system, _user in llm.prompts if system == SUFFICIENCY_SYSTEM_PROMPT)
+
+    def test_a_closed_answer_ends_the_run_at_one_level(self):
+        llm = self._gate(
+            SufficiencyVerdict(
+                missing="", closure="the signature lists four arguments", complete=True
+            )
+        )
+        events, summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3)
+        )
+
+        self.assertEqual(len([e for e in events if e["type"] == "level"]), 1)
+        # Nothing was retracted, because nothing beyond level one was promised.
+        self.assertEqual([e for e in events if e["type"] == "plan_update"], [])
+        self.assertEqual([l["kind"] for l in events[0]["levels"]], ["fast"])
+        self.assertEqual(summary["status"], "complete")
+        self.assertIsNone(summary["incomplete_reason"])
+
+    def test_an_unbounded_answer_grows_the_plan_to_every_stage(self):
+        llm = self._gate(
+            SufficiencyVerdict(
+                missing="other allocation functions documented elsewhere",
+                closure="",
+                complete=False,
+            )
+        )
+        events, summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3)
+        )
+
+        self.assertEqual(len([e for e in events if e["type"] == "level"]), 3)
+        updates = [e for e in events if e["type"] == "plan_update"]
+        self.assertEqual([update["reason"] for update in updates], ["deeper"])
+        self.assertEqual(summary["status"], "complete")
+
+    def test_the_plan_update_precedes_the_level_frame(self):
+        # The client reports a level the moment it lands and builds its hand-off
+        # from the plan it holds then; an update afterwards is too late.
+        llm = self._gate(SufficiencyVerdict(missing="more to find", complete=False))
+        events, _summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3)
+        )
+
+        kinds = [event["type"] for event in events]
+        self.assertLess(kinds.index("plan_update"), kinds.index("level"))
+
+    def test_the_decision_is_made_once_not_per_level(self):
+        llm = self._gate(SufficiencyVerdict(missing="more to find", complete=False))
+        run_pipeline(llm=llm, options=RealtimeOptions(max_levels=3))
+
+        # Three stages run, but the depth of the run was settled after the first.
+        self.assertEqual(self._gate_calls(llm), 1)
+
+    def test_six_of_twelve_items_does_not_close_the_list(self):
+        # The failure this must not have: a list that reads whole because it is
+        # the part that happened to be retrieved. The model named a gap, so its
+        # own `complete` does not get to overrule it.
+        llm = self._gate(
+            SufficiencyVerdict(
+                missing="further allocation functions in sections not yet read",
+                closure="the answer enumerates six allocation functions",
+                complete=True,
+            )
+        )
+        events, _summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3)
+        )
+
+        self.assertEqual(len([e for e in events if e["type"] == "level"]), 3)
+
+    def test_a_verdict_without_closure_is_not_trusted(self):
+        # Agreeing without being able to say what closed the set is the failure
+        # the field order exists to catch.
+        llm = self._gate(SufficiencyVerdict(missing="", closure="", complete=True))
+        events, _summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3)
+        )
+
+        self.assertEqual(len([e for e in events if e["type"] == "level"]), 3)
+
+    def test_a_failed_check_researches_deeper_rather_than_stopping(self):
+        # A slow complete answer is a far smaller problem than a fast half one,
+        # so a broken endpoint must never quietly shorten every run.
+        llm = self._gate(None, raises=True)
+        events, _summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3)
+        )
+
+        self.assertEqual(len([e for e in events if e["type"] == "level"]), 3)
+
+    def test_nothing_answered_researches_deeper_without_asking(self):
+        def responder(system: str, _user: str):
+            if system == SUFFICIENCY_SYSTEM_PROMPT:
+                raise AssertionError("no answer yet; there is nothing to judge")
+            return ShallowResearchAnswer()
+
+        llm = FakeLlm(responder)
+        events, _summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3)
+        )
+
+        self.assertEqual(self._gate_calls(llm), 0)
+        self.assertEqual(len([e for e in events if e["type"] == "level"]), 3)
+
+    def test_a_single_stage_run_never_pays_for_the_check(self):
+        llm = self._gate(SufficiencyVerdict(missing="", closure="closed", complete=True))
+        run_pipeline(llm=llm, options=RealtimeOptions(max_levels=1))
+
+        # Nothing could be added, so nothing to pay a model call for.
+        self.assertEqual(self._gate_calls(llm), 0)
+
+    def test_the_gate_can_be_disabled(self):
+        llm = self._gate(SufficiencyVerdict(missing="", closure="closed", complete=True))
+        events, _summary, _llm, _search = run_pipeline(
+            llm=llm, options=RealtimeOptions(max_levels=3, sufficiency_gate=False)
+        )
+
+        self.assertEqual(self._gate_calls(llm), 0)
+        self.assertEqual(len([e for e in events if e["type"] == "level"]), 3)
 
 
 class BudgetTests(unittest.TestCase):

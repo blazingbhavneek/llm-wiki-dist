@@ -887,9 +887,8 @@ def run_subagent(
     )
 
     # Prefer the explicit finish() answer, otherwise fall back to the last message.
-    answer = _sanitize_string_for_llm(
-        str(ctx.finished.get("answer") or "")
-    ).strip() or _last_message_text(state)
+    concluded = _sanitize_string_for_llm(str(ctx.finished.get("answer") or "")).strip()
+    answer = concluded or _last_message_text(state)
 
     # Prefer cited IDs from finish(); otherwise cite visited nodes as a fallback.
     cited = _clean_ids(ctx.finished.get("cited_node_ids", [])) or dedupe(run.visited)
@@ -910,6 +909,11 @@ def run_subagent(
         "start": run.start_id,
         "answer": answer or "(no findings)",
         "cited": cited,
+        # False when the agent ran out of steps instead of calling finish(), so
+        # `answer` above is its last raw message rather than a conclusion. The
+        # lead agent can live with scratchpad; a caller that speaks the answer
+        # aloud needs to be able to tell the difference.
+        "finished": bool(concluded),
     }
 
 

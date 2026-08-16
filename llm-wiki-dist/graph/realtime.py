@@ -43,7 +43,7 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
@@ -139,6 +139,34 @@ class ShallowResearchAnswer(BaseModel):
     node_ids: list[str] = Field(default_factory=list)
 
 
+class DeepAgentSelection(BaseModel):
+    """Which candidate starting points the selector judged genuinely distinct."""
+
+    node_ids: list[str] = Field(default_factory=list)
+
+
+class SufficiencyVerdict(BaseModel):
+    """Whether the sources themselves close the answer.
+
+    The fields are ordered, and a structured decoder fills them in that order,
+    so each one is written before the model may commit to the next.
+
+    `missing` does the real work. Asserting that an answer is complete is easy
+    for a model that has just read a fluent one, and asking it to justify the
+    assertion afterwards only produces a fluent justification -- an answer
+    listing six of twelve functions invites "the answer enumerates six", which
+    describes the answer rather than any boundary in the sources. Naming
+    something a further search could still turn up is easy only when something
+    could: an open enumeration always has a plausible next item, and a closed
+    one has none to invent. Failing to generate is the hard test; asserting is
+    the easy one.
+    """
+
+    missing: str = ""
+    closure: str = ""
+    complete: bool = False
+
+
 # Retained as transport-compatible schemas for callers that imported the
 # earlier experimental reader pipeline.
 class ResearchMove(BaseModel):
@@ -199,7 +227,15 @@ class RealtimeOptions:
     # path may spend twenty steps and five reads before it is allowed to
     # answer; here, a gate like that guarantees the stage misses its deadline
     # and contributes nothing.
-    subagent_count: int = 3
+    subagent_count: int = 4
+    # Floor on how many agents the selector may keep — it may return fewer
+    # only when fewer than this many candidates are genuinely distinct.
+    subagent_min_count: int = 2
+    # Soft deadline for the agent branch of the deep stage: compile whoever
+    # has answered by then. If literally none have, wait uncapped for the
+    # first one rather than dropping the whole branch — see
+    # `_harvest_with_fallback`.
+    subagent_compile_wait_seconds: float = 30.0
     subagent_concurrency: int = 3
     subagent_max_steps: int = 5
     subagent_min_reads: int = 1
@@ -221,6 +257,16 @@ class RealtimeOptions:
     anticipation_deadline_seconds: float = 120.0
     anticipation_terms: int = 3
 
+    # --- sufficiency gate --------------------------------------------------
+    # After a level lands, one bounded check asks whether the sources
+    # themselves close the answer. When they do, the levels below are marked
+    # skipped and the run ends: they can only restate what has been said. A
+    # question whose answer has no closing condition -- which functions do X,
+    # how do A and B differ -- is exactly what those levels exist for, so the
+    # gate fails open: any error, timeout, or unevidenced yes runs them all.
+    sufficiency_gate: bool = True
+    sufficiency_timeout_seconds: float = 6.0
+
     # --- run --------------------------------------------------------------
     # Wall-clock budget for the whole run. Retrieval and model calls cannot be
     # interrupted once started, so the budget bounds *new* work.
@@ -241,6 +287,8 @@ class RealtimeOptions:
 def _normalize_options(options: RealtimeOptions) -> RealtimeOptions:
     """Clamp caller-supplied options so a bad value degrades instead of raising."""
     max_admit = max(0, int(options.neighbor_max_admit))
+    max_subagents = max(0, int(options.subagent_count))
+    deep_deadline = max(0.0, float(options.deep_deadline_seconds))
     return replace(
         options,
         max_levels=max(1, min(3, int(options.max_levels))),
@@ -256,17 +304,25 @@ def _normalize_options(options: RealtimeOptions) -> RealtimeOptions:
         search_limit=max(1, int(options.search_limit)),
         rerank_top_k=max(1, int(options.rerank_top_k)),
         max_context_chars=max(0, int(options.max_context_chars)),
-        subagent_count=max(0, int(options.subagent_count)),
+        subagent_count=max_subagents,
+        subagent_min_count=max(0, min(int(options.subagent_min_count), max_subagents)),
+        subagent_compile_wait_seconds=max(
+            0.5, min(float(options.subagent_compile_wait_seconds), deep_deadline)
+        ),
         subagent_concurrency=max(1, int(options.subagent_concurrency)),
         subagent_max_steps=max(1, int(options.subagent_max_steps)),
         subagent_min_reads=max(0, int(options.subagent_min_reads)),
         subagent_max_reads=max(1, int(options.subagent_max_reads)),
-        deep_deadline_seconds=max(0.0, float(options.deep_deadline_seconds)),
+        deep_deadline_seconds=deep_deadline,
         deep_node_limit=max(1, int(options.deep_node_limit)),
         anticipation_deadline_seconds=max(
             0.0, float(options.anticipation_deadline_seconds)
         ),
         anticipation_terms=max(0, int(options.anticipation_terms)),
+        sufficiency_gate=bool(options.sufficiency_gate),
+        sufficiency_timeout_seconds=max(
+            0.5, min(float(options.sufficiency_timeout_seconds), 30.0)
+        ),
         deadline_seconds=max(0.0, float(options.deadline_seconds)),
     )
 
@@ -462,6 +518,78 @@ related setting. Do not restate what is already established below.
 
 {_COMMON_RULES}"""
 
+DEEP_AGENT_SELECT_SYSTEM_PROMPT = """You are choosing which candidates deserve their own
+independent research agent for this question. Every candidate below sits in the
+structural neighbourhood of material a first pass over the ranked results
+already used, so several of them typically lead to the same underlying point,
+restated in different words. Giving each of those its own agent produces the
+same finding several times over, not more coverage.
+
+Pick only the candidates that would each explore a genuinely distinct
+subtopic, angle, or aspect of the question, never two that would converge on
+the same point. Fewer, distinct choices are better than more, redundant ones.
+
+Judge only from the id, title and summary given for each candidate. Return
+each choice as its node_id, copied verbatim; never invent one that was not
+listed."""
+
+DEEP_AGENT_COMPILE_SYSTEM_PROMPT = f"""Independent research agents each explored a different
+part of the subgraph and reported back separately below. Combine their
+findings into one answer: where two reports make the same point in different
+words, say it once; where they add different specifics, keep both. Do not
+add anything beyond what the reports themselves state.
+
+{_SCOPE_RULES}
+
+{_COMMON_RULES}"""
+
+SUFFICIENCY_SYSTEM_PROMPT = """A first pass has answered the user's question from the
+sources. Deeper stages will now search the rest of the corpus unless that
+answer is already provably complete. Running them costs the person waiting
+about a minute, and skipping them wrongly leaves the question half answered,
+so decide honestly rather than agreeably.
+
+An answer is complete only when the sources themselves show where it ends.
+Asked for a function's arguments, the signature enumerates them and the answer
+covers every one. Asked for one named value, a source states it. Nothing
+further can be found in those cases, because the source has closed the set.
+
+An answer is not complete when nothing bounds it. Asked which functions do
+some kind of thing, more of them may be documented elsewhere. Asked how two
+things differ, no single source states the comparison and another one may
+change it. Asked what something broadly is, there is no point at which it is
+finished. Reading fluently, confidently or at length is not the same as being
+complete, and neither is having answered the part you happened to find.
+
+A count is never a boundary. Having found six of something is not evidence
+that six is all there is; it is evidence of six. A list is closed only when
+something outside it says where it ends -- a signature, a declared set, an
+enumeration in the question itself -- never by the list looking whole.
+
+Write three things, in this order.
+
+`missing`: name one specific thing a further search could still turn up that
+this question asked for -- another item belonging on the list, a condition or
+exception not stated, the part of the question left unanswered. Be concrete.
+If you genuinely cannot name one, leave it empty; do not invent a gap, and do
+not name something the question did not ask for.
+
+`closure`: the specific thing that bounds this answer -- the signature that
+enumerates the arguments, the question naming every member it asks about, the
+sentence stating the one value. It must be something in the sources or in the
+question, not a property of the answer: that the answer reads completely, or
+lists several items, is not a boundary. If you cannot point at one, leave it
+empty.
+
+`complete`: true only when `missing` is empty and `closure` names something
+real that the answer already covers in full."""
+
+# Bigger than the selector's own max count so it has real choices; small
+# enough (titles/summaries only, no bodies) to stay a cheap, fast call.
+_SELECTOR_CANDIDATE_LIMIT = 12
+_SELECTOR_TIMEOUT_SECONDS = 8.0
+_COMPILE_TIMEOUT_SECONDS = 10.0
+
 ANTICIPATION_SYSTEM_PROMPT = f"""The first answer used a term without explaining it, and
 that is what will be asked next. Explain that one term from the sources given:
 what it is, what values or arguments it takes, and where it is used.
@@ -501,9 +629,17 @@ _UNSUPPORTED_DISCLAIMER_RE = re.compile(
     # 情報 is deliberately not a standalone anchor: "…必要な情報をすべて持って
     # いません" is a real statement about Unified Memory. It is still covered
     # when it follows 提供された/与えられた, which is the disclaiming form.
+    # The negation is not always the end of the sentence. A shard that cannot
+    # answer usually gives the reason first and refuses afterwards -- 「…資料に
+    # は定義が含まれていない*ため*、…回答*できません*。」 -- so requiring the
+    # sentence to stop at ありません/いません let every の…ため、…できません
+    # form through, and the client spoke the apology instead of the answer
+    # sitting beside it. Match to the end of the sentence, and treat a refusal
+    # to answer as a terminator in its own right.
     r"[^。\n]*?(?:提供された|与えられた|資料|抜粋|文書|ドキュメント"
     r"|コンテキスト|ソース|記載|記述|言及)"
-    r"[^。\n]*?(?:ありません|いません|見つかりません|不足しています)。|"
+    r"[^。\n]*?(?:ありません|いません|ございません|見つかりません|不足しています"
+    r"|含まれていない|できません|できない|不明です)[^。\n]*。|"
     r"(?:the )?(?:provided|supplied) (?:material|evidence|documentation).{0,140}?"
     r"(?:does not|doesn't|cannot).{0,100}?(?:state|describe|contain|provide).{0,80}?(?:\.|$)",
     re.IGNORECASE,
@@ -579,7 +715,15 @@ class RealtimePipeline:
 
         try:
             retrieval = self._retrieve(question, opts, stop_event)
-            levels = self._plan(retrieval, opts)
+            planned = self._plan(retrieval, opts)
+            # Announce only the stage that is certain to run. Whether the
+            # deeper ones are needed cannot be known from the question -- it
+            # depends on what the shallow answer turns out to contain -- so
+            # that decision is made once, after level one, and the plan grows
+            # to match. A plan that only ever grows is never retracted, which
+            # is why the spoken preview can be trusted the moment it is said.
+            levels = planned[:1]
+            pending_stages = planned[1:]
             statuses = {level.id: "pending" for level in levels}
             plan_version = 1
             safe_emit(
@@ -609,7 +753,13 @@ class RealtimePipeline:
                 self._build_subgraph, retrieval, opts, stop_event
             )
 
-            for position, level in enumerate(levels, start=1):
+            # `levels` grows while this runs, so it is indexed rather than
+            # iterated: appending to a list a for-loop is walking is exactly
+            # the kind of thing that works until it does not.
+            position = 0
+            while position < len(levels):
+                position += 1
+                level = levels[position - 1]
                 self._check_stop(stop_event)
                 if self._expired(deadline):
                     state.unresolved = True
@@ -663,6 +813,35 @@ class RealtimePipeline:
 
                 statuses[level.id] = "complete"
                 new_facts = state.accept(outcomes)
+
+                # One decision, once, in the only place it can be made well:
+                # after the shallow answer exists but before it is sent. How
+                # much digging a question deserves is not visible in the
+                # question -- "the arguments of X" and "the functions that do
+                # Y" read alike -- and by the time a later stage has run, the
+                # minute it cost is already spent. It has to go before the
+                # level frame either way: the client reports a level the
+                # moment it lands and builds its "and next we look at..."
+                # hand-off from the plan it holds right then.
+                if pending_stages:
+                    if self._needs_deeper_research(
+                        retrieval, state, opts, pool, stop_event, deadline
+                    ):
+                        levels.extend(pending_stages)
+                        statuses.update(
+                            {stage.id: "pending" for stage in pending_stages}
+                        )
+                        plan_version += 1
+                        safe_emit(
+                            {
+                                "type": "plan_update",
+                                "version": plan_version,
+                                "reason": "deeper",
+                                "levels": self._public_levels(levels, statuses),
+                            }
+                        )
+                    pending_stages = []
+
                 safe_emit(
                     self._level_event(
                         level, position, plan_version, outcomes, new_facts, level_started
@@ -1189,11 +1368,11 @@ class RealtimePipeline:
         # harvest entirely. One plain reader over the same subgraph always runs
         # alongside them: a single generation, reliably inside the stage, so
         # the level is never empty because the exploratory branch ran long.
-        agents = (
-            self._submit_deep_agents(retrieval, state, fresh, options, pool, stop_event)
-            if self._deep_agent is not None
-            else []
-        )
+        #
+        # Readers are submitted first, unconditionally, so their thread starts
+        # regardless of how long the agent branch's selector call below takes —
+        # the guaranteed fallback must never wait on it.
+        has_agents = self._deep_agent is not None and options.subagent_count > 0
         readers = self._submit_deep_readers(
             retrieval,
             state,
@@ -1201,11 +1380,189 @@ class RealtimePipeline:
             options,
             pool,
             stop_event,
-            count=1 if agents else options.subagent_count,
+            count=1 if has_agents else options.subagent_count,
         )
-        return self._harvest(
-            agents + readers, stage_deadline, label=lambda name: str(name)
+        agents = (
+            self._submit_deep_agents(
+                retrieval, state, fresh, options, pool, stop_event, stage_deadline
+            )
+            if has_agents
+            else []
         )
+        reader_outcomes = self._harvest(
+            readers, stage_deadline, label=lambda name: str(name)
+        )
+        if not agents:
+            return reader_outcomes
+
+        # Give the agent branch its own, usually-shorter soft deadline: compile
+        # whoever has answered by then rather than holding first audio hostage
+        # to the slowest of a handful of agents. If literally none have
+        # answered yet, fall through to waiting for the first one — see
+        # `_harvest_with_fallback`.
+        soft_deadline = min(
+            stage_deadline, time.perf_counter() + options.subagent_compile_wait_seconds
+        )
+        agent_outcomes = self._harvest_with_fallback(
+            agents, soft_deadline, stage_deadline, label=lambda name: str(name)
+        )
+        agent_outcomes = self._compile_agent_reports(
+            retrieval, state, agent_outcomes, options, pool, stage_deadline, stop_event
+        )
+        return agent_outcomes + reader_outcomes
+
+    def _select_agent_starts(
+        self,
+        retrieval: Retrieval,
+        fresh: list[NeighborRef],
+        options: RealtimeOptions,
+        stop_event: threading.Event | None,
+    ) -> list[str]:
+        """Advisory only. Any failure, empty result, or out-of-set ID falls
+        back to the blind top-N slice this replaces — a bad call costs
+        redundancy, never an agent the stage would otherwise have had."""
+        self._check_stop(stop_event)
+        min_count, max_count = options.subagent_min_count, options.subagent_count
+        blind = [ref.node_id for ref in fresh[:max_count]]
+        pool_refs = fresh[:_SELECTOR_CANDIDATE_LIMIT]
+        prompt = (
+            f"User question:\n{retrieval.query}\n\n"
+            "Candidate starting points:\n"
+            + "\n".join(ref.line() for ref in pool_refs)
+            + f"\n\nChoose between {min_count} and {max_count} of these node_ids: "
+            "the ones most likely to each lead to a distinct finding. If fewer "
+            f"than {min_count} are genuinely distinct, return only those."
+        )
+        try:
+            selection = self._llm().complete_structured(
+                DEEP_AGENT_SELECT_SYSTEM_PROMPT, prompt, DeepAgentSelection
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("realtime subagent selector failed: %s", exc)
+            return blind
+
+        valid = {ref.node_id for ref in pool_refs}
+        chosen = [nid for nid in dict.fromkeys(selection.node_ids or []) if nid in valid]
+        for ref in pool_refs:  # pad to the floor from the next-ranked candidates
+            if len(chosen) >= min_count:
+                break
+            if ref.node_id not in chosen:
+                chosen.append(ref.node_id)
+        return chosen[:max_count] or blind
+
+    def _compile_agent_reports(
+        self,
+        retrieval: Retrieval,
+        state: "_RunState",
+        outcomes: list[QueryOutcome],
+        options: RealtimeOptions,
+        pool: ThreadPoolExecutor,
+        stage_deadline: float,
+        stop_event: threading.Event | None,
+    ) -> list[QueryOutcome]:
+        """Merge several agent reports into one voice instead of raw
+        concatenation. Never a hard dependency: any failure or timeout falls
+        back to returning the outcomes exactly as harvested."""
+        self._check_stop(stop_event)
+        with_facts = [outcome for outcome in outcomes if outcome.facts]
+        others = [outcome for outcome in outcomes if not outcome.facts]
+        if len(with_facts) < 2:
+            return outcomes  # nothing to merge, or exactly one — pass through raw
+
+        started = time.perf_counter()
+        flat_facts = [fact for outcome in with_facts for fact in outcome.facts]
+        node_ids = self._unique(nid for fact in flat_facts for nid in fact.node_ids)
+        prompt = "\n\n".join(
+            part
+            for part in (
+                f"User question:\n{retrieval.query}",
+                self._scope_line(retrieval),
+                "Independent findings to combine, each already source-backed "
+                f"(citable node_ids in brackets):\n{self._format_facts(flat_facts, 4_000)}",
+            )
+            if part
+        )
+
+        def run_compile() -> Any:
+            return self._llm().complete_structured(
+                DEEP_AGENT_COMPILE_SYSTEM_PROMPT, prompt, ShallowResearchAnswer
+            )
+
+        budget = min(
+            _COMPILE_TIMEOUT_SECONDS, max(0.0, stage_deadline - time.perf_counter())
+        )
+        try:
+            answer = pool.submit(run_compile).result(timeout=budget)
+        except Exception as exc:  # noqa: BLE001 - includes TimeoutError
+            log.info("realtime subagent compile failed: %s", exc)
+            return outcomes  # raw-concatenate whatever agent outcomes are available
+
+        state.allow(node_ids)
+        compiled = self._outcome(
+            "agent_compiled", answer, state, started, node_ids, len(with_facts)
+        )
+        return [compiled, *others]
+
+    def _needs_deeper_research(
+        self,
+        retrieval: Retrieval,
+        state: "_RunState",
+        options: RealtimeOptions,
+        pool: ThreadPoolExecutor,
+        stop_event: threading.Event | None,
+        deadline: float | None,
+    ) -> bool:
+        """Whether the stages below the shallow answer are worth their minute.
+
+        Biased toward saying yes. Every failure path -- the check disabled, the
+        endpoint down, the call timing out, a verdict the model cannot
+        evidence -- runs the deeper stages, because a slow complete answer is
+        a far smaller problem than a fast half one. Only a confident, evidenced
+        "nothing further can be found" stops the run here.
+        """
+        if not options.sufficiency_gate or not state.facts:
+            return True
+        self._check_stop(stop_event)
+
+        prompt = "\n\n".join(
+            part
+            for part in (
+                f"User question:\n{state.question}",
+                self._scope_line(retrieval),
+                "The answer so far, with the sources each part came from:\n"
+                f"{self._format_facts(state.facts, 6_000)}",
+            )
+            if part
+        )
+
+        def run_check() -> Any:
+            return self._llm().complete_structured(
+                SUFFICIENCY_SYSTEM_PROMPT, prompt, SufficiencyVerdict
+            )
+
+        budget = options.sufficiency_timeout_seconds
+        if deadline is not None:
+            budget = min(budget, max(0.0, deadline - time.perf_counter()))
+        try:
+            verdict = pool.submit(run_check).result(timeout=budget)
+        except Exception as exc:  # noqa: BLE001 - includes TimeoutError
+            log.info("realtime depth check failed; researching deeper: %s", exc)
+            return True
+
+        # The conjunction is enforced here, not left to the model: it has just
+        # read a fluent answer and is being asked whether that answer is done.
+        # All three must agree -- it says so, it could not name a gap, and it
+        # could name a boundary -- and any one of them missing keeps digging.
+        missing = _text(getattr(verdict, "missing", ""))
+        closure = _text(getattr(verdict, "closure", ""))
+        complete = bool(getattr(verdict, "complete", False)) and not missing and bool(closure)
+        log.info(
+            "realtime depth check: deeper=%s missing=%s closure=%s",
+            not complete,
+            missing[:120] or "-",
+            closure[:120] or "-",
+        )
+        return not complete
 
     def _submit_deep_agents(
         self,
@@ -1215,8 +1572,23 @@ class RealtimePipeline:
         options: RealtimeOptions,
         pool: ThreadPoolExecutor,
         stop_event: threading.Event | None,
+        stage_deadline: float,
     ) -> list[tuple[str, "Future[QueryOutcome]"]]:
-        starts = [ref.node_id for ref in fresh[: options.subagent_count]]
+        blind = [ref.node_id for ref in fresh[: options.subagent_count]]
+        if options.subagent_count > 0 and len(fresh) > options.subagent_min_count:
+            selector_future = pool.submit(
+                self._select_agent_starts, retrieval, fresh, options, stop_event
+            )
+            budget = min(
+                _SELECTOR_TIMEOUT_SECONDS, max(0.0, stage_deadline - time.perf_counter())
+            )
+            try:
+                starts = selector_future.result(timeout=budget)
+            except Exception as exc:  # noqa: BLE001 - includes TimeoutError
+                log.info("realtime subagent selector unavailable: %s", exc)
+                starts = blind
+        else:
+            starts = blind
         # Without this, each agent reconstructs the fast answer from scratch —
         # same comparison, same table, three times over — because none of them
         # knows level one already said it. `_submit_deep_readers` already gets
@@ -1253,6 +1625,22 @@ class RealtimePipeline:
             # would say every reference out loud twice.
             raw_answer = str(report.get("answer") or "")
             answer_text = re.split(r"\n引用[:：]", raw_answer, maxsplit=1)[0].strip()
+            answer_text = self._strip_reasoning(answer_text, retrieval.query)
+            # An agent that never called finish() has not concluded anything;
+            # `run_subagent` hands back its last raw message instead, which is
+            # scratchpad. Where that message ends in a real answer the strip
+            # above keeps it, but a message that never reached the question's
+            # own language is deliberation end to end. Reporting nothing is the
+            # honest outcome -- the plain reader beside these agents is exactly
+            # the safety net for a branch that comes back empty.
+            if not report.get("finished", True) and (
+                not answer_text
+                or (_is_japanese(retrieval.query) and not _is_japanese(answer_text))
+            ):
+                log.info("realtime deep agent %s ended without a conclusion", index)
+                return QueryOutcome(
+                    query=f"agent_{index}", latency_ms=self._elapsed_ms(started)
+                )
             answer = ShallowResearchAnswer(answer=answer_text, node_ids=cited)
             return self._outcome(
                 f"agent_{index}", answer, state, started, cited, len(cited)
@@ -1526,23 +1914,14 @@ class RealtimePipeline:
 
     # region stage plumbing
 
-    def _harvest(
+    def _collect(
         self,
         futures: list[tuple[Any, "Future[QueryOutcome]"]],
-        deadline: float,
+        done: set["Future[QueryOutcome]"],
         *,
         label: Callable[[Any], str],
     ) -> list[QueryOutcome]:
-        """Take what finished, drop what did not. Never wait for all branches.
-
-        Fan-out is a tail-latency shape: four parallel calls finish at the
-        slowest of four. A late shard makes the answer shorter, which is
-        recoverable; a late shard that blocks the stream is not.
-        """
-        remaining = max(0.0, deadline - time.perf_counter())
-        pending = [future for _key, future in futures]
-        done, _unfinished = wait(pending, timeout=remaining)
-
+        """Take what's in ``done``, drop and log everything else."""
         outcomes: list[QueryOutcome] = []
         for key, future in futures:
             if future not in done:
@@ -1559,6 +1938,51 @@ class RealtimePipeline:
                     QueryOutcome(query=label(key), error=self._short_error(exc))
                 )
         return outcomes
+
+    def _harvest(
+        self,
+        futures: list[tuple[Any, "Future[QueryOutcome]"]],
+        deadline: float,
+        *,
+        label: Callable[[Any], str],
+    ) -> list[QueryOutcome]:
+        """Take what finished, drop what did not. Never wait for all branches.
+
+        Fan-out is a tail-latency shape: four parallel calls finish at the
+        slowest of four. A late shard makes the answer shorter, which is
+        recoverable; a late shard that blocks the stream is not.
+        """
+        remaining = max(0.0, deadline - time.perf_counter())
+        pending = [future for _key, future in futures]
+        done, _unfinished = wait(pending, timeout=remaining)
+        return self._collect(futures, done, label=label)
+
+    def _harvest_with_fallback(
+        self,
+        futures: list[tuple[Any, "Future[QueryOutcome]"]],
+        soft_deadline: float,
+        hard_deadline: float,
+        *,
+        label: Callable[[Any], str],
+    ) -> list[QueryOutcome]:
+        """Wait for every branch up to ``soft_deadline``; if literally none
+        finished by then, wait uncapped for the first one, but never past
+        ``hard_deadline``.
+
+        Used only by the deep stage's agent branch: with a small (2-4),
+        selected agent count, dropping everything just because none finished
+        by the soft deadline is worse than giving the fastest one the rest of
+        the stage.
+        """
+        pending = [future for _key, future in futures]
+        remaining_soft = max(0.0, soft_deadline - time.perf_counter())
+        done, _unfinished = wait(pending, timeout=remaining_soft)
+        if not done:
+            remaining_hard = max(0.0, hard_deadline - time.perf_counter())
+            done, _unfinished = wait(
+                pending, timeout=remaining_hard, return_when=FIRST_COMPLETED
+            )
+        return self._collect(futures, done, label=label)
 
     def _outcome(
         self,
@@ -1943,6 +2367,37 @@ class RealtimePipeline:
             lines.append(line)
             previous_blank = False
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def _strip_reasoning(text: str, question: str) -> str:
+        """Drop a deliberating preamble a subagent left in front of its answer.
+
+        An agent that runs out of steps without calling `finish()` reports its
+        last raw message instead, and that message is often the scratchpad --
+        "The user wants to know... Wait, the user asked for... I'll check
+        node:..." -- with the real answer glued onto the end. Spoken, the user
+        hears the model think.
+
+        Only a Japanese question can be repaired this way, and only by cutting
+        a *leading* run of ASCII: the answer is then in a different script from
+        the deliberation, which is the one signal here that cannot misfire on
+        prose that merely sounds tentative. An answer that is ASCII throughout
+        is left exactly as it is, because nothing distinguishes its reasoning
+        from its content.
+        """
+        answer = str(text or "").strip()
+        if not answer or not _is_japanese(question) or not _is_japanese(answer):
+            return answer
+        # Cut at the first Japanese character: everything before it is a
+        # language the answer to a Japanese question was never going to be in.
+        match = re.search(r"[぀-ヿ㐀-鿿]", answer)
+        if match is None or match.start() == 0:
+            return answer
+        head, tail = answer[: match.start()], answer[match.start() :].strip()
+        if not tail:
+            return answer
+        log.info("realtime deep agent reasoning stripped: %s", head.strip()[:120])
+        return tail
 
     @staticmethod
     def _fact_key(text: str) -> str:
