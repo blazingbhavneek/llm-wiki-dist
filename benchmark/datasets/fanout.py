@@ -1,4 +1,11 @@
-"""FanOutQA loader with resumable per-revision Wikipedia caching."""
+"""FanOutQA loader with resumable per-revision Wikipedia caching.
+
+--sample caps the question count, but every one of FanOutQA's 310 questions
+cites at least one full Wikipedia article long enough to need llm-wiki's
+chunked ingest path, so unlike musique the per-question evidence size does
+not shrink with the sample -- only the question count (and total revisions
+fetched) does.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +36,9 @@ def load(args: SimpleNamespace) -> legacy.DatasetBundle:
         raise legacy.BenchmarkError(
             f"no evidence-backed FanOutQA questions in {questions_path}"
         )
+    selected = legacy.stable_record_sample(
+        selected, sample=args.sample, seed=args.seed
+    )
 
     questions: list[legacy.Question] = []
     keys_by_question: dict[str, set[tuple[str, str]]] = {}

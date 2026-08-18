@@ -1,4 +1,10 @@
-"""MultiHop-RAG loader (complete corpus and complete evidence-backed QA set)."""
+"""MultiHop-RAG loader (complete corpus; complete evidence-backed QA set, or
+a --sample-capped subset of it).
+
+The corpus is every MultiHop-RAG news article regardless of --sample: only
+the question count shrinks, since evidence documents are drawn from a fixed
+article set rather than derived per-question like musique/fanout.
+"""
 
 from __future__ import annotations
 
@@ -14,9 +20,7 @@ NAME = "multihop"
 
 
 def load(args: SimpleNamespace) -> legacy.DatasetBundle:
-    full_args = SimpleNamespace(**vars(args))
-    full_args.sample = None
-    return legacy.load_multihop_dataset(full_args)
+    return legacy.load_multihop_dataset(args)
 
 
 def prepare(datastore: Path, args: SimpleNamespace) -> legacy.DatasetBundle:

@@ -1,4 +1,9 @@
-"""Two-phase benchmark CLI with stable, restartable dataset paths."""
+"""Two-phase benchmark CLI with stable, restartable dataset paths.
+
+Defaults to the whole dataset; pass --sample N to build a separate, smaller
+<dataset>-sampleN datastore capped at N questions and the corpus material
+they reference.
+"""
 
 from __future__ import annotations
 
@@ -30,15 +35,25 @@ DEBUG_QUESTION_SAMPLE = 100
 DEBUG_SAMPLE_SEED = 0
 
 
-def datastore_path(dataset: str) -> Path:
-    return RESULTS_ROOT / "datastores" / dataset
+def datastore_path(dataset: str, *, sample: int | None = None) -> Path:
+    # A --sample run gets its own datastore tree: it ingests a different,
+    # smaller set of documents/questions than the full dataset, so sharing a
+    # directory would either trip the manifest guard or silently shrink the
+    # full corpus underneath already-completed work.
+    name = f"{dataset}-sample{sample}" if sample else dataset
+    return RESULTS_ROOT / "datastores" / name
 
 
-def benchmark_path(dataset: str, *, debug: bool = False) -> Path:
+def benchmark_path(
+    dataset: str, *, debug: bool = False, sample: int | None = None
+) -> Path:
     # A debug run keeps its own results tree: its accuracy is not comparable to
     # a full run, and sharing a directory would either trip the manifest guard
-    # or quietly mix subset predictions into the real ones.
-    name = f"{dataset}-debug" if debug else dataset
+    # or quietly mix subset predictions into the real ones. Same reasoning for
+    # a --sample run, which scores a different question set than the full one.
+    name = f"{dataset}-sample{sample}" if sample else dataset
+    if debug:
+        name = f"{name}-debug"
     return RESULTS_ROOT / "benchmark" / name
 
 
@@ -77,17 +92,22 @@ def build_args(
     *,
     chat_base_url: str | None = None,
     debug: bool = False,
+    sample: int | None = None,
 ) -> SimpleNamespace:
     url = chat_base_url or os.environ.get(
         "BENCH_CHAT_BASE_URL", legacy.DEFAULT_CHAT_BASE_URL
     )
     args = legacy.fixed_args(url, dataset)
-    args.sample = None
+    # Unlike the fixed 100-question presets `fixed_args` computes for the
+    # legacy single-shot CLI, this two-phase pipeline defaults to the whole
+    # dataset. `sample` is only set when the caller opts into a smaller,
+    # permanent datastore via `--sample`.
+    args.sample = sample
     args.resume = True
     args.debug = debug
     args.debug_seed = DEBUG_SAMPLE_SEED
     args.corpus_scope = "combined"
-    args.output = str(benchmark_path(dataset, debug=debug))
+    args.output = str(benchmark_path(dataset, debug=debug, sample=sample))
     args.chat_api_key = os.environ.get("BENCH_CHAT_API_KEY", "local")
     args.embed_api_key = os.environ.get("BENCH_EMBED_API_KEY", "local")
     args.judge_api_key = os.environ.get("BENCH_JUDGE_API_KEY", args.chat_api_key)
@@ -171,7 +191,7 @@ def command_ingest(
     *,
     preflight: bool = True,
 ) -> int:
-    datastore = datastore_path(args.dataset)
+    datastore = datastore_path(args.dataset, sample=getattr(args, "sample", None))
     dataset = get_dataset(args.dataset)
     bundle = dataset.prepare(datastore, args)
     manifest = _manifest(datastore / "manifest.json")
@@ -282,7 +302,7 @@ def command_bench(
     *,
     preflight: bool = True,
 ) -> int:
-    datastore = datastore_path(args.dataset)
+    datastore = datastore_path(args.dataset, sample=getattr(args, "sample", None))
     dataset_manifest = _require_ingestion(datastore, clients)
     bundle = load_canonical(datastore)
     debug = bool(getattr(args, "debug", False))
@@ -450,6 +470,21 @@ def parser() -> argparse.ArgumentParser:
             default=CLIENT_NAMES,
             help="comma-separated subset; defaults to vanilla,llm_wiki,graphrag",
         )
+        command.add_argument(
+            "--sample",
+            type=int,
+            default=None,
+            help=(
+                "cap the dataset at N questions, keeping only the corpus "
+                "material those questions reference, in a separate "
+                "<dataset>-sampleN datastore; omit for the full dataset. "
+                "musique and multihop shrink with N; novel and fanout's "
+                "corpus is mostly fixed size regardless (fanout's evidence "
+                "pages are large full Wikipedia articles either way, and "
+                "novel's 20-novel corpus doesn't depend on question count), "
+                "so N mainly cuts their query cost, not ingest size"
+            ),
+        )
         if phase == "bench":
             command.add_argument(
                 "--debug",
@@ -470,6 +505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.dataset,
             chat_base_url=options.chat_base_url,
             debug=getattr(options, "debug", False),
+            sample=options.sample,
         )
         if options.phase == "ingest":
             return command_ingest(args, options.clients)

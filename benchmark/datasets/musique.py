@@ -1,4 +1,5 @@
-"""MuSiQue loader (all answerable, evidence-backed development questions)."""
+"""MuSiQue loader (all answerable, evidence-backed development questions,
+or a --sample-capped subset of them)."""
 
 from __future__ import annotations
 
@@ -14,9 +15,10 @@ NAME = "musique"
 
 
 def load(args: SimpleNamespace) -> legacy.DatasetBundle:
-    full_args = SimpleNamespace(**vars(args))
-    full_args.sample = None
-    return legacy.load_musique_dataset(full_args)
+    # args.sample is None for the full dataset, or an explicit cap from
+    # --sample; either way load_musique_dataset only materializes the
+    # supporting paragraphs the selected questions actually reference.
+    return legacy.load_musique_dataset(args)
 
 
 def prepare(datastore: Path, args: SimpleNamespace) -> legacy.DatasetBundle:
