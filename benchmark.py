@@ -77,13 +77,13 @@ ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 # Fixed benchmark presets. The only optional public input is the chat server URL.
-DEFAULT_CHAT_BASE_URL = "http://170.64.243.132:26572/v1"
-CHAT_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
+DEFAULT_CHAT_BASE_URL = "http://10.160.144.101:51028/v1"
+CHAT_MODEL = "gemma-4-31B"
 NVIDIA_API_KEY = "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"
-EMBED_BASE_URL = "http://localhost:8000/v1"
+EMBED_BASE_URL = "http://10.160.152.38:10001/v1"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 EMBED_DIM = 1024
-RERANK_BASE_URL = "http://localhost:8001/v1"
+RERANK_BASE_URL = "http://10.160.152.38:10002/v1"
 RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 DATA_DIR = ROOT / "benchmark-data"
 DATASETS = ("novel", "fanout", "multihop", "musique")
@@ -566,30 +566,8 @@ def download_if_missing(
 ) -> None:
     if path.exists():
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    log(f"downloading official benchmark data: {path.name}")
-    try:
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "llm-wiki-benchmark/1.0"},
-        )
-        with (
-            urllib.request.urlopen(request, timeout=120) as response,
-            temporary.open("wb") as target,
-        ):
-            shutil.copyfileobj(response, target, length=1024 * 1024)
-        # Refuse an HTML error page or a suspiciously small partial response.
-        if temporary.stat().st_size < minimum_bytes:
-            raise BenchmarkError(f"downloaded dataset is unexpectedly small: {url}")
-        temporary.replace(path)
-    except Exception as exc:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
-        if isinstance(exc, BenchmarkError):
-            raise
-        raise BenchmarkError(f"could not download {url}: {exc}") from exc
 
+    raise BenchmarkError(f"Download this URL and place it {path} here: {url}")
 
 def ensure_datasets(corpus_path: Path, questions_path: Path) -> None:
     if corpus_path.resolve() == CORPUS_PATH.resolve():
@@ -2270,7 +2248,7 @@ def run_logged(
 
 
 class UsageRecordingProxy:
-    """Local OpenAI-compatible proxy that records provider token usage.
+    """Local OpenAI-compatible proxy that bounds and records provider usage.
 
     GraphRAG hardcodes ``stream=True`` for every search call and reads its
     metrics off the response before the iterator is consumed, so a streamed
@@ -2282,10 +2260,20 @@ class UsageRecordingProxy:
     chunk so the client still sees exactly the stream it expected.
     """
 
-    def __init__(self, upstream: str, record_path: Path, *, timeout: float):
+    def __init__(
+        self,
+        upstream: str,
+        record_path: Path,
+        *,
+        timeout: float,
+        embedding_upstream: str | None = None,
+        request_semaphore: threading.BoundedSemaphore | None = None,
+    ):
         self.upstream = upstream.rstrip("/")
+        self.embedding_upstream = (embedding_upstream or upstream).rstrip("/")
         self.record_path = record_path
         self.timeout = timeout
+        self.request_semaphore = request_semaphore
         self._lock = threading.Lock()
         self._server: Any = None
         self._thread: threading.Thread | None = None
@@ -2340,7 +2328,6 @@ class UsageRecordingProxy:
             with self.record_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row) + "\n")
                 handle.flush()
-                os.fsync(handle.fileno())
 
     def __enter__(self) -> "UsageRecordingProxy":
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2362,7 +2349,14 @@ class UsageRecordingProxy:
             def do_POST(self) -> None:  # noqa: N802 - stdlib naming
                 proxy._enter_request()
                 try:
-                    self._proxy_post()
+                    if proxy.request_semaphore is None:
+                        self._proxy_post()
+                    else:
+                        # Keep the permit until the complete response stream has
+                        # been forwarded: this caps active inference, rather
+                        # than merely the rate at which requests are admitted.
+                        with proxy.request_semaphore:
+                            self._proxy_post()
                 finally:
                     proxy._leave_request()
 
@@ -2377,8 +2371,13 @@ class UsageRecordingProxy:
                     # The provider only reports usage for a stream when asked.
                     payload["stream_options"] = {"include_usage": True}
                     body = json.dumps(payload).encode("utf-8")
+                upstream_base = (
+                    proxy.embedding_upstream
+                    if "embedding" in self.path.casefold()
+                    else proxy.upstream
+                )
                 request = urllib.request.Request(
-                    f"{proxy.upstream}{self.path}",
+                    f"{upstream_base}{self.path}",
                     data=body,
                     headers={
                         key: value
@@ -2422,6 +2421,7 @@ class UsageRecordingProxy:
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Transfer-Encoding", "chunked")
                     self.end_headers()
+                    final_usage: dict[str, Any] | None = None
                     for line in upstream:
                         if line.startswith(b"data: "):
                             chunk = line[6:].strip()
@@ -2430,13 +2430,19 @@ class UsageRecordingProxy:
                                     value = json.loads(chunk)
                                     usage = value.get("usage")
                                     if isinstance(usage, dict):
-                                        proxy._record(usage, True, self.path)
+                                        # Some OpenAI-compatible servers repeat
+                                        # cumulative usage on every token chunk.
+                                        # Retain only the final value so one
+                                        # upstream request becomes one journal row.
+                                        final_usage = usage
                                     # A usage-only trailer has no choices. The
                                     # client never asked for it; do not forward.
                                     if not value.get("choices"):
                                         continue
                         self._write_chunk(line)
                     self._write_chunk(b"")
+                    if final_usage is not None:
+                        proxy._record(final_usage, True, self.path)
 
             def _write_chunk(self, data: bytes) -> None:
                 self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
@@ -2464,8 +2470,8 @@ class UsageRecordingProxy:
     ) -> tuple[dict[str, dict[str, int]], int]:
         """Usage recorded after ``offset`` bytes, by category, and the new offset.
 
-        GraphRAG queries run one at a time, so slicing this journal around a
-        single query attributes every call it made to that question exactly.
+        Each concurrent GraphRAG query receives its own proxy journal, so
+        slicing this journal attributes every call it made to that question.
         """
         with self._lock:
             text = self.record_path.read_text(encoding="utf-8")
@@ -2790,13 +2796,8 @@ def worker_repair_graphrag_embeddings(request_path: Path) -> int:
     return 0
 
 
-def point_graphrag_chat_at(workspace: Path, api_base: str) -> None:
-    """Send only GraphRAG's completion traffic through ``api_base``.
-
-    Embeddings already report usage on every call, so they keep talking to the
-    provider directly and the proxy carries just the traffic whose accounting
-    is broken.
-    """
+def point_graphrag_at(workspace: Path, api_base: str) -> None:
+    """Send all GraphRAG model traffic through a local benchmark gateway."""
 
     import yaml  # type: ignore
 
@@ -2804,13 +2805,22 @@ def point_graphrag_chat_at(workspace: Path, api_base: str) -> None:
     data = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise BenchmarkError(f"invalid GraphRAG settings: {settings_path}")
-    for value in (data.get("completion_models") or {}).values():
+    for section in ("completion_models", "embedding_models"):
+        for value in (data.get(section) or {}).values():
+            if isinstance(value, dict):
+                value["api_base"] = api_base
+    for value in (data.get("models") or {}).values():
         if isinstance(value, dict):
             value["api_base"] = api_base
     settings_path.write_text(
         yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
+
+
+# Kept as a compatibility alias for callers outside the package.
+def point_graphrag_chat_at(workspace: Path, api_base: str) -> None:
+    point_graphrag_at(workspace, api_base)
 
 
 def ensure_graphrag_embedding_layout(

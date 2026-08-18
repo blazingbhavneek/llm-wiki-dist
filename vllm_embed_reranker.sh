@@ -24,13 +24,13 @@ sleep 1
 
 vllm serve "$EMBED_MODEL_PATH" \
   --served-model-name "$EMBED_MODEL_NAME" \
-  --port 8000 \
-  --gpu-memory-utilization 0.5 \
+  --port 10001 --host 0.0.0.0 --enforce-eager\
+  --gpu-memory-utilization 0.4 \
   > /tmp/vllm-embed.log 2>&1 &
 
 vllm serve "$RERANK_MODEL_PATH" \
   --served-model-name "$RERANK_MODEL_NAME" \
-  --port 8001 \
+  --port 10002 --host 0.0.0.0 \
   --gpu-memory-utilization 0.4 \
   > /tmp/vllm-rerank.log 2>&1 &
 

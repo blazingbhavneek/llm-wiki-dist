@@ -26,7 +26,7 @@ RESULTS_ROOT = legacy.ROOT / "benchmark-results"
 # --debug trades statistical power for a turnaround short enough to check that
 # all three clients still answer end to end. The seed is fixed so every client,
 # dataset, and rerun sees the identical subset.
-DEBUG_QUESTION_SAMPLE = 20
+DEBUG_QUESTION_SAMPLE = 100
 DEBUG_SAMPLE_SEED = 0
 
 
@@ -127,9 +127,18 @@ def build_args(
     args.hybrid_candidate_k = int(
         os.environ.get("BENCH_HYBRID_CANDIDATE_K", str(args.top_k * 10))
     )
-    # GraphRAG writes hidden-call metrics to a shared log.  Serial native DRIFT
-    # queries make each question's byte range unambiguous.
-    args.graphrag_query_workers = 1
+    # Each GraphRAG question gets a private query root and accounting proxy;
+    # those proxies share a MAX_CONCURRENT_REQUESTS semaphore. This can safely
+    # keep the GPU busy without exceeding the benchmark-wide request budget.
+    args.graphrag_query_workers = max(
+        1,
+        int(
+            os.environ.get(
+                "BENCH_GRAPHRAG_QUERY_WORKERS",
+                str(legacy.MAX_CONCURRENT_REQUESTS),
+            )
+        ),
+    )
     return args
 
 
@@ -231,6 +240,7 @@ def _benchmark_config(args: SimpleNamespace, clients: Sequence[str]) -> dict[str
         "search_candidate_pool": args.search_candidate_pool,
         "query_token_budget": args.query_token_budget,
         "graphrag_method": args.graphrag_method,
+        "graphrag_query_workers": args.graphrag_query_workers,
         "debug_sample": (
             {"questions": DEBUG_QUESTION_SAMPLE, "seed": DEBUG_SAMPLE_SEED}
             if getattr(args, "debug", False)

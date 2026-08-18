@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
@@ -20,17 +23,6 @@ from .base import (
 
 
 NAME = "graphrag"
-
-
-def _log_offsets(workspace: Path) -> dict[Path, int]:
-    log_dir = workspace / "logs"
-    if not log_dir.exists():
-        return {}
-    return {
-        path: path.stat().st_size
-        for path in log_dir.rglob("*.log")
-        if path.is_file()
-    }
 
 
 def _new_log_text(workspace: Path, offsets: dict[Path, int]) -> str:
@@ -180,78 +172,102 @@ def query(
 ) -> list[dict[str, Any]]:
     legacy.ensure_graphrag_embedding_layout(workspace, args)
     style = legacy.detect_graphrag_query_style(args)
-    results: list[dict[str, Any]] = []
-    # GraphRAG's own metrics miss every streamed call, which is most of them.
-    # Routing its traffic through a recording proxy counts each request from
-    # the provider's own usage payload instead.
-    with legacy.UsageRecordingProxy(
-        args.chat_base_url,
-        workspace / "provider-usage.jsonl",
-        timeout=args.timeout,
-    ) as proxy:
-        env = legacy.subprocess_environment(args)
-        legacy.point_graphrag_chat_at(workspace, proxy.base_url)
-        usage_offset = proxy.usage_since(0)[1]
-        # One CLI process at a time is deliberate: all hidden GraphRAG requests
-        # report into one query.log, and byte-range attribution is exact only
-        # when query lifetimes do not overlap.
-        for index, question in enumerate(questions, start=1):
-            result = question.result_base()
-            started = time.perf_counter()
-            try:
-                offsets = _log_offsets(workspace)
-                completed = legacy.run_logged(
-                    legacy.graphrag_query_command(
-                        args,
-                        workspace,
-                        question.question,
-                        style=style,
-                    ),
-                    cwd=legacy.ROOT,
-                    env=env,
-                    log_path=(
-                        workspace
-                        / "query-logs"
-                        / f"{legacy.safe_name(question.id)}.log"
-                    ),
-                    timeout=legacy.remaining_timeout(args),
+    # Each CLI gets a private root and journal, while every private proxy shares
+    # this one cap. That lets questions run concurrently without either
+    # interleaving their usage attribution or exceeding the provider budget.
+    request_semaphore = threading.BoundedSemaphore(legacy.MAX_CONCURRENT_REQUESTS)
+
+    def answer_one(question: legacy.Question) -> dict[str, Any]:
+        result = question.result_base()
+        started = time.perf_counter()
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=f"graphrag-query-{legacy.safe_name(question.id)}-",
+                dir=workspace,
+            ) as temporary:
+                query_root = Path(temporary)
+                # Query uses the indexed output but requires a root-local
+                # settings file. Isolating both settings and logs lets every
+                # subprocess point at its own accounting proxy safely.
+                (query_root / "output").symlink_to(
+                    workspace / "output", target_is_directory=True
                 )
-                answer = legacy.parse_graphrag_answer(
-                    completed.stdout.strip()
-                    or "\n".join((completed.stdout, completed.stderr))
-                )
-                if not answer:
-                    raise legacy.BenchmarkError(
-                        "could not parse GraphRAG query response"
+                if (workspace / "input").exists():
+                    (query_root / "input").symlink_to(
+                        workspace / "input", target_is_directory=True
                     )
-                # The CLI can exit while its last responses are still draining.
-                proxy.drain()
-                usage, usage_offset = proxy.usage_since(usage_offset)
-                log_text = _new_log_text(workspace, offsets)
-                _measured, attempted = legacy.graphrag_metrics_coverage(
-                    log_text, args
-                )
-                counted = int(usage["retrieval_chat"].get("requests") or 0)
-                result.update(
-                    {
-                        "generated_answer": answer,
-                        "retrieval_method": args.graphrag_method,
-                        "token_usage": usage,
-                        "chat_calls_measured": counted,
-                        "chat_calls_attempted": attempted,
-                        # The proxy sees every request the CLI actually issued,
-                        # so its own count is the authority when GraphRAG's log
-                        # reports fewer.
-                        "token_accounting_complete": counted >= max(attempted, 1),
-                        "error": None,
-                    }
-                )
-            except Exception as exc:
-                result["error"] = f"{type(exc).__name__}: {exc}"
-                usage_offset = proxy.usage_since(usage_offset)[1]
-            result["latency_seconds"] = time.perf_counter() - started
-            results.append(result)
+                if (workspace / "prompts").exists():
+                    (query_root / "prompts").symlink_to(
+                        workspace / "prompts", target_is_directory=True
+                    )
+                shutil.copy2(workspace / "settings.yaml", query_root / "settings.yaml")
+                usage_path = query_root / "provider-usage.jsonl"
+                with legacy.UsageRecordingProxy(
+                    args.chat_base_url,
+                    usage_path,
+                    timeout=args.timeout,
+                    embedding_upstream=args.embed_base_url,
+                    request_semaphore=request_semaphore,
+                ) as proxy:
+                    legacy.point_graphrag_at(query_root, proxy.base_url)
+                    completed = legacy.run_logged(
+                        legacy.graphrag_query_command(
+                            args,
+                            query_root,
+                            question.question,
+                            style=style,
+                        ),
+                        cwd=legacy.ROOT,
+                        env=legacy.subprocess_environment(args),
+                        log_path=(
+                            workspace
+                            / "query-logs"
+                            / f"{legacy.safe_name(question.id)}.log"
+                        ),
+                        timeout=legacy.remaining_timeout(args),
+                    )
+                    answer = legacy.parse_graphrag_answer(
+                        completed.stdout.strip()
+                        or "\n".join((completed.stdout, completed.stderr))
+                    )
+                    if not answer:
+                        raise legacy.BenchmarkError(
+                            "could not parse GraphRAG query response"
+                        )
+                    proxy.drain()
+                    usage, _ = proxy.usage_since(0)
+                    log_text = _new_log_text(query_root, {})
+                    _measured, attempted = legacy.graphrag_metrics_coverage(
+                        log_text, args
+                    )
+            counted = int(usage["retrieval_chat"].get("requests") or 0)
+            result.update(
+                {
+                    "generated_answer": answer,
+                    "retrieval_method": args.graphrag_method,
+                    "token_usage": usage,
+                    "chat_calls_measured": counted,
+                    "chat_calls_attempted": attempted,
+                    "token_accounting_complete": counted >= max(attempted, 1),
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        result["latency_seconds"] = time.perf_counter() - started
+        return result
+
+    results: list[dict[str, Any] | None] = [None] * len(questions)
+    workers = min(args.graphrag_query_workers, len(questions))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {
+            executor.submit(answer_one, question): index
+            for index, question in enumerate(questions)
+        }
+        for completed_count, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            results[futures[future]] = result
             if on_result is not None:
                 on_result(result)
-        legacy.log(f"graphrag answered {index}/{len(questions)}")
-    return results
+            legacy.log(f"graphrag answered {completed_count}/{len(questions)}")
+    return [result for result in results if result is not None]
