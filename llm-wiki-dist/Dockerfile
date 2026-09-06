@@ -33,6 +33,7 @@ ENV PATH="${APP_HOME}/.venv/bin:/usr/local/bin:${PATH}"
 ENV WIKI_DB_DIR=.wiki
 ENV WIKI_DEFAULT_DB=wiki
 ENV WIKI_PREFIX=/llm-wiki
+ENV REALTIME_TEMP=0.1
 
 ENV CHROME_BIN=/usr/local/bin/chrome-headless-shell
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chrome-headless-shell
@@ -481,7 +482,7 @@ echo "SSH:"
 echo "  ssh -p 51027 seigyo@<HOST>"
 echo
 echo "Backend:"
-echo "  http://<HOST>:51028"
+echo "  http://<HOST>:51029"
 echo
 echo "MCP:"
 echo "  http://<HOST>:8001${WIKI_PREFIX-/llm-wiki}/{wiki}/mcp"

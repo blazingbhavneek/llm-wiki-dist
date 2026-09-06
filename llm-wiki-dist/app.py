@@ -93,6 +93,7 @@ class AgentRunRegistry:
 DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki_docker"))
 DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki_moove")
 PREFIX = os.environ.get("WIKI_PREFIX", "/agent/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
+REALTIME_TEMP = float(os.environ.get("REALTIME_TEMP", "0.0"))
 _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
 _RESERVED_DB_NAMES = {"admin", "assets"}
 
@@ -1852,6 +1853,7 @@ async def ask_realtime_stream(payload: RealtimeAskBody) -> StreamingResponse:
                 overrides=payload.overrides,
                 stop_event=stop_event,
                 options=options,
+                realtime_temperature=REALTIME_TEMP,
             )
         except asyncio.CancelledError:
             stop_event.set()
