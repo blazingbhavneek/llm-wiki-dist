@@ -8,3 +8,4 @@ llm-wiki-dist/.wiki_docker/
 .DS_Store
 benchmark-data/
 benchmark-results/
+llm-wiki-dist/usage_log.jsonl

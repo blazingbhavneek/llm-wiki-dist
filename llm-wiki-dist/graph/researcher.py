@@ -2000,6 +2000,7 @@ class Researcher:
         overrides: dict[str, Any] | None = None,
         stop_event: threading.Event | None = None,
         options: dict[str, Any] | None = None,
+        realtime_temperature: float = 0.0,
     ) -> dict[str, Any]:
         """Run the staged realtime RAG pipeline in one worker thread.
 
@@ -2029,6 +2030,7 @@ class Researcher:
             # by contrast, must be realtime-sized.
             base_settings = session.settings.model_copy(
                 update={
+                    "chat_temperature": realtime_temperature,
                     "rerank_top_k": realtime_options.rerank_top_k,
                     "subagent_count": realtime_options.subagent_count,
                     "subagent_concurrency": realtime_options.subagent_concurrency,
@@ -2136,7 +2138,7 @@ class Researcher:
                     model=session.settings.chat_model,
                     base_url=session.settings.chat_base_url,
                     api_key=session.settings.chat_api_key,
-                    temperature=0.0,
+                    temperature=session.settings.chat_temperature,
                     timeout=chat_timeout,
                     retry_attempts=0,
                     retry_delay_seconds=0.0,
