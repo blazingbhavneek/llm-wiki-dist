@@ -53,6 +53,7 @@ from .core import (
     source_hash,
 )
 from .neighborhood import build_payload as build_neighborhood_payload
+from .vectors import SqliteVecIndex
 
 if TYPE_CHECKING:
     from .gateway import ModelGateway
@@ -208,6 +209,7 @@ class Librarian:
     ):
         self.gateway = gateway  # GPU Stuff, LLM/Embed/Reranker
         self.store = store  # DB Connection
+        self.vector_index = SqliteVecIndex(store)
         self._inline_enrichment = (
             not background
         )  # Do inline enrichment when running on background is disabled, and vice versa
@@ -1974,7 +1976,7 @@ class Librarian:
     def _ensure_vec(self) -> None:
         # Make sure vector tables exist and match the current embedder dimension.
         with self._schema_lock:
-            self.store.ensure_vec_tables(self.gateway.embedder.dim)
+            self.vector_index.ensure("body", self.gateway.embedder.dim)
 
     def _store_vectors(
         self, node: Node
@@ -1984,12 +1986,12 @@ class Librarian:
         self._ensure_vec()
 
         body_vec = self.gateway.embedder.embed_document(node.body)
-        self.store.set_vector(node.id, "vec_body", body_vec)
+        self.vector_index.upsert("body", [node.id], [body_vec])
 
         summary_vec = None
         if node.summary.strip():
             summary_vec = self.gateway.embedder.embed_document(node.summary)
-            self.store.set_vector(node.id, "vec_summary", summary_vec)
+            self.vector_index.upsert("summary", [node.id], [summary_vec])
 
         if not node.bridge_probe.strip():
             try:
@@ -2003,7 +2005,7 @@ class Librarian:
         bridge_vec = None
         if node.bridge_probe.strip():
             bridge_vec = self.gateway.embedder.embed_document(node.bridge_probe)
-            self.store.set_vector(node.id, "vec_bridge", bridge_vec)
+            self.vector_index.upsert("bridge", [node.id], [bridge_vec])
 
         # Also rebuild chunk/title/claim search rows for this node.
         self._store_search_items(node)
@@ -2174,20 +2176,20 @@ class Librarian:
         node_id = node.id
         channels: list[list[str]] = []
 
-        def add_vec_channel(table: str, vector: list[float] | None) -> None:
+        def add_vec_channel(channel: str, vector: list[float] | None) -> None:
             if not vector:
                 return
             ids = [
                 cid
-                for cid, _distance in self.store.vector_search(vector, table, k + 1)
+                for cid, _distance in self.vector_index.search(channel, vector, k + 1)
                 if cid != node_id
             ]
             if ids:
                 channels.append(ids)
 
-        add_vec_channel("vec_body", body_vec)
-        add_vec_channel("vec_summary", summary_vec)
-        add_vec_channel("vec_bridge", bridge_vec)
+        add_vec_channel("body", body_vec)
+        add_vec_channel("summary", summary_vec)
+        add_vec_channel("bridge", bridge_vec)
 
         lexical_text = " ".join(filter(None, [node.title, node.body[:1500]]))
         text_channel = self._lexical_candidate_ids(lexical_text, node_id, k + 1)
@@ -2735,7 +2737,7 @@ class Librarian:
         self, node_id: str, body_vec: list[float], allowed: set[str] | None = None
     ) -> str | None:
         # Return the cluster of the nearest active neighbor, optionally restricted.
-        for cid, _dist in self.store.vector_search(body_vec, "vec_body", 50):
+        for cid, _dist in self.vector_index.search("body", body_vec, 50):
             if cid == node_id:
                 continue
 
@@ -2783,10 +2785,8 @@ class Librarian:
         if node.summary.strip():
             # Store summary vector and rebuild search items now that summary exists.
             self._ensure_vec()
-            self.store.set_vector(
-                node.id,
-                "vec_summary",
-                self.gateway.embedder.embed_document(node.summary),
+            self.vector_index.upsert(
+                "summary", [node.id], [self.gateway.embedder.embed_document(node.summary)]
             )
             self._store_search_items(node)
 

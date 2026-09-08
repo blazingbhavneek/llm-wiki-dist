@@ -1487,6 +1487,13 @@ class GraphStore:
         # Commit now unless this is inside a larger transaction().
         self._commit()
 
+    def delete_vector(self, node_id: str, table: str) -> None:
+        """Delete one vector through the same sqlite-vec seam as upsert."""
+        if self.readonly:
+            raise RuntimeError("cannot delete vector on readonly database")
+        self.connection.execute(f"DELETE FROM {table} WHERE node_id=?", (node_id,))
+        self._commit()
+
     def count_vectors(self, table: str = "vec_body") -> int:
         """Number of stored vectors in a table.
 
