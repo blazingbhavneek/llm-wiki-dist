@@ -57,10 +57,20 @@ class GrowiClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([page.page_id for page in pages], ["p1"])
         self.assertEqual(cursor, "next")
 
-    async def test_writes_are_not_enabled_in_read_only_package(self):
-        client = GrowiClient("https://wiki.example", "token")
-        with self.assertRaises(NotImplementedError):
-            await client.create_page("/a", "body")
+    async def test_create_page_uses_v3_write_route(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/_api/v3/page/")
+            return httpx.Response(
+                201,
+                json={"page": {"_id": "p", "path": "/a", "revision": "r"}},
+            )
+
+        client = GrowiClient(
+            "https://wiki.example", "token", transport=httpx.MockTransport(handler)
+        )
+        page = await client.create_page("/a", "body")
+        self.assertEqual(page.page_id, "p")
 
 
 if __name__ == "__main__":

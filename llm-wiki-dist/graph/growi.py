@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin
 
@@ -279,3 +280,95 @@ async def publish_pages(
                 await client.update_page(refreshed.page_id, refreshed.revision_id, retry_body)
             )
     return results
+
+
+async def sync_growi_pages(
+    client: GrowiClient,
+    registry: Any,
+    connection: Any,
+    *,
+    on_page: Any,
+    on_delete: Any,
+    on_rename: Any | None = None,
+) -> dict[str, int | str | None]:
+    """Incrementally sync a GROWI page listing into a local index.
+
+    The sync cursor is recorded only after every page callback succeeds. A
+    crash therefore repeats work safely instead of skipping an unseen page.
+    """
+    remote, next_cursor = await client.list_pages(
+        connection.root_path,
+        updated_after=connection.last_sync_at,
+        cursor=connection.sync_cursor,
+    )
+    local = {item.page_id: item for item in registry.pages(connection.name)}
+    remote_ids = {page.page_id for page in remote}
+    added = changed = renamed = deleted = 0
+
+    for listed in remote:
+        previous = local.get(listed.page_id)
+        if previous and previous.revision_id == listed.revision_id:
+            if previous.path != listed.path:
+                if on_rename is not None:
+                    await _maybe_await(on_rename, previous, listed)
+                registry.upsert_page(
+                    registry_page(
+                        connection.name,
+                        listed,
+                        indexed_at=previous.indexed_at,
+                    )
+                )
+                renamed += 1
+            continue
+
+        full = await client.get_page(page_id=listed.page_id)
+        if full is None:
+            continue
+        await _maybe_await(on_page, full, previous)
+        registry.upsert_page(registry_page(connection.name, full))
+        if previous is None:
+            added += 1
+        else:
+            changed += 1
+
+    for page_id, previous in local.items():
+        if page_id in remote_ids:
+            continue
+        await _maybe_await(on_delete, previous)
+        registry.delete_page(connection.name, page_id)
+        deleted += 1
+
+    # This is intentionally last: callback failures leave the old cursor in
+    # place, so a subsequent run cannot skip the failed page.
+    registry.record_sync(
+        connection.name,
+        cursor=next_cursor,
+        synced_at=datetime.now(timezone.utc).isoformat(),
+        error=None,
+    )
+    return {
+        "added": added,
+        "changed": changed,
+        "renamed": renamed,
+        "deleted": deleted,
+        "cursor": next_cursor,
+    }
+
+
+async def _maybe_await(callback: Any, *args: Any) -> Any:
+    result = callback(*args)
+    if hasattr(result, "__await__"):
+        return await result
+    return result
+
+
+def registry_page(name: str, page: GrowiPage, *, indexed_at: str | None = None) -> Any:
+    from .registry import GrowiPageIndex
+
+    return GrowiPageIndex(
+        name=name,
+        page_id=page.page_id,
+        revision_id=page.revision_id,
+        path=page.path,
+        indexed_at=indexed_at or datetime.now(timezone.utc).isoformat(),
+    )

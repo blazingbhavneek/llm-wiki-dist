@@ -572,6 +572,9 @@ class Librarian:
         if job.type == "publish_to_growi":
             return self.publish_to_growi(job)
 
+        if job.type == "sync_growi":
+            return self.sync_growi(job)
+
         if job.type == "ensure_japanese_clusters":
             mapping = self.ensure_japanese_clusters()
             return {"renamed": mapping}
@@ -1801,6 +1804,79 @@ class Librarian:
             raise
         registry.record_sync(name, error=None)
         return {"name": name, "published": len(results)}
+
+    def sync_growi(self, job: WriteJob) -> dict[str, Any]:
+        """Backfill or incrementally refresh one registered GROWI connection."""
+        import os
+
+        from .growi import sync_growi_pages
+        from .registry import ConnectionRegistry
+
+        name = str(job.payload["name"])
+        registry = ConnectionRegistry(
+            os.environ.get(
+                "WIKI_ENGINE_DB",
+                str(Path(self.settings.database_path).parent / "engine.sqlite"),
+            )
+        )
+        connection = registry.get(name)
+        if connection is None:
+            raise KeyError(f"GROWI connection not found: {name}")
+        from .growi import GrowiClient
+
+        client = GrowiClient(connection.url, connection.api_token)
+        document_name = f"growi:{name}"
+
+        def index_page(page: Any, previous: Any) -> None:
+            if job.stop_event.is_set():
+                raise JobCancelled("GROWI sync cancelled")
+            old_nodes = [
+                node
+                for node in self.store.get_nodes_by_document(document_name, active_only=True)
+                if node.source_path == page.path
+            ]
+            for old in old_nodes:
+                self.store.set_node_status(old.id, NodeStatus.stale)
+            node = Node(
+                id=short_hash(f"{name}|{page.page_id}|{page.revision_id}"),
+                body=page.body,
+                type=NodeType.page,
+                title=page.title or page.path.rstrip("/").split("/")[-1],
+                original_document_name=document_name,
+                source_path=page.path,
+                source_version=page.revision_id,
+                source_material_hash=source_hash(page.body),
+                cluster="GROWI",
+            )
+            self._ingest_one(node)
+
+        def delete_page(indexed: Any) -> None:
+            for node in self.store.get_nodes_by_document(document_name, active_only=True):
+                if node.source_path == indexed.path:
+                    self.store.set_node_status(node.id, NodeStatus.deleted)
+
+        def rename_page(previous: Any, listed: Any) -> None:
+            for node in self.store.get_nodes_by_document(document_name, active_only=True):
+                if node.source_path == previous.path:
+                    node.source_path = listed.path
+                    self.store.upsert_node(node)
+
+        try:
+            result = asyncio.run(
+                sync_growi_pages(
+                    client,
+                    registry,
+                    connection,
+                    on_page=index_page,
+                    on_delete=delete_page,
+                    on_rename=rename_page,
+                )
+            )
+        except Exception as exc:
+            registry.record_sync(name, error=f"{type(exc).__name__}: {exc}")
+            raise
+        job.progress = {"stage": "growi_sync", **result}
+        return {"name": name, **result}
 
     def cascading_update(
         self,
