@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import posixpath
+import re
 from typing import Any
 from urllib.parse import urljoin
 
@@ -24,6 +26,9 @@ class GrowiPage(BaseModel):
     title: str = ""
     body: str = ""
     updated_at: str = ""
+
+
+_CHUNK_MARKER_RE = re.compile(r"^<!-- chunk: (?P<id>[^ ]+).*?-->\s*$", re.MULTILINE)
 
 
 class GrowiClient:
@@ -165,7 +170,112 @@ class GrowiClient:
         return pages, str(next_cursor) if next_cursor else None
 
     async def create_page(self, path: str, body: str) -> GrowiPage:
-        raise NotImplementedError("GROWI writes are enabled in WP-12")
+        response = await self._request(
+            "POST",
+            "/page/",
+            json_body={"path": path, "body": body},
+        )
+        return self._page_from_payload(response.json())
 
     async def update_page(self, page_id: str, revision_id: str, body: str) -> GrowiPage:
-        raise NotImplementedError("GROWI writes are enabled in WP-12")
+        response = await self._request(
+            "PUT",
+            "/page/",
+            json_body={
+                "pageId": page_id,
+                "revisionId": revision_id,
+                "body": body,
+                "origin": "editor",
+            },
+        )
+        return self._page_from_payload(response.json())
+
+
+def assert_publish_path(path: str, *, mode: str, write_path: str, root_path: str = "/") -> None:
+    """Reject writes outside the configured attach/own boundary."""
+    normalized = "/" + posixpath.normpath(path).lstrip("/")
+    boundary = "/" + posixpath.normpath(write_path or "/").lstrip("/")
+    if mode == "attach" and not (
+        normalized == boundary or normalized.startswith(boundary.rstrip("/") + "/")
+    ):
+        raise PermissionError(
+            f"attach-mode GROWI write outside write_path: {normalized} not under {boundary}"
+        )
+    if mode == "own":
+        own_boundary = "/" + posixpath.normpath(root_path or "/").lstrip("/")
+        if not (
+            own_boundary == "/"
+            or normalized == own_boundary
+            or normalized.startswith(own_boundary.rstrip("/") + "/")
+        ):
+            raise PermissionError(
+                f"own-mode GROWI write outside root_path: {normalized} not under {own_boundary}"
+            )
+
+
+def _marked_sections(body: str) -> dict[str, tuple[int, int]]:
+    matches = list(_CHUNK_MARKER_RE.finditer(body))
+    return {
+        match.group("id"): (
+            match.start(),
+            matches[index + 1].start() if index + 1 < len(matches) else len(body),
+        )
+        for index, match in enumerate(matches)
+    }
+
+
+def merge_marked_sections(existing: str, additions: str) -> str:
+    """Replace/append only chunk-marked sections; preserve all other text."""
+    additions_sections = _marked_sections(additions)
+    if not additions_sections:
+        raise ValueError("GROWI publish body contains no chunk markers")
+    result = existing
+    for chunk_id, (start, end) in sorted(
+        additions_sections.items(), key=lambda item: item[1][0], reverse=True
+    ):
+        new_section = additions[start:end]
+        existing_sections = _marked_sections(result)
+        if chunk_id in existing_sections:
+            old_start, old_end = existing_sections[chunk_id]
+            if old_end < len(result) and not new_section.endswith("\n"):
+                new_section += "\n\n"
+            result = result[:old_start] + new_section + result[old_end:]
+        else:
+            separator = "" if not result or result.endswith("\n") else "\n"
+            result = result + separator + "\n" + new_section
+    return result
+
+
+async def publish_pages(
+    client: GrowiClient,
+    pages: list[dict[str, str]],
+    *,
+    mode: str,
+    write_path: str,
+    root_path: str = "/",
+) -> list[GrowiPage]:
+    """Publish each page once, retrying one stale-revision conflict."""
+    results: list[GrowiPage] = []
+    for item in pages:
+        path = item["path"]
+        body = item["body"]
+        assert_publish_path(path, mode=mode, write_path=write_path, root_path=root_path)
+        existing = await client.get_page(path=path)
+        if existing is None:
+            results.append(await client.create_page(path, body))
+            continue
+        merged = merge_marked_sections(existing.body, body)
+        try:
+            results.append(await client.update_page(existing.page_id, existing.revision_id, merged))
+        except GrowiAPIError as exc:
+            if exc.status_code != 409:
+                raise
+            refreshed = await client.get_page(path=path)
+            if refreshed is None:
+                results.append(await client.create_page(path, body))
+                continue
+            retry_body = merge_marked_sections(refreshed.body, body)
+            results.append(
+                await client.update_page(refreshed.page_id, refreshed.revision_id, retry_body)
+            )
+    return results
