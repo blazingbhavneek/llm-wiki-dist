@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -87,6 +87,23 @@ class Settings(BaseModel):
     search_candidate_pool: int = 50
     rerank_top_k: int = 20
     entity_dedup: bool = True
+
+    # --- page assembly -----------------------------------------------------
+    # Both ingest modes remain available; chunks is the historical default.
+    ingest_mode: Literal["chunks", "pages"] = "chunks"
+    page_min_chunks: int = 3
+    page_max_chunks: int = 8
+    page_min_lines: int = 150
+    page_max_lines: int = 900
+    page_route_candidates: int = 5
+    page_route_min_score: float = 0.25
+    page_route_concurrency: int = 8
+    page_stitch: bool = False
+    page_stitch_concurrency: int = 4
+
+    # --- vector storage ----------------------------------------------------
+    vector_backend: Literal["sqlite", "qdrant"] = "sqlite"
+    qdrant_url: str = ""
 
     # bounded parallelism for the additive benchmark ingest path
     ingest_concurrency: int = 4
@@ -188,6 +205,11 @@ class Settings(BaseModel):
             search_rrf_k=int(env("WIKI_SEARCH_RRF_K", cls.search_rrf_k)),
             entity_dedup=env("WIKI_ENTITY_DEDUP", "1" if cls.entity_dedup else "0")
             not in {"0", "false", "False", ""},
+            ingest_mode=env("WIKI_INGEST_MODE", cls.ingest_mode),
+            page_stitch=env("WIKI_PAGE_STITCH", "1" if cls.page_stitch else "0")
+            not in {"0", "false", "False", ""},
+            vector_backend=env("WIKI_VECTOR_BACKEND", cls.vector_backend),
+            qdrant_url=env("QDRANT_URL", cls.qdrant_url),
             ingest_concurrency=max(
                 1, int(env("WIKI_INGEST_CONCURRENCY", cls.ingest_concurrency))
             ),
