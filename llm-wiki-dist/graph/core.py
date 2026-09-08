@@ -104,6 +104,8 @@ class Settings(BaseModel):
     # --- vector storage ----------------------------------------------------
     vector_backend: Literal["sqlite", "qdrant"] = "sqlite"
     qdrant_url: str = ""
+    qdrant_collection: str = "wiki_vectors"
+    qdrant_growi_id: str = ""
 
     # bounded parallelism for the additive benchmark ingest path
     ingest_concurrency: int = 4
@@ -210,6 +212,8 @@ class Settings(BaseModel):
             not in {"0", "false", "False", ""},
             vector_backend=env("WIKI_VECTOR_BACKEND", cls.vector_backend),
             qdrant_url=env("QDRANT_URL", cls.qdrant_url),
+            qdrant_collection=env("WIKI_QDRANT_COLLECTION", cls.qdrant_collection),
+            qdrant_growi_id=env("WIKI_QDRANT_GROWI_ID", cls.qdrant_growi_id),
             ingest_concurrency=max(
                 1, int(env("WIKI_INGEST_CONCURRENCY", cls.ingest_concurrency))
             ),

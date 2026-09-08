@@ -53,7 +53,7 @@ from .core import (
     source_hash,
 )
 from .neighborhood import build_payload as build_neighborhood_payload
-from .vectors import SqliteVecIndex
+from .vectors import QdrantIndex, SqliteVecIndex
 
 if TYPE_CHECKING:
     from .gateway import ModelGateway
@@ -209,7 +209,17 @@ class Librarian:
     ):
         self.gateway = gateway  # GPU Stuff, LLM/Embed/Reranker
         self.store = store  # DB Connection
-        self.vector_index = SqliteVecIndex(store)
+        settings = gateway.settings
+        if getattr(settings, "vector_backend", "sqlite") == "qdrant":
+            database_name = Path(settings.database_path).stem
+            growi_id = getattr(settings, "qdrant_growi_id", "") or database_name
+            self.vector_index = QdrantIndex(
+                getattr(settings, "qdrant_url", ""),
+                collection=getattr(settings, "qdrant_collection", "wiki_vectors"),
+                growi_id=growi_id,
+            )
+        else:
+            self.vector_index = SqliteVecIndex(store)
         self._inline_enrichment = (
             not background
         )  # Do inline enrichment when running on background is disabled, and vice versa
@@ -925,6 +935,9 @@ class Librarian:
         model/dim changed or coverage is incomplete. Returns (active_nodes, reembedded).
         """
 
+        if isinstance(self.vector_index, QdrantIndex):
+            return self._bootstrap_qdrant_vectors()
+
         # Ensure vector tables exist with the current embedding dimension.
         self.store.ensure_vec_tables(self.gateway.embedder.dim)
 
@@ -1017,6 +1030,45 @@ class Librarian:
 
         log.info("bootstrap.reembedding_done")
         return active_nodes, reembedded
+
+    def _bootstrap_qdrant_vectors(self) -> tuple[list[Node], bool]:
+        """Bootstrap the shared Qdrant collection without touching sqlite-vec."""
+        current_model = self.gateway.embedder.model_name
+        current_dim = self.gateway.embedder.dim
+        active_nodes = [
+            n for n in self.store.get_all_nodes() if n.status == NodeStatus.active
+        ]
+
+        self.vector_index.ensure("body", current_dim)
+        stored_model = self.store.get_meta("embed_model")
+        stored_dim_raw = self.store.get_meta("embed_dim")
+        stored_dim = int(stored_dim_raw) if stored_dim_raw else None
+        dim_changed = stored_dim is not None and stored_dim != current_dim
+        model_changed = stored_model is not None and stored_model != current_model
+        coverage_incomplete = self.vector_index.count("body") < len(active_nodes)
+        reembedded = dim_changed or model_changed or coverage_incomplete
+
+        if not reembedded:
+            log.info("bootstrap.qdrant_vectors_up_to_date")
+            return active_nodes, False
+
+        self.vector_index.reset()
+        for node in tqdm(active_nodes, desc="bootstrap: qdrant vectors", unit="node"):
+            try:
+                body_vec = self.gateway.embedder.embed_document(node.body)
+                self.vector_index.upsert("body", [node.id], [body_vec])
+                if node.summary.strip():
+                    summary_vec = self.gateway.embedder.embed_document(node.summary)
+                    self.vector_index.upsert("summary", [node.id], [summary_vec])
+                if node.bridge_probe.strip():
+                    bridge_vec = self.gateway.embedder.embed_document(node.bridge_probe)
+                    self.vector_index.upsert("bridge", [node.id], [bridge_vec])
+            except Exception as exc:
+                log.warning("qdrant reembed node %s failed: %s", node.id, exc)
+
+        self.store.set_meta("embed_model", current_model)
+        self.store.set_meta("embed_dim", str(current_dim))
+        return active_nodes, True
 
     def _bootstrap_search_items(
         self, active_nodes: list[Node], reembedded: bool
@@ -2095,6 +2147,17 @@ class Librarian:
         with self._schema_lock:
             self.vector_index.ensure("body", self.gateway.embedder.dim)
 
+    def _get_vector(self, node_id: str, channel: str) -> list[float] | None:
+        fetch = getattr(self.vector_index, "get", None)
+        if fetch is not None:
+            return fetch(channel, node_id)
+        table = {
+            "body": "vec_body",
+            "summary": "vec_summary",
+            "bridge": "vec_bridge",
+        }[channel]
+        return self.store.get_vector(node_id, table)
+
     def _store_vectors(
         self, node: Node
     ) -> tuple[list[float], list[float] | None, list[float] | None]:
@@ -2261,7 +2324,20 @@ class Librarian:
                     continue
 
                 try:
-                    self.store.set_search_item_vector(item["id"], vector)
+                    self.vector_index.upsert(
+                        "search_item",
+                        [item["id"]],
+                        [vector],
+                        payload={
+                            "node_id": item["node_id"],
+                            "field": item["field"],
+                        },
+                    )
+                    # Researcher remains deliberately SQLite-backed, so keep
+                    # this compatibility mirror while Qdrant is opt-in.
+                    if isinstance(self.vector_index, QdrantIndex):
+                        self.store.ensure_vec_tables(self.gateway.embedder.dim)
+                        self.store.set_search_item_vector(item["id"], vector)
                 except Exception as exc:
                     log.info("set item vector failed %s: %s", item["id"], exc)
 
@@ -2913,12 +2989,12 @@ class Librarian:
         if not node or node.status != NodeStatus.active:
             return
 
-        body_vec = self.store.get_vector(node.id, "vec_body")
+        body_vec = self._get_vector(node.id, "body")
         if body_vec is None:
             body_vec = self.gateway.embedder.embed_document(node.body)
 
-        summary_vec = self.store.get_vector(node.id, "vec_summary")
-        bridge_vec = self.store.get_vector(node.id, "vec_bridge")
+        summary_vec = self._get_vector(node.id, "summary")
+        bridge_vec = self._get_vector(node.id, "bridge")
 
         candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
         self._link_entity_duplicates(node, candidates)
