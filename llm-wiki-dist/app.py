@@ -184,7 +184,22 @@ async def _bootstrap_db(db: str) -> None:
     errors[db] = None
     stages[db] = "starting"
     try:
-        stack = await asyncio.to_thread(_build_stack, str(DB_DIR / f"{db}.sqlite"))
+        growi_connection = _registered_growi(db)
+        if growi_connection is not None:
+            from graph.growi import GrowiClient
+
+            stages[db] = "checking_growi"
+            client = GrowiClient(
+                growi_connection.url,
+                growi_connection.api_token,
+            )
+            if not await client.health():
+                raise RuntimeError("GROWI healthcheck failed")
+            cache_path = _growi_cache_path(db)
+            stack = await asyncio.to_thread(_build_stack, str(cache_path))
+            stack["growi_connection"] = growi_connection
+        else:
+            stack = await asyncio.to_thread(_build_stack, str(DB_DIR / f"{db}.sqlite"))
         await stack["librarian"].start()
         STACKS[db] = stack
         stages[db] = "ready"
@@ -256,7 +271,7 @@ async def lifespan(_: FastAPI):
 
     require_all_dbs_ready = os.environ.get(
         "WIKI_STARTUP_REQUIRE_ALL_DBS",
-        "true",
+        "false",
     ).lower() in {"1", "true", "yes", "on"}
 
     try:
@@ -278,6 +293,16 @@ async def lifespan(_: FastAPI):
                 continue
 
             existing_dbs.append(db)
+
+        if GROWI_ENABLED:
+            try:
+                existing_dbs.extend(
+                    connection.name
+                    for connection in _growi_registry().list()
+                    if connection.name not in existing_dbs
+                )
+            except Exception as exc:
+                log.warning("startup: unable to enumerate GROWI connections: %s", exc)
 
         if existing_dbs:
             log.info(
@@ -493,6 +518,20 @@ def _growi_registry():
 
         _GROWI_REGISTRY = ConnectionRegistry(GROWI_ENGINE_DB)
     return _GROWI_REGISTRY
+
+
+def _registered_growi(name: str):
+    if not GROWI_ENABLED:
+        return None
+    try:
+        return _growi_registry().get(name)
+    except Exception as exc:
+        log.warning("GROWI registry lookup failed for %s: %s", name, exc)
+        return None
+
+
+def _growi_cache_path(name: str) -> Path:
+    return GROWI_ENGINE_DB.parent / "growi-cache" / f"{name}.sqlite"
 
 
 def _db_path(db: str) -> Path:
@@ -927,7 +966,8 @@ async def db_routing(request: Request, call_next):
 
     # Important: normal wiki traffic must never create a new empty DB because
     # of a typo in the URL. Only admin create/upload may create DB files.
-    if not _db_path(seg).exists():
+    is_growi = _registered_growi(seg) is not None
+    if not is_growi and not _db_path(seg).exists():
         return PlainTextResponse("unknown wiki", status_code=404)
 
     if tail == "" and not path.endswith("/"):
