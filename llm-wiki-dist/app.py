@@ -102,6 +102,16 @@ MAX_SQLITE_UPLOAD_BYTES = int(
     os.environ.get("WIKI_MAX_SQLITE_UPLOAD_BYTES", str(512 * 1024 * 1024))
 )
 ADMIN_DB_LOCK = asyncio.Lock()
+GROWI_ENABLED = os.environ.get("WIKI_GROWI_ENABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+GROWI_ENGINE_DB = Path(
+    os.environ.get("WIKI_ENGINE_DB", str(DB_DIR / "engine.sqlite"))
+)
+_GROWI_REGISTRY: Any = None
 
 # The db for the current request; set by the db_routing middleware from the URL.
 current_db: ContextVar[str] = ContextVar("current_db", default=DEFAULT_DB)
@@ -451,13 +461,38 @@ def _path_within_ingest_root(value: str) -> str:
     return str(path)
 
 
-def _validate_db_name(db: str) -> str:
+def _validate_name(db: str) -> str:
     if not _DB_RE.fullmatch(db) or db in _RESERVED_DB_NAMES:
         raise HTTPException(
             status_code=400,
             detail=api_error("invalid db name", False, "bad_db_name"),
         )
     return db
+
+
+# Keep the old helper name for existing database endpoints.
+_validate_db_name = _validate_name
+
+
+def _require_growi_enabled() -> None:
+    if not GROWI_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail=api_error(
+                "GROWI integration is disabled; set WIKI_GROWI_ENABLED=true",
+                False,
+                "growi_disabled",
+            ),
+        )
+
+
+def _growi_registry():
+    global _GROWI_REGISTRY
+    if _GROWI_REGISTRY is None:
+        from graph.registry import ConnectionRegistry
+
+        _GROWI_REGISTRY = ConnectionRegistry(GROWI_ENGINE_DB)
+    return _GROWI_REGISTRY
 
 
 def _db_path(db: str) -> Path:
@@ -960,6 +995,143 @@ async def restart_bootstrap() -> dict[str, Any]:
 # ============================================================================
 # prefix-level ADMIN DB MANAGEMENT
 # ============================================================================
+
+
+class GrowiConnectionBody(BaseModel):
+    url: str
+    api_token: str
+    mongo_uri: str | None = None
+    mode: str = "attach"
+    root_path: str = "/"
+    write_path: str = "/inbox"
+
+
+class GrowiConnectionPatch(BaseModel):
+    url: str | None = None
+    api_token: str | None = None
+    mongo_uri: str | None = None
+    mode: str | None = None
+    root_path: str | None = None
+    write_path: str | None = None
+
+
+def _growi_public_summary(connection: Any) -> dict[str, Any]:
+    data = _growi_registry().public(connection)
+    data.update(
+        {
+            "stage": stages.get(connection.name, "not_started"),
+            "error": errors.get(connection.name),
+            "page_count": _growi_registry().page_count(connection.name),
+        }
+    )
+    return _redact(data)
+
+
+@app.get("/admin/api/connections")
+async def admin_list_connections(
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    _require_growi_enabled()
+    return {"connections": [_growi_public_summary(item) for item in _growi_registry().list()]}
+
+
+@app.post("/admin/api/connections/{name}")
+async def admin_register_connection(
+    name: str,
+    payload: GrowiConnectionBody,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    _require_growi_enabled()
+    name = _validate_name(name)
+    try:
+        connection = _growi_registry().register(name=name, **payload.model_dump())
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error(str(exc), False, "invalid_connection"),
+        ) from exc
+    return _growi_public_summary(connection)
+
+
+@app.patch("/admin/api/connections/{name}")
+async def admin_patch_connection(
+    name: str,
+    payload: GrowiConnectionPatch,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    _require_growi_enabled()
+    name = _validate_name(name)
+    fields = {key: value for key, value in payload.model_dump().items() if value is not None}
+    try:
+        connection = _growi_registry().update(name, **fields)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=api_error("connection not found", False, "not_found"),
+        ) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error(str(exc), False, "invalid_connection"),
+        ) from exc
+    return _growi_public_summary(connection)
+
+
+@app.post("/admin/api/connections/{name}/test")
+async def admin_test_connection(
+    name: str,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    _require_growi_enabled()
+    name = _validate_name(name)
+    connection = _growi_registry().get(name)
+    if connection is None:
+        raise HTTPException(status_code=404, detail=api_error("connection not found", False, "not_found"))
+    from graph.growi import GrowiClient
+
+    client = GrowiClient(connection.url, connection.api_token)
+    reachable = await client.health()
+    pages: list[Any] = []
+    if reachable:
+        pages, _cursor = await client.list_pages(connection.root_path)
+    return {
+        "name": name,
+        "reachable": reachable,
+        "version": None,
+        "page_count": len(pages),
+    }
+
+
+@app.post("/admin/api/connections/{name}/resync")
+async def admin_resync_connection(
+    name: str,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    _require_admin(_)
+    _require_growi_enabled()
+    name = _validate_name(name)
+    if _growi_registry().get(name) is None:
+        raise HTTPException(status_code=404, detail=api_error("connection not found", False, "not_found"))
+    return await _enqueue("sync_growi", {"name": name})
+
+
+@app.delete("/admin/api/connections/{name}")
+async def admin_delete_connection(
+    name: str,
+    _: str | None = Header(default=None, alias="X-Admin-Password"),
+):
+    """Detach a GROWI connection; delete only our local index rows."""
+    _require_admin(_)
+    _require_growi_enabled()
+    name = _validate_name(name)
+    deleted = _growi_registry().delete(name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=api_error("connection not found", False, "not_found"))
+    return {"name": name, "deleted": True, "growi_untouched": True}
 
 
 @app.get("/admin/api/dbs")
@@ -1537,7 +1709,13 @@ class IngestBody(BaseModel):
 
 # Secret fields are server-only (compile-time config). Redact before sending
 # to any client so our API keys never reach the browser.
-_SECRET_KEYS = {"chat_api_key", "embed_api_key", "rerank_api_key"}
+_SECRET_KEYS = {
+    "chat_api_key",
+    "embed_api_key",
+    "rerank_api_key",
+    "api_token",
+    "mongo_uri",
+}
 
 
 def _redact(data: dict) -> dict:
