@@ -161,7 +161,12 @@ class GrowiClient:
         payload = response.json()
         if not isinstance(payload, dict):
             return [], None
-        raw_pages = payload.get("pages") or payload.get("docs") or payload.get("paginateResult", {}).get("docs", [])
+        paginate = payload.get("paginateResult") or {}
+        raw_pages = (
+            payload.get("pages")
+            or payload.get("docs")
+            or paginate.get("docs", [])
+        )
         pages = [self._page_from_payload(item) for item in raw_pages if isinstance(item, dict)]
         next_cursor = payload.get("nextCursor") or payload.get("next_cursor")
         if next_cursor is None:
@@ -296,11 +301,25 @@ async def sync_growi_pages(
     The sync cursor is recorded only after every page callback succeeds. A
     crash therefore repeats work safely instead of skipping an unseen page.
     """
-    remote, next_cursor = await client.list_pages(
-        connection.root_path,
-        updated_after=connection.last_sync_at,
-        cursor=connection.sync_cursor,
-    )
+    # A changed-only listing cannot prove that an absent page was deleted.
+    # Enumerate the root on each poll, then fetch bodies only for new/revised
+    # pages.  The cursor is still honored for pagination within this crawl.
+    remote_by_id: dict[str, GrowiPage] = {}
+    cursor: str | None = None
+    next_cursor: str | None = None
+    while True:
+        batch, batch_cursor = await client.list_pages(
+            connection.root_path,
+            updated_after=None,
+            cursor=cursor,
+        )
+        for page in batch:
+            remote_by_id[page.page_id] = page
+        next_cursor = batch_cursor
+        if not batch_cursor or batch_cursor == cursor:
+            break
+        cursor = batch_cursor
+    remote = list(remote_by_id.values())
     local = {item.page_id: item for item in registry.pages(connection.name)}
     remote_ids = {page.page_id for page in remote}
     added = changed = renamed = deleted = 0
