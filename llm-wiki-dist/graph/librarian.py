@@ -569,6 +569,9 @@ class Librarian:
         if job.type == "chunk_and_ingest":
             return self.chunk_and_ingest(job)
 
+        if job.type == "publish_to_growi":
+            return self.publish_to_growi(job)
+
         if job.type == "ensure_japanese_clusters":
             mapping = self.ensure_japanese_clusters()
             return {"renamed": mapping}
@@ -1760,6 +1763,44 @@ class Librarian:
         finally:
             if result.out_dir.exists():
                 shutil.rmtree(result.out_dir)
+
+    def publish_to_growi(self, job: WriteJob) -> dict[str, Any]:
+        """Publish marked page bodies through the registry-backed GROWI client."""
+        import os
+
+        from .growi import publish_pages
+        from .registry import ConnectionRegistry
+
+        name = str(job.payload["name"])
+        registry_path = Path(
+            os.environ.get(
+                "WIKI_ENGINE_DB",
+                str(Path(self.settings.database_path).parent / "engine.sqlite"),
+            )
+        )
+        registry = ConnectionRegistry(registry_path)
+        connection = registry.get(name)
+        if connection is None:
+            raise KeyError(f"GROWI connection not found: {name}")
+
+        from .growi import GrowiClient
+
+        client = GrowiClient(connection.url, connection.api_token)
+        try:
+            results = asyncio.run(
+                publish_pages(
+                    client,
+                    list(job.payload.get("pages") or []),
+                    mode=connection.mode,
+                    write_path=connection.write_path,
+                    root_path=connection.root_path,
+                )
+            )
+        except Exception as exc:
+            registry.record_sync(name, error=f"{type(exc).__name__}: {exc}")
+            raise
+        registry.record_sync(name, error=None)
+        return {"name": name, "published": len(results)}
 
     def cascading_update(
         self,
