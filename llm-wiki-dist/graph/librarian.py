@@ -15,7 +15,8 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Sequence
 
 from tqdm import tqdm
 
@@ -87,7 +88,7 @@ _MAX_FUSED_CANDIDATES = 16
 # all at once: a small local model handling 15+ mixed-relevance candidates in
 # one call tends to miss or misjudge; a handful of top-ranked peers at a time
 # is more reliable and still bounded in call count.
-_EDGE_GROUP_SIZE = 4
+_EDGE_GROUP_SIZE = 8
 
 # How many lines of the original source file to pull before/after a chunk's
 # own range when generating its bridge-probe text, so a small/thin chunk
@@ -116,6 +117,19 @@ class JobCancelled(RuntimeError):
 
 def _is_job_cancelled(exc: BaseException) -> bool:
     return isinstance(exc, JobCancelled) or type(exc).__name__ == "JobCancelled"
+
+
+@dataclass
+class _DocumentIngest:
+    """Working state carried through a document's prepare/revise/link phases."""
+
+    doc_name: str
+    version: str
+    node: Node
+    active_old: list[Node]
+    reused: Node | None = None
+    vectors: tuple[list[float], list[float] | None, list[float] | None] | None = None
+    best: tuple[Node, float] | None = None
 
 
 @dataclass
@@ -205,6 +219,11 @@ class Librarian:
         # so DB writes cannot overlap and corrupt/conflict with each other.
         self._write_lock = threading.Lock()
 
+        # Per-node preparation/linking uses independent GraphStore connections,
+        # but schema creation and cluster refresh are shared operations.
+        self._schema_lock = threading.Lock()
+        self._cluster_lock = threading.RLock()
+
         # This is a check for "if a backup file exists, it means the server closed in between an ingest job"
         # At the start on an ingest job, a backup file will be created, and that backup file will be deleted when the ingest job is complete fully
         # if not, and the server restarts, it will restore back to the state where the graph was before the half ingest job
@@ -239,6 +258,13 @@ class Librarian:
         # from the main async server/event loop.
         self._enrich_thread: threading.Thread | None = None
 
+        self._recluster_every = max(
+            0, int(getattr(self.settings, "recluster_every", 10))
+        )
+        self._ingest_concurrency = max(
+            1, int(getattr(self.settings, "ingest_concurrency", 4))
+        )
+
         if background:
             s = self.settings
 
@@ -246,11 +272,6 @@ class Librarian:
             # getattr(..., 3.0) means default to 3.0 if setting is missing.
             # max(0.0, ...) prevents negative sleep times.
             self._drip_seconds = max(0.0, float(getattr(s, "enrich_drip_seconds", 3.0)))
-
-            # How often to refresh/recompute clusters during enrichment.
-            # getattr(..., 10) means default to every 10 enrichment cycles.
-            # max(1, ...) prevents invalid values like 0 or negative numbers.
-            self._recluster_every = max(1, int(getattr(s, "recluster_every", 10)))
 
             # Create the enrichment background thread.
             # target=self._enrich_run means this thread will execute self._enrich_run().
@@ -736,6 +757,15 @@ class Librarian:
 
     def _maybe_recluster(self) -> None:
         # Read the persisted recluster counter from metadata.
+        if self._recluster_every <= 0:
+            return
+
+        with self._cluster_lock:
+            self._maybe_recluster_locked()
+
+    def _maybe_recluster_locked(self) -> None:
+        # Read the persisted recluster counter from metadata. The caller holds
+        # _cluster_lock; keeping this split makes the batch path explicit.
         raw = self.get_meta(RECLUSTER_COUNTER_KEY)
 
         # Increment the counter, or start at 1 if missing/invalid.
@@ -1312,43 +1342,124 @@ class Librarian:
         source_path: str | None = None,
         source_ranges: list[tuple[int, int]] | None = None,
     ) -> Node:
-        # Empty documents are invalid.
-        body = body.strip()
+        """Ingest one document through the deterministic batch implementation."""
+        return self.create_document_nodes(
+            [
+                {
+                    "body": body,
+                    "title": title,
+                    "document_name": document_name,
+                    "source_path": source_path,
+                    "source_ranges": source_ranges,
+                }
+            ]
+        )[0]
+
+    def create_document_nodes(
+        self,
+        documents: Sequence[dict[str, Any]],
+        *,
+        concurrency: int | None = None,
+    ) -> list[Node]:
+        """Prepare, revise, then link a group of documents with a barrier."""
+        if not documents:
+            return []
+
+        names = [str(entry.get("document_name") or "") for entry in documents]
+        duplicates = sorted({name for name in names if name and names.count(name) > 1})
+        if duplicates:
+            raise ValueError(
+                "create_document_nodes needs distinct document_name values; "
+                f"repeated: {duplicates[:5]}"
+            )
+
+        states: list[_DocumentIngest] = self._run_ingest_phase(
+            self._prepare_document, documents, concurrency=concurrency
+        )
+
+        replacements: dict[str, str] = {}
+        stale_sources: set[str] = set()
+        actions: list[str] = []
+        for state in states:
+            if state.reused is None:
+                self._revise_document_node(
+                    state, replacements, stale_sources, actions
+                )
+
+        pending = [state for state in states if state.reused is None]
+        self._run_ingest_phase(self._link_document, pending, concurrency=concurrency)
+
+        if not self._inline_enrichment:
+            self.enqueue_cascade(replacements, list(stale_sources))
+            for state in pending:
+                self.enqueue_entity_dedup(state.node.id)
+                self.note_endogenous_added()
+        else:
+            self._cascade_dependents(replacements, stale_sources, actions)
+            for _ in pending:
+                self._maybe_recluster()
+
+        return [state.reused if state.reused is not None else state.node for state in states]
+
+    def _run_ingest_phase(
+        self,
+        work: Callable[[Any], Any],
+        items: Sequence[Any],
+        *,
+        concurrency: int | None = None,
+    ) -> list[Any]:
+        """Run independent phase work with a bounded, order-preserving pool."""
+        if not items:
+            return []
+        requested = (
+            getattr(self.settings, "ingest_concurrency", self._ingest_concurrency)
+            if concurrency is None
+            else concurrency
+        )
+        workers = max(1, min(int(requested), len(items)))
+        if workers == 1:
+            return [work(item) for item in items]
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(work, items))
+
+    def _prepare_document(self, entry: dict[str, Any]) -> _DocumentIngest:
+        body = str(entry.get("body") or "").strip()
         if not body:
             raise ValueError("document body is empty")
 
-        # Infer document metadata when caller does not provide it.
+        title = entry.get("title")
         inferred_title = title or self._title_from_markdown(body)
         doc_name = self._document_name(
-            document_name or inferred_title or f"uploaded-{short_hash(body)}.md"
+            entry.get("document_name")
+            or inferred_title
+            or f"uploaded-{short_hash(body)}.md"
         )
-
         line_count = max(1, len(body.splitlines()))
-        ranges = source_ranges if source_ranges is not None else [(1, line_count)]
+        ranges = entry.get("source_ranges")
+        if ranges is None:
+            ranges = [(1, line_count)]
         version = source_hash(body)
-
-        # Build the new endogenous/document node.
         node = Node(
             id=make_node_id(body, doc_name),
             body=body,
             type=NodeType.endogenous,
             title=inferred_title or doc_name,
             original_document_name=doc_name,
-            source_path=source_path,
+            source_path=entry.get("source_path"),
             source_ranges=ranges,
             source_version=version,
             source_material_hash=source_hash(body),
             cluster="Uploaded Documents",
         )
-
-        # Find active existing nodes from the same document.
         active_old = [
             n
             for n in self.store.get_nodes_by_document(doc_name, active_only=True)
             if n.type == NodeType.endogenous
         ]
+        state = _DocumentIngest(
+            doc_name=doc_name, version=version, node=node, active_old=active_old
+        )
 
-        # If exact same source content already exists, reuse/update it.
         for old in active_old:
             old_hash = old.source_material_hash or source_hash(old.body)
             if old_hash == node.source_material_hash:
@@ -1357,62 +1468,95 @@ class Librarian:
                 self.store.upsert_node(old)
                 self._ingest_one(old)
                 self.store.record_source(doc_name, version)
-                return old
+                state.reused = old
+                return state
 
-        # Prepare derived fields and revision/cascade tracking.
-        self._fill_cheap_fields(node)
-        replacements: dict[str, str] = {}
-        stale_sources: set[str] = set()
-        actions: list[str] = []
-
-        # Backfill older metadata before trying to match old node to new node.
         backfilled_old = [self._backfill_revision_metadata(n) for n in active_old]
-        best = max(
+        state.best = max(
             ((old, match_score(old, node)) for old in backfilled_old),
             key=lambda item: item[1],
             default=None,
         )
+        state.vectors = self._prepare_node(node, cheap=not self._inline_enrichment)
+        return state
 
-        # Persist new node cheaply first; expensive enrichment can happen later.
-        self._persist_node(node, cheap=True)
-
+    def _revise_document_node(
+        self,
+        state: _DocumentIngest,
+        replacements: dict[str, str],
+        stale_sources: set[str],
+        actions: list[str],
+    ) -> None:
+        node, best = state.node, state.best
         matched_old_id: str | None = None
         if best is not None and best[1] >= _CASCADE_MATCH_THRESHOLD:
-            # If a strong old match exists, supersede it with this new node.
             matched_old_id = best[0].id
             self._supersede(best[0], node)
             replacements[best[0].id] = node.id
             actions.append(f"superseded:{best[0].id}->{node.id}")
 
-        # Any old active nodes not matched are now stale.
-        for old in active_old:
+        for old in state.active_old:
             if old.id == matched_old_id:
                 continue
             self.store.set_node_status(old.id, NodeStatus.stale)
             stale_sources.add(old.id)
             actions.append(f"stale:{old.id}")
 
-        # Update document-level structural/source metadata.
-        self._replace_structural_edges(doc_name, [])
-        self.store.record_source(doc_name, version)
+        self._replace_structural_edges(state.doc_name, [])
+        self.store.record_source(state.doc_name, state.version)
 
-        # Defer the expensive graph-wide bookkeeping so the UI add returns fast.
-        # The node + its semantic edges are already committed and searchable;
-        # duplicate-merge, cascade regen, and reclustering catch up in the
-        # background (recluster only fires every N endogenous adds).
-        if not self._inline_enrichment:
-            self.enqueue_cascade(replacements, list(stale_sources))
-            self.enqueue_entity_dedup(node.id)
-            self.note_endogenous_added()
-        else:
-            self._cascade_dependents(replacements, stale_sources, actions)
-            self._refresh_clusters()
+    def _link_document(self, state: _DocumentIngest) -> None:
+        assert state.vectors is not None
+        candidates = self._link_node(state.node, state.vectors)
+        if self._inline_enrichment and self.settings.entity_dedup:
+            self._link_entity_duplicates(state.node, candidates)
 
-        return node
+    def _prepare_and_link_nodes(
+        self,
+        nodes: Sequence[Node],
+        *,
+        concurrency: int | None = None,
+        stop_check: Callable[[], bool] | None = None,
+        label: str = "Graph ingest",
+        before_link: Callable[[], None] | None = None,
+    ) -> None:
+        indexed_nodes = list(enumerate(nodes, start=1))
+
+        def prepare(item: tuple[int, Node]):
+            index, node = item
+            if stop_check and stop_check():
+                raise JobCancelled("ingest cancelled")
+            log.debug("%s: preparing node %d/%d", label, index, len(nodes))
+            return self._prepare_node(node, cheap=not self._inline_enrichment)
+
+        vectors = self._run_ingest_phase(
+            prepare, indexed_nodes, concurrency=concurrency
+        )
+        if before_link is not None:
+            before_link()
+
+        def link(item: tuple[int, Node, Any]) -> None:
+            index, node, node_vectors = item
+            if stop_check and stop_check():
+                raise JobCancelled("ingest cancelled")
+            log.debug("%s: linking node %d/%d", label, index, len(nodes))
+            candidates = self._link_node(node, node_vectors)
+            if self.settings.entity_dedup:
+                self._link_entity_duplicates(node, candidates)
+
+        self._run_ingest_phase(
+            link,
+            [
+                (index, node, node_vectors)
+                for (index, node), node_vectors in zip(indexed_nodes, vectors)
+            ],
+            concurrency=concurrency,
+        )
 
     def recluster(self, resolution: float = 1.0) -> dict[str, str]:
         # Public wrapper for reclustering and persisting cluster assignments.
-        return self._recluster(resolution=resolution, persist=True)
+        with self._cluster_lock:
+            return self._recluster(resolution=resolution, persist=True)
 
     def ensure_japanese_clusters(self) -> dict[str, str]:
         # Public wrapper to ensure cluster names are Japanese/UI-friendly.
@@ -1423,6 +1567,7 @@ class Librarian:
         md_output_dir: str | Path,
         stop_check: Callable[[], bool] | None = None,
         raw_source_path: str | Path | None = None,
+        concurrency: int | None = None,
     ) -> list[Node]:
         # Load a markdown-output directory produced by the parser/chunker.
         out_path = Path(md_output_dir)
@@ -1450,21 +1595,17 @@ class Librarian:
             )
             log.info("re-ingest via revision flow: %s", "; ".join(actions) or "no-op")
         else:
-            # First ingest: persist each node and build semantic/dedup edges.
-            edge_count = 0
-            for index, node in enumerate(nodes, start=1):
-                if stop_check and stop_check():
-                    raise JobCancelled("ingest cancelled")
+            # First ingest: prepare every node before linking any node. This
+            # keeps the graph observed by the link phase deterministic while
+            # allowing independent model/embedding work to overlap.
+            for node in nodes:
                 node.source_version = version
-                edges = self._ingest_one(node)
-                edge_count += len(edges)
-                log.info(
-                    "ingest %d/%d | edges so far %d | %s",
-                    index,
-                    len(nodes),
-                    edge_count,
-                    node.id,
-                )
+            self._prepare_and_link_nodes(
+                nodes,
+                concurrency=concurrency,
+                stop_check=stop_check,
+                label="Markdown ingest",
+            )
 
             # Replace structural document edges and remember source version.
             self._replace_structural_edges(document_name, structural_edges)
@@ -1472,13 +1613,15 @@ class Librarian:
                 self.store.record_source(document_name, version)
 
             log.info(
-                "ingest done: %d nodes, %d semantic/dedup edges, %d structural",
+                "ingest done: %d nodes, %d structural edges",
                 len(nodes),
-                edge_count,
                 len(structural_edges),
             )
 
         # Best-effort clustering after ingest.
+        if self._recluster_every <= 0:
+            return nodes
+
         try:
             if stop_check and stop_check():
                 raise JobCancelled("ingest cancelled")
@@ -1495,6 +1638,9 @@ class Librarian:
 
         body = job.payload["body"]
         settings = self.settings
+        ingest_concurrency = max(
+            1, int(getattr(settings, "ingest_concurrency", self._ingest_concurrency))
+        )
 
         document_name = self._document_name(
             job.payload.get("document_name")
@@ -1540,6 +1686,7 @@ class Librarian:
             document_name=document_name,
             out_dir=out_dir,
             llm=llm,
+            concurrency=ingest_concurrency,
             on_progress=on_progress,
             stop_check=stop_check,
         )
@@ -1554,18 +1701,32 @@ class Librarian:
                 result.out_dir,
                 stop_check=stop_check,
                 raw_source_path=raw_source_path,
+                concurrency=ingest_concurrency,
             )
 
-            for index, node in enumerate(nodes, start=1):
+            progress_lock = threading.Lock()
+            completed = 0
+
+            def post_enrich(item: tuple[int, Node]) -> None:
+                nonlocal completed
+                _index, node = item
                 if stop_check():
                     raise JobCancelled("job cancelled")
-                job.progress = {
-                    "stage": "enriching",
-                    "current": index,
-                    "total": len(nodes),
-                }
                 self.enrich_summary(node.id)
                 self.enrich_entity_dedup(node.id)
+                with progress_lock:
+                    completed += 1
+                    job.progress = {
+                        "stage": "enriching",
+                        "current": completed,
+                        "total": len(nodes),
+                    }
+
+            self._run_ingest_phase(
+                post_enrich,
+                list(enumerate(nodes, start=1)),
+                concurrency=ingest_concurrency,
+            )
 
             job.progress = {"stage": "done", "total": len(nodes)}
 
@@ -1780,11 +1941,11 @@ class Librarian:
         self.store.upsert_node(node)
 
         body_vec, summary_vec, bridge_vec = self._store_vectors(node)
-        edges = self._build_semantic_edges(node, body_vec, summary_vec, bridge_vec)
+        candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
+        edges = self._build_semantic_edges(node, candidates)
 
         # Optionally find and link duplicate/same-entity nodes.
         if self.settings.entity_dedup:
-            candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
             edges += self._link_entity_duplicates(node, candidates)
 
         return edges
@@ -1795,7 +1956,8 @@ class Librarian:
 
     def _ensure_vec(self) -> None:
         # Make sure vector tables exist and match the current embedder dimension.
-        self.store.ensure_vec_tables(self.gateway.embedder.dim)
+        with self._schema_lock:
+            self.store.ensure_vec_tables(self.gateway.embedder.dim)
 
     def _store_vectors(
         self, node: Node
@@ -2290,14 +2452,10 @@ class Librarian:
     def _build_semantic_edges(
         self,
         node: Node,
-        body_vec: list[float],
-        summary_vec: list[float] | None,
-        bridge_vec: list[float] | None = None,
+        candidates: list[Node],
     ) -> list[Edge]:
-        # Find nearby/bridged nodes, then ask the LLM what relationships exist.
-        # Candidates are sent in small groups (best-ranked first) rather than
-        # all at once - see _EDGE_GROUP_SIZE.
-        candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
+        # Candidates are resolved by the caller so the same search can be reused
+        # by entity deduplication in the same ingest phase.
         if not candidates:
             return []
 
@@ -2395,14 +2553,34 @@ class Librarian:
 
     def _persist_node(self, node: Node, *, cheap: bool = False) -> Node:
         # Fill fields, save node, store vectors, and build semantic edges.
-        (self._fill_cheap_fields if cheap else self._fill_derived_fields)(node)
-
-        self.store.upsert_node(node)
-
-        body_vec, summary_vec, bridge_vec = self._store_vectors(node)
-        self._build_semantic_edges(node, body_vec, summary_vec, bridge_vec)
+        self._persist_node_with_candidates(node, cheap=cheap)
 
         return node
+
+    def _persist_node_with_candidates(
+        self, node: Node, *, cheap: bool = False
+    ) -> list[Node]:
+        """Persist a node and return the candidate set used for its edges."""
+        return self._link_node(node, self._prepare_node(node, cheap=cheap))
+
+    def _prepare_node(
+        self, node: Node, *, cheap: bool = False
+    ) -> tuple[list[float], list[float] | None, list[float] | None]:
+        """Derive, persist, and embed one node; safe to run in prepare phase."""
+        (self._fill_cheap_fields if cheap else self._fill_derived_fields)(node)
+        self.store.upsert_node(node)
+        return self._store_vectors(node)
+
+    def _link_node(
+        self,
+        node: Node,
+        vectors: tuple[list[float], list[float] | None, list[float] | None],
+    ) -> list[Node]:
+        """Resolve neighbours and create semantic edges for a prepared node."""
+        body_vec, summary_vec, bridge_vec = vectors
+        candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
+        self._build_semantic_edges(node, candidates)
+        return candidates
 
     def _supersede(self, old: Node, new: Node) -> None:
         # Link old -> new and new -> old so history/revision lineage is preserved.

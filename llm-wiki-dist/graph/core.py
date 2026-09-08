@@ -88,6 +88,12 @@ class Settings(BaseModel):
     rerank_top_k: int = 20
     entity_dedup: bool = True
 
+    # bounded parallelism for the additive benchmark ingest path
+    ingest_concurrency: int = 4
+    # 0 disables automatic reclustering; the caller runs one explicit refresh
+    # after a batch has completed.
+    recluster_every: int = 10
+
     #  evidence-first search: chunking (chars)
     search_big_chunk_size: int = 3000
     search_big_chunk_overlap: int = 300
@@ -182,6 +188,10 @@ class Settings(BaseModel):
             search_rrf_k=int(env("WIKI_SEARCH_RRF_K", cls.search_rrf_k)),
             entity_dedup=env("WIKI_ENTITY_DEDUP", "1" if cls.entity_dedup else "0")
             not in {"0", "false", "False", ""},
+            ingest_concurrency=max(
+                1, int(env("WIKI_INGEST_CONCURRENCY", cls.ingest_concurrency))
+            ),
+            recluster_every=int(env("WIKI_RECLUSTER_EVERY", cls.recluster_every)),
             search_candidate_pool=int(
                 env("WIKI_SEARCH_POOL", cls.search_candidate_pool)
             ),
@@ -278,6 +288,7 @@ for _settings_field, _settings_info in Settings.model_fields.items():
 class NodeType(str, Enum):
     endogenous = "endogenous"
     exogenous = "exogenous"
+    page = "page"
 
 
 # whether a node is overruled by newer version, with updated version

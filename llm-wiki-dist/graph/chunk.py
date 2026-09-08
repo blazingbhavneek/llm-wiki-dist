@@ -1906,6 +1906,7 @@ async def plan_concept_files_streaming(
     source_lines: list[str],
     target_lines: int = 100,
     max_extra: int = 30,
+    concurrency: int | None = None,
     stop_check: Callable[[], bool] | None = None,
 ) -> list[ConceptFilePlan]:
     """
@@ -1943,50 +1944,40 @@ async def plan_concept_files_streaming(
         for start_idx, end_idx in chunk_ranges
     ]
 
-    committed: list[ConceptFilePlan] = []
-    pending: ConceptFilePlan | None = None
+    worker_count = max(1, int(CONCURRENCY if concurrency is None else concurrency))
+    semaphore = asyncio.Semaphore(worker_count)
 
-    for chunk_index, (chunk_start, chunk_end) in enumerate(global_chunks, start=1):
-        if stop_check and stop_check():
-            raise JobCancelled("chunk planning cancelled")
-
-        is_final_chunk = chunk_index == len(global_chunks)
-
-        if pending is not None:
-            prompt_start = pending.source_start
-        else:
-            prompt_start = chunk_start
-
-        prompt_end = chunk_end
-        label = f"chunk {chunk_index}/{len(global_chunks)}"
-
-        split = await split_window_until_valid(
-            llm=llm,
-            source_lines=source_lines,
-            source_start=prompt_start,
-            source_end=prompt_end,
-            pending=pending,
-            label=label,
-            stop_check=stop_check,
-        )
-
-        if not split:
-            raise RuntimeError(f"{label}: valid split unexpectedly returned no files.")
-
-        if is_final_chunk:
-            committed.extend(split)
-            pending = None
-        else:
-            committed.extend(split[:-1])
-            pending = split[-1]
-
-            print(
-                "[Planning] Carrying pending concept forward: "
-                f"{pending.title} [{pending.source_start}-{pending.source_end}]"
+    async def plan_window(
+        chunk_index: int, chunk_start: int, chunk_end: int
+    ) -> list[ConceptFilePlan]:
+        async with semaphore:
+            if stop_check and stop_check():
+                raise JobCancelled("chunk planning cancelled")
+            label = f"chunk {chunk_index}/{len(global_chunks)}"
+            split = await split_window_until_valid(
+                llm=llm,
+                source_lines=source_lines,
+                source_start=chunk_start,
+                source_end=chunk_end,
+                pending=None,
+                label=label,
+                stop_check=stop_check,
             )
+            if not split:
+                raise RuntimeError(
+                    f"{label}: valid split unexpectedly returned no files."
+                )
+            return split
 
-    if pending is not None:
-        committed.append(pending)
+    planned_windows = await asyncio.gather(
+        *(
+            plan_window(chunk_index, chunk_start, chunk_end)
+            for chunk_index, (chunk_start, chunk_end) in enumerate(
+                global_chunks, start=1
+            )
+        )
+    )
+    committed = [item for window in planned_windows for item in window]
 
     accepted, error = validate_concept_partition(
         files=committed,
@@ -2592,6 +2583,7 @@ def run_chunk_pipeline(
     document_name: str,
     out_dir: Path,
     llm: Any = None,
+    concurrency: int | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
 ) -> SimpleNamespace:
@@ -2601,6 +2593,7 @@ def run_chunk_pipeline(
             document_name=document_name,
             out_dir=out_dir,
             llm=llm,
+            concurrency=concurrency,
             on_progress=on_progress,
             stop_check=stop_check,
         )
@@ -2613,6 +2606,7 @@ async def arun_chunk_pipeline(
     document_name: str,
     out_dir: Path,
     llm: Any = None,
+    concurrency: int | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
 ) -> SimpleNamespace:
@@ -2673,6 +2667,7 @@ async def arun_chunk_pipeline(
             source_lines=source_lines,
             target_lines=100,
             max_extra=MAX_CHUNK_EXTRA,
+            concurrency=concurrency,
             stop_check=stop_check,
         )
 
