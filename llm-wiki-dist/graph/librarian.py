@@ -1454,7 +1454,7 @@ class Librarian:
         active_old = [
             n
             for n in self.store.get_nodes_by_document(doc_name, active_only=True)
-            if n.type == NodeType.endogenous
+            if n.type in {NodeType.endogenous, NodeType.page}
         ]
         state = _DocumentIngest(
             doc_name=doc_name, version=version, node=node, active_old=active_old
@@ -1681,15 +1681,32 @@ class Librarian:
             temperature=settings.chat_temperature,
         )
 
-        result = run_chunk_pipeline(
-            source_text=body,
-            document_name=document_name,
-            out_dir=out_dir,
-            llm=llm,
-            concurrency=ingest_concurrency,
-            on_progress=on_progress,
-            stop_check=stop_check,
-        )
+        options = job.payload.get("chunk_options") or {}
+        mode = options.get("ingest_mode") or getattr(settings, "ingest_mode", "chunks")
+
+        if mode == "pages":
+            from .pages import run_pages_pipeline
+
+            result = run_pages_pipeline(
+                source_text=body,
+                document_name=document_name,
+                out_dir=out_dir,
+                llm=llm,
+                embedder=self.gateway.embedder,
+                settings=settings,
+                on_progress=on_progress,
+                stop_check=stop_check,
+            )
+        else:
+            result = run_chunk_pipeline(
+                source_text=body,
+                document_name=document_name,
+                out_dir=out_dir,
+                llm=llm,
+                concurrency=ingest_concurrency,
+                on_progress=on_progress,
+                stop_check=stop_check,
+            )
 
         if stop_check():
             raise JobCancelled("job cancelled")
@@ -1796,7 +1813,7 @@ class Librarian:
         active_old = [
             n
             for n in self.store.get_nodes_by_document(document_name, active_only=True)
-            if n.type == NodeType.endogenous
+            if n.type in {NodeType.endogenous, NodeType.page}
         ]
 
         # If this document has no active old nodes, ingest everything as new.
@@ -2902,7 +2919,7 @@ class Librarian:
             node_ids = {
                 n.id
                 for n in self.store.get_nodes_by_document(document_name)
-                if n.type == NodeType.endogenous
+                if n.type in {NodeType.endogenous, NodeType.page}
             }
             self.store.delete_edges_by_label_for_nodes("follows", node_ids)
 
@@ -3615,6 +3632,10 @@ class Librarian:
         # Planning JSON files are optional; default to empty metadata.
         metadata = self._read_json(planning_dir / "metadata.json", default={})
         coverage = self._read_json(planning_dir / "coverage.json", default={})
+        manifest = self._read_json(planning_dir / "manifest.json", default={})
+        is_page_output = (
+            manifest.get("planning", {}).get("ingest_mode") == "pages"
+        )
 
         document_name = (
             metadata.get("inferred_file_name")
@@ -3660,11 +3681,12 @@ class Librarian:
                 # Fall back to frontmatter source_lines if coverage is missing.
                 ranges = self._parse_ranges(meta.get("source_lines"))
 
-            # Build an endogenous node from the docs/ markdown page.
+            # Preserve the mode used to produce this document so later setting
+            # changes cannot reinterpret an existing page as a chunk.
             node = Node(
                 id=make_node_id(body, document_name),
                 body=body,
-                type=NodeType.endogenous,
+                type=NodeType.page if is_page_output else NodeType.endogenous,
                 title=(
                     cov_rec.get("title")
                     or meta.get("title")
