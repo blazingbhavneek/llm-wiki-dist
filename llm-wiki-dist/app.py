@@ -1996,6 +1996,7 @@ async def create_document(payload: DocumentBody) -> dict:
                 "title": payload.title,
                 "document_name": payload.document_name,
                 "source_path": payload.source_path,
+                "chunk_options": payload.chunk_options or {},
             },
         )
 
