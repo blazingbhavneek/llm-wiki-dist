@@ -204,6 +204,8 @@ async def _bootstrap_db(db: str) -> None:
         STACKS[db] = stack
         stages[db] = "ready"
         errors[db] = None
+        if growi_connection is not None:
+            await stack["librarian"].enqueue("sync_growi", {"name": db})
         log.info("startup: ready db=%s, serving requests", db)
     except Exception as exc:
         stages[db] = "failed"
