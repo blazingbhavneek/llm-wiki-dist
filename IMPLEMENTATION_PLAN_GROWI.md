@@ -18,6 +18,90 @@ able to read it too, so it explains itself rather than assuming context.
 
 ---
 
+## STATUS — review of the `growi` branch (2026-09-08)
+
+An implementer has completed **WP-0 through WP-14**. This section records what was
+verified, what is good, and what to do next. Read it before picking up any work.
+
+Reviewed by diffing `dist..growi`: 14 commits, +7146 / −1118 lines.
+
+### Verdict
+
+**The backend implementation is sound and the hard constraints were respected.** The
+remaining work is the frontend, which the plan under-specified — that gap is now **Track C**
+below.
+
+### What was verified as correct
+
+| Check | Result |
+|---|---|
+| **C4** — forbidden files untouched | ✅ `researcher.py`, `realtime.py`, `vocab.py`, `neighborhood.py`, `gateway.py` all show **zero diff** |
+| **C3** — chunks mode preserved | ✅ `arun_chunk_pipeline` / `run_chunk_pipeline` intact and unmodified |
+| **WP-0 trap avoided** | ✅ `refresh_neighborhood`, `rebuild_neighborhoods`, `enqueue_neighborhood`, `_bootstrap_neighborhoods` all still present — the branch was cherry-picked, not merged |
+| **C1** — additive | ✅ `librarian.py` diff is all new methods plus one inner-function rename (`add_vec_channel` table→channel, part of the WP-7 seam). No existing method rewritten. |
+| **C2** — defaults unchanged | ✅ `ingest_mode='chunks'`, `page_stitch=False`, `vector_backend='sqlite'` |
+| **C7** — tests | ✅ 15 new test modules; **19 modules / 132 tests, all passing** |
+| Appendix A contract | ✅ round-trip verified: `source_lines: "[[1, 100], [201, 300]]"` → `_split_frontmatter` → `_parse_ranges` → `[(1, 100), (201, 300)]` |
+| Integrity check wired in | ✅ `assert_pages_preserve_chunks` is **called** at `graph/pages.py:933`, not merely defined |
+| `write_path` guard | ✅ `assert_publish_path` (`graph/growi.py:200`) raises `PermissionError` on attach-mode writes outside the boundary |
+| revisionId conflict | ✅ 409 → re-fetch → `merge_marked_sections` → retry once (`graph/growi.py:263-285`), exactly as specified |
+
+Run the suite yourself with:
+
+```bash
+cd llm-wiki-dist
+for f in tests/test_*.py; do .venv/bin/python -m unittest "tests.$(basename ${f%.py})"; done
+```
+
+(There is no `pytest` in the venv — use `unittest`, and pass a **module path** with dots,
+not a file path.)
+
+### New modules
+
+| File | Lines | Contains |
+|---|---|---|
+| `graph/pages.py` | 940 | shelf, router, sizing, assembly, stitcher, integrity checks |
+| `graph/vectors.py` | 449 | `VectorIndex` seam, sqlite-vec and Qdrant backends |
+| `graph/growi.py` | 393 | API client, publish guard, marked-section merge |
+| `graph/registry.py` | 263 | encrypted connection registry |
+
+### What to fix — ranked
+
+**1. Zero frontend work was done.** Nothing under `frontend/` changed. The practical
+consequence: **`ingest_mode` cannot be switched from the UI**, because
+`SettingsView.jsx` builds its form from a hand-written `COOKIE_FIELDS` list rather than
+from `/api/settings/schema`. Today you can only flip it with `curl` or MCP. This defeats
+the point of C3 for a non-technical user. → **WP-F1, do it first.**
+
+**2. Missing test: both modes coexisting in one wiki.** WP-6's Verify explicitly required
+ingesting document A as `chunks` and document B as `pages` into the same wiki and
+confirming both are searchable. No test covers it. That is the single assertion that
+proves C3 holds in practice. → **add to `tests/test_pages_wire.py`.**
+
+**3. Test depth is thin for the new work.** Most new modules have 1–3 tests
+(`test_admin_connections.py` has **one**, `test_pages_wire.py` has **one**). The plan's
+Verify sections listed more specific assertions than were written — for example WP-3's
+"page description embeddings computed once, not once per chunk". Worth a hardening pass
+before this carries real data.
+
+**4. Commit hygiene drifted twice.**
+- WP-3, WP-4 and WP-5 were bundled into one commit (`b1ca461` "WP-2: add optional shelf routing and page assembly"). The one-package-one-commit rule exists so any single package can be reverted; bundled, they cannot.
+- Commit `9085623` "added some docs" also rewrote **`proto.py` (+663/−884)** and `RESEARCH.md`. Those are unrelated to the GROWI work. Unrelated changes riding in a docs commit make a later revert dangerous. → Going forward, keep unrelated work on its own commit.
+
+**5. WP-15 (deletions) correctly not started.** Do not start it. See **Checkpoints and
+committing** — Phase 3 waits until GROWI has served real users.
+
+### Next steps, in order
+
+1. **WP-F1** — expose the new settings in the UI. Small, and it unblocks the whole point of the mode switch.
+2. **Add the coexistence test** (fix #2 above).
+3. **WP-F2** — queue-view stage labels, so page-mode ingest shows readable progress.
+4. Harden the thin tests (fix #3).
+5. **WP-F3 → WP-F6** — the rest of Track C.
+6. Only then consider Phase 3.
+
+---
+
 ## Reference material — read the source, do not guess
 
 You will need to look things up. These are the places to look. **When this plan and the
@@ -326,11 +410,23 @@ switches back.
   WP-6  wire into chunk_and_ingest   WP-13  read from GROWI
   WP-7  VectorIndex seam             WP-14  Qdrant backend
 
-  WP-0 (optional, do first): merge benchmark speedups
+  TRACK C — frontend                 (after Track B; Track A/B are backend-only)
+  WP-F1  expose new settings   <- unblocks the mode switch, do first
+  WP-F2  queue view labels
+  WP-F3  per-upload mode picker
+  WP-F4  admin -> GROWI connections
+  WP-F5  hand viewing/editing to GROWI
+  WP-F6  GROWI script plugin
+
+  WP-0 (optional, do first): port benchmark speedups
   WP-15 (last, optional): deletions
 ```
 
 **Track A is worth shipping alone.** Do it first. Do not start Track B until WP-6 verifies.
+
+**Tracks A and B are backend-only.** As of the `growi` branch they are complete — see
+**STATUS** above. Track C is the remaining work, and **WP-F1 is the highest-value single
+package in this document**, because without it the mode switch is unreachable from the UI.
 
 ---
 
@@ -347,8 +443,12 @@ switches back.
                  (both storage models coexist)
                           |
                           v
+  PHASE 2b       frontend catches up                   WP-F1 .. WP-F6
+                 (UI reaches the new backend)
+                          |
+                          v
   PHASE 3        delete what GROWI replaced            WP-15
-                 (only after phase 2 has run for real)
+                 (only after phase 2b has run for real)
 ```
 
 **Never reorder these.** Phase 3 deletes code that Phase 2 must first prove is redundant.
@@ -399,6 +499,7 @@ last line matters most — it is how a reviewer confirms C2 at a glance.
 ```bash
 git tag wp7-track-a-complete     # current ingest improved, no GROWI
 git tag wp14-track-b-complete    # GROWI wired in, nothing deleted yet
+git tag wpf6-track-c-complete    # UI reaches all of it; ready to consider deletions
 ```
 
 These are the two points worth being able to return to instantly. `wp7` in particular is a
@@ -1276,6 +1377,295 @@ Same-input parity with `SqliteVecIndex`; tenant A's query never returns tenant B
 
 ---
 
+# TRACK C — frontend
+
+The backend is done; this is what remains. Track C has its own arc:
+
+```
+  WP-F1  expose the new settings          <- do first, unblocks the mode switch
+  WP-F2  queue view understands pages mode
+  WP-F3  per-upload mode picker
+  WP-F4  admin panel -> GROWI connections
+  WP-F5  hand viewing + editing to GROWI
+  WP-F6  the GROWI script plugin (chat inside GROWI)
+```
+
+### The strategic point of Track C
+
+Today the frontend is **12,826 lines**, and roughly a third of it is a wiki that GROWI
+does better:
+
+| Component | Lines | Fate |
+|---|---|---|
+| `pages/admin/AdminApp.jsx` | 1447 | **rewrite** — points at connections instead of files |
+| `components/SettingsView.jsx` | 1344 | small additions |
+| `components/ChatPanel.jsx` | 1251 | **keep** — this is the product |
+| `components/PdfParserView.jsx` | 998 | keep — GROWI cannot ingest a PDF |
+| `components/markdown/MarkdownRenderer.jsx` | 602 | **GROWI replaces** |
+| `components/markdown/RichMarkdownEditor.jsx` | 583 | **GROWI replaces** |
+| `components/layout/RightDocumentRail.jsx` | 429 | **GROWI replaces** |
+| `components/GraphCanvas.jsx` | 393 | **keep** — GROWI has no graph view |
+| `components/DocSidebar.jsx` | 377 | **GROWI replaces** |
+| `components/QueueView.jsx` | 330 | keep, extend |
+| `components/UploadView.jsx` | 316 | keep, extend |
+| `components/MarkdownView.jsx` | 296 | **GROWI replaces** |
+| `components/markdown/imageUnits.js` | 292 | **GROWI replaces** |
+
+**About 2,580 lines of viewing and editing hand over to GROWI.** What survives is what
+GROWI cannot do: the chat, the graph, the PDF parser, the job queue.
+
+> Same rule as everywhere else: **do not delete anything in Track C until GROWI is actually
+> serving the content.** WP-F5 puts the deletions behind a flag; the removals themselves
+> belong to WP-15.
+
+---
+
+## WP-F1 — Expose the new settings *(do this first)*
+
+**Goal.** Let a human flip `ingest_mode` without `curl`. Without this, C3 is theoretical.
+
+**Files.** `frontend/src/components/SettingsView.jsx` (edit)
+
+### The problem
+
+`SettingsView.jsx` does **not** render from the settings schema. It has a hand-written
+`FALLBACK_DEFAULTS` object (line 8), a `COOKIE_FIELDS` list (line 36), and hard-coded
+`DEPTH` / `NET` preset arrays (lines 391, 444). `api.js` exports `settingsSchema` but the
+form does not use it.
+
+So every field added in WP-1 is invisible.
+
+### Two options — pick the first
+
+**Option A — add a small explicit section (recommended).** Matches the existing style, no
+refactor, ~60 lines. Add an "取り込みモード" (ingest mode) panel:
+
+| Control | Setting | Notes |
+|---|---|---|
+| segmented toggle | `ingest_mode` | `チャンク` / `ページ` — **default must render as チャンク** |
+| checkbox | `page_stitch` | disabled unless mode is pages |
+| number inputs | `page_min_chunks`, `page_max_chunks`, `page_min_lines`, `page_max_lines` | collapsed under "詳細" |
+| number input | `page_route_candidates` | advanced |
+| read-only badge | `vector_backend` | display only — changing it needs a restart, do not offer it as an editable control |
+
+**Option B — schema-driven rendering.** Fetch `/api/settings/schema`, render anything not
+already claimed by a hand-written control. More future-proof, but it is a refactor of a
+1344-line file and it will churn the layout. **Not now.**
+
+### Rules
+
+- The mode toggle needs a one-line explanation next to it, because the choice is not
+  self-evident. Suggested copy:
+  - **チャンク** — 元の文章をそのまま、章ごとに分割して取り込みます（従来の動作）
+  - **ページ** — 関連する内容をまとめて、1つのWikiページに組み立てます
+- **Show that switching is safe.** Add a note: 既に取り込んだ文書には影響しません。 That is true (mode is recorded per document in the manifest) and it is the reassurance that makes people willing to try it.
+- Settings already round-trip through `PATCH /api/settings`; no API work needed.
+
+**Verify.** Flip the toggle in the UI, reload, confirm it persisted. Ingest a document in
+each mode. Confirm a fresh browser profile shows チャンク selected.
+
+---
+
+## WP-F2 — Queue view understands pages mode
+
+**Goal.** Show readable progress during a page-mode ingest.
+
+**Files.** `frontend/src/components/QueueView.jsx` (edit)
+
+`progressText()` (line 129) does `t.stages[p.stage] || p.stage` — unknown stages fall back
+to the raw id, so nothing crashes, but the user sees `routing` instead of Japanese.
+
+Add labels to the `stages` maps (lines 36 and 75) for whatever `graph/pages.py` emits.
+**Read the actual strings out of `pages.py` — do not guess them.** Expect roughly:
+
+| stage | ja | en |
+|---|---|---|
+| `chunking` | チャンク分割 | Splitting |
+| `summarizing` | 要約作成中 | Summarizing |
+| `shelf` | 目次を設計中 | Planning outline |
+| `routing` | ページへ振り分け中 | Routing chunks |
+| `sizing` | ページサイズ調整中 | Balancing pages |
+| `assembling` | ページを組み立て中 | Assembling |
+| `stitching` | 文章を整えています | Stitching |
+| `ingesting` | 取り込み中 | Ingesting |
+
+> **Note the pre-existing drift.** The current map has `chunking:signals`,
+> `chunking:skeleton`, `chunking:assemble` — stage ids that `chunk.py` no longer emits (it
+> emits `チャンク分割`). Clean that up while you are here, or the map keeps rotting.
+
+Also surface `current/total` when the payload has it — `progressText` already appends a
+counter, so this may be free.
+
+**Verify.** Ingest a document in pages mode and watch the queue. Every stage shows
+Japanese, and the counter advances.
+
+---
+
+## WP-F3 — Per-upload mode picker
+
+**Goal.** Choose the mode for one upload without changing the global setting.
+
+**Files.** `frontend/src/components/UploadView.jsx` (edit), `frontend/src/api.js` (edit)
+
+The backend hook already exists: WP-1 made `create_document` forward
+`payload.chunk_options` into the job, and `chunk_and_ingest` reads
+`options.get("ingest_mode")` before falling back to the global setting.
+
+So this is: add a small select to the upload form, and pass it through.
+
+```js
+// api.js — createDocument already takes an options object; add chunkOptions
+createDocument: async ({ body, title, documentName, sourcePath, sourceRanges,
+                         chunkOptions }, jobOpts) => ...
+    chunk_options: chunkOptions,     // -> { ingest_mode: "pages" }
+```
+
+Default the select to "設定に従う" (follow the global setting) so behaviour is unchanged
+unless somebody chooses otherwise.
+
+**Verify.** With the global setting on `chunks`, upload one document with the picker set to
+`pages`. That document assembles into pages; the global setting is untouched.
+
+---
+
+## WP-F4 — Admin panel points at GROWI connections
+
+**Goal.** Manage GROWI instances where `.sqlite` files are managed today.
+
+**Files.** `frontend/src/pages/admin/AdminApp.jsx` (**substantial rewrite**)
+
+> **Scope correction.** An earlier draft of this plan called `AdminApp.jsx` "survives,
+> repurposed". That undersold it. The file is 1447 hand-built lines shaped entirely around
+> files — `formatBytes`, `normalizeDbStats`, upload and copy modals. The **layout and the
+> component kit survive**; the data model does not.
+
+### What is reusable as-is
+
+`StatCard` (321), `Pill` (340), `PanelTitle` (361), `Button` (380), `TextInput` (420),
+`EmptyState` (442), `Modal` (456), plus `detectAdminApiBase` (214), `detectPrefix` (227),
+`cx`, `formatDate`, `asErrorMessage`. Keep all of them. Do not restyle.
+
+### Endpoint mapping
+
+| Today | After (WP-10 built these) |
+|---|---|
+| `GET /admin/api/dbs` | `GET /admin/api/connections` |
+| `POST /admin/api/dbs/{db}` | `POST /admin/api/connections/{name}` |
+| `POST /admin/api/dbs/{db}/upload` | **gone** — no file to upload |
+| `POST /admin/api/dbs/{db}/copy` | **gone** — meaningless for a connection |
+| `PATCH /admin/api/dbs/{db}/rename` | `PATCH /admin/api/connections/{name}` |
+| `DELETE /admin/api/dbs/{db}` | `DELETE /admin/api/connections/{name}` — **detach** |
+| — | `POST /admin/api/connections/{name}/test` (new) |
+| — | `POST /admin/api/connections/{name}/resync` (new) |
+
+`X-Admin-Password` auth is unchanged.
+
+### The registration form
+
+| Field | Control | Note |
+|---|---|---|
+| `name` | text | the URL segment; validate with the existing `validateName` (line 519) |
+| `url` | text | `https://growi.example.com` |
+| `api_token` | **password** | write-only. The API returns it blanked — an empty value must mean "keep existing", never "clear it". |
+| `mode` | radio | `attach` (default) / `own` |
+| `root_path` | text | default `/` |
+| `write_path` | text | default `/inbox`; **only shown in attach mode** |
+| `mongo_uri` | password, optional | labelled *read-only, backfill only* |
+
+### Replace the file stats with connection stats
+
+`normalizeDbStats` (282) and `getDocInfo` (286) are built around `size_bytes`,
+`nodes_total`, `docs`. A connection reports different things:
+
+| Show | From |
+|---|---|
+| reachability | `/test` result — green / red pill |
+| indexed pages | registry count |
+| last sync | `last_sync_at` |
+| stage / error | `stage`, `last_error` — reuse the existing `Pill` |
+| GROWI version | `/test` |
+
+Drop `formatBytes` from the card; a connection has no size.
+
+### Two things the UI must make unmistakable
+
+1. **Delete means detach.** The confirm modal must say so plainly: 「この操作はGROWI側のページを削除しません。llm-wiki側の索引のみ削除します。」 The API returns `growi_untouched: true` — surface it in the success toast.
+2. **Never render a token.** Even masked. The API blanks it; keep it blank.
+
+**Verify.** Register two GROWIs, see both listed with health. Test, resync, rename,
+detach. Confirm detach issues zero writes to GROWI (check its page count before and
+after). Confirm no token appears in any response in the network tab.
+
+---
+
+## WP-F5 — Hand viewing and editing to GROWI
+
+**Goal.** Stop maintaining a markdown editor. Send people to GROWI for reading and writing.
+
+**Files.** `App.jsx`, `components/layout/LeftSidebar.jsx`, `components/DocSidebar.jsx`
+
+### Why
+
+GROWI already has an editor with diff, history, comments, attachments, tags and
+permissions. `MarkdownView` + `RichMarkdownEditor` + `MarkdownRenderer` + `imageUnits` +
+`DocSidebar` + `RightDocumentRail` is ~2,580 lines reimplementing a worse version.
+
+### Do it behind a flag, in two stages
+
+**Stage 1 — deep-link out (this package).** When a node has a `growi_page_id`, the
+document rail shows **「GROWIで開く」** linking to `{growi_url}{path}`, and
+**「GROWIで編集」** linking to `{growi_url}{path}#edit`. Keep the local viewer working.
+
+Add a client setting `prefer_growi_viewer`, default **off**. When on, clicking a document
+opens GROWI in a new tab instead of `centerView='markdown'`.
+
+**Stage 2 — remove the local viewer.** Only once stage 1 has been used in anger, and only
+as part of WP-15.
+
+### What must survive either way
+
+- **Citations still need an in-app preview.** When the chat cites a node, the user must see the evidence *without* leaving the page. Keep a read-only renderer for that — a small one, not the full editor.
+- The **PDF parser** stays. GROWI cannot ingest a book.
+- The **graph canvas** stays. GROWI has no graph.
+
+**Verify.** With the flag off, everything behaves as today. With it on, documents open in
+GROWI and citations still preview inline.
+
+---
+
+## WP-F6 — The GROWI script plugin
+
+**Goal.** Put the chat panel inside GROWI, so people never leave their wiki.
+
+**Files.** a **new repository** — a GROWI plugin is installed from a Git repo, not from
+this codebase.
+
+Read <https://docs.growi.org/en/dev/plugin/overview.html> first. Script plugins may inject
+UI components and call external APIs, which is exactly what this needs.
+
+### Shape
+
+A small script plugin that mounts a side panel and talks to llm-wiki's existing SSE
+endpoint. `ChatPanel.jsx` (1251 lines) is the reference implementation — extract the
+streaming logic from `hooks/useAskStream.js` rather than rewriting it.
+
+### The detail that is easy to get wrong
+
+With many GROWIs behind one engine, **the plugin must say which connection it is calling
+from.** Configure it explicitly with its connection name and call
+`/{prefix}/{name}/api/ask/stream`. Do not infer from `Origin` — it breaks behind an
+unexpected proxy and fails silently.
+
+Because the plugin now calls across origins, tighten CORS: `app.py` currently sets
+`allow_origins=["*"]` (line ~802). Replace with an allowlist built from the registered
+connection URLs.
+
+**Verify.** Install the plugin on a registered GROWI, ask a question, get a streamed
+answer with citations linking back to GROWI pages. Confirm a second GROWI's plugin hits
+its own connection.
+
+---
+
 ## WP-15 — Deletions *(last, optional, only when everything above is proven)*
 
 Only after GROWI has been the source of truth for real work.
@@ -1714,6 +2104,10 @@ Collected mistakes, each of which would break a constraint.
 | Write to GROWI's MongoDB | Corrupts the page tree and desyncs Elasticsearch. |
 | Write outside `write_path` in `attach` mode | Damages somebody's real wiki. |
 | Return a GROWI token in any response | Extend `_redact()`. |
+| Render a GROWI token in the admin UI, even masked | WP-F4. The API blanks it; keep it blank. |
+| Treat an empty token field as "clear the token" | WP-F4. Empty means **keep existing**. |
+| Delete `MarkdownView` / `RichMarkdownEditor` before GROWI serves the content | WP-F5 is a flag, not a deletion. Removals belong to WP-15. |
+| Remove the in-app citation preview | Chat citations must render without leaving the page. |
 | Edit `researcher.py`, `realtime.py`, `vocab.py`, `neighborhood.py`, `gateway.py` | C4. Produce data in the shape they already read. |
 | Add a second "not ready" or job-queue mechanism | C5. Reuse `stages` and `WriteJob`. |
 | Call a real model in a test | C7. |
@@ -1731,6 +2125,15 @@ Collected mistakes, each of which would break a constraint.
 - [ ] `ask()` and the realtime pipeline work in both modes with no edits to their files
 - [ ] Page sizes respect all four bounds
 - [ ] `page_stitch=False` makes zero LLM calls in pass 4
+
+**Track C** is done when:
+
+- [ ] `ingest_mode` is switchable from the settings UI, defaulting to チャンク
+- [ ] page-mode ingest shows readable Japanese progress in the queue
+- [ ] a single upload can override the mode without changing the global setting
+- [ ] the admin panel manages GROWI connections; delete-means-detach is unmistakable
+- [ ] no API token is ever rendered, even masked
+- [ ] documents can be opened and edited in GROWI, while citations still preview in-app
 
 **Track B** is done when:
 
