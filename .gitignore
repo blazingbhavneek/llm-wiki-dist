@@ -9,3 +9,6 @@ llm-wiki-dist/.wiki_docker/
 benchmark-data/
 benchmark-results/
 llm-wiki-dist/usage_log.jsonl
+.wiki/
+test_wiki/
+inputs/

@@ -997,37 +997,65 @@ async def structured_ainvoke(
     messages: list[Any],
     max_output_tokens: int | None = None,
 ) -> BaseModel:
+    request_timeout = getattr(llm, "request_timeout", None)
+    try:
+        hard_timeout = float(request_timeout) if request_timeout is not None else None
+    except (TypeError, ValueError):
+        hard_timeout = None
+
+    async def invoke(runnable: Any, payload: list[Any]) -> Any:
+        operation = runnable.ainvoke(payload)
+        if hard_timeout is None or hard_timeout <= 0:
+            return await operation
+        return await asyncio.wait_for(operation, timeout=hard_timeout)
+
     call_llm = (
         llm.bind(max_tokens=max_output_tokens) if max_output_tokens is not None else llm
     )
 
     try:
         structured = call_llm.with_structured_output(schema_cls)
-        result = await structured.ainvoke(messages)
+        result = await invoke(structured, messages)
 
         if isinstance(result, schema_cls):
             return result
 
         return schema_cls.model_validate(result)
 
-    except Exception:
+    except Exception as structured_error:
         schema_json = json.dumps(schema_cls.model_json_schema(), indent=2)
+        last_error: Exception = structured_error
 
-        fallback_messages = list(messages)
-        fallback_messages.append(
-            HumanMessage(
-                content=(
-                    "Return ONLY valid JSON matching this JSON Schema. "
-                    "Be concise. Do not include extra prose.\n\n"
-                    f"{schema_json}"
+        # A thinking/streaming model can still return malformed JSON after the
+        # structured-output call fails. Give it one additional bounded, concise
+        # request; do not create an unbounded retry loop.
+        for retry in range(2):
+            fallback_messages = list(messages)
+            fallback_messages.append(
+                HumanMessage(
+                    content=(
+                        (
+                            "The previous response was invalid. Return the smallest "
+                            "valid JSON object that satisfies this schema. Use empty "
+                            "arrays or strings when uncertain."
+                            if retry
+                            else "Return ONLY valid JSON matching this JSON Schema. "
+                            "Be concise. Do not include extra prose."
+                        )
+                        + "\n\n"
+                        + schema_json
+                    )
                 )
             )
-        )
+            try:
+                raw = await invoke(call_llm, fallback_messages)
+                text = raw.content if hasattr(raw, "content") else str(raw)
+                data = extract_json_from_text(text)
+                return schema_cls.model_validate(data)
+            except Exception as fallback_error:
+                last_error = fallback_error
 
-        raw = await call_llm.ainvoke(fallback_messages)
-        text = raw.content if hasattr(raw, "content") else str(raw)
-        data = extract_json_from_text(text)
-        return schema_cls.model_validate(data)
+        raise last_error from structured_error
 
 
 # endregion LLM

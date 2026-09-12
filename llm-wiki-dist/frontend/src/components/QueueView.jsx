@@ -16,6 +16,11 @@ import { useT } from '../i18n.jsx'
 const API_BASE = import.meta.env.VITE_API_URL ?? window.location.pathname.replace(/\/$/, '')
 const POLL_MS = 2500
 
+// Stage labels are keyed on what the pipelines actually report: the Japanese
+// `stage` string, with the ASCII `step` appended after a colon when the run is
+// granular enough to report one ("ページ分割:routing"). An unknown key falls
+// back to the bare stage and then to the raw string, so a step added on the
+// backend still shows up as something readable.
 const STR = {
   ja: {
     title: 'ジョブキュー',
@@ -34,11 +39,17 @@ const STR = {
       cancelled: 'キャンセル済み',
     },
     stages: {
-      'chunking:signals': 'チャンク化: 境界スコア計算中',
-      'chunking:skeleton': 'チャンク化: 構造ラベリング中',
-      'chunking:assemble': 'チャンク化: 分割の最適化中',
-      'chunking:adjudicate': 'チャンク化: 境界の検証中',
-      'chunking:render': 'チャンク化: ファイル出力中',
+      'チャンク分割': 'チャンク分割',
+      'チャンク分割:planning': 'チャンク分割: 分割計画を作成中',
+      'チャンク分割:metadata': 'チャンク分割: 見出し・メタデータを整理中',
+      'チャンク分割:done': 'チャンク分割: 完了、取り込みへ',
+      'ページ分割': 'ページ組み立て',
+      'ページ分割:chunking': 'ページ組み立て: チャンクを切り出し中',
+      'ページ分割:summarizing': 'ページ組み立て: チャンクを要約中',
+      'ページ分割:shelf': 'ページ組み立て: 章立てを設計中',
+      'ページ分割:routing': 'ページ組み立て: チャンクをページに割り当て中',
+      'ページ分割:stitching': 'ページ組み立て: 章のつながりを編集中',
+      'ページ分割:writing': 'ページ組み立て: ページを書き出し中',
       ingesting: 'グラフへ取り込み中',
       enriching: '要約・重複チェック中',
       done: '完了処理中',
@@ -73,11 +84,17 @@ const STR = {
       cancelled: 'Cancelled',
     },
     stages: {
-      'chunking:signals': 'Chunking: scoring boundaries',
-      'chunking:skeleton': 'Chunking: labeling structure',
-      'chunking:assemble': 'Chunking: optimizing partition',
-      'chunking:adjudicate': 'Chunking: reviewing boundaries',
-      'chunking:render': 'Chunking: writing files',
+      'チャンク分割': 'Chunking',
+      'チャンク分割:planning': 'Chunking: planning the split',
+      'チャンク分割:metadata': 'Chunking: tidying headings and metadata',
+      'チャンク分割:done': 'Chunking: done, ingesting',
+      'ページ分割': 'Page assembly',
+      'ページ分割:chunking': 'Page assembly: cutting chunks',
+      'ページ分割:summarizing': 'Page assembly: summarizing chunks',
+      'ページ分割:shelf': 'Page assembly: designing the shelf',
+      'ページ分割:routing': 'Page assembly: routing chunks to pages',
+      'ページ分割:stitching': 'Page assembly: stitching the page together',
+      'ページ分割:writing': 'Page assembly: writing pages',
       ingesting: 'Ingesting into the graph',
       enriching: 'Summaries + dedup',
       done: 'Finishing',
@@ -129,10 +146,16 @@ function jobLabel(job, t) {
 function progressText(job, t) {
   const p = job.progress
   if (!p?.stage) return null
-  const stage = t.stages[p.stage] || p.stage
+  const key = p.step ? `${p.stage}:${p.step}` : p.stage
+  const stage = t.stages[key] || t.stages[p.stage] || p.stage
   const counter =
     p.current != null && p.total != null ? ` ${p.current}/${p.total}` : ''
-  const extra = p.files != null ? ` (${p.files})` : p.lines != null ? ` (${p.lines})` : ''
+  const tallies = [
+    p.files != null ? p.files : p.file_count,
+    p.lines != null ? p.lines : p.source_line_count,
+    p.chunk_count,
+  ].filter((value) => value != null)
+  const extra = tallies.length ? ` (${tallies.join(' / ')})` : ''
   return `${stage}${counter}${extra}`
 }
 

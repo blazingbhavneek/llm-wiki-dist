@@ -62,6 +62,63 @@ const COOKIE_FIELDS = [
   'pdf_image_model',
 ]
 
+// Ingest settings (WP-F1) are NOT cookie overrides: they change what the
+// server does when it writes, so they live on the server and round-trip
+// through PATCH /api/settings. Defaults match graph/core.py Settings, i.e.
+// today's behaviour — chunks, no stitching.
+const INGEST_DEFAULTS = {
+  ingest_mode: 'chunks',
+  page_stitch: false,
+  page_min_chunks: 3,
+  page_max_chunks: 8,
+  page_min_lines: 150,
+  page_max_lines: 900,
+  page_route_candidates: 5,
+}
+
+const INGEST_INT_BOUNDS = {
+  page_min_chunks: [1, 100],
+  page_max_chunks: [1, 200],
+  page_min_lines: [1, 20000],
+  page_max_lines: [1, 100000],
+  page_route_candidates: [1, 50],
+}
+
+function readIngestSettings(source) {
+  const out = { ...INGEST_DEFAULTS, ...(source || {}) }
+
+  out.ingest_mode = out.ingest_mode === 'pages' ? 'pages' : 'chunks'
+  out.page_stitch = Boolean(out.page_stitch)
+
+  for (const [field, [min, max]] of Object.entries(INGEST_INT_BOUNDS)) {
+    out[field] = clampInt(out[field], min, max, INGEST_DEFAULTS[field])
+  }
+
+  // page_min_chunks must not exceed page_max_chunks, or sizing can never be
+  // satisfied. Keep the pair self-consistent instead of sending nonsense.
+  if (out.page_min_chunks > out.page_max_chunks) {
+    out.page_min_chunks = INGEST_DEFAULTS.page_min_chunks
+  }
+  if (out.page_min_lines > out.page_max_lines) {
+    out.page_min_lines = INGEST_DEFAULTS.page_min_lines
+  }
+
+  return out
+}
+
+// The pages pipeline never stitches unless pages mode is on, so a saved
+// "true" while in chunks mode would silently reappear the next time pages
+// mode is switched on. Force it off in the payload we send.
+const ingestPatch = (ingest) => ({
+  ingest_mode: ingest.ingest_mode,
+  page_stitch: ingest.ingest_mode === 'pages' ? ingest.page_stitch : false,
+  page_min_chunks: ingest.page_min_chunks,
+  page_max_chunks: ingest.page_max_chunks,
+  page_min_lines: ingest.page_min_lines,
+  page_max_lines: ingest.page_max_lines,
+  page_route_candidates: ingest.page_route_candidates,
+})
+
 const TEST_IMAGE_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6X6N8sAAAAASUVORK5CYII='
 
@@ -273,6 +330,45 @@ const STR = {
     subHelp: (n, at) =>
       `${n} 個の並列エクスプローラー（同時最大 ${at}）。`,
 
+    ingestSettings: '取り込み設定',
+    ingestSettingsHint:
+      '文書をグラフに取り込むときの組み立て方を選びます。この Wiki に対する設定で、いつでも元に戻せます。',
+
+    ingestMode: '取り込みモード',
+    ingestModeHint: 'アップロード画面では、この文書だけを指定することもできます。',
+    modeChunks: 'チャンク',
+    modePages: 'ページ',
+    modeChunksHelp:
+      '元の文章をそのまま、章ごとに分割して取り込みます（従来の動作）',
+    modePagesHelp:
+      '関連する内容をまとめて、1つのWikiページに組み立てます',
+    modeSafe:
+      '切り替えても既に取り込んだ文書には影響しません。文書ごとに、取り込んだ当時のモードが記録されています。',
+
+    pageStitch: 'つなぎ文章の補整',
+    pageStitchHint:
+      '導入文や見出しなど、つなぎの文章だけを追加します。引用した本文は1文字も変更しません。',
+    pageStitchNeedsPages: 'ページモードのときだけ選択できます。',
+
+    advanced: '詳細',
+    pageMinChunks: '1ページあたりの最小チャンク数',
+    pageMaxChunks: '最大チャンク数',
+    pageMinLines: '1ページの最小行数',
+    pageMaxLines: '1ページの最大行数',
+    pageRouteCandidates: '振り分けの候補ページ数',
+
+    vectorBackend: 'ベクトルの保存先',
+    vectorBackendHint:
+      '変更にはサーバーの再起動が必要なため、ここでは確認のみできます。',
+
+    ingestSaving: '保存中…',
+    ingestSaved: 'サーバーに保存しました',
+    ingestSaveFailed: '設定を保存できませんでした: ',
+
+    preferGrowiViewer: '文書はGROWIで開く',
+    preferGrowiViewerHint:
+      'オンにすると文書をクリックしたときにGROWIを新しいタブで開きます。チャットの引用プレビューは今までどおりこのアプリ内に表示されます。',
+
     pdfParserSettings: 'PDF パーサー設定',
     pdfParserSettingsHint:
       'PDF 変換サーバーと、画像解析に使うマルチモーダル LLM を設定します。画像説明や Mermaid 生成は PDF 変換画面で毎回選択できます。',
@@ -350,6 +446,45 @@ const STR = {
     subagents: 'Sub-agents',
     subHelp: (n, at) =>
       `${n} parallel explorer${n > 1 ? 's' : ''} (up to ${at} at once).`,
+
+    ingestSettings: 'Ingest settings',
+    ingestSettingsHint:
+      'Choose how a document is assembled when it enters the graph. This is a per-wiki setting and you can switch back at any time.',
+
+    ingestMode: 'Ingest mode',
+    ingestModeHint: 'The upload screen can override this for a single document.',
+    modeChunks: 'Chunks',
+    modePages: 'Pages',
+    modeChunksHelp:
+      'Keep the original wording, split chapter by chapter (the original behaviour)',
+    modePagesHelp:
+      'Group related content together and assemble it into one wiki page',
+    modeSafe:
+      'Switching never changes documents already ingested. Each document keeps the mode it was ingested with.',
+
+    pageStitch: 'Connective-text stitching',
+    pageStitchHint:
+      'Adds only connective text such as an intro or headings. Quoted source text is never changed.',
+    pageStitchNeedsPages: 'Only available in pages mode.',
+
+    advanced: 'Advanced',
+    pageMinChunks: 'Minimum chunks per page',
+    pageMaxChunks: 'Maximum chunks per page',
+    pageMinLines: 'Minimum lines per page',
+    pageMaxLines: 'Maximum lines per page',
+    pageRouteCandidates: 'Candidate pages per chunk when routing',
+
+    vectorBackend: 'Vector storage',
+    vectorBackendHint:
+      'Changing this needs a server restart, so it is shown here read-only.',
+
+    ingestSaving: 'Saving…',
+    ingestSaved: 'Saved on the server',
+    ingestSaveFailed: 'Could not save the settings: ',
+
+    preferGrowiViewer: 'Open documents in GROWI',
+    preferGrowiViewerHint:
+      'When on, clicking a document opens GROWI in a new tab. Chat citations still preview inside this app.',
 
     pdfParserSettings: 'PDF parser settings',
     pdfParserSettingsHint:
@@ -584,6 +719,18 @@ export default function SettingsView({ overrides, onApply }) {
   const [net, setNetState] = useState(3)
   const [agents, setAgentsState] = useState(4)
 
+  // Server-side ingest settings. These are not cookie overrides: they change
+  // what the server writes, so they live on the server and round-trip through
+  // PATCH /api/settings.
+  const [ingest, setIngest] = useState(INGEST_DEFAULTS)
+  const [vectorBackend, setVectorBackend] = useState('sqlite')
+  const [ingestSaving, setIngestSaving] = useState(false)
+  const [ingestSaved, setIngestSaved] = useState(false)
+  const [ingestError, setIngestError] = useState('')
+
+  // The PATCH effect must not fire for the values just loaded from the server.
+  const ingestDirty = useRef(false)
+
   const [loadErr, setLoadErr] = useState(null)
 
   const firstRun = useRef(true)
@@ -671,6 +818,12 @@ export default function SettingsView({ overrides, onApply }) {
         setDepthState(nextDepth)
         setNetState(nextNet)
         setAgentsState(nextAgents)
+
+        // Ingest mode is a server setting, so it is read from what the backend
+        // reports (never from a cookie): that is what a fresh browser profile
+        // and a second browser both see.
+        setIngest(readIngestSettings(defaults))
+        setVectorBackend(defaults.vector_backend ?? 'sqlite')
 
         if (Object.keys(cookieOverrides).length > 0) {
           const patch = buildPatch({
@@ -846,6 +999,50 @@ export default function SettingsView({ overrides, onApply }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patch])
 
+  // Ingest settings are server state, so push them whenever the user changes
+  // them. The very first render is skipped: those values came from the server.
+  useEffect(() => {
+    if (!ingestDirty.current) return undefined
+
+    let cancelled = false
+
+    setIngestSaving(true)
+    setIngestSaved(false)
+
+    api
+      .patchSettings(ingestPatch(ingest))
+      .then(() => {
+        if (cancelled) return
+        setIngestSaved(true)
+        setIngestError('')
+        // Tell the rest of the app what the server now does, so the upload
+        // screen's "follow the setting" option describes reality.
+        emitSettingsChanged(ingestPatch(ingest))
+      })
+      .catch((e) => {
+        if (cancelled) return
+        setIngestError(`${t.ingestSaveFailed}${e?.message || String(e)}`)
+      })
+      .finally(() => {
+        if (!cancelled) setIngestSaving(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [ingest, t])
+
+  const setIngestField = (field, value) => {
+    ingestDirty.current = true
+    setIngestSaved(false)
+    setIngest((current) => ({ ...current, [field]: value }))
+  }
+
+  const setIngestNumberField = (field, raw) => {
+    const [min, max] = INGEST_INT_BOUNDS[field]
+    setIngestField(field, clampInt(raw, min, max, INGEST_DEFAULTS[field]))
+  }
+
   const resetToDefaults = () => {
     if (!loaded) return
 
@@ -929,6 +1126,13 @@ export default function SettingsView({ overrides, onApply }) {
       net: nextNet,
       agents: nextAgents,
     })
+
+    // Cookie overrides are not the whole story: put the server-side ingest
+    // mode back to the shipped default too, otherwise "reset" would quietly
+    // leave pages mode switched on.
+    ingestDirty.current = true
+    setIngestSaved(false)
+    setIngest(INGEST_DEFAULTS)
 
     onApply?.(resetPatch)
     emitSettingsChanged(resetPatch)
@@ -1139,6 +1343,163 @@ export default function SettingsView({ overrides, onApply }) {
 
         <section className="mt-[26px] border border-line bg-gradient-to-b from-white to-[#fbfdff] p-[18px] shadow-sm">
           <h2 className="m-0 text-[17px] font-extrabold text-ink">
+            {t.ingestSettings}
+          </h2>
+
+          <p className="mt-[4px] text-[12.5px] leading-[1.5] text-muted">
+            {t.ingestSettingsHint}
+          </p>
+        </section>
+
+        <section className="mt-[14px] border border-line bg-white p-[18px] shadow-sm">
+          <h3 className="m-0 text-[14px] font-extrabold text-ink">
+            {t.ingestMode}
+          </h3>
+
+          <p className="mb-[12px] mt-[3px] text-[12px] text-muted">
+            {t.ingestModeHint}
+          </p>
+
+          <div className="inline-flex border border-line bg-soft p-[3px]">
+            {[
+              { value: 'chunks', label: t.modeChunks },
+              { value: 'pages', label: t.modePages },
+            ].map((option) => {
+              const active = ingest.ingest_mode === option.value
+
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => setIngestField('ingest_mode', option.value)}
+                  className={`px-[18px] py-[7px] text-[13px] font-extrabold transition ${
+                    active
+                      ? 'bg-blue text-white shadow-sm'
+                      : 'text-muted hover:text-ink'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              )
+            })}
+          </div>
+
+          <p className="mt-[10px] text-[12.5px] leading-[1.5] text-ink">
+            {ingest.ingest_mode === 'pages'
+              ? t.modePagesHelp
+              : t.modeChunksHelp}
+          </p>
+
+          <p className="mt-[8px] border border-line bg-soft px-[10px] py-[8px] text-[12px] leading-[1.5] text-muted">
+            {t.modeSafe}
+          </p>
+
+          <label
+            className={`mt-[14px] flex items-start gap-[10px] ${
+              ingest.ingest_mode === 'pages' ? '' : 'opacity-50'
+            }`}
+          >
+            <input
+              type="checkbox"
+              className="mt-[2px] accent-blue"
+              disabled={ingest.ingest_mode !== 'pages'}
+              checked={ingest.ingest_mode === 'pages' && ingest.page_stitch}
+              onChange={(e) => setIngestField('page_stitch', e.target.checked)}
+            />
+
+            <span>
+              <span className="block text-[13px] font-bold text-ink">
+                {t.pageStitch}
+              </span>
+
+              <span className="block text-[12px] leading-[1.5] text-muted">
+                {ingest.ingest_mode === 'pages'
+                  ? t.pageStitchHint
+                  : t.pageStitchNeedsPages}
+              </span>
+            </span>
+          </label>
+
+          <details className="mt-[14px] border border-line bg-soft p-[12px]">
+            <summary className="cursor-pointer text-[12.5px] font-bold text-ink">
+              {t.advanced}
+            </summary>
+
+            <div className="mt-[12px] grid grid-cols-1 gap-[12px] md:grid-cols-2">
+              <NumberField
+                label={t.pageMinChunks}
+                value={ingest.page_min_chunks}
+                onChange={(v) => setIngestNumberField('page_min_chunks', v)}
+              />
+
+              <NumberField
+                label={t.pageMaxChunks}
+                value={ingest.page_max_chunks}
+                onChange={(v) => setIngestNumberField('page_max_chunks', v)}
+              />
+
+              <NumberField
+                label={t.pageMinLines}
+                value={ingest.page_min_lines}
+                onChange={(v) => setIngestNumberField('page_min_lines', v)}
+              />
+
+              <NumberField
+                label={t.pageMaxLines}
+                value={ingest.page_max_lines}
+                onChange={(v) => setIngestNumberField('page_max_lines', v)}
+              />
+
+              <NumberField
+                label={t.pageRouteCandidates}
+                value={ingest.page_route_candidates}
+                onChange={(v) =>
+                  setIngestNumberField('page_route_candidates', v)
+                }
+              />
+            </div>
+          </details>
+
+          <div className="mt-[14px] flex flex-wrap items-start justify-between gap-[10px] border-t border-line pt-[12px]">
+            <div className="min-w-0">
+              <span className="text-[11.5px] font-bold uppercase tracking-wider text-muted">
+                {t.vectorBackend}
+              </span>
+
+              <span className="ml-[8px] border border-line bg-soft px-[8px] py-[3px] font-mono text-[12px] text-ink">
+                {vectorBackend}
+              </span>
+
+              <p className="mt-[5px] text-[11.5px] leading-[1.5] text-muted">
+                {t.vectorBackendHint}
+              </p>
+            </div>
+
+            {(ingestSaving || ingestSaved || ingestError) && (
+              <span
+                className={`text-[12px] font-semibold ${
+                  ingestError ? 'text-[#7c1230]' : 'text-muted'
+                }`}
+              >
+                {ingestSaving
+                  ? t.ingestSaving
+                  : ingestError
+                    ? ingestError
+                    : t.ingestSaved}
+              </span>
+            )}
+          </div>
+
+          {ingestError && (
+            <div className="mt-[10px] border border-red/25 bg-red/10 px-[10px] py-[8px] text-[12.5px] leading-[1.45] text-[#7c1230]">
+              {ingestError}
+            </div>
+          )}
+        </section>
+
+        <section className="mt-[26px] border border-line bg-gradient-to-b from-white to-[#fbfdff] p-[18px] shadow-sm">
+          <h2 className="m-0 text-[17px] font-extrabold text-ink">
             {t.pdfParserSettings}
           </h2>
 
@@ -1336,6 +1697,23 @@ function Text({
         type={password ? 'password' : 'text'}
         value={value}
         placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-[36px] w-full border border-line bg-white px-[11px] text-[13px] text-ink outline-none focus:border-blue/50"
+      />
+    </label>
+  )
+}
+
+function NumberField({ label, value, onChange, min = 1 }) {
+  return (
+    <label className="block">
+      <Label>{label}</Label>
+
+      <input
+        type="number"
+        min={min}
+        step={1}
+        value={value}
         onChange={(e) => onChange(e.target.value)}
         className="h-[36px] w-full border border-line bg-white px-[11px] text-[13px] text-ink outline-none focus:border-blue/50"
       />

@@ -186,7 +186,7 @@ export function useGraphWrites({
     }
   }
 
-  const uploadMarkdown = async ({ filename, markdown }, onStatus) => {
+  const uploadMarkdown = async ({ filename, markdown, ingestMode }, onStatus) => {
     try {
       startAssimilationPolling()
 
@@ -197,6 +197,9 @@ export function useGraphWrites({
           body: markdown,
           title: (filename || t.untitled).replace(/\.(md|markdown)$/i, ''),
           documentName: filename,
+          // No choice made = no chunk_options sent, so the server-side
+          // ingest_mode setting decides how this document is split.
+          ...(ingestMode ? { chunkOptions: { ingest_mode: ingestMode } } : {}),
         },
         {
           timeoutMs: BIG_JOB_TIMEOUT_MS,

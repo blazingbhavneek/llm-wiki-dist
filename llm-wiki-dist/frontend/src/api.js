@@ -186,7 +186,10 @@ export const api = {
         question: metadata.question || null,
       }),
     }, jobOpts), jobOpts),
-  createDocument: async ({ body, title, documentName, sourcePath, sourceRanges }, jobOpts) =>
+  createDocument: async (
+    { body, title, documentName, sourcePath, sourceRanges, chunkOptions },
+    jobOpts,
+  ) =>
     unwrapAdd(await writeReq('/api/document', {
       method: 'POST',
       body: JSON.stringify({
@@ -195,6 +198,9 @@ export const api = {
         document_name: documentName,
         source_path: sourcePath,
         source_ranges: sourceRanges,
+        // Per-document ingest choices (e.g. {ingest_mode: "pages"}). Left out
+        // when the caller has no opinion so the server setting decides.
+        ...(chunkOptions ? { chunk_options: chunkOptions } : {}),
       }),
     }, jobOpts), jobOpts),
 

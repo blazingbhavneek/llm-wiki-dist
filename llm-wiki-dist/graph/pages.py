@@ -236,16 +236,31 @@ async def plan_shelf(
         "- title と description は日本語\n\n"
         + "\n".join(outline_lines)
     )
-    raw = await structured_ainvoke(
-        llm,
-        _ShelfTree,
-        _message_pair(
-            "あなたは技術文書全体の章立てを統合する編集者です。構造化出力のみを返してください。",
-            merge_prompt,
-        ),
-        max_output_tokens=3000,
-    )
-    tree = _ShelfTree.model_validate(raw)
+    try:
+        raw = await structured_ainvoke(
+            llm,
+            _ShelfTree,
+            _message_pair(
+                "あなたは技術文書全体の章立てを統合する編集者です。構造化出力のみを返してください。",
+                merge_prompt,
+            ),
+            max_output_tokens=3000,
+        )
+        tree = _ShelfTree.model_validate(raw)
+    except Exception:
+        # The merge response can exceed the model's JSON budget for a large
+        # document. Keep the already generated local topic assignments instead
+        # of losing the ingest; the normal missing-ID catch-all below still
+        # guarantees complete source coverage.
+        tree = _ShelfTree(
+            chapters=[
+                _Chapter(
+                    title="文書",
+                    description="局所目次の分類を保持した資料構成。",
+                    pages=[topic for outline in local for topic in outline.topics],
+                )
+            ]
+        )
     expected = {chunk.id for chunk in chunks}
     seen: set[str] = set()
     pages: list[ShelfPage] = []
@@ -734,11 +749,23 @@ def assert_pages_preserve_chunks(
 ) -> None:
     page_bodies = [path.read_text(encoding="utf-8") for path in sorted((out_dir / "docs").glob("*.md"))]
     for chunk_id, chunk in chunks_by_id.items():
-        occurrences = sum(body.count(chunk.body) for body in page_bodies)
-        if occurrences != 1:
+        marker = re.compile(
+            rf"^<!-- chunk: {re.escape(chunk_id)} [^\n]* -->\n",
+            re.MULTILINE,
+        )
+        matches = [match for body in page_bodies for match in marker.finditer(body)]
+        if len(matches) != 1:
             raise RuntimeError(
-                f"chunk {chunk_id} appears {occurrences} times in assembled pages"
+                f"chunk marker {chunk_id} appears {len(matches)} times in assembled pages"
             )
+        page_body = next(body for body in page_bodies if marker.search(body))
+        match = marker.search(page_body)
+        assert match is not None
+        next_marker = re.search(r"^<!-- chunk: [^ ]+ [^\n]* -->\n", page_body[match.end() :], re.MULTILINE)
+        segment_end = match.end() + next_marker.start() if next_marker else len(page_body)
+        segment = page_body[match.end() : segment_end]
+        if chunk.body not in segment:
+            raise RuntimeError(f"chunk body for {chunk_id} is missing from its marked section")
     expected = set(chunks_by_id)
     assigned = {
         decision.chunk_id
@@ -870,6 +897,8 @@ async def arun_pages_pipeline(
         )
         for plan in sorted(plans, key=lambda item: (item.source_start, item.source_end))
     ]
+    if on_progress:
+        on_progress({"stage": "ページ分割", "step": "summarizing", "chunk_count": len(chunks)})
     chunks = await summarize_chunks(
         llm,
         chunks,
@@ -879,6 +908,8 @@ async def arun_pages_pipeline(
     if on_progress:
         on_progress({"stage": "ページ分割", "step": "shelf", "chunk_count": len(chunks)})
     shelf = await plan_shelf(llm, chunks, stop_check=stop_check)
+    if on_progress:
+        on_progress({"stage": "ページ分割", "step": "routing", "chunk_count": len(chunks)})
     decisions, parked = await route_chunks(
         llm,
         embedder,
@@ -904,6 +935,8 @@ async def arun_pages_pipeline(
             decision.page_id = owner.id if owner else None
     assembled: dict[str, str] = {}
     if getattr(settings, "page_stitch", False):
+        if on_progress:
+            on_progress({"stage": "ページ分割", "step": "stitching"})
         for page in [item for item in shelf.pages if not item.is_chapter and item.chunk_ids]:
             ops = await stitch_page(
                 llm,
@@ -920,6 +953,8 @@ async def arun_pages_pipeline(
                 stop_check=stop_check,
             )
             assembled[page.id] = apply_stitch_ops(assemble_page(page, decisions, chunks_by_id), ops)
+    if on_progress:
+        on_progress({"stage": "ページ分割", "step": "writing", "chunk_count": len(chunks)})
     result = write_pages_output(
         out_dir=out_dir,
         shelf=shelf,

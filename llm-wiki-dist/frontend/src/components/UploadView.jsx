@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import PdfParserView from './PdfParserView'
+import { api } from '../api'
 import { useT } from '../i18n.jsx'
 
 const COOKIE_PREFIX = 'llm_wiki_setting_'
@@ -66,6 +67,14 @@ const STR = {
     uploadMarkdown: 'アップロード',
     markdownNameRequired: 'Markdown 名を入力してください。',
     markdownRequired: 'Markdown ファイルを選択してください。',
+    ingestMode: '取り込みモード',
+    modeDefault: (mode) => `設定に従う（${mode}）`,
+    modeChunks: 'チャンク',
+    modePages: 'ページ',
+    modeHint:
+      'このドキュメントの分割方法だけを変更します。設定の値より先に、ここで選んだ方が適用されます。',
+    modeNote:
+      '短い文書は分割して取り込まないため、この選択は影響しません。',
   },
   en: {
     readingFile: 'Reading markdown file...',
@@ -82,6 +91,14 @@ const STR = {
     uploadMarkdown: 'Upload markdown',
     markdownNameRequired: 'Please enter a markdown name.',
     markdownRequired: 'Please choose a markdown file first.',
+    ingestMode: 'Ingest mode',
+    modeDefault: (mode) => `Follow settings (${mode})`,
+    modeChunks: 'Chunks',
+    modePages: 'Pages',
+    modeHint:
+      'Changes how this document alone is split. What you pick here wins over the setting.',
+    modeNote:
+      'Short documents are ingested without splitting, so this choice does not affect them.',
   },
 }
 
@@ -107,8 +124,17 @@ export default function UploadView({
   const [name, setName] = useState('')
   const [markdownName, setMarkdownName] = useState('')
   const [markdownDraft, setMarkdownDraft] = useState(null)
+  const [ingestMode, setIngestMode] = useState('')
+  const [serverMode, setServerMode] = useState('chunks')
   const [status, setStatus] = useState('')
   const [error, setError] = useState(null)
+
+  // What the server would do if this document were uploaded with no choice
+  // made. Echoed inside the "follow settings" option so the picker never lies.
+  const settingsMode =
+    (settingsSource.ingest_mode || serverMode) === 'pages'
+      ? t.modePages
+      : t.modeChunks
 
   const [parserBase, setParserBase] = useState(() =>
     readParserBase({
@@ -126,6 +152,28 @@ export default function UploadView({
     )
   }, [pdfApiBase, settings, overrides])
 
+  // The ingest mode lives on the server, so ask for it: the parent app keeps no
+  // copy of server settings of its own.
+  useEffect(() => {
+    let alive = true
+
+    api
+      .settings()
+      .then((server) => {
+        if (alive && server?.ingest_mode) {
+          setServerMode(server.ingest_mode === 'pages' ? 'pages' : 'chunks')
+        }
+      })
+      .catch(() => {
+        // Leave the default label alone: the picker still works, it just shows
+        // チャンク until the server answers.
+      })
+
+    return () => {
+      alive = false
+    }
+  }, [])
+
   useEffect(() => {
     const syncParserBase = () => {
       setParserBase(
@@ -138,6 +186,10 @@ export default function UploadView({
 
     const onSettingsChanged = (event) => {
       const detail = event?.detail
+
+      if (detail && detail.ingest_mode !== undefined) {
+        setServerMode(detail.ingest_mode === 'pages' ? 'pages' : 'chunks')
+      }
 
       if (detail && detail[PDF_API_FIELD] !== undefined) {
         setParserBase(clean(detail[PDF_API_FIELD]))
@@ -217,6 +269,7 @@ export default function UploadView({
         {
           filename: nextName,
           markdown: markdownDraft.markdown,
+          ingestMode: ingestMode || undefined,
         },
         (nextStatus) => setStatus(nextStatus),
       )
@@ -267,6 +320,31 @@ export default function UploadView({
 
           {markdownDraft && (
             <div className="mt-[14px]">
+              <div className="mb-[12px] flex flex-wrap items-center gap-[10px]">
+                <span className="text-[12.5px] font-bold text-ink">
+                  {t.ingestMode}
+                </span>
+
+                <select
+                  value={ingestMode}
+                  disabled={busy}
+                  onChange={(e) => setIngestMode(e.target.value)}
+                  className="border border-line bg-soft px-[10px] py-[7px] text-[13px] text-ink outline-none focus:border-blue/50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <option value="">{t.modeDefault(settingsMode)}</option>
+                  <option value="chunks">{t.modeChunks}</option>
+                  <option value="pages">{t.modePages}</option>
+                </select>
+              </div>
+
+              <p className="mb-[6px] text-[12px] leading-[1.5] text-muted">
+                {t.modeHint}
+              </p>
+
+              <p className="mb-[14px] text-[12px] leading-[1.5] text-muted">
+                {t.modeNote}
+              </p>
+
               <label className="mb-[6px] block text-[12.5px] font-bold text-ink">
                 {t.markdownName}
               </label>
