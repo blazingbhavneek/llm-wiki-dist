@@ -10,7 +10,7 @@ import asyncio
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .config import NeoConfig
+from .config import WikiConfig
 from .ids import document_id, window_id
 from .images import ImageUnit, extract_image_units, image_records, numbered_prompt_block
 from .model import ModelPort
@@ -184,7 +184,7 @@ async def _observe_one(
     units: Sequence[ImageUnit],
     document: str,
     model: ModelPort,
-    config: NeoConfig,
+    config: WikiConfig,
     checkpoint_root: Path | None,
     live_root: Path | None,
     stop_check: StopCheck,
@@ -303,7 +303,7 @@ async def observe_document(
     source_text: str,
     *,
     model: ModelPort,
-    config: NeoConfig | None = None,
+    config: WikiConfig | None = None,
     document: str | None = None,
     checkpoint_dir: Path | str | None = None,
     live_output_dir: Path | str | None = None,
@@ -312,7 +312,7 @@ async def observe_document(
 ) -> ObservationSet:
     """Inventory independent overlapping windows, four at a time by default."""
 
-    config = config or NeoConfig()
+    config = config or WikiConfig()
     text = normalize_source(source_text)
     document = document or document_id(text)
     if not text:

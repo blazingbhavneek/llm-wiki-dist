@@ -205,6 +205,12 @@ export const api = {
     }, jobOpts), jobOpts),
 
   assimilation: () => req('/api/assimilation'),
+  syncProject: (ingestMode) =>
+    req('/api/sync', {
+      method: 'POST',
+      body: JSON.stringify({ ingest_mode: ingestMode || null }),
+    }),
+  wikiZipUrl: () => `${BASE}/api/wiki.zip`,
 
   settings: () => req('/api/settings'),
   settingsSchema: () => req('/api/settings/schema'),

@@ -1972,40 +1972,54 @@ async def plan_concept_files_streaming(
         for start_idx, end_idx in chunk_ranges
     ]
 
-    worker_count = max(1, int(CONCURRENCY if concurrency is None else concurrency))
-    semaphore = asyncio.Semaphore(worker_count)
+    # Sequential on purpose: the last concept of each window is carried into the
+    # next prompt so a topic that straddles a window boundary is planned once,
+    # whole. The parallel version (b739a17) dropped this and cut topics in half.
+    # ``concurrency`` is accepted for API compatibility and intentionally unused.
+    committed: list[ConceptFilePlan] = []
+    pending: ConceptFilePlan | None = None
 
-    async def plan_window(
-        chunk_index: int, chunk_start: int, chunk_end: int
-    ) -> list[ConceptFilePlan]:
-        async with semaphore:
-            if stop_check and stop_check():
-                raise JobCancelled("chunk planning cancelled")
-            label = f"chunk {chunk_index}/{len(global_chunks)}"
-            split = await split_window_until_valid(
-                llm=llm,
-                source_lines=source_lines,
-                source_start=chunk_start,
-                source_end=chunk_end,
-                pending=None,
-                label=label,
-                stop_check=stop_check,
-            )
-            if not split:
-                raise RuntimeError(
-                    f"{label}: valid split unexpectedly returned no files."
-                )
-            return split
+    for chunk_index, (chunk_start, chunk_end) in enumerate(global_chunks, start=1):
+        if stop_check and stop_check():
+            raise JobCancelled("chunk planning cancelled")
 
-    planned_windows = await asyncio.gather(
-        *(
-            plan_window(chunk_index, chunk_start, chunk_end)
-            for chunk_index, (chunk_start, chunk_end) in enumerate(
-                global_chunks, start=1
-            )
+        is_final_chunk = chunk_index == len(global_chunks)
+
+        if pending is not None:
+            prompt_start = pending.source_start
+        else:
+            prompt_start = chunk_start
+
+        prompt_end = chunk_end
+        label = f"chunk {chunk_index}/{len(global_chunks)}"
+
+        split = await split_window_until_valid(
+            llm=llm,
+            source_lines=source_lines,
+            source_start=prompt_start,
+            source_end=prompt_end,
+            pending=pending,
+            label=label,
+            stop_check=stop_check,
         )
-    )
-    committed = [item for window in planned_windows for item in window]
+
+        if not split:
+            raise RuntimeError(f"{label}: valid split unexpectedly returned no files.")
+
+        if is_final_chunk:
+            committed.extend(split)
+            pending = None
+        else:
+            committed.extend(split[:-1])
+            pending = split[-1]
+
+            print(
+                "[Planning] Carrying pending concept forward: "
+                f"{pending.title} [{pending.source_start}-{pending.source_end}]"
+            )
+
+    if pending is not None:
+        committed.append(pending)
 
     accepted, error = validate_concept_partition(
         files=committed,

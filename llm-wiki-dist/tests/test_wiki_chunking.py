@@ -9,14 +9,14 @@ import unittest
 from pathlib import Path
 from typing import Any, Sequence
 
-from graph.neo import document_map, images, markdown_blocks, pipeline, prompts, windows
-from graph.neo.schemas import (
+from graph.wiki import document_map, images, markdown_blocks, pipeline, prompts, windows
+from graph.wiki.schemas import (
     CompiledSeedPlan,
     ObservationSet,
     RegionalReport,
     WindowReport,
 )
-from graph.neo.wire import (
+from graph.wiki.wire import (
     ImportantOmission,
     ObservedRange,
     PageJudgeResult,
@@ -376,7 +376,7 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
                 units=[],
                 tokens={1: set(), 2: set()},
                 model=FakeModel(research),
-                config=pipeline.NeoConfig(reference_attempts=1),
+                config=pipeline.WikiConfig(reference_attempts=1),
                 work_root=root,
                 seed_root=root / "seeds",
                 stop_check=None,
@@ -449,7 +449,7 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
             result = await pipeline._rewrite_page(
                 self.pages()[0], pages=self.pages(), lines=self.lines(), units=[],
                 tokens={1: set(), 2: set()}, model=FakeModel(behaviour),
-                config=pipeline.NeoConfig(write_attempts=3, section_target_lines=80, section_min_lines=1),
+                config=pipeline.WikiConfig(write_attempts=3, section_target_lines=80, section_min_lines=1),
                 work_root=root, seed_root=root / "seeds", source_line_count=18,
                 stop_check=None, on_progress=None,
             )
@@ -476,7 +476,7 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
             result = await pipeline._rewrite_page(
                 self.pages()[0], pages=self.pages(), lines=self.lines(), units=[],
                 tokens={1: set(), 2: set()}, model=FakeModel(behaviour),
-                config=pipeline.NeoConfig(write_attempts=2, section_min_lines=1),
+                config=pipeline.WikiConfig(write_attempts=2, section_min_lines=1),
                 work_root=root, seed_root=root / "seeds", source_line_count=18,
                 stop_check=None, on_progress=None,
             )
@@ -512,7 +512,7 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
             result = await pipeline._rewrite_page(
                 self.pages()[0], pages=self.pages(), lines=self.lines(), units=[],
                 tokens={1: set(), 2: set()}, model=FakeModel(behaviour),
-                config=pipeline.NeoConfig(write_attempts=3, section_min_lines=1),
+                config=pipeline.WikiConfig(write_attempts=3, section_min_lines=1),
                 work_root=root, seed_root=root / "seeds", source_line_count=18,
                 stop_check=None, on_progress=None,
             )
@@ -549,7 +549,7 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             source = root / "doc.md"
             source.write_text(fake_source(), encoding="utf-8")
-            config = pipeline.NeoConfig(output_root=str(root / "out"), planner_attempts=1, map_attempts=1)
+            config = pipeline.WikiConfig(output_root=str(root / "out"), planner_attempts=1, map_attempts=1)
             run_root = await pipeline.run_pipeline(source, config=config, model=FakeModel(behaviour))
 
             wiki = run_root / "wiki"
@@ -564,7 +564,7 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WindowObservationTests(unittest.IsolatedAsyncioTestCase):
-    def config(self, **overrides) -> pipeline.NeoConfig:
+    def config(self, **overrides) -> pipeline.WikiConfig:
         values = {
             "window_target_lines": 100,
             "window_overlap_lines": 20,
@@ -572,7 +572,7 @@ class WindowObservationTests(unittest.IsolatedAsyncioTestCase):
             "planner_attempts": 2,
         }
         values.update(overrides)
-        return pipeline.NeoConfig(**values)
+        return pipeline.WikiConfig(**values)
 
     def test_windows_overlap_by_exact_configured_amount(self) -> None:
         self.assertEqual(
@@ -777,7 +777,7 @@ class HierarchicalPlanningTests(unittest.IsolatedAsyncioTestCase):
         regions = await document_map._build_regions(
             observations,
             model=FakeModel(region),
-            config=pipeline.NeoConfig(regional_window_count=10),
+            config=pipeline.WikiConfig(regional_window_count=10),
             checkpoint_root=None,
             stop_check=None,
             on_progress=None,
@@ -825,7 +825,7 @@ class HierarchicalPlanningTests(unittest.IsolatedAsyncioTestCase):
             ],
             lines=["line"] * 10,
             model=FakeModel(compile_plan),
-            config=pipeline.NeoConfig(map_attempts=3),
+            config=pipeline.WikiConfig(map_attempts=3),
             checkpoint_root=None,
             stop_check=None,
             on_progress=None,
@@ -869,7 +869,7 @@ class HierarchicalPlanningTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory)
-            config = pipeline.NeoConfig(map_attempts=2)
+            config = pipeline.WikiConfig(map_attempts=2)
             await document_map._compile_seed_plan(
                 semantic,
                 regions,

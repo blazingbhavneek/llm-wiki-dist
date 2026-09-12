@@ -74,6 +74,10 @@ const INGEST_DEFAULTS = {
   page_min_lines: 150,
   page_max_lines: 900,
   page_route_candidates: 5,
+  wiki_section_target_lines: 80,
+  wiki_write_attempts: 3,
+  wiki_rewrite_concurrency: 4,
+  wiki_output_language: 'Japanese (日本語)',
 }
 
 const INGEST_INT_BOUNDS = {
@@ -82,12 +86,17 @@ const INGEST_INT_BOUNDS = {
   page_min_lines: [1, 20000],
   page_max_lines: [1, 100000],
   page_route_candidates: [1, 50],
+  wiki_section_target_lines: [10, 1000],
+  wiki_write_attempts: [1, 10],
+  wiki_rewrite_concurrency: [1, 32],
 }
 
 function readIngestSettings(source) {
   const out = { ...INGEST_DEFAULTS, ...(source || {}) }
 
-  out.ingest_mode = out.ingest_mode === 'pages' ? 'pages' : 'chunks'
+  out.ingest_mode = ['chunks', 'pages', 'wiki'].includes(out.ingest_mode)
+    ? out.ingest_mode
+    : 'chunks'
   out.page_stitch = Boolean(out.page_stitch)
 
   for (const [field, [min, max]] of Object.entries(INGEST_INT_BOUNDS)) {
@@ -117,6 +126,10 @@ const ingestPatch = (ingest) => ({
   page_min_lines: ingest.page_min_lines,
   page_max_lines: ingest.page_max_lines,
   page_route_candidates: ingest.page_route_candidates,
+  wiki_section_target_lines: ingest.wiki_section_target_lines,
+  wiki_write_attempts: ingest.wiki_write_attempts,
+  wiki_rewrite_concurrency: ingest.wiki_rewrite_concurrency,
+  wiki_output_language: clean(ingest.wiki_output_language),
 })
 
 const TEST_IMAGE_DATA_URL =
@@ -338,10 +351,13 @@ const STR = {
     ingestModeHint: 'アップロード画面では、この文書だけを指定することもできます。',
     modeChunks: 'チャンク',
     modePages: 'ページ',
+    modeWiki: 'Wiki',
     modeChunksHelp:
       '元の文章をそのまま、章ごとに分割して取り込みます（従来の動作）',
     modePagesHelp:
       '関連する内容をまとめて、1つのWikiページに組み立てます',
+    modeWikiHelp:
+      '原文を失わずにセクション単位でWikiページへ書き換えます',
     modeSafe:
       '切り替えても既に取り込んだ文書には影響しません。文書ごとに、取り込んだ当時のモードが記録されています。',
 
@@ -356,6 +372,11 @@ const STR = {
     pageMinLines: '1ページの最小行数',
     pageMaxLines: '1ページの最大行数',
     pageRouteCandidates: '振り分けの候補ページ数',
+    wikiWriter: 'Wiki ライター',
+    wikiSectionTargetLines: 'セクション目標行数',
+    wikiWriteAttempts: '書き直し試行回数',
+    wikiRewriteConcurrency: '同時書き換え数',
+    wikiOutputLanguage: '出力言語',
 
     vectorBackend: 'ベクトルの保存先',
     vectorBackendHint:
@@ -455,10 +476,13 @@ const STR = {
     ingestModeHint: 'The upload screen can override this for a single document.',
     modeChunks: 'Chunks',
     modePages: 'Pages',
+    modeWiki: 'Wiki',
     modeChunksHelp:
       'Keep the original wording, split chapter by chapter (the original behaviour)',
     modePagesHelp:
       'Group related content together and assemble it into one wiki page',
+    modeWikiHelp:
+      'Rewrite source sections into wiki pages while preserving every source line',
     modeSafe:
       'Switching never changes documents already ingested. Each document keeps the mode it was ingested with.',
 
@@ -473,6 +497,11 @@ const STR = {
     pageMinLines: 'Minimum lines per page',
     pageMaxLines: 'Maximum lines per page',
     pageRouteCandidates: 'Candidate pages per chunk when routing',
+    wikiWriter: 'Wiki writer',
+    wikiSectionTargetLines: 'Target lines per section',
+    wikiWriteAttempts: 'Write attempts',
+    wikiRewriteConcurrency: 'Rewrite concurrency',
+    wikiOutputLanguage: 'Output language',
 
     vectorBackend: 'Vector storage',
     vectorBackendHint:
@@ -1364,6 +1393,7 @@ export default function SettingsView({ overrides, onApply }) {
             {[
               { value: 'chunks', label: t.modeChunks },
               { value: 'pages', label: t.modePages },
+              { value: 'wiki', label: t.modeWiki },
             ].map((option) => {
               const active = ingest.ingest_mode === option.value
 
@@ -1388,7 +1418,9 @@ export default function SettingsView({ overrides, onApply }) {
           <p className="mt-[10px] text-[12.5px] leading-[1.5] text-ink">
             {ingest.ingest_mode === 'pages'
               ? t.modePagesHelp
-              : t.modeChunksHelp}
+              : ingest.ingest_mode === 'wiki'
+                ? t.modeWikiHelp
+                : t.modeChunksHelp}
           </p>
 
           <p className="mt-[8px] border border-line bg-soft px-[10px] py-[8px] text-[12px] leading-[1.5] text-muted">
@@ -1457,7 +1489,47 @@ export default function SettingsView({ overrides, onApply }) {
                 onChange={(v) =>
                   setIngestNumberField('page_route_candidates', v)
                 }
-              />
+                />
+
+              {ingest.ingest_mode === 'wiki' && (
+                <div className="col-span-full border-t border-line pt-[12px]">
+                  <h4 className="mb-[10px] mt-0 text-[13px] font-extrabold text-ink">
+                    {t.wikiWriter}
+                  </h4>
+
+                  <div className="grid grid-cols-1 gap-[12px] md:grid-cols-2">
+                    <NumberField
+                      label={t.wikiSectionTargetLines}
+                      value={ingest.wiki_section_target_lines}
+                      onChange={(v) =>
+                        setIngestNumberField('wiki_section_target_lines', v)
+                      }
+                    />
+
+                    <NumberField
+                      label={t.wikiWriteAttempts}
+                      value={ingest.wiki_write_attempts}
+                      onChange={(v) =>
+                        setIngestNumberField('wiki_write_attempts', v)
+                      }
+                    />
+
+                    <NumberField
+                      label={t.wikiRewriteConcurrency}
+                      value={ingest.wiki_rewrite_concurrency}
+                      onChange={(v) =>
+                        setIngestNumberField('wiki_rewrite_concurrency', v)
+                      }
+                    />
+
+                    <Text
+                      label={t.wikiOutputLanguage}
+                      value={ingest.wiki_output_language}
+                      onChange={(v) => setIngestField('wiki_output_language', v)}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </details>
 

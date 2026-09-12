@@ -71,10 +71,15 @@ const STR = {
     modeDefault: (mode) => `設定に従う（${mode}）`,
     modeChunks: 'チャンク',
     modePages: 'ページ',
+    modeWiki: 'Wiki',
     modeHint:
       'このドキュメントの分割方法だけを変更します。設定の値より先に、ここで選んだ方が適用されます。',
     modeNote:
       '短い文書は分割して取り込まないため、この選択は影響しません。',
+    syncRaw: 'raw/ から同期',
+    downloadWiki: 'Wiki をダウンロード',
+    syncStarted: '同期ジョブをキューに追加しました。',
+    syncNeedsRoot: 'WIKI_DATA_ROOT が設定されていません。',
   },
   en: {
     readingFile: 'Reading markdown file...',
@@ -95,10 +100,15 @@ const STR = {
     modeDefault: (mode) => `Follow settings (${mode})`,
     modeChunks: 'Chunks',
     modePages: 'Pages',
+    modeWiki: 'Wiki',
     modeHint:
       'Changes how this document alone is split. What you pick here wins over the setting.',
     modeNote:
       'Short documents are ingested without splitting, so this choice does not affect them.',
+    syncRaw: 'Sync from raw/',
+    downloadWiki: 'Download wiki (zip)',
+    syncStarted: 'Sync job queued.',
+    syncNeedsRoot: 'WIKI_DATA_ROOT is not configured.',
   },
 }
 
@@ -128,13 +138,19 @@ export default function UploadView({
   const [serverMode, setServerMode] = useState('chunks')
   const [status, setStatus] = useState('')
   const [error, setError] = useState(null)
+  const [syncBusy, setSyncBusy] = useState(false)
+  const [syncStatus, setSyncStatus] = useState('')
+  const [hasDataRoot, setHasDataRoot] = useState(null)
 
   // What the server would do if this document were uploaded with no choice
   // made. Echoed inside the "follow settings" option so the picker never lies.
+  const activeServerMode = settingsSource.ingest_mode || serverMode
   const settingsMode =
-    (settingsSource.ingest_mode || serverMode) === 'pages'
+    activeServerMode === 'pages'
       ? t.modePages
-      : t.modeChunks
+      : activeServerMode === 'wiki'
+        ? t.modeWiki
+        : t.modeChunks
 
   const [parserBase, setParserBase] = useState(() =>
     readParserBase({
@@ -161,8 +177,13 @@ export default function UploadView({
       .settings()
       .then((server) => {
         if (alive && server?.ingest_mode) {
-          setServerMode(server.ingest_mode === 'pages' ? 'pages' : 'chunks')
+          setServerMode(
+            ['chunks', 'pages', 'wiki'].includes(server.ingest_mode)
+              ? server.ingest_mode
+              : 'chunks',
+          )
         }
+        if (alive) setHasDataRoot(Boolean(server?.data_root))
       })
       .catch(() => {
         // Leave the default label alone: the picker still works, it just shows
@@ -188,7 +209,11 @@ export default function UploadView({
       const detail = event?.detail
 
       if (detail && detail.ingest_mode !== undefined) {
-        setServerMode(detail.ingest_mode === 'pages' ? 'pages' : 'chunks')
+        setServerMode(
+          ['chunks', 'pages', 'wiki'].includes(detail.ingest_mode)
+            ? detail.ingest_mode
+            : 'chunks',
+        )
       }
 
       if (detail && detail[PDF_API_FIELD] !== undefined) {
@@ -209,6 +234,23 @@ export default function UploadView({
       document.removeEventListener('visibilitychange', syncParserBase)
     }
   }, [pdfApiBase, settings, overrides])
+
+  const syncRaw = async () => {
+    setSyncBusy(true)
+    setSyncStatus('')
+    setError(null)
+    try {
+      await api.syncProject()
+      setSyncStatus(t.syncStarted)
+    } catch (ex) {
+      if (ex?.code === 'no_data_root' || ex?.payload?.detail?.code === 'no_data_root') {
+        setHasDataRoot(false)
+      }
+      setError(ex.message || String(ex))
+    } finally {
+      setSyncBusy(false)
+    }
+  }
 
   const pickMd = async (e) => {
     const file = e.target.files?.[0]
@@ -295,6 +337,32 @@ export default function UploadView({
             {t.hint}
           </p>
 
+          <div className="mb-[14px] flex flex-wrap gap-[10px]">
+            <button
+              type="button"
+              disabled={syncBusy || hasDataRoot === false}
+              title={hasDataRoot === false ? t.syncNeedsRoot : undefined}
+              onClick={syncRaw}
+              className="border border-blue/30 bg-blue px-[15px] py-[9px] text-[13px] font-extrabold text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {syncBusy ? t.adding : t.syncRaw}
+            </button>
+
+            <a
+              href={api.wikiZipUrl()}
+              className={`border border-line bg-soft px-[15px] py-[9px] text-[13px] font-extrabold text-ink ${hasDataRoot === false ? 'pointer-events-none opacity-50' : ''}`}
+              title={hasDataRoot === false ? t.syncNeedsRoot : undefined}
+            >
+              {t.downloadWiki}
+            </a>
+          </div>
+
+          {syncStatus && (
+            <p className="mb-[12px] text-[12px] font-semibold text-muted">
+              {syncStatus}
+            </p>
+          )}
+
           <div className="flex items-center gap-[10px]">
             <input
               ref={mdRef}
@@ -334,6 +402,7 @@ export default function UploadView({
                   <option value="">{t.modeDefault(settingsMode)}</option>
                   <option value="chunks">{t.modeChunks}</option>
                   <option value="pages">{t.modePages}</option>
+                  <option value="wiki">{t.modeWiki}</option>
                 </select>
               </div>
 

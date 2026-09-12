@@ -14,7 +14,7 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel
 
-from .config import NeoConfig
+from .config import WikiConfig
 
 
 @runtime_checkable
@@ -48,7 +48,7 @@ _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 class ChatModelPort:
     """OpenAI-compatible chat endpoint via langchain structured output."""
 
-    def __init__(self, config: NeoConfig, *, llm: Any | None = None) -> None:
+    def __init__(self, config: WikiConfig, *, llm: Any | None = None) -> None:
         from graph.chunk import make_llm
 
         self.config = config

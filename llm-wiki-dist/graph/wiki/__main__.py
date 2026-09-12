@@ -5,17 +5,17 @@ import asyncio
 import json
 import sys
 
-from .config import NeoConfig
+from .config import WikiConfig
 from .pipeline import run_pipeline
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a lossless wiki from Markdown")
     parser.add_argument("source", help="source Markdown document")
-    parser.add_argument("--output", default=".wiki/neo", help="output root")
+    parser.add_argument("--output", default=".wiki/pages", help="output root")
     parser.add_argument("--slug", default="", help="output slug")
     args = parser.parse_args()
-    config = NeoConfig(
+    config = WikiConfig(
         output_root=args.output,
         document_slug=args.slug,
     )
@@ -76,7 +76,7 @@ def main() -> None:
         fallback = " [fallback]" if event.get("fallback") else ""
         cached = " [cached]" if event.get("cached") else ""
         print(
-            f"[neo] {stage}: {step}{count}{fallback}{cached} {detail}".rstrip(),
+            f"[wiki] {stage}: {step}{count}{fallback}{cached} {detail}".rstrip(),
             file=sys.stderr,
             flush=True,
         )

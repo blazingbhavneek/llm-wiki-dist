@@ -1,11 +1,11 @@
-"""Pure section/lossless/link helpers used by the neo page writer."""
+"""Pure section/lossless/link helpers used by the wiki page writer."""
 
 from __future__ import annotations
 
 import unittest
 
-from graph.neo import page
-from graph.neo.wire import ReferenceFact
+from graph.wiki import page
+from graph.wiki.wire import ReferenceFact
 
 
 def source() -> list[str]:

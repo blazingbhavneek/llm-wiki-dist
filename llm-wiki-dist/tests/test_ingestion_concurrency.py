@@ -13,9 +13,18 @@ from graph.librarian import Librarian
 
 
 class ChunkPlanningConcurrencyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_windows_are_bounded_and_returned_in_source_order(self) -> None:
+    async def test_planning_is_sequential_and_carries_the_last_concept_forward(self) -> None:
+        """The last concept of a window is re-planned with the next window.
+
+        The parallel planner (b739a17) dropped this and cut topics at window
+        boundaries; ``concurrency`` is accepted but must not change the order.
+        """
+
+        import asyncio
+
         active = 0
         maximum = 0
+        calls: list[tuple[int, int, str | None]] = []
 
         async def fake_split(**kwargs):
             nonlocal active, maximum
@@ -25,14 +34,18 @@ class ChunkPlanningConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.005)
                 start = kwargs["source_start"]
                 end = kwargs["source_end"]
+                pending = kwargs["pending"]
+                calls.append((start, end, pending.title if pending else None))
+                middle = start + (end - start) // 2
                 return [
                     chunk.ConceptFilePlan(
-                        title=f"topic-{start}",
-                        filename=f"topic-{start}.md",
-                        source_start=start,
-                        source_end=end,
-                        summary="summary",
-                    )
+                        title=f"topic-{start}", filename=f"topic-{start}.md",
+                        source_start=start, source_end=middle, summary="summary",
+                    ),
+                    chunk.ConceptFilePlan(
+                        title=f"tail-{middle + 1}", filename=f"tail-{middle + 1}.md",
+                        source_start=middle + 1, source_end=end, summary="summary",
+                    ),
                 ]
             finally:
                 active -= 1
@@ -41,12 +54,16 @@ class ChunkPlanningConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             result = await chunk.plan_concept_files_streaming(
                 llm=object(),
                 source_lines=[f"line {i}" for i in range(1, 13)],
-                target_lines=2,
+                target_lines=4,
                 max_extra=0,
                 concurrency=3,
             )
 
-        self.assertEqual(maximum, 3)
+        self.assertEqual(maximum, 1)
+        # Window 2 starts at the pending concept's first line, not at its own.
+        self.assertEqual(calls[0][2], None)
+        self.assertEqual(calls[1][0], calls[0][1] // 2 + 1)
+        self.assertEqual(calls[1][2], "tail-3")
         self.assertEqual(result[0].source_start, 1)
         self.assertEqual(result[-1].source_end, 12)
         self.assertEqual(

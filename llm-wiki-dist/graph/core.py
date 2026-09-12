@@ -90,7 +90,7 @@ class Settings(BaseModel):
 
     # --- page assembly -----------------------------------------------------
     # Both ingest modes remain available; chunks is the historical default.
-    ingest_mode: Literal["chunks", "pages"] = "chunks"
+    ingest_mode: Literal["chunks", "pages", "wiki"] = "chunks"
     page_min_chunks: int = 3
     page_max_chunks: int = 8
     page_min_lines: int = 150
@@ -100,6 +100,14 @@ class Settings(BaseModel):
     page_route_concurrency: int = 8
     page_stitch: bool = False
     page_stitch_concurrency: int = 4
+    # wiki mode: lossless section-wise rewrite, see graph/wiki
+    wiki_section_target_lines: int = 80
+    wiki_write_attempts: int = 3
+    wiki_rewrite_concurrency: int = 4
+    wiki_output_language: str = "Japanese (日本語)"
+    # project data folder (WP-S2); empty = legacy single-sqlite layout
+    data_root: str = ""
+    parser_base_url: str = ""
 
     # --- vector storage ----------------------------------------------------
     vector_backend: Literal["sqlite", "qdrant"] = "sqlite"
@@ -210,6 +218,16 @@ class Settings(BaseModel):
             ingest_mode=env("WIKI_INGEST_MODE", cls.ingest_mode),
             page_stitch=env("WIKI_PAGE_STITCH", "1" if cls.page_stitch else "0")
             not in {"0", "false", "False", ""},
+            wiki_section_target_lines=int(
+                env("WIKI_SECTION_TARGET_LINES", cls.wiki_section_target_lines)
+            ),
+            wiki_write_attempts=int(env("WIKI_WRITE_ATTEMPTS", cls.wiki_write_attempts)),
+            wiki_rewrite_concurrency=int(
+                env("WIKI_REWRITE_CONCURRENCY", cls.wiki_rewrite_concurrency)
+            ),
+            wiki_output_language=env("WIKI_OUTPUT_LANGUAGE", cls.wiki_output_language),
+            data_root=env("WIKI_DATA_ROOT", cls.data_root),
+            parser_base_url=env("WIKI_PARSER_BASE_URL", cls.parser_base_url),
             vector_backend=env("WIKI_VECTOR_BACKEND", cls.vector_backend),
             qdrant_url=env("QDRANT_URL", cls.qdrant_url),
             qdrant_collection=env("WIKI_QDRANT_COLLECTION", cls.qdrant_collection),

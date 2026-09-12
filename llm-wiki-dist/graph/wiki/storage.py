@@ -1,4 +1,4 @@
-"""Deterministic file IO for the neo pipeline.
+"""Deterministic file IO for the wiki pipeline.
 
 Every artifact the pipeline owns is written through here so that:
 

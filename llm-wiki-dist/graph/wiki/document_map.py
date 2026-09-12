@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .config import SEED_PLAN_VERSION, NeoConfig
+from .config import SEED_PLAN_VERSION, WikiConfig
 from .markdown_blocks import BlockIndex, build_block_index
 from .prompts import (
     regional_plan_prompt,
@@ -295,7 +295,7 @@ async def _build_regions(
     observations: ObservationSet,
     *,
     model,
-    config: NeoConfig,
+    config: WikiConfig,
     checkpoint_root: Path | None,
     stop_check: StopCheck,
     on_progress: Callable[[dict], None] | None,
@@ -430,7 +430,7 @@ async def _build_semantic_plan(
     *,
     source_line_count: int,
     model,
-    config: NeoConfig,
+    config: WikiConfig,
     checkpoint_root: Path | None,
     stop_check: StopCheck,
     on_progress: Callable[[dict], None] | None,
@@ -506,7 +506,7 @@ async def _compile_seed_plan(
     *,
     lines: Sequence[str],
     model,
-    config: NeoConfig,
+    config: WikiConfig,
     checkpoint_root: Path | None,
     stop_check: StopCheck,
     on_progress: Callable[[dict], None] | None,
@@ -674,7 +674,7 @@ async def build_seed_plan(
     *,
     lines: Sequence[str],
     model,
-    config: NeoConfig,
+    config: WikiConfig,
     checkpoint_dir: Path | str | None = None,
     stop_check: StopCheck = None,
     on_progress: Callable[[dict], None] | None = None,

@@ -16,6 +16,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -91,6 +92,11 @@ class AgentRunRegistry:
 
 # Per-db runtime config (reverse-proxy prefix + where the .sqlite files live).
 DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki_docker"))
+DATA_ROOT = (
+    Path(os.environ["WIKI_DATA_ROOT"]).resolve()
+    if os.environ.get("WIKI_DATA_ROOT")
+    else None
+)
 DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki_moove")
 PREFIX = os.environ.get("WIKI_PREFIX", "/agent/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
 REALTIME_TEMP = float(os.environ.get("REALTIME_TEMP", "0.0"))
@@ -139,10 +145,12 @@ def _not_ready_detail(db: str) -> dict[str, Any]:
     )
 
 
-def _build_stack(db_path: str) -> dict:
+def _build_stack(db_path: str, data_root: str | None = None) -> dict:
     log.info("startup: building stack db=%s", db_path)
     settings = Settings.from_env()
     settings.database_path = db_path  # pick the sqlite for this db
+    if data_root:
+        settings.data_root = data_root
 
     new_gateway = ModelGateway(settings)
     new_write_store = GraphStore(settings.database_path)  # rwc: created if missing
@@ -196,10 +204,10 @@ async def _bootstrap_db(db: str) -> None:
             if not await client.health():
                 raise RuntimeError("GROWI healthcheck failed")
             cache_path = _growi_cache_path(db)
-            stack = await asyncio.to_thread(_build_stack, str(cache_path))
+            stack = await asyncio.to_thread(_build_stack, str(cache_path), _data_root(db))
             stack["growi_connection"] = growi_connection
         else:
-            stack = await asyncio.to_thread(_build_stack, str(DB_DIR / f"{db}.sqlite"))
+            stack = await asyncio.to_thread(_build_stack, str(_db_path(db)), _data_root(db))
         await stack["librarian"].start()
         STACKS[db] = stack
         stages[db] = "ready"
@@ -253,7 +261,7 @@ async def lifespan(_: FastAPI):
     )
     logging.getLogger("graph_librarian").setLevel(logging.INFO)
 
-    DB_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_ROOT or DB_DIR).mkdir(parents=True, exist_ok=True)
 
     loop = asyncio.get_running_loop()
     loop.set_default_executor(
@@ -279,11 +287,24 @@ async def lifespan(_: FastAPI):
     try:
         existing_dbs: list[str] = []
 
-        for path in sorted(DB_DIR.glob("*.sqlite"), key=lambda p: p.name):
-            if not path.is_file():
-                continue
+        if DATA_ROOT is not None:
+            candidates = sorted(
+                (
+                    path.name,
+                    path / "graph.sqlite",
+                )
+                for path in DATA_ROOT.iterdir()
+                if path.is_dir()
+                and ((path / "graph.sqlite").is_file() or (path / "raw").is_dir())
+            )
+        else:
+            candidates = sorted(
+                (path.name[: -len(".sqlite")], path)
+                for path in DB_DIR.glob("*.sqlite")
+                if path.is_file()
+            )
 
-            db = path.name[: -len(".sqlite")]
+        for db, path in candidates:
 
             # Do not preload invalid/reserved DB names. This matches your
             # routing/admin validation behavior.
@@ -357,7 +378,7 @@ async def lifespan(_: FastAPI):
             log.info(
                 "startup: no existing sqlite dbs found in %s; "
                 "normal wiki routes will 404 until an admin creates/uploads a db",
-                DB_DIR,
+                DATA_ROOT or DB_DIR,
             )
 
         yield
@@ -536,7 +557,17 @@ def _growi_cache_path(name: str) -> Path:
     return GROWI_ENGINE_DB.parent / "growi-cache" / f"{name}.sqlite"
 
 
+def _data_root(db: str) -> str | None:
+    # The project folder is keyed by db name, not by where the sqlite lives
+    # (a GROWI-attached db builds its stack on a cache sqlite elsewhere).
+    return str(DATA_ROOT / db) if DATA_ROOT is not None else None
+
+
 def _db_path(db: str) -> Path:
+    if DATA_ROOT is not None:
+        from graph.project import Project
+
+        return Project(DATA_ROOT / db).ensure().database
     return DB_DIR / f"{db}.sqlite"
 
 
@@ -739,8 +770,8 @@ def _migrate_sqlite_file(path: Path) -> None:
             store.close()
 
 
-def _db_summary_from_path(path: Path) -> dict[str, Any]:
-    db = path.name[: -len(".sqlite")]
+def _db_summary_from_path(path: Path, db_name: str | None = None) -> dict[str, Any]:
+    db = db_name or path.name[: -len(".sqlite")]
     stat = path.stat()
 
     base: dict[str, Any] = {
@@ -1179,16 +1210,39 @@ async def admin_delete_connection(
 @app.get("/admin/api/dbs")
 async def admin_list_dbs(_: str | None = Header(default=None, alias="X-Admin-Password")):
     _require_admin(_)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    dbs = [
-        _db_summary_from_path(path)
-        for path in sorted(DB_DIR.glob("*.sqlite"), key=lambda p: p.name)
-        if not path.name.endswith(".sqlite-wal")
-        and not path.name.endswith(".sqlite-shm")
-    ]
+    (DATA_ROOT or DB_DIR).mkdir(parents=True, exist_ok=True)
+    if DATA_ROOT is not None:
+        dbs = []
+        for project in sorted(DATA_ROOT.iterdir(), key=lambda p: p.name):
+            if not project.is_dir() or not (
+                (project / "graph.sqlite").is_file() or (project / "raw").is_dir()
+            ):
+                continue
+            path = project / "graph.sqlite"
+            if path.exists():
+                dbs.append(_db_summary_from_path(path, db_name=project.name))
+            else:
+                dbs.append(
+                    {
+                        "name": project.name,
+                        "url": _db_url(project.name),
+                        "path": str(path),
+                        "size_bytes": 0,
+                        "modified_at": 0,
+                        "valid": False,
+                        "error": "graph.sqlite not created",
+                    }
+                )
+    else:
+        dbs = [
+            _db_summary_from_path(path)
+            for path in sorted(DB_DIR.glob("*.sqlite"), key=lambda p: p.name)
+            if not path.name.endswith(".sqlite-wal")
+            and not path.name.endswith(".sqlite-shm")
+        ]
     return {
         "default": DEFAULT_DB,
-        "db_dir": str(DB_DIR),
+        "db_dir": str(DATA_ROOT or DB_DIR),
         "dbs": dbs,
     }
 
@@ -1218,7 +1272,6 @@ async def admin_create_db(
     db = _validate_db_name(db)
 
     async with ADMIN_DB_LOCK:
-        DB_DIR.mkdir(parents=True, exist_ok=True)
         path = _db_path(db)
         if path.exists():
             raise HTTPException(
@@ -1261,7 +1314,7 @@ async def admin_upload_db(
     tmp_path: Path | None = None
 
     async with ADMIN_DB_LOCK:
-        DB_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_ROOT or DB_DIR).mkdir(parents=True, exist_ok=True)
         target = _db_path(db)
 
         if target.exists() and not replace:
@@ -1434,7 +1487,7 @@ async def admin_copy_db(
         )
 
     async with ADMIN_DB_LOCK:
-        DB_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_ROOT or DB_DIR).mkdir(parents=True, exist_ok=True)
 
         source = _db_path(db)
         target = _db_path(target_db)
@@ -1525,7 +1578,7 @@ async def admin_rename_db(
         )
 
     async with ADMIN_DB_LOCK:
-        DB_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_ROOT or DB_DIR).mkdir(parents=True, exist_ok=True)
 
         source = _db_path(db)
         target = _db_path(target_db)
@@ -1742,6 +1795,10 @@ class CascadingUpdateBody(BaseModel):
 
 class IngestBody(BaseModel):
     path: str
+
+
+class SyncBody(BaseModel):
+    ingest_mode: str | None = None
 
 
 # ============================================================================
@@ -2259,6 +2316,42 @@ async def ingest(payload: IngestBody) -> dict:
             detail=api_error(f"path not found: {path}", False, "bad_path"),
         )
     return await _enqueue("ingest_md_output", {"path": path})
+
+
+@app.post("/api/sync")
+async def sync_project(payload: SyncBody | None = None) -> dict:
+    if DATA_ROOT is None:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error(
+                "WIKI_DATA_ROOT is not configured", False, "no_data_root"
+            ),
+        )
+    return await _enqueue(
+        "sync_project",
+        {"ingest_mode": payload.ingest_mode if payload else None},
+    )
+
+
+@app.get("/api/wiki.zip")
+async def wiki_zip() -> StreamingResponse:
+    if DATA_ROOT is None:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error(
+                "WIKI_DATA_ROOT is not configured", False, "no_data_root"
+            ),
+        )
+    from graph.project import Project, zip_wiki
+
+    project = Project(DATA_ROOT / current_db.get())
+    return StreamingResponse(
+        io.BytesIO(zip_wiki(project)),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{current_db.get()}-wiki.zip"'
+        },
+    )
 
 
 # ============================================================================

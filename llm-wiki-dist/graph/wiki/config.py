@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-PROMPT_VERSION = "neo-overlap-plan-ja-6"
-SEED_PLAN_VERSION = "neo-seed-plan-ja-8"
-REWRITE_PROMPT_VERSION = "neo-sections-ja-1"
+PROMPT_VERSION = "wiki-overlap-plan-ja-6"
+SEED_PLAN_VERSION = "wiki-seed-plan-ja-8"
+REWRITE_PROMPT_VERSION = "wiki-sections-ja-1"
 
 
-class NeoConfig(BaseModel):
+class WikiConfig(BaseModel):
     # Overlapping source observation
     window_target_lines: int = 250
     window_overlap_lines: int = 50
@@ -43,5 +43,7 @@ class NeoConfig(BaseModel):
     output_language: str = "Japanese (日本語)"
     prompt_version: str = PROMPT_VERSION
     resume: bool = True
-    output_root: str = ".wiki/neo"
+    output_root: str = ".wiki/pages"
     document_slug: str = ""
+    # Keep project runs stable so changed sources can resume incrementally.
+    run_dir: str = ""

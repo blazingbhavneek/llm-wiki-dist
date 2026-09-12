@@ -1,4 +1,4 @@
-"""The neo pipeline: deterministic partition, section-wise lossless rewriting.
+"""The wiki pipeline: deterministic partition, section-wise lossless rewriting.
 
 1. Overlapping 250-line windows are described without assigning ownership.
 2. Regional and document planners compile one exact sequential seed partition.
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .config import REWRITE_PROMPT_VERSION, SEED_PLAN_VERSION, NeoConfig
+from .config import REWRITE_PROMPT_VERSION, SEED_PLAN_VERSION, WikiConfig
 from .document_map import build_seed_plan
 from .ids import document_id, slugify
 from .images import ImageUnit, extract_image_units, restore_images
@@ -572,7 +572,7 @@ async def _research_references(
     units: Sequence[ImageUnit],
     tokens: dict[int, set[str]],
     model: ModelPort,
-    config: NeoConfig,
+    config: WikiConfig,
     work_root: Path,
     seed_root: Path,
     stop_check: StopCheck,
@@ -864,7 +864,7 @@ async def _write_section(
     lines: Sequence[str],
     units: Sequence[ImageUnit],
     model: ModelPort,
-    config: NeoConfig,
+    config: WikiConfig,
     task_dir: Path,
     stop_check: StopCheck,
     on_progress: Progress,
@@ -1006,7 +1006,7 @@ async def _write_intro(
     body: str,
     *,
     model: ModelPort,
-    config: NeoConfig,
+    config: WikiConfig,
     task_dir: Path,
     stop_check: StopCheck,
 ) -> str:
@@ -1047,7 +1047,7 @@ async def _rewrite_page(
     units: Sequence[ImageUnit],
     tokens: dict[int, set[str]],
     model: ModelPort,
-    config: NeoConfig,
+    config: WikiConfig,
     work_root: Path,
     seed_root: Path,
     source_line_count: int,
@@ -1124,7 +1124,7 @@ async def _rewrite_all(
     lines: list[str],
     units: Sequence[ImageUnit],
     model: ModelPort,
-    config: NeoConfig,
+    config: WikiConfig,
     work_root: Path,
     seed_root: Path,
     wiki_root: Path,
@@ -1273,7 +1273,7 @@ def _manifest(
 async def run_pipeline(
     source_path: Path | str,
     *,
-    config: NeoConfig | None = None,
+    config: WikiConfig | None = None,
     model: ModelPort | None = None,
     on_progress: Progress = None,
     stop_check: StopCheck = None,
@@ -1285,10 +1285,14 @@ async def run_pipeline(
     source_text = source_bytes.decode("utf-8")
     normalized = normalize_source(source_text)
     lines = split_source_lines(normalized)
-    config = config or NeoConfig()
+    config = config or WikiConfig()
     model = model or ChatModelPort(config)
     slug = slugify(config.document_slug or source_path.stem, fallback="document").casefold()
-    run_root = Path(config.output_root) / f"{slug}-{sha256_text(source_text)[:12]}"
+    run_root = (
+        Path(config.run_dir).resolve()
+        if config.run_dir
+        else Path(config.output_root) / f"{slug}-{sha256_text(source_text)[:12]}"
+    )
     source_root = run_root / "source"
     state_root = run_root / "state"
     work_root = run_root / "work"

@@ -427,7 +427,7 @@ class Librarian:
     # them in one transaction would hold a SQLite write-transaction open the
     # whole time (blocking WAL checkpointing). Instead they snapshot the DB up
     # front, commit incrementally, and revert from the snapshot on any failure.
-    _SNAPSHOT_JOB_TYPES = {"ingest_md_output", "chunk_and_ingest"}
+    _SNAPSHOT_JOB_TYPES = {"ingest_md_output", "chunk_and_ingest", "sync_project"}
 
     def _apply_job(self, job: WriteJob) -> Any:
         if job.type in self._SNAPSHOT_JOB_TYPES:
@@ -578,6 +578,9 @@ class Librarian:
 
         if job.type == "chunk_and_ingest":
             return self.chunk_and_ingest(job)
+
+        if job.type == "sync_project":
+            return self.sync_project(job)
 
         if job.type == "publish_to_growi":
             return self.publish_to_growi(job)
@@ -1694,7 +1697,7 @@ class Librarian:
         return nodes
 
     def chunk_and_ingest(self, job: WriteJob) -> dict[str, Any]:
-        from .chunk import make_llm, run_chunk_pipeline
+        from .chunk import make_llm
 
         body = job.payload["body"]
         settings = self.settings
@@ -1744,29 +1747,20 @@ class Librarian:
         options = job.payload.get("chunk_options") or {}
         mode = options.get("ingest_mode") or getattr(settings, "ingest_mode", "chunks")
 
-        if mode == "pages":
-            from .pages import run_pages_pipeline
+        from .writers import build_wiki_output
 
-            result = run_pages_pipeline(
-                source_text=body,
-                document_name=document_name,
-                out_dir=out_dir,
-                llm=llm,
-                embedder=self.gateway.embedder,
-                settings=settings,
-                on_progress=on_progress,
-                stop_check=stop_check,
-            )
-        else:
-            result = run_chunk_pipeline(
-                source_text=body,
-                document_name=document_name,
-                out_dir=out_dir,
-                llm=llm,
-                concurrency=ingest_concurrency,
-                on_progress=on_progress,
-                stop_check=stop_check,
-            )
+        result = build_wiki_output(
+            source_path=raw_source_path,
+            document_name=document_name,
+            out_dir=out_dir,
+            mode=mode,
+            settings=settings,
+            llm=llm,
+            embedder=self.gateway.embedder,
+            state_dir=Path(settings.database_path).parent / "wiki-state" / out_dir.name,
+            on_progress=on_progress,
+            stop_check=stop_check,
+        )
 
         if stop_check():
             raise JobCancelled("job cancelled")
@@ -1819,6 +1813,39 @@ class Librarian:
             if result.out_dir.exists():
                 shutil.rmtree(result.out_dir)
 
+    def sync_project(self, job: WriteJob) -> dict[str, Any]:
+        """Bring one project folder and its graph in line with raw/ git."""
+
+        from .chunk import make_llm
+        from .project import Project
+        from .sync import sync_project
+
+        data_root = getattr(self.settings, "data_root", "")
+        if not data_root:
+            raise ValueError("sync_project needs WIKI_DATA_ROOT (Settings.data_root)")
+        project = Project(Path(data_root)).ensure()
+        settings = self.settings
+        llm = make_llm(
+            model=settings.chat_model,
+            base_url=settings.chat_base_url,
+            api_key=settings.chat_api_key,
+            temperature=settings.chat_temperature,
+        )
+
+        def on_progress(update: dict[str, Any]) -> None:
+            job.progress = update
+
+        return sync_project(
+            project,
+            self,
+            mode=str(job.payload.get("ingest_mode") or getattr(settings, "ingest_mode", "chunks")),
+            settings=settings,
+            llm=llm,
+            embedder=self.gateway.embedder,
+            on_progress=on_progress,
+            stop_check=lambda: job.stop_event.is_set(),
+        )
+
     def publish_to_growi(self, job: WriteJob) -> dict[str, Any]:
         """Publish marked page bodies through the registry-backed GROWI client."""
         import os
@@ -1841,11 +1868,19 @@ class Librarian:
         from .growi import GrowiClient
 
         client = GrowiClient(connection.url, connection.api_token)
+        pages = list(job.payload.get("pages") or [])
+        if job.payload.get("from_wiki"):
+            data_root = getattr(self.settings, "data_root", "")
+            if not data_root:
+                raise ValueError("from_wiki needs WIKI_DATA_ROOT (Settings.data_root)")
+            pages = self.growi_pages_from_wiki(
+                Path(data_root) / "wiki", connection.write_path
+            )
         try:
             results = asyncio.run(
                 publish_pages(
                     client,
-                    list(job.payload.get("pages") or []),
+                    pages,
                     mode=connection.mode,
                     write_path=connection.write_path,
                     root_path=connection.root_path,
@@ -1856,6 +1891,24 @@ class Librarian:
             raise
         registry.record_sync(name, error=None)
         return {"name": name, "published": len(results)}
+
+    def growi_pages_from_wiki(
+        self, wiki_root: Path, write_path: str
+    ) -> list[dict[str, str]]:
+        """Build the page payload expected by ``publish_pages`` from wiki/."""
+
+        pages: list[dict[str, str]] = []
+        for md in sorted(Path(wiki_root).rglob("*.md")):
+            if "_planning" in md.parts or md.name == "index.md":
+                continue
+            rel = md.relative_to(wiki_root).with_suffix("").as_posix()
+            pages.append(
+                {
+                    "path": f"{write_path.rstrip('/')}/{rel}",
+                    "body": md.read_text(encoding="utf-8"),
+                }
+            )
+        return pages
 
     def sync_growi(self, job: WriteJob) -> dict[str, Any]:
         """Backfill or incrementally refresh one registered GROWI connection."""
@@ -3818,6 +3871,10 @@ class Librarian:
         # New parser output stores metadata in _planning/ and markdown pages in docs/.
         planning_dir = out_path / "_planning"
         docs_dir = out_path / "docs"
+
+        if not docs_dir.exists() and any(out_path.glob("*.md")):
+            # Published wiki folders keep pages at the top level.
+            docs_dir = out_path
 
         if not docs_dir.exists():
             raise FileNotFoundError(f"no docs directory found in {out_path}")
