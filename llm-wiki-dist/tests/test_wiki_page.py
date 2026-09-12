@@ -24,9 +24,16 @@ class SplitSectionsTests(unittest.TestCase):
         self.assertEqual(sections[-1][1], len(lines))
         for (_, left_end), (right_start, _) in zip(sections, sections[1:]):
             self.assertEqual(left_end + 1, right_start)
-        self.assertIn(11, [s for s, _ in sections])
+        # Title + A (19 lines) pack into one section; B is cut at its heading.
+        self.assertEqual(sections[0], (1, 19))
         self.assertIn(20, [s for s, _ in sections])
         self.assertGreater(len(sections), 3)
+        self.assertTrue(all(e - s + 1 <= 40 for s, e in sections))
+
+    def test_adjacent_headings_pack_up_to_target(self) -> None:
+        lines = (["## a"] + ["x"] * 9) * 6  # six 10-line subsections
+        self.assertEqual(page.split_sections(lines, 1, 60, target=30, min_lines=2), [(1, 30), (31, 60)])
+        self.assertEqual(page.split_sections(lines, 1, 60, target=10, min_lines=2), [(i, i + 9) for i in range(1, 60, 10)])
 
     def test_heading_inside_fence_is_not_a_cut(self) -> None:
         lines = ["## top", "text", "```sh", "# not a heading", "```", "tail"]
@@ -38,7 +45,7 @@ class SplitSectionsTests(unittest.TestCase):
 
     def test_offsets_are_absolute(self) -> None:
         lines = ["skip"] * 10 + ["## a"] + ["x"] * 10 + ["## b"] + ["y"] * 10
-        sections = page.split_sections(lines, 11, 32, target=80, min_lines=2)
+        sections = page.split_sections(lines, 11, 32, target=15, min_lines=2)
         self.assertEqual(sections, [(11, 21), (22, 32)])
 
 
@@ -46,6 +53,18 @@ class LosslessCheckTests(unittest.TestCase):
     def test_code_tokens_keep_identifiers_and_drop_prose(self) -> None:
         tokens = page.code_tokens("call mpf_mfs_open with E_MFS_ETIMEOUT at 0x1F; the file [[NEO-IMAGE:abc_1]]")
         self.assertEqual(tokens, {"mpf_mfs_open", "E_MFS_ETIMEOUT", "0x1F"})
+
+    def test_code_tokens_compare_plural_acronyms_by_stem(self) -> None:
+        self.assertEqual(page.code_tokens("uses GPUs, CPUs and VEs") - page.code_tokens("GPU と CPU と VE"), set())
+
+    def test_code_tokens_ignore_doc_parser_backslash_escapes(self) -> None:
+        # doc-parser/pandoc escapes underscores in prose ("mpi\_aware"); a
+        # faithful rewrite naturally drops the escape, so it must not count
+        # as a lost identifier (see graph/wiki/page.py MD_ESCAPE_RE).
+        escaped = page.code_tokens(r"the mpi\_aware flag and nd\_range call")
+        plain = page.code_tokens("the mpi_aware flag and nd_range call")
+        self.assertEqual(escaped, plain)
+        self.assertEqual(escaped, {"mpi_aware", "nd_range"})
 
     def test_verbatim_blocks_are_found_with_absolute_lines(self) -> None:
         self.assertEqual(page.verbatim_blocks(source(), 1, 20), [("fence", 12, 15), ("table", 16, 18)])

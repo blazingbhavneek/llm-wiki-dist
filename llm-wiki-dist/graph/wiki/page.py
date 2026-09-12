@@ -19,6 +19,13 @@ WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}|[ァ-ヶー]{3,}|[一-龯]{2,}"
 REFERENCE_MARKER_RE = re.compile(r"（参照元:\s*原文\s*(\d+)\s*(?:[-–—]\s*(\d+)\s*)?行）")
 THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 PLACEHOLDER_RE = re.compile(r"\[\[NEO-IMAGE:[A-Za-z0-9_-]+\]\]")
+# doc-parser output backslash-escapes CommonMark punctuation in prose (e.g.
+# ``mpi\_aware``). A faithful rewrite naturally drops that escape, which used
+# to make code_tokens() see "_aware" as a token the draft "lost". Strip the
+# escape before tokenizing so both sides compare the same identifier.
+MD_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~])")
+# "GPUs"/"VEs" in English prose become "GPU"/"VE" in the rewrite; compare stems.
+PLURAL_ACRONYM_RE = re.compile(r"\b([A-Z0-9]{2,})s\b")
 
 
 def _nonblank(lines: Sequence[str], start: int, end: int) -> int:
@@ -37,8 +44,9 @@ def split_sections(
 
     Cuts happen before Markdown headings (never inside a fence, table or
     image unit); anything longer than ``target`` is split on atomic-block
-    boundaries; anything with fewer than ``min_lines`` non-blank lines is
-    merged into its neighbour.  The result tiles ``start..end`` exactly.
+    boundaries; adjacent pieces are packed while they fit in ``target`` lines,
+    and anything with fewer than ``min_lines`` non-blank lines is merged into
+    its neighbour regardless.  The result tiles ``start..end`` exactly.
     """
 
     page = list(lines[start - 1 : end])
@@ -64,7 +72,10 @@ def split_sections(
 
     merged: list[list[int]] = []
     for s, e in split:
-        if merged and _nonblank(page, merged[-1][0], merged[-1][1]) < min_lines:
+        if merged and (
+            _nonblank(page, merged[-1][0], merged[-1][1]) < min_lines
+            or e - merged[-1][0] + 1 <= target
+        ):
             merged[-1][1] = e
         else:
             merged.append([s, e])
@@ -83,7 +94,9 @@ def code_tokens(text: str) -> set[str]:
 
     # ponytail: bare numbers are too noisy; add units-aware numeric checks if needed.
     found: set[str] = set()
-    for token in CODE_TOKEN_RE.findall(PLACEHOLDER_RE.sub(" ", text or "")):
+    cleaned = MD_ESCAPE_RE.sub(r"\1", PLACEHOLDER_RE.sub(" ", text or ""))
+    cleaned = PLURAL_ACRONYM_RE.sub(r"\1", cleaned)
+    for token in CODE_TOKEN_RE.findall(cleaned):
         if (
             token[:2].lower() == "0x"
             or "_" in token
@@ -97,7 +110,8 @@ def code_tokens(text: str) -> set[str]:
 def word_tokens(text: str) -> set[str]:
     """Coarse vocabulary used only to rank reference candidates."""
 
-    return set(WORD_RE.findall(PLACEHOLDER_RE.sub(" ", text or "")))
+    cleaned = MD_ESCAPE_RE.sub(r"\1", PLACEHOLDER_RE.sub(" ", text or ""))
+    return set(WORD_RE.findall(cleaned))
 
 
 def verbatim_blocks(

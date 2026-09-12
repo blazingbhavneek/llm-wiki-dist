@@ -83,11 +83,12 @@ class ChatModelPort:
     ) -> str:
         """One bounded plain-text completion; the caller validates the content."""
 
-        llm = (
-            self.llm.bind(max_tokens=max_output_tokens)
-            if max_output_tokens is not None
-            else self.llm
-        )
+        kwargs: dict[str, Any] = {}
+        if max_output_tokens is not None:
+            kwargs["max_tokens"] = max_output_tokens
+        if not self.config.text_thinking:
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        llm = self.llm.bind(**kwargs)
         reply = await asyncio.wait_for(
             llm.ainvoke(list(messages)), timeout=self.config.request_timeout
         )

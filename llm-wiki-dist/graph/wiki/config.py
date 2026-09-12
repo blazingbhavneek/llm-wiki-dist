@@ -5,8 +5,8 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 PROMPT_VERSION = "wiki-overlap-plan-ja-6"
-SEED_PLAN_VERSION = "wiki-seed-plan-ja-8"
-REWRITE_PROMPT_VERSION = "wiki-sections-ja-1"
+SEED_PLAN_VERSION = "wiki-seed-plan-ja-9"
+REWRITE_PROMPT_VERSION = "wiki-sections-ja-2"
 
 
 class WikiConfig(BaseModel):
@@ -20,6 +20,8 @@ class WikiConfig(BaseModel):
     map_attempts: int = 0
     planner_max_output_tokens: int = 4000
     map_max_output_tokens: int = 32000
+    # Planner target per page; pages over twice this are split at headings by Python.
+    page_target_lines: int = 200
 
     # Section-wise page writing
     rewrite_concurrency: int = 4
@@ -40,6 +42,9 @@ class WikiConfig(BaseModel):
     chat_model: str = "gemma-4-31B"
     temperature: float = 0.0
     request_timeout: int = 300
+    # Reasoning on plain-text rewrite/intro calls (structured calls keep the
+    # server default). Python's lossless checks gate the output either way.
+    text_thinking: bool = False
     output_language: str = "Japanese (日本語)"
     prompt_version: str = PROMPT_VERSION
     resume: bool = True

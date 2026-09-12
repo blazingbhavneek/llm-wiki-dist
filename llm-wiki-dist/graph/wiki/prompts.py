@@ -127,6 +127,7 @@ def regional_plan_prompt(
     previous_region: str,
     output_language: str,
     last_error: str | None = None,
+    page_target_lines: int = 200,
 ) -> Prompt:
     from .wire import RegionalPlan
 
@@ -151,6 +152,8 @@ def regional_plan_prompt(
             "繰り返される具体的エンティティは個別に把握する。ただし20行未満の候補は作らず、"
             "短い隣接エンティティは同じ種類・目的のまとまりとしてグループ化する。"
             "列挙の導入・共通規則も最も適切なまとまりへ含める。\n"
+            f"各候補は約{page_target_lines}行を目安にし、最大{2 * page_target_lines}行を超える章・節は"
+            "見出しやエンティティの境界で複数の候補に分ける。\n"
             "ただし、普通の短いリスト、数段落だけの説明、抽象概念を機械的に細分化しない。"
             "行数を揃えるための切断や、エンティティ途中での切断を提案しない。\n"
             f"{correction}\n\n"
@@ -166,6 +169,7 @@ def semantic_plan_prompt(
     regional_reports: str,
     output_language: str,
     last_error: str | None = None,
+    page_target_lines: int = 200,
 ) -> Prompt:
     from .wire import SemanticPlan
 
@@ -196,6 +200,8 @@ def semantic_plan_prompt(
             "同じ種類・目的の隣接項目と意味のある単位へまとめる。\n"
             "- 普通の短い箇条書き、説明の一部、単なる抽象概念は独立ページにしない。\n"
             "- 地域境界を越えて続くエンティティを一つに戻し、重複観察を一件として扱う。\n"
+            f"- 各ページは約{page_target_lines}行を目安にし、最大{2 * page_target_lines}行を超えない。"
+            "長い章は見出し・エンティティの境界で複数ページに分ける（章全体を1ページにしない）。\n"
             f"{correction}\n\n地域地図:\n{regional_reports}"
         ),
     )
@@ -209,6 +215,7 @@ def seed_plan_compile_prompt(
     output_language: str,
     last_error: str | None = None,
     previous_plan: str = "",
+    page_target_lines: int = 200,
 ) -> Prompt:
     from .wire import SeedPlan
 
@@ -246,6 +253,8 @@ def seed_plan_compile_prompt(
             "先頭なら次、末尾なら前の候補だけを検討する。単に20行へ届かせるため、別エンティティの一部や"
             "空行だけを移動してはならない。\n"
             "- ページを空にせず、題名と短いsummaryを付ける。\n"
+            f"- 各ページは約{page_target_lines}行を目安にし、最大{2 * page_target_lines}行を超える"
+            "ページは見出し・エンティティの境界で分ける。\n"
             f"{correction}\n\n意味計画:\n{semantic_plan}\n\n地域地図:\n{regional_reports}"
         ),
     )
@@ -257,13 +266,10 @@ def reference_research_prompt(
     target_title: str,
     target_ranges: str,
     target_source: str,
-    reference_number: int,
-    reference_title: str,
-    reference_ranges: str,
-    reference_source: str,
+    references: str,
     output_language: str,
 ) -> Prompt:
-    """Compare one complete reference seed with one complete target seed."""
+    """Compare every selected reference seed with one complete target seed."""
 
     from .wire import ReferenceResearchResult
 
@@ -278,14 +284,13 @@ def reference_research_prompt(
         ),
         body=(
             f"対象: {target_number:03d} {target_title}（原文 {target_ranges}行）\n"
-            f"参照: {reference_number:03d} {reference_title}（原文 {reference_ranges}行）\n"
             f"説明は{output_language}で書くこと。\n\n"
             "判定規則:\n"
             "- 対象原文に既にある事実は追加候補にしない。\n"
             "- 対象ページを単独で理解、利用、実装、運用、障害対応するために有用な"
             "前提、用語、関係、使用条件、制約、注意だけを選ぶ。\n"
             "- 単なる関数一覧、章番号、同じ説明の言い換え、ナビゲーション用リンクは選ばない。\n"
-            "- 各事実のsource_start/source_endは、必ず参照原文に表示された正確な行番号にする。\n"
+            "- 各事実のsource_start/source_endは、必ずいずれかの参照原文に表示された正確な行番号にする。\n"
             "- target_lineには、その事実を本文へ入れるべき対象原文の行番号"
             "（対象原文に表示された番号のうち、最も関係の深い行）を書く。\n"
             "- descriptionには追加する事実、reasonには必要な理由、insertion_pointには"
@@ -293,7 +298,7 @@ def reference_research_prompt(
             "- 有用な事実がなければuseful_factsを空にし、"
             "no_useful_information_reasonへ具体的な理由を書く。捏造して水増ししない。\n\n"
             f"--- 対象ページの行番号付き原文（全文） ---\n{target_source}\n\n"
-            f"--- 参照ページの行番号付き原文（全文） ---\n{reference_source}"
+            f"{references}"
         ),
     )
 
@@ -374,8 +379,10 @@ def section_write_prompt(
             "単独で読んで理解できるWikiの節に書き直す。\n"
             "- 出力はMarkdown本文だけ。前置き、説明、JSON、出力全体をコードフェンスで囲むことは禁止。\n"
             "- 事実を捏造しない。原文と追加事実にない引数、動作、例、一般論を書かない。\n"
-            "- 原文の技術情報を一切落とさない。コードブロック、表、識別子、定数、数値、単位、"
-            "エラーコード、警告文は一字も変えずにそのまま写す。"
+            "- 原文の技術情報を一切落とさない。識別子、定数、数値、単位、"
+            "エラーコード、警告文は一字も変えずにそのまま写す。\n"
+            "- コードブロック、表、画像は`[[NEO-IMAGE:...]]`トークンとして与えられる。"
+            "トークンを一字も変えず、元と同じ話題の直後に1回だけ置く。トークンの中身を書き起こさない。"
         ),
         body=(
             "# 対象\n"
@@ -391,7 +398,7 @@ def section_write_prompt(
             "- 先頭の行番号は出典を示すためのもので、本文には書かない。\n"
             "- リンク（`[...](...)`）は書かない。「関連ページ」などの一覧も作らない。\n"
             "- 章番号、頁番号、目次など技術的な意味のない体裁だけは省いてよい。\n"
-            "- 画像トークンは一字も変えず、元と同じ話題の直後に1回だけ置く。\n"
+            "- トークン一覧（各1回だけ置く）:\n"
             f"{image_context}\n\n"
             "# 他ページから追加する事実\n"
             f"{facts_text}\n"

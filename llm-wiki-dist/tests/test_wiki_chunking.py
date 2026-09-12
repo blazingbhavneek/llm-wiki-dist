@@ -198,6 +198,23 @@ class SeedPlanTests(unittest.TestCase):
         self.assertIn("gap", error)
         self.assertIn("must be 11", error)
 
+    def test_oversize_pages_are_split_at_headings_by_python(self) -> None:
+        lines = [f"# 節{n // 30}" if n % 30 == 0 else f"line {n}" for n in range(300)]
+        plan = SeedPlan(pages=[SeedRange(title="章", summary="s", source_start=1, source_end=300)])
+
+        checked, error = document_map.validate_seed_plan(
+            plan, source_line_count=300, block_index=markdown_blocks.build_block_index(lines),
+            lines=lines, page_target_lines=50,
+        )
+
+        self.assertIsNone(error)
+        sizes = [p.source_end - p.source_start + 1 for p in checked.pages]
+        self.assertGreater(len(sizes), 1)
+        self.assertTrue(all(size <= 100 for size in sizes), sizes)
+        self.assertEqual(sum(sizes), 300)
+        self.assertEqual(checked.pages[0].title, f"章（1/{len(sizes)}）")
+        self.assertTrue(all(lines[p.source_start - 1].startswith("# ") for p in checked.pages))
+
     def test_seed_validation_sends_under_twenty_lines_back_to_the_llm(self) -> None:
         lines = ["line"] * 50
         plan = SeedPlan(
@@ -425,8 +442,11 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
                               owner_ranges=[(16, 18)], filename="002-settings.md", page_id="page-002"),
         ]
 
-    async def test_lost_code_block_is_fed_back_and_final_page_is_lossless(self) -> None:
+    async def test_dropped_code_token_is_reinserted_and_final_page_is_lossless(self) -> None:
         prompts_seen: list[str] = []
+        lines = self.lines()
+        units = images.block_units(lines)
+        fence, table = units[0].placeholder, units[1].placeholder
 
         async def behaviour(schema, messages):
             prompt = messages[-1].content
@@ -439,26 +459,29 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
             if "導入文" in prompt:
                 return "このページは mpf_open の使い方を説明する。"
             prompts_seen.append(prompt)
-            if "前回の出力の不足" not in prompt:
-                return "## 対象API\n\nmpf_open は開く。設定の有効化が必要。（参照元: 原文 17-17行）\n\n| 引数 | 意味 |\n|---|---|\n| filenum | 番号 |\n|\n\n## 注意\nE_TIMEOUT が返ることがある。続き。\n"
-            return ("## 対象API\n\nmpf_open は開く。設定の有効化が必要。（参照元: 原文 17-17行）\n\n```c\nint mpf_open(int filenum);\n```\n\n"
-                    "| 引数 | 意味 |\n|---|---|\n| filenum | 番号 |\n\n## 注意\nE_TIMEOUT が返ることがある。続き。\n")
+            # The writer forgets the fence token; Python puts it back.
+            return (f"## 対象API\n\nmpf_open は開く。設定の有効化が必要。（参照元: 原文 17-17行）\n\n{table}\n\n"
+                    "## 注意\nE_TIMEOUT が返ることがある。続き。\n")
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = await pipeline._rewrite_page(
-                self.pages()[0], pages=self.pages(), lines=self.lines(), units=[],
+                self.pages()[0], pages=self.pages(), lines=lines, units=units,
                 tokens={1: set(), 2: set()}, model=FakeModel(behaviour),
                 config=pipeline.WikiConfig(write_attempts=3, section_target_lines=80, section_min_lines=1),
                 work_root=root, seed_root=root / "seeds", source_line_count=18,
                 stop_check=None, on_progress=None,
             )
 
-        self.assertEqual(len(prompts_seen), 2)
-        self.assertIn("コードブロック", prompts_seen[1])
-        self.assertIn("int mpf_open(int filenum);", result.markdown)
+        self.assertEqual(len(prompts_seen), 1)
+        self.assertIn(fence, prompts_seen[0])
+        self.assertNotIn("int mpf_open(int filenum);", prompts_seen[0])
+        self.assertIn("```c\nint mpf_open(int filenum);\n```", result.markdown)
+        self.assertIn("| filenum | 番号 |", result.markdown)
+        self.assertNotIn("NEO-IMAGE", result.markdown)
         self.assertTrue(result.markdown.startswith("# 対象API\n\nこのページは"))
         self.assertIn("[設定](002-settings.md)の有効化が必要", result.markdown)
+        self.assertIn("（参照元: [設定](002-settings.md) 原文 17-17行）", result.markdown)
         self.assertIn("次のページ: [設定](002-settings.md)", result.markdown)
         self.assertEqual(result.verbatim_sections, [])
         self.assertEqual(result.page.reference_ranges, [(17, 17)])

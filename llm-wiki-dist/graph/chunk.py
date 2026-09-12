@@ -1023,6 +1023,10 @@ async def structured_ainvoke(
         return schema_cls.model_validate(result)
 
     except Exception as structured_error:
+        # A timed-out prompt will time out again; re-sending it twice more only
+        # triples the loss. Let the caller's retry policy decide.
+        if isinstance(structured_error, TimeoutError) or "Timeout" in type(structured_error).__name__:
+            raise
         schema_json = json.dumps(schema_cls.model_json_schema(), indent=2)
         last_error: Exception = structured_error
 

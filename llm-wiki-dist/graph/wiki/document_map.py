@@ -17,6 +17,7 @@ from typing import Callable, Sequence
 
 from .config import SEED_PLAN_VERSION, WikiConfig
 from .markdown_blocks import BlockIndex, build_block_index
+from .page import split_sections
 from .prompts import (
     regional_plan_prompt,
     seed_plan_compile_prompt,
@@ -121,6 +122,8 @@ def validate_seed_plan(
     *,
     source_line_count: int,
     block_index: BlockIndex,
+    lines: Sequence[str] = (),
+    page_target_lines: int = 0,
 ) -> tuple[CompiledSeedPlan | None, str | None]:
     """Require one ordered, contiguous, non-overlapping partition of ``1..N``."""
 
@@ -218,6 +221,31 @@ def validate_seed_plan(
                     "both neighbors, then return the complete plan. "
                     "Do not split an entity or move only filler lines to satisfy the limit."
                 )
+    if lines and page_target_lines > 0:
+        # ponytail: the planner is only asked for ~target lines; Python cuts oversize
+        # pages at headings. Ask the model to title the parts if "（i/n）" reads badly.
+        sized: list[SeedRange] = []
+        for page in repaired:
+            parts = (
+                split_sections(
+                    lines, page.source_start, page.source_end,
+                    target=2 * page_target_lines, min_lines=page_target_lines // 2,
+                )
+                if page.source_end - page.source_start + 1 > 2 * page_target_lines
+                else []
+            )
+            if len(parts) < 2:
+                sized.append(page)
+                continue
+            sized.extend(
+                page.model_copy(update={
+                    "title": f"{page.title}（{index}/{len(parts)}）",
+                    "source_start": part_start,
+                    "source_end": part_end,
+                })
+                for index, (part_start, part_end) in enumerate(parts, start=1)
+            )
+        repaired = sized
     return CompiledSeedPlan(summary=plan.summary.strip(), pages=repaired), None
 
 
@@ -226,6 +254,8 @@ def _boundary_repairs(
     checked: CompiledSeedPlan,
 ) -> list[dict[str, int | str]]:
     repairs: list[dict[str, int | str]] = []
+    if len(original.pages) != len(checked.pages):
+        return [{"title": "*", "note": f"{len(original.pages)} planned pages split into {len(checked.pages)}"}]
     for before, after in zip(original.pages, checked.pages):
         if (
             before.source_start == after.source_start
@@ -357,6 +387,7 @@ async def _build_regions(
                     previous_region=previous,
                     output_language=config.output_language,
                     last_error=last_error or None,
+                    page_target_lines=config.page_target_lines,
                 )
                 if task_root:
                     write_text_atomic(task_root / f"attempt-{attempt:02d}-prompt.md", prompt.render())
@@ -465,6 +496,7 @@ async def _build_semantic_plan(
             regional_reports=material,
             output_language=config.output_language,
             last_error=last_error or None,
+            page_target_lines=config.page_target_lines,
         )
         if task_root:
             write_text_atomic(task_root / f"attempt-{attempt:02d}-prompt.md", prompt.render())
@@ -532,6 +564,8 @@ async def _compile_seed_plan(
                 cached,
                 source_line_count=source_line_count,
                 block_index=block_index,
+                lines=lines,
+                page_target_lines=config.page_target_lines,
             )
             if error is None and checked is not None:
                 if on_progress:
@@ -561,6 +595,8 @@ async def _compile_seed_plan(
                     candidate,
                     source_line_count=source_line_count,
                     block_index=block_index,
+                    lines=lines,
+                    page_target_lines=config.page_target_lines,
                 )
                 if error is None and checked is not None:
                     repairs = _boundary_repairs(candidate, checked)
@@ -605,6 +641,7 @@ async def _compile_seed_plan(
             output_language=config.output_language,
             last_error=last_error or None,
             previous_plan=previous_plan,
+            page_target_lines=config.page_target_lines,
         )
         prompt_path = ""
         response_path = ""
@@ -630,6 +667,8 @@ async def _compile_seed_plan(
                 candidate,
                 source_line_count=source_line_count,
                 block_index=block_index,
+                lines=lines,
+                page_target_lines=config.page_target_lines,
             )
             if error is None and checked is not None:
                 repairs = _boundary_repairs(candidate, checked)

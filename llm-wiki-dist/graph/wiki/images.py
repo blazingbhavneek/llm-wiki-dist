@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from .ids import image_id
-from .markdown_blocks import IMAGE_UNIT_CLOSE, IMAGE_UNIT_OPEN
+from .markdown_blocks import IMAGE_UNIT_CLOSE, IMAGE_UNIT_OPEN, build_block_index
 from .schemas import ImageRecord
 from .storage import sha256_text, slice_text
 
@@ -120,6 +120,23 @@ def extract_image_units(lines: Sequence[str]) -> list[ImageUnit]:
         raise ValueError(f"unclosed <image-unit> opened at line {open_line}")
 
     return units
+
+
+def block_units(lines: Sequence[str]) -> list[ImageUnit]:
+    """Fences and tables as placeholder units: the writer places a token,
+    Python restores the exact source lines, so code is never retyped."""
+
+    return [
+        ImageUnit(
+            image_id=f"{block.kind}-{block.start}-{block.end}",
+            source_start=block.start,
+            source_end=block.end,
+            raw=slice_text(lines, block.start, block.end),
+            description=f"{block.kind}: {lines[block.start - 1].strip()[:80]}",
+        )
+        for block in build_block_index(list(lines)).blocks
+        if block.kind in ("fence", "table")
+    ]
 
 
 # --------------------------------------------------------------------------

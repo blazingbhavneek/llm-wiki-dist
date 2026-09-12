@@ -3,9 +3,10 @@
 1. Overlapping 250-line windows are described without assigning ownership.
 2. Regional and document planners compile one exact sequential seed partition.
 3. Python picks references (adjacent + shared vocabulary); one structured
-   compare call per reference collects facts to import.
-4. Python cuts each page into sections; the model rewrites one section at a
-   time as plain Markdown; Python checks fences, tables, identifiers, images
+   compare call per page collects facts to import from all of them.
+4. Python cuts each page into sections; fences, tables and images become
+   placeholder tokens the model must place; the model rewrites one section at
+   a time as plain Markdown; Python restores the tokens and checks identifiers
    and imported facts survived before a judge looks for semantic omissions.
 5. Python writes the title, one model-written intro, links and navigation.
 
@@ -25,7 +26,7 @@ from typing import Any, Callable, Sequence
 from .config import REWRITE_PROMPT_VERSION, SEED_PLAN_VERSION, WikiConfig
 from .document_map import build_seed_plan
 from .ids import document_id, slugify
-from .images import ImageUnit, extract_image_units, restore_images
+from .images import ImageUnit, block_units, extract_image_units, restore_images
 from .model import ChatModelPort, ModelPort
 from .page import (
     PLACEHOLDER_RE,
@@ -37,7 +38,6 @@ from .page import (
     link_titles,
     normalize_draft,
     split_sections,
-    verbatim_blocks,
     word_tokens,
 )
 from .prompts import (
@@ -281,11 +281,13 @@ def _insert_image_near_context(
 ) -> str:
     """Best-effort placement next to surviving original context."""
 
+    # Insert on its own line: the neighbour may be mid-sentence in the draft.
     if before and before in markdown:
-        position = markdown.find(before) + len(before)
+        position = markdown.find("\n", markdown.find(before) + len(before))
+        position = len(markdown) if position < 0 else position
         return markdown[:position] + f"\n\n{placeholder}" + markdown[position:]
     if after and after in markdown:
-        position = markdown.find(after)
+        position = markdown.rfind("\n", 0, markdown.find(after)) + 1
         return markdown[:position] + f"{placeholder}\n\n" + markdown[position:]
     return markdown.rstrip() + f"\n\n## 原文の図・画像\n\n{placeholder}\n"
 
@@ -313,7 +315,7 @@ def _preserve_image_placeholders(
 
 def _image_context(units: Sequence[ImageUnit], lines: Sequence[str]) -> str:
     if not units:
-        return "（このページに画像はない）"
+        return "（この節にトークンはない）"
     entries: list[str] = []
     for unit in units:
         before, after = _image_neighbors(lines, unit)
@@ -352,6 +354,29 @@ def _reference_ranges_from_markdown(
             continue
         found.append((start, end))
     return _merge_ranges(found)
+
+
+def _link_reference_markers(
+    markdown: str, page: SeedPage, pages: Sequence[SeedPage]
+) -> str:
+    """Point each imported-fact marker at the page that owns the cited lines."""
+
+    def link(match) -> str:
+        start = int(match.group(1))
+        owner = next(
+            (
+                item for item in pages
+                if item.number != page.number
+                and any(s <= start <= e for s, e in item.owner_ranges)
+            ),
+            None,
+        )
+        if owner is None:
+            return match.group(0)
+        span = match.group(1) + (f"-{match.group(2)}" if match.group(2) else "")
+        return f"（参照元: [{owner.title}]({owner.filename}) 原文 {span}行）"
+
+    return REFERENCE_MARKER_RE.sub(link, markdown)
 
 
 def _write_reference_seeds(
@@ -578,7 +603,7 @@ async def _research_references(
     stop_check: StopCheck,
     on_progress: Progress,
 ) -> tuple[list[_ReferenceEvidence], str]:
-    """Python selects references; one structured compare call per reference."""
+    """Python selects references; one structured compare call per page."""
 
     selected = _select_references(page, pages, tokens, limit=config.reference_candidates)
     if not selected:
@@ -597,42 +622,39 @@ async def _research_references(
         references=[item.number for item in selected],
     )
 
+    references = "\n\n".join(
+        f"--- 参照ページ {candidate.number:03d} {candidate.title}"
+        f"（原文 {_ranges_text(candidate.owner_ranges)}行）の行番号付き原文（全文） ---\n"
+        + _numbered_source(lines, candidate.owner_ranges, _page_units(candidate, units))
+        for candidate in selected
+    )
+    prompt = reference_research_prompt(
+        target_number=page.number,
+        target_title=page.title,
+        target_ranges=_ranges_text(page.owner_ranges),
+        target_source=target_source,
+        references=references,
+        output_language=config.output_language,
+    )
+    result, attempts, error = await _structured_with_artifacts(
+        schema=ReferenceResearchResult,
+        prompt=prompt,
+        model=model,
+        output_dir=research_dir,
+        stem="references",
+        attempts=config.reference_attempts,
+        max_output_tokens=config.reference_max_output_tokens,
+        stop_check=stop_check,
+    )
+    reason = (
+        result.no_useful_information_reason.strip()
+        if result is not None
+        else f"調査呼び出し失敗: {error}"
+    )
     evidence: list[_ReferenceEvidence] = []
     for current, candidate in enumerate(selected, start=1):
-        reference_source = _numbered_source(
-            lines, candidate.owner_ranges, _page_units(candidate, units)
-        )
-        prompt = reference_research_prompt(
-            target_number=page.number,
-            target_title=page.title,
-            target_ranges=_ranges_text(page.owner_ranges),
-            target_source=target_source,
-            reference_number=candidate.number,
-            reference_title=candidate.title,
-            reference_ranges=_ranges_text(candidate.owner_ranges),
-            reference_source=reference_source,
-            output_language=config.output_language,
-        )
-        result, attempts, error = await _structured_with_artifacts(
-            schema=ReferenceResearchResult,
-            prompt=prompt,
-            model=model,
-            output_dir=research_dir,
-            stem=f"reference-{candidate.number:03d}",
-            attempts=config.reference_attempts,
-            max_output_tokens=config.reference_max_output_tokens,
-            stop_check=stop_check,
-        )
-        facts = (
-            _valid_reference_facts(result.useful_facts, candidate, page)
-            if result
-            else []
-        )
-        reason = (
-            result.no_useful_information_reason.strip()
-            if result is not None
-            else f"調査呼び出し失敗: {error}"
-        )
+        # _valid_reference_facts keeps only facts inside this candidate's range.
+        facts = _valid_reference_facts(result.useful_facts, candidate, page) if result else []
         evidence.append(
             _ReferenceEvidence(
                 page=candidate, facts=facts, no_useful_information_reason=reason
@@ -878,7 +900,6 @@ async def _write_section(
     placeholders = [unit.placeholder for unit in section_units]
     numbered = _numbered_source(lines, [(start, end)], section_units)
     source_text = _prompt_safe(slice_text(list(lines), start, end), section_units)
-    blocks = verbatim_blocks(lines, start, end)
     facts_text = _facts_text(facts, lines, units)
     stem = f"section-{index:02d}"
     candidates: list[_SectionCandidate] = []
@@ -924,7 +945,7 @@ async def _write_section(
             draft,
             lines=lines,
             source_text=source_text,
-            block_ranges=blocks,
+            block_ranges=(),
             placeholders=placeholders,
             facts=facts,
         )
@@ -1108,6 +1129,7 @@ async def _rewrite_page(
     page.reference_ranges = _reference_ranges_from_markdown(
         restored, page.owner_ranges, source_line_count
     )
+    restored = _link_reference_markers(restored, page, pages)
     return RewriteResult(
         page=page,
         markdown=restored,
@@ -1340,7 +1362,7 @@ async def run_pipeline(
         )
         pages = _plan_pages(seed_plan)
         _verify_ranges(pages, len(lines))
-    units = extract_image_units(lines)
+    units = extract_image_units(lines) + block_units(lines)
     seed_root = (work_root / "seeds").resolve()
     if not resumed_seed_plan:
         if seed_root.exists():

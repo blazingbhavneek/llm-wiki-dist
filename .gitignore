@@ -19,3 +19,5 @@ llm-wiki-dist/usage_log.jsonl
 .wiki/
 test_wiki/
 inputs/
+/data/
+.env
