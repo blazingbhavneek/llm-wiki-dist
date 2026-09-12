@@ -69,12 +69,6 @@ class SeedPlan(BaseModel):
     pages: list[SeedRange] = Field(default_factory=list)
 
 
-class ReferenceSelection(BaseModel):
-    """Small shortlist of pages worth comparing with one target page."""
-
-    page_numbers: list[int] = Field(default_factory=list)
-
-
 class ReferenceFact(BaseModel):
     """One useful fact found outside the target page's owned source range."""
 
@@ -83,6 +77,7 @@ class ReferenceFact(BaseModel):
     insertion_point: str = ""
     source_start: int = 0
     source_end: int = 0
+    target_line: int = 0
 
 
 class ReferenceResearchResult(BaseModel):
@@ -90,13 +85,6 @@ class ReferenceResearchResult(BaseModel):
 
     useful_facts: list[ReferenceFact] = Field(default_factory=list)
     no_useful_information_reason: str = ""
-
-
-class WikiPlanJudgeResult(BaseModel):
-    """Whether a plan designs a real standalone Wiki instead of a cleanup."""
-
-    acceptable: bool = False
-    issues: list[str] = Field(default_factory=list)
 
 
 class ImportantOmission(BaseModel):

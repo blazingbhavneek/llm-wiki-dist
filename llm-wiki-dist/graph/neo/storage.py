@@ -12,9 +12,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+def clean_workdir(path: Path | str) -> Path:
+    """A fresh, empty working directory for one worker turn."""
+
+    directory = Path(path)
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
+    return directory
 
 
 # --------------------------------------------------------------------------

@@ -3,6 +3,13 @@ llm-wiki-dist/.wiki
 **.pyc
 **.tar.gz
 .codegraph
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.uv-cache/
+**/.venv/
+**/node_modules/
+**/dist/
 chrome-headless-shell-linux64/
 llm-wiki-dist/.wiki_docker/
 .DS_Store

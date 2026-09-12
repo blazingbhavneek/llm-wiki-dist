@@ -15,7 +15,6 @@ from typing import Any, Sequence
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from .config import (
-    LINK_PROMPT_VERSION,
     PROMPT_VERSION,
     REWRITE_PROMPT_VERSION,
     SEED_PLAN_VERSION,
@@ -41,7 +40,7 @@ class Prompt:
         return [SystemMessage(content=self.system), HumanMessage(content=self.body)]
 
     def render(self) -> str:
-        """Flatten system and user text for a CLI-agent turn."""
+        """Flatten system and user text for artifact logging."""
 
         return f"{self.system}\n\n{self.body}"
 
@@ -252,58 +251,6 @@ def seed_plan_compile_prompt(
     )
 
 
-def artifact_instruction(artifact_path: str, schema: Any) -> str:
-    """JSON artifactの場所と形式を指定する。標準出力は状態として扱わない。"""
-
-    return (
-        f"回答を作業ディレクトリの`{artifact_path}`ファイルへ単一のJSONオブジェクトとして書き込む。"
-        "受理する出力はこのファイルだけである。説明文で囲まず、他のファイルを作成しない。\n"
-        "必須JSON形式:\n" + _schema_hint(schema)
-    )
-
-
-def render_agent_prompt(prompt: Prompt, artifact_path: str) -> str:
-    """Resolve the artifact placeholder for a CLI agent turn."""
-
-    return prompt.render().replace("{artifact}", artifact_path)
-
-
-def reference_selection_prompt(
-    *,
-    page_number: int,
-    page_title: str,
-    owner_ranges: str,
-    numbered_original: str,
-    page_summaries: str,
-    output_language: str,
-) -> Prompt:
-    """Select a tiny set of references before reading their full text."""
-
-    from .wire import ReferenceSelection
-
-    return Prompt(
-        kind="reference_selection",
-        version=REWRITE_PROMPT_VERSION,
-        system=(
-            "あなたは技術Wikiの参照候補選定者である。記事は書かない。"
-            "対象ページを単独で理解しやすくする事実を持つ可能性があるページだけを選ぶ。"
-            "構造化JSONだけを返す。\n\nJSON形式:\n"
-            + _schema_hint(ReferenceSelection)
-        ),
-        body=(
-            f"対象ページ: {page_number:03d} {page_title}\n"
-            f"対象の原文範囲: {owner_ranges}行\n"
-            "必要な候補をすべて選ぶ。件数上限はない。対象ページ自身は選ばない。\n"
-            "単に同じライブラリに属するだけのページは選ばない。前提、用語、相互作用、"
-            "使用条件、制約、注意、または対象機能への具体的な言及がありそうなページを選ぶ。"
-            "有用な候補がなければ空配列にする。\n"
-            f"説明は{output_language}で考えること。\n\n"
-            f"--- 対象ページの行番号付き原文 ---\n{numbered_original}\n\n"
-            f"--- 候補ページ一覧 ---\n{page_summaries}"
-        ),
-    )
-
-
 def reference_research_prompt(
     *,
     target_number: int,
@@ -339,328 +286,14 @@ def reference_research_prompt(
             "前提、用語、関係、使用条件、制約、注意だけを選ぶ。\n"
             "- 単なる関数一覧、章番号、同じ説明の言い換え、ナビゲーション用リンクは選ばない。\n"
             "- 各事実のsource_start/source_endは、必ず参照原文に表示された正確な行番号にする。\n"
+            "- target_lineには、その事実を本文へ入れるべき対象原文の行番号"
+            "（対象原文に表示された番号のうち、最も関係の深い行）を書く。\n"
             "- descriptionには追加する事実、reasonには必要な理由、insertion_pointには"
             "対象記事のどこへ入れるかを書く。\n"
             "- 有用な事実がなければuseful_factsを空にし、"
             "no_useful_information_reasonへ具体的な理由を書く。捏造して水増ししない。\n\n"
             f"--- 対象ページの行番号付き原文（全文） ---\n{target_source}\n\n"
             f"--- 参照ページの行番号付き原文（全文） ---\n{reference_source}"
-        ),
-    )
-
-
-def wiki_page_plan_prompt(
-    *,
-    page_number: int,
-    page_title: str,
-    working_page_path: str,
-    plan_path: str,
-    page_index_path: str,
-    references_path: str,
-    owner_ranges: str,
-    image_context: str,
-    output_language: str,
-    reference_research_path: str = "",
-    reference_research: str = "",
-    missing_information: Sequence[str] = (),
-    last_error: str | None = None,
-) -> Prompt:
-    """Ask a small file-capable model to research and plan one Wiki page."""
-
-    feedback = ""
-    if missing_information:
-        feedback += (
-            "\n# 前版で不足した内容\n- "
-            + "\n- ".join(missing_information)
-            + "\nこれらを今回の計画で必ず解決する。\n"
-        )
-    if last_error:
-        feedback += f"\n# 前回の実行エラー\n{last_error}\n"
-
-    return Prompt(
-        kind="wiki_page_plan",
-        version=REWRITE_PROMPT_VERSION,
-        system=(
-            "あなたは日本語技術Wikiの構成設計者である。\n"
-            "この工程で記事本文は書かない。原文の章立てを写すのではなく、読者が"
-            "概念を理解し、目的に応じて機能を選び、正しく利用できる記事を設計する。"
-            "次の執筆者が判断をやり直さなくてよい具体的なMarkdown計画を`wiki-plan.md`に書く。\n"
-            "`wiki-plan.md`以外のファイルは変更しない。"
-        ),
-        body=(
-            "# 計画対象\n"
-            f"- ページ番号: {page_number:03d}\n"
-            f"- タイトル: {page_title}\n"
-            f"- 計画の書き込み先: `{plan_path}`\n\n"
-            "# 行番号の意味（重要）\n"
-            f"- `{owner_ranges}`は全原文における出典行番号である。\n"
-            "- これは`page.md`内の行番号ではない。\n"
-            "- `page.md`はその原文範囲を切り出したシードで、ローカル行番号は1から始まる。"
-            "`page.md`が出典行番号より短くても正常であり、矛盾ではない。\n"
-            f"- `page.md`の{owner_ranges}行目を探したり、この値をreadツールのoffsetに使ったりしない。\n\n"
-            f"{feedback}"
-            "# 必ずこの順番で作業する\n"
-            f"1. `{working_page_path}`を1行目から最後まで全て読む。\n"
-            f"2. `{reference_research_path}`を最後まで読む。これはPythonが参照ページの"
-            "全文を比較して作成した調査結果である。\n"
-            "3. 下にも同じ調査結果を掲載している。useful factを一件ずつ理解し、"
-            "記事のどこで使うか決める。\n"
-            f"4. 調査後に`{plan_path}`のみを編集する。\n\n"
-            "# `wiki-plan.md`に必ず書く内容\n"
-            "1. `# 読者と利用目的`: 誰が、どんな疑問や作業のために読む記事か。\n"
-            "2. `# 読後に理解できること`: 個別項目だけでなく、目的、全体像、"
-            "項目間の関係、選び方、利用の流れを具体的に書く。\n"
-            "3. `# 必ず残す事実`: `page.md`の全機能、コマンド、API、引数、オプション、"
-            "出力、手順、制約、注意、エラー、パス、環境変数。\n"
-            "4. `# 参照から追加する内容`: 追加する事実、必要な理由、挿入場所、"
-            "読み取り用シードの絶対パス、全原文の出典行範囲。"
-            "下の調査結果にあるuseful factを勝手に「なし」にしない。"
-            "調査結果自体が追加なしの場合だけ「なし」と書く。\n"
-            "5. `# 原文からの再構成方針`: 原文順を変える箇所、まとめる重複、"
-            "比較表にする項目、先に説明する前提、後で示す詳細を具体的に書く。\n"
-            "6. `# 記事構成`: 完成記事の見出しを学習・利用しやすい順に並べる。"
-            "各見出しには、その節で読者が得る理解、使う事実、説明する項目間の関係、"
-            "使用する原文範囲または参照範囲を書く。\n"
-            "7. `# 画像の配置`: 各画像トークンをどの見出しのどの説明の直後に置くか。\n"
-            "8. `# 執筆後の確認`: 欠落、捏造、参照元行マーカー、画像、"
-            "単独で理解できるかを確認するチェックリスト。\n\n"
-            "原文の見出し一覧を言い換えて並べただけの計画は不合格である。"
-            "冒頭で目的と使いどころを説明し、関連するAPIや概念を比較・接続し、"
-            "読者が判断や作業を進められる順序にする。"
-            "ただし、根拠にないチュートリアル手順や説明は作らない。\n"
-            "ページタイトルと関係が薄く見える項目も、自分の判断で削除する計画にしない。"
-            "必要なら独立した小見出しにする。\n"
-            "根拠のない一般論、例、引数、動作を追加する計画にしない。\n\n"
-            "# 画像\n"
-            "下のトークンをそれぞれ必ず1回残す計画にする。\n"
-            f"{image_context}\n\n"
-            "# 読み取るファイル\n"
-            f"- 編集対象のシード: `{working_page_path}`\n"
-            f"- 全ページ一覧: `{page_index_path}`\n"
-            f"- 他ページの要約と参照先: `{references_path}`\n"
-            f"- 参照調査結果: `{reference_research_path}`\n"
-            f"- 出力する計画: `{plan_path}`\n\n"
-            f"# Pythonが本文を比較して確定した参照調査結果\n{reference_research}"
-        ),
-    )
-
-
-def simple_page_edit_prompt(
-    *,
-    page_number: int,
-    page_title: str,
-    final_page_path: str,
-    working_page_path: str,
-    plan_path: str,
-    original_path: str,
-    page_index_path: str,
-    references_path: str,
-    owner_ranges: str,
-    image_context: str,
-    output_language: str,
-    reference_research_path: str = "",
-    reference_research: str = "",
-    missing_information: Sequence[str] = (),
-    last_error: str | None = None,
-) -> Prompt:
-    """Tell the writer to turn the staged seed into a Wiki page in place."""
-
-    correction = ""
-    if last_error:
-        correction = (
-            "## 前回の実行エラー\n"
-            "`page.md`をもう一度編集し、以下を修正すること:\n- "
-            + "\n- ".join(item.strip() for item in last_error.split("; ") if item.strip())
-            + "\n\n"
-        )
-
-    repair = ""
-    if missing_information:
-        repair = (
-            "## 判定で見つかった不足\n"
-            "既存の有用な内容を削らず、以下を追加または再構成すること:\n- "
-            + "\n- ".join(missing_information)
-            + "\n\n"
-        )
-
-    return Prompt(
-        kind="simple_page_edit",
-        version=REWRITE_PROMPT_VERSION,
-        system=(
-            "あなたは日本語Wikiの執筆者である。\n"
-            "調査済みの`wiki-plan.md`に従って`page.md`を直接編集し、"
-            "それ単独で学習と検索に使えるWiki記事にする。\n"
-            "事実を捏造せず、判断できない内容は推測しない。\n"
-            "最終成果は編集済みの`page.md`である。JSONや別の成果ファイルは作らない。"
-            "`page.md`以外は変更しない。"
-        ),
-        body=(
-            "# 対象\n"
-            f"- ページ番号: {page_number:03d}\n"
-            f"- 最終ファイル名: `{final_page_path}`\n"
-            f"- タイトル: {page_title}\n"
-            f"- 編集対象: `{working_page_path}`\n\n"
-            "# 行番号の意味（重要）\n"
-            f"- `{owner_ranges}`は、全原文における出典行番号である。\n"
-            "- これは`page.md`内の行番号ではない。\n"
-            "- `page.md`は原文から切り出したシードで、ローカル行番号は1から始まる。"
-            "`page.md`が出典行番号より短くても正常であり、矛盾ではない。\n"
-            f"- `page.md`の{owner_ranges}行目を探したり、この値をreadツールのoffsetに使ったりしない。\n"
-            "- 全原文の行番号が必要なときだけ、"
-            "`page-index.md`または`references.md`に書かれた`all-source-numbered.md`の絶対パスを開く。\n\n"
-            f"{repair}"
-            f"{correction}"
-            "# 必ずこの順番で作業する\n"
-            f"1. `{working_page_path}`を1行目から最後まで全て読む。\n"
-            f"2. `{plan_path}`を1行目から最後まで全て読む。\n"
-            f"3. `{reference_research_path}`を最後まで読む。参照ページの必要な抜粋は"
-            "Pythonがこのファイルへ既に入れているので、別ファイルを探す必要はない。\n"
-            "4. 計画と参照調査結果を照合し、useful factを漏らさず、"
-            "何をどの見出しに書くかを理解する。\n"
-            f"5. `{working_page_path}`を直接編集する。新しい短文を別に作らない。\n"
-            "6. 編集後の`page.md`を再度1行目から最後まで読み、下の確認項目を検査する。\n\n"
-            "# Wiki記事の作り方\n"
-            f"- タイトルと本文は{output_language}で書く。\n"
-            "- `page.md`にはMarkdown本文だけを残し、H1見出しを置く。\n"
-            "- 原文の整形や言い換えだけで終わらない。"
-            "前後の章を読んでいない人にも、何のための機能か、いつ使うか、どう動くか、"
-            "何に注意するかが分かる記事にする。\n"
-            "- 原文の見出しや順序をそのまま複製しない。目的と使いどころから始め、"
-            "前提、選択基準、操作の流れ、個別仕様、制約・失敗時の確認というように、"
-            "読者の理解順へ再構成する。該当しない節を無理に作る必要はない。\n"
-            "- 複数のAPI、コマンド、値がある場合は、最初に相互関係と使い分けを説明し、"
-            "必要なら比較表や処理の流れを作ってから個別仕様を示す。\n"
-            "- 参照調査のuseful factは付録や末尾一覧へ隔離せず、"
-            "理解に必要な本文の位置へ自然に統合する。\n"
-            "- 主題に応じて、概要、前提、用語、動作、使い方、制約、注意、例を読みやすい順序に再構成する。\n"
-            "- APIやコマンドは、根拠がある範囲で目的、形式、引数、動作、出力、"
-            "状態変化、失敗条件、制約を検索しやすく整理する。\n"
-            "- 構成、順序、見出し、表現、表、箇条書き、注意書きは自由に変更してよい。\n"
-            "- 根拠のない一般論、引数、戻り値、例、動作を作らない。\n\n"
-            "# 内容を失わないためのルール\n"
-            "- 編集前の`page.md`にある各機能、コマンド、API、オプション、手順、"
-            "制約、注意、エラー、ファイルパス、環境変数を残す。\n"
-            "- ページタイトルと関係が薄く見える項目も、自分の判断で削除しない。"
-            "必要なら独立した小見出しとして整理する。\n"
-            "- 削除してよいのは、重複した見出し、頁番号、章番号など、"
-            "技術的な意味を持たない体裁上のノイズだけである。\n\n"
-            "# 参照シードの使い方\n"
-            "- Pythonが選別した参照調査結果を読まずに執筆しない。\n"
-            "- このページを単独で理解するために必要な前提、用語定義、関係、"
-            "使用方法、制約、注意事項だけを要約して本文へ統合する。\n"
-            "- 参照ページ全体をコピーしない。関係しない情報を追加しない。\n"
-            "- 他ページから追加した段落、表、または箇条書きの直後に、"
-            "`（参照元: 原文 123-145行）`の形式で出典範囲を書く。\n"
-            f"- 自分の出典範囲`{owner_ranges}`の情報には参照元マーカーを付けない。\n\n"
-            "# リンクと末尾一覧\n"
-            "- この工程では新しい内部リンクを追加しない。リンクは後段の専用工程で追加する。\n"
-            "- ナビゲーション用の「関連ページ」「関連機能」「関連項目」「参考」"
-            "「参照先」などの節や一覧を追加しない。\n"
-            "- 必要な関係性は、ナビゲーション一覧ではなく通常の本文として説明する。\n\n"
-            "# 画像\n"
-            "下の画像トークンを一字も変えず、それぞれ必ず1回残す。"
-            "元と同じ話題のすぐ近くに置く。末尾の画像集へ移動したり、削除したりしない。\n"
-            f"{image_context}\n\n"
-            "# ファイル\n"
-            f"- 編集する: `{working_page_path}`\n"
-            f"- 必ず読む調査・構成計画: `{plan_path}`\n"
-            f"- 編集しない保存用コピー: `{original_path}`\n"
-            f"- 不明点があるときの全ページ一覧: `{page_index_path}`\n"
-            f"- 不明点があるときの参照一覧: `{references_path}`\n\n"
-            f"# Pythonが本文を比較して確定した参照調査結果\n{reference_research}\n\n"
-            "# 終了前の確認\n"
-            "- `page.md`は原文の整形だけではなく、単独で理解できるWikiになっている。\n"
-            "- 編集前の重要な技術情報を失っていない。\n"
-            "- 参照から追加した情報には出典行マーカーがある。\n"
-            "- 指定された画像トークンがそれぞれ1回ある。\n"
-            "- `page.md`以外を変更していない。\n"
-            "確認後、作業を終了する。"
-        ),
-    )
-
-
-def wiki_plan_judge_prompt(
-    *,
-    page_title: str,
-    numbered_original: str,
-    reference_research: str,
-    wiki_plan: str,
-    output_language: str,
-) -> Prompt:
-    """Reject plans that merely preserve the manual's original outline."""
-
-    from .wire import WikiPlanJudgeResult
-
-    return Prompt(
-        kind="wiki_plan_judge",
-        version=REWRITE_PROMPT_VERSION,
-        system=(
-            "あなたは技術Wikiの構成計画を査読する。記事本文は書かず、構造化JSONだけを返す。"
-            "原文の情報保持と、独立した学習・参照記事としての再構成を両方評価する。\n\n"
-            "JSON形式:\n" + _schema_hint(WikiPlanJudgeResult)
-        ),
-        body=(
-            f"対象ページ: {page_title}\n"
-            f"issuesは{output_language}で具体的に書くこと。\n\n"
-            "acceptable=trueにできる条件:\n"
-            "- 読者、利用目的、読後に理解できることが具体的である。\n"
-            "- 原文の重要事実を保持する計画がある。\n"
-            "- useful factがある場合、その内容、挿入場所、出典範囲が計画に入っている。\n"
-            "- 原文の見出しを同じ順番で言い換えただけではなく、目的、前提、関係、"
-            "選び方、利用の流れ、個別仕様、制約を読者の理解順に組み立てている。\n"
-            "- 各見出しで何を説明し、どの事実を使うかが執筆者に明確である。\n"
-            "満たさない場合はacceptable=falseにして、直すべき点だけをissuesへ書く。"
-            "根拠のない内容追加や過剰な長文化は要求しない。\n\n"
-            f"--- 所有原文 ---\n{numbered_original}\n\n"
-            f"--- 参照調査結果 ---\n{reference_research}\n\n"
-            f"--- Wiki計画 ---\n{wiki_plan}"
-        ),
-    )
-
-
-def link_page_prompt(
-    *,
-    page_title: str,
-    working_page_path: str,
-    original_path: str,
-    page_index_path: str,
-    output_language: str,
-    last_error: str | None = None,
-) -> Prompt:
-    """Ask the selected CLI agent for a final, additive-only link pass."""
-
-    correction = ""
-    if last_error:
-        correction = f"\n前回の編集は無効だった。次の問題だけを修正すること:\n{last_error}\n"
-    return Prompt(
-        kind="link_page",
-        version=LINK_PROMPT_VERSION,
-        system=(
-            "あなたは日本語Wikiの内部リンク編集者である。既に完成した記事へ、"
-            "必要最小限のMarkdownリンクだけを追加する。\n"
-            "記事の情報、語句、順序、見出し、画像、参照元表記を削除・変更・要約してはならない。"
-            "新しい技術説明も追加してはならない。`page.md`以外を変更しないこと。"
-        ),
-        body=(
-            f"対象記事: {page_title}\n"
-            f"本文は{output_language}のまま維持すること。\n"
-            f"最初に `{working_page_path}` と `{page_index_path}` を最後まで読むこと。"
-            "page-indexにある要約から関連候補を選び、候補の絶対パスを実際に開いて確認すること。\n"
-            "page-indexの「追加情報を所有するWiki」は、書き直し時に別の原文範囲から情報を"
-            "取り込んだ履歴であり、本文中に該当語句があれば優先的なリンク候補にすること。"
-            "本文中で、別Wikiページの主題である関数、コマンド、設定、エラー、機能、前提事項が"
-            "既に言及されている箇所だけに、`[既存の語句](NNN-file.md)`形式のリンクを加える。"
-            "リンクは必ず既存本文中の言及へ直接付ける。末尾や別節へ「関連機能」「関連項目」"
-            "「参考」「参照先」などの一覧を追加してはならない。"
-            "無関係なページ、同じページ自身、存在しないファイルへリンクしないこと。"
-            "適切なリンクがなければpage.mdを変更せず終了してよい。\n"
-            "これは純粋な追加編集である。元の文字を一文字も削除・置換・並べ替えないこと。"
-            "YAMLフロントマターを追加しないこと。\n\n"
-            "作業ファイル（すべて作業ディレクトリ内の絶対パス）:\n"
-            f"- 編集対象: `{working_page_path}`\n"
-            f"- 編集前コピー（変更禁止）: `{original_path}`\n"
-            f"- 全完成Wikiの要約と絶対パス: `{page_index_path}`\n"
-            f"{correction}"
         ),
     )
 
@@ -687,11 +320,9 @@ def page_judge_prompt(
             "手順、API挙動、引数、戻り値、警告、例外、エラーの意味である。"
             "章番号、節番号、目次、改訂履歴、装飾、重複文、言い回しなどの些細な差は欠落に含めない。"
             "要約や再構成で意味が保持されていれば欠落ではない。捏造された欠落を報告しない。\n"
-            "単なる原文の整形・言い換えで、目的、前提、動作、使い方、制約、項目間の関係が"
-            "原文から説明できるのに説明されず、前後の章なしでは理解しにくい場合は未完成である。"
-            "その場合はmissing_important_informationへ必要な改善を具体的に1件以上入れ、"
-            "coverage_scoreを85以下にする。短くても内容が完結したAPIやエラー項目に、"
-            "根拠のない説明や不要な長文化を要求してはならない。\n\n"
+            "候補は原文の一部（節）だけを書き直したものである。節の範囲外の情報、"
+            "より詳しい説明、一般的な解説、構成の改善を要求してはならない。"
+            "「他ページから追加した事実」が候補に含まれていなければ、それは欠落として報告する。\n\n"
             "JSON形式:\n" + _schema_hint(PageJudgeResult)
         ),
         body=(
@@ -707,35 +338,95 @@ def page_judge_prompt(
     )
 
 
-def reference_enrichment_judge_prompt(
+# --------------------------------------------------------------------------
+# Section writing (plain text output)
+# --------------------------------------------------------------------------
+
+
+def section_write_prompt(
     *,
     page_title: str,
-    reference_research: str,
-    candidate: str,
+    page_summary: str,
+    index: int,
+    count: int,
+    source_start: int,
+    source_end: int,
+    numbered_section: str,
+    facts_text: str,
+    image_context: str,
     output_language: str,
+    feedback: Sequence[str] = (),
 ) -> Prompt:
-    """Check that every accepted cross-page fact reached the Wiki article."""
+    """Rewrite one section losslessly; everything needed is in this prompt."""
 
-    from .wire import PageJudgeResult
-
+    feedback_block = ""
+    if feedback:
+        feedback_block = (
+            "# 前回の出力の不足（必ず全て直す）\n- "
+            + "\n- ".join(item.strip() for item in feedback if item.strip())
+            + "\n\n"
+        )
     return Prompt(
-        kind="reference_enrichment_judge",
+        kind="section_write",
         version=REWRITE_PROMPT_VERSION,
         system=(
-            "あなたは技術Wikiの参照情報反映を判定する査読者である。文章を書き直さず、"
-            "構造化JSONだけを返す。調査結果でuseful factとされた情報が、意味を保って"
-            "Wiki候補へ統合されているかを確認する。\n\nJSON形式:\n"
-            + _schema_hint(PageJudgeResult)
+            "あなたは日本語技術Wikiの執筆者である。原文の一部（節）を、"
+            "単独で読んで理解できるWikiの節に書き直す。\n"
+            "- 出力はMarkdown本文だけ。前置き、説明、JSON、出力全体をコードフェンスで囲むことは禁止。\n"
+            "- 事実を捏造しない。原文と追加事実にない引数、動作、例、一般論を書かない。\n"
+            "- 原文の技術情報を一切落とさない。コードブロック、表、識別子、定数、数値、単位、"
+            "エラーコード、警告文は一字も変えずにそのまま写す。"
         ),
         body=(
-            f"ページ: {page_title}\n"
-            f"判定文は{output_language}で書くこと。\n"
-            "全useful factが本文に反映され、各追加箇所に対応する"
-            "`（参照元: 原文 ...行）`があればcoverage_score=100とする。"
-            "欠落、意味の変化、または出典行マーカー不足があれば、その事実の正確な"
-            "source_start/source_endをmissing_important_informationへ入れる。"
-            "調査結果にuseful factがなければ新しい情報を要求しない。\n\n"
-            f"--- 参照調査結果 ---\n{reference_research}\n\n"
-            f"--- Wiki候補 ---\n{candidate}"
+            "# 対象\n"
+            f"- ページ: {page_title}\n"
+            f"- ページ全体の要約: {page_summary or '要約なし'}\n"
+            f"- この節: {index}/{count}（原文 {source_start}-{source_end}行）\n"
+            f"- 本文は{output_language}で書く。\n\n"
+            "# 書き方\n"
+            "- 見出しは`##`以下を使う。`# `（H1）は書かない。\n"
+            "- 原文の見出しは残してよいが、内容が分かる名前に変えてよい。\n"
+            "- 段落や箇条書きに整理し、何のための機能か、いつ使うか、何に注意するかが"
+            "原文から分かる範囲で伝わるようにする。文の意味、条件、順序に関わる情報は変えない。\n"
+            "- 先頭の行番号は出典を示すためのもので、本文には書かない。\n"
+            "- リンク（`[...](...)`）は書かない。「関連ページ」などの一覧も作らない。\n"
+            "- 章番号、頁番号、目次など技術的な意味のない体裁だけは省いてよい。\n"
+            "- 画像トークンは一字も変えず、元と同じ話題の直後に1回だけ置く。\n"
+            f"{image_context}\n\n"
+            "# 他ページから追加する事実\n"
+            f"{facts_text}\n"
+            "各事実は本文の該当箇所へ自然に組み込み、その段落の直後に"
+            "`（参照元: 原文 S-E行）`（SとEは各事実の出典行）と書く。"
+            f"原文 {source_start}-{source_end}行の情報にはこのマーカーを付けない。\n\n"
+            f"{feedback_block}"
+            "--- 行番号付き原文（この節） ---\n"
+            f"{numbered_section}"
+        ),
+    )
+
+
+def intro_prompt(
+    *,
+    page_title: str,
+    page_summary: str,
+    body: str,
+    output_language: str,
+) -> Prompt:
+    """One additive lead paragraph written from the finished body only."""
+
+    return Prompt(
+        kind="intro",
+        version=REWRITE_PROMPT_VERSION,
+        system=(
+            "あなたは日本語技術Wikiの編集者である。Markdown本文だけを出力する。"
+            "前置き、見出し、リンク、箇条書き、コードフェンスは書かない。"
+        ),
+        body=(
+            "次のWiki記事の冒頭に置く導入文を書く。2〜6文で、何のための機能・情報か、"
+            "いつ使うか、この記事を読むと何が分かるかを説明する。"
+            f"本文にない事実、識別子、数値は書かない。{output_language}で書く。\n\n"
+            f"# タイトル\n{page_title}\n\n"
+            f"# 要約\n{page_summary or '要約なし'}\n\n"
+            f"# 本文\n{body}"
         ),
     )

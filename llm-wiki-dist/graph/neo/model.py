@@ -7,6 +7,8 @@ pipeline needs no new model client.  Tests inject any object with the same
 
 from __future__ import annotations
 
+import asyncio
+import re
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from langchain_core.messages import BaseMessage
@@ -30,6 +32,17 @@ class ModelPort(Protocol):
         max_output_tokens: int | None = None,
     ) -> BaseModel:  # pragma: no cover - protocol declaration
         ...
+
+    async def text(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        max_output_tokens: int | None = None,
+    ) -> str:  # pragma: no cover - protocol declaration
+        ...
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 
 class ChatModelPort:
@@ -61,3 +74,27 @@ class ChatModelPort:
         return await structured_ainvoke(
             self.llm, schema, list(messages), max_output_tokens=max_output_tokens
         )
+
+    async def text(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        """One bounded plain-text completion; the caller validates the content."""
+
+        llm = (
+            self.llm.bind(max_tokens=max_output_tokens)
+            if max_output_tokens is not None
+            else self.llm
+        )
+        reply = await asyncio.wait_for(
+            llm.ainvoke(list(messages)), timeout=self.config.request_timeout
+        )
+        content = getattr(reply, "content", reply)
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return _THINK_RE.sub("", str(content))

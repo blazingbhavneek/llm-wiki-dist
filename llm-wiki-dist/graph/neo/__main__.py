@@ -14,14 +14,10 @@ def main() -> None:
     parser.add_argument("source", help="source Markdown document")
     parser.add_argument("--output", default=".wiki/neo", help="output root")
     parser.add_argument("--slug", default="", help="output slug")
-    parser.add_argument(
-        "--agent-backend", choices=("hermes", "pi", "chat"), default="hermes"
-    )
     args = parser.parse_args()
     config = NeoConfig(
         output_root=args.output,
         document_slug=args.slug,
-        agent_backend=args.agent_backend,
     )
     def progress(event: dict) -> None:
         stage = event.get("stage", "work")
@@ -58,55 +54,18 @@ def main() -> None:
             )
         elif stage == "plan" and step == "semantic":
             detail = f"attempt={event.get('attempt', '?')}"
-        elif stage == "judge":
-            pieces = [str(event.get("page", ""))]
-            if event.get("version") is not None:
-                pieces.append(f"version={event['version']}")
-            if event.get("score") is not None:
-                pieces.append(f"score={event['score']}")
-            if event.get("enrichment_score") is not None:
-                pieces.append(f"enrichment={event['enrichment_score']}")
-            if event.get("missing") is not None:
-                pieces.append(f"missing={event['missing']}")
-            if event.get("attempts") is not None:
-                pieces.append(f"attempts={event['attempts']}")
+        elif stage == "write":
+            pieces = [str(event.get("page", "")), f"section={event.get('section', '?')}"]
+            for key in ("attempt", "score", "missing"):
+                if event.get(key) is not None:
+                    pieces.append(f"{key}={event[key]}")
             detail = " ".join(pieces)
         elif stage == "research":
-            pieces = [str(event.get("page", ""))]
-            if event.get("reference"):
-                pieces.append(f"reference={event['reference']}")
-            if event.get("candidates") is not None:
-                pieces.append(f"candidates={event['candidates']}")
-            if event.get("facts") is not None:
-                pieces.append(f"facts={event['facts']}")
-            if event.get("reads") is not None:
-                pieces.append(f"reads={event['reads']}")
-            if event.get("minimum") is not None:
-                pieces.append(f"minimum={event['minimum']}")
-            if event.get("attempts") is not None:
-                pieces.append(f"attempts={event['attempts']}")
-            detail = " ".join(pieces)
-        elif stage == "rewrite" and step in {
-            "plan_start",
-            "plan_done",
-            "plan_retry",
-            "write_start",
-            "write_retry",
-        }:
-            pieces = [str(event.get("page", ""))]
-            if event.get("version") is not None:
-                pieces.append(f"version={event['version']}")
-            if event.get("attempt") is not None:
-                pieces.append(f"attempt={event['attempt']}")
-            if event.get("output"):
-                pieces.append(f"output={event['output']}")
-            detail = " ".join(pieces)
+            detail = f"{event.get('page', '')} references={event.get('references') or event.get('reference', '')}"
         elif stage == "rewrite" and step == "page_done":
             pieces = [str(event.get("page", ""))]
             if event.get("attempts") is not None:
                 pieces.append(f"attempts={event['attempts']}")
-            if event.get("version"):
-                pieces.append(f"selected_version={event['version']}")
             if event.get("score") is not None:
                 pieces.append(f"score={event['score']}")
             detail = " ".join(pieces)

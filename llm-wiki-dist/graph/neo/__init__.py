@@ -1,9 +1,4 @@
-"""neo: overlapping source observation, seed planning, and CLI-agent rewrites.
-
-The runtime never reads ``PROMPT.md``.  Python owns source ranges, numbered
-filenames, provenance, retries, and publication. Planning calls are bounded;
-each rewrite task plans and then edits one page body only.
-"""
+"""neo: overlapping observation, seed planning, and section-wise lossless rewriting."""
 
 from __future__ import annotations
 
