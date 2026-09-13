@@ -51,6 +51,7 @@ from .core import (
     now_iso,
     short_hash,
     source_hash,
+    strip_image_media,
 )
 from .neighborhood import build_payload as build_neighborhood_payload
 from .vectors import QdrantIndex, SqliteVecIndex
@@ -2279,8 +2280,12 @@ class Librarian:
         if not context.strip():
             return ""
 
+        # context comes straight from the raw source file (see
+        # _bridge_probe_context), which for wiki-mode documents still has
+        # embedded base64 images; sanitize before truncating, same reasoning
+        # as _extract_claims/_extract_keywords.
         result = self.gateway.llm.complete_structured(
-            BRIDGE_PROBE_PROMPT, context[:6000], BridgeProbe
+            BRIDGE_PROBE_PROMPT, strip_image_media(context)[:6000], BridgeProbe
         )
 
         parsed = (
@@ -2325,7 +2330,13 @@ class Librarian:
         for i, claim in enumerate(node.claims):
             add("claim", claim, i, None, None)
 
-        body = node.body or ""
+        # Strip embedded image media before chunking: chunk_text slices by
+        # character offset, so an inline base64 image (common in wiki-mode
+        # pages) would otherwise land whole or in fragments across several
+        # big_chunk/small_chunk rows. embed_documents() (unlike embed_document)
+        # has no sanitizing/chunking fallback of its own, so this must happen
+        # before the text reaches it.
+        body = strip_image_media(node.body or "")
 
         # Add larger body chunks for broad semantic recall.
         for i, (start, end, chunk) in enumerate(
@@ -2437,7 +2448,9 @@ class Librarian:
         add_vec_channel("summary", summary_vec)
         add_vec_channel("bridge", bridge_vec)
 
-        lexical_text = " ".join(filter(None, [node.title, node.body[:1500]]))
+        lexical_text = " ".join(
+            filter(None, [node.title, strip_image_media(node.body)[:1500]])
+        )
         text_channel = self._lexical_candidate_ids(lexical_text, node_id, k + 1)
         if text_channel:
             channels.append(text_channel)
@@ -2642,8 +2655,12 @@ class Librarian:
         if not text.strip():
             return []
 
+        # Strip embedded image media before truncating: a base64 blob near the
+        # top of a wiki page can eat the whole char budget and, if truncation
+        # lands mid-blob, leave an unterminated <image-unit> that later
+        # sanitization can no longer match (see graph/core.py strip_image_media).
         result = self.gateway.llm.complete_structured(
-            KEYWORD_PROMPT, text[:8000], Keywords
+            KEYWORD_PROMPT, strip_image_media(text)[:8000], Keywords
         )
 
         parsed = (
@@ -2667,8 +2684,9 @@ class Librarian:
         if not text.strip():
             return ClaimExtraction()
 
+        # Same ordering fix as _extract_keywords: sanitize before truncating.
         result = self.gateway.llm.complete_structured(
-            CLAIM_PROMPT, text[:12000], ClaimExtraction
+            CLAIM_PROMPT, strip_image_media(text)[:12000], ClaimExtraction
         )
 
         parsed = (
@@ -2741,7 +2759,9 @@ class Librarian:
                 "summary": node.summary,
                 "keywords": node.keywords,
                 "header": node.cluster or "",
-                "body": node.body[:4000],
+                # Sanitize before truncating: see _extract_claims for why order
+                # matters when a body may contain an embedded base64 image.
+                "body": strip_image_media(node.body)[:4000],
             },
             "candidates": [
                 {
@@ -2750,7 +2770,7 @@ class Librarian:
                     "summary": c.summary,
                     "keywords": c.keywords,
                     "header": c.cluster or "",
-                    "body": c.body[:1200],
+                    "body": strip_image_media(c.body)[:1200],
                 }
                 for c in group
             ],
@@ -3304,14 +3324,14 @@ class Librarian:
                 "id": old.id,
                 "title": old.title,
                 "summary": old.summary,
-                "body": old.body[:4000],
+                "body": strip_image_media(old.body)[:4000],
             },
             "current_support_material": [
                 {
                     "id": n.id,
                     "title": n.title,
                     "summary": n.summary,
-                    "body": n.body[:2500],
+                    "body": strip_image_media(n.body)[:2500],
                 }
                 for n in support_nodes[:8]
             ],

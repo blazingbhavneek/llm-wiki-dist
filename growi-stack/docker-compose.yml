@@ -1,0 +1,33 @@
+services:
+  mongo:
+    image: mongo:6
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  growi:
+    image: weseek/growi:latest
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      MONGO_URI: mongodb://mongo:27017/growi
+      # First boot has no admin/token yet: create the admin user via the
+      # setup wizard at http://localhost:3000, then generate an API token
+      # from Admin > Users > (your user) > API token, or Admin > API.
+      PASSWORD_SEED: changeme-seed
+      FILE_UPLOAD: local
+    volumes:
+      - growi_data:/data
+
+volumes:
+  mongo_data:
+  growi_data:

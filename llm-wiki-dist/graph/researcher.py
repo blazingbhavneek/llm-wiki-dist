@@ -1626,7 +1626,11 @@ class ResearchSession:
                         " ".join((ev.get("text") or "").split())
                         for ev in r.get("evidence", [])
                     ],
-                    "body": r["node"].body[:2500],
+                    # Sanitize before truncating: a raw node.body slice can land
+                    # mid-base64 for wiki-mode pages with embedded images,
+                    # leaving an unterminated <image-unit> that sanitization
+                    # inside self.llm.complete() can no longer match.
+                    "body": _sanitize_string_for_llm(r["node"].body)[:2500],
                 }
                 for r in top
             ],
