@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { FileText, FolderTree, X } from 'lucide-react'
 
 import { useT } from '../../i18n.jsx'
@@ -23,6 +24,10 @@ const RIGHT_RAIL_STR = {
   },
 }
 
+const DEFAULT_RAIL_WIDTH = 380
+const MIN_RAIL_WIDTH = 300
+const MAX_RAIL_WIDTH = 640
+
 export function RightDocumentRail({
   mode,
   library,
@@ -43,6 +48,57 @@ export function RightDocumentRail({
   mentionedNodeIdsByAnswerId,
 }) {
   const t = useT(RIGHT_RAIL_STR)
+  const [railWidth, setRailWidth] = useState(DEFAULT_RAIL_WIDTH)
+  const [resizing, setResizing] = useState(false)
+
+  useEffect(() => {
+    if (!resizing) return undefined
+
+    const stop = () => setResizing(false)
+    const move = (event) => {
+      setRailWidth(clampRailWidth(window.innerWidth - event.clientX))
+    }
+
+    const previousCursor = document.body.style.cursor
+    const previousUserSelect = document.body.style.userSelect
+    document.body.style.cursor = 'ew-resize'
+    document.body.style.userSelect = 'none'
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop)
+    window.addEventListener('pointercancel', stop)
+
+    return () => {
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousUserSelect
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', stop)
+      window.removeEventListener('pointercancel', stop)
+    }
+  }, [resizing])
+
+  useEffect(() => {
+    const fitToViewport = () => setRailWidth((width) => clampRailWidth(width))
+    window.addEventListener('resize', fitToViewport)
+    return () => window.removeEventListener('resize', fitToViewport)
+  }, [])
+
+  const startResize = (event) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    setResizing(true)
+  }
+
+  const resizeWithKeyboard = (event) => {
+    const delta = event.key === 'ArrowLeft' ? 24 : event.key === 'ArrowRight' ? -24 : 0
+    if (!delta && event.key !== 'Home' && event.key !== 'End') return
+
+    event.preventDefault()
+    setRailWidth((width) => {
+      if (event.key === 'Home') return clampRailWidth(MAX_RAIL_WIDTH)
+      if (event.key === 'End') return clampRailWidth(MIN_RAIL_WIDTH)
+      return clampRailWidth(width + delta)
+    })
+  }
 
   const allTabs = [
     {
@@ -63,7 +119,26 @@ export function RightDocumentRail({
       : []
 
   return (
-    <aside className="flex h-full min-h-0 w-[380px] shrink-0 flex-col border-l border-line bg-[#f8fafc]">
+    <aside
+      style={{ width: railWidth }}
+      className="relative flex h-full min-h-0 shrink-0 flex-col border-l border-line bg-[#f8fafc]"
+    >
+      <div
+        role="separator"
+        tabIndex={0}
+        aria-label="Resize knowledge sidebar"
+        aria-orientation="vertical"
+        aria-valuemin={MIN_RAIL_WIDTH}
+        aria-valuemax={MAX_RAIL_WIDTH}
+        aria-valuenow={Math.round(railWidth)}
+        onPointerDown={startResize}
+        onKeyDown={resizeWithKeyboard}
+        className={resizing ? 'absolute -left-[4px] top-0 z-30 flex h-full w-[8px] cursor-ew-resize items-center justify-center bg-blue-100/80' : 'absolute -left-[4px] top-0 z-30 flex h-full w-[8px] cursor-ew-resize items-center justify-center hover:bg-blue-50/80'}
+        title="Drag to resize"
+      >
+        <span className="h-10 w-[2px] rounded-full bg-slate-300" />
+      </div>
+
       <div className="flex h-[46px] shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-white px-2">
         {allTabs.map((tab) => {
           const active = tab.id === activeTab.id
@@ -138,6 +213,17 @@ export function RightDocumentRail({
         )}
       </div>
     </aside>
+  )
+}
+
+function clampRailWidth(width) {
+  const viewportMax =
+    typeof window === 'undefined'
+      ? MAX_RAIL_WIDTH
+      : Math.max(MIN_RAIL_WIDTH, window.innerWidth - 320)
+  return Math.max(
+    MIN_RAIL_WIDTH,
+    Math.min(MAX_RAIL_WIDTH, viewportMax, Number(width) || DEFAULT_RAIL_WIDTH),
   )
 }
 

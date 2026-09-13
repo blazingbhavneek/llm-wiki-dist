@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_openai import ChatOpenAI
 
-from .core import GRAPH_SYSTEM_PROMPT, Settings, strip_image_media
+from .core import GRAPH_SYSTEM_PROMPT, Settings, strip_big_tables, strip_image_media
 
 # endregion Imports
 
@@ -74,7 +74,7 @@ class LlmClient:
         self.api_key = api_key or API_KEY
 
         # Remove image/media content before storing prompts.
-        self.system_prompt = strip_image_media(system_prompt)
+        self.system_prompt = strip_big_tables(strip_image_media(system_prompt))
 
         # Store generation and request settings.
         self.temperature = temperature
@@ -112,7 +112,7 @@ class LlmClient:
 
     def invoke(self, prompt: str) -> str:
         # Clean the prompt and reject empty input.
-        prompt = strip_image_media(prompt).strip()
+        prompt = strip_big_tables(strip_image_media(prompt)).strip()
         if not prompt:
             raise ValueError("prompt must not be empty")
 
@@ -130,7 +130,7 @@ class LlmClient:
 
     def invoke_structured(self, prompt: str, output_model: type[Any]) -> Any:
         # Clean the prompt and reject empty input.
-        prompt = strip_image_media(prompt).strip()
+        prompt = strip_big_tables(strip_image_media(prompt)).strip()
         if not prompt:
             raise ValueError("prompt must not be empty")
 
@@ -336,7 +336,7 @@ class LlmClient:
                 entry = dict(message)
 
                 if isinstance(entry.get("content"), str):
-                    entry["content"] = strip_image_media(entry["content"])
+                    entry["content"] = strip_big_tables(strip_image_media(entry["content"]))
 
                 normalized.append(entry)
                 continue
@@ -354,7 +354,7 @@ class LlmClient:
                 raise TypeError(f"Unsupported message type: {type(message)!r}")
 
             if isinstance(content, str):
-                content = strip_image_media(content)
+                content = strip_big_tables(strip_image_media(content))
 
             entry: dict[str, Any] = {"role": role, "content": content}
 
@@ -579,7 +579,7 @@ class Embedder:
         # Shorten data URI image blobs so huge base64 strings are not embedded.
         text = _DATA_IMAGE_URI_RE.sub("data:image;base64,[omitted]", text)
 
-        return text
+        return strip_big_tables(text)
 
     def _embed_with_chunking(self, text: str) -> list[float]:
         try:

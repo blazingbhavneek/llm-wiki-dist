@@ -20,6 +20,14 @@ def raw_name_for(mount_name: str) -> str:
     return f"{path.stem}_{ext}.md" if ext else f"{path.stem}.md"
 
 
+RESERVED_TEAMS = {"all", "admin", "assets"}
+
+
+def team_of(rel: str) -> str:
+    head, sep, _ = rel.partition("/")
+    return head if sep and head else "general"
+
+
 @dataclass(frozen=True)
 class Project:
     root: Path
@@ -43,6 +51,10 @@ class Project:
     @property
     def database(self) -> Path:
         return self.root / "graph.sqlite"
+
+    @property
+    def engine_db(self) -> Path:
+        return self.root / "engine.sqlite"
 
     @property
     def last_sha_path(self) -> Path:
@@ -79,11 +91,22 @@ class Project:
             if ".git" not in path.parts
         )
 
+    def teams(self) -> list[str]:
+        names: set[str] = set()
+        for base in (self.mount, self.raw):
+            if not base.is_dir():
+                continue
+            for path in base.iterdir():
+                if path.is_dir() and not path.name.startswith(".") and path.name not in RESERVED_TEAMS:
+                    names.add(path.name)
+        return sorted(names)
 
-def zip_wiki(project: Project) -> bytes:
+
+def zip_wiki(project: Project, team: str | None = None) -> bytes:
     buffer = io.BytesIO()
+    base = project.wiki / team if team else project.wiki
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(project.wiki.rglob("*")):
+        for path in sorted(base.rglob("*")):
             if not path.is_file() or "_planning" in path.parts:
                 continue
             archive.write(path, path.relative_to(project.wiki).as_posix())

@@ -62,6 +62,7 @@ class SeedRange(BaseModel):
     chapter: str = ""
     source_start: int = 0
     source_end: int = 0
+    path: list[str] = Field(default_factory=list)
 
 
 class SeedPlan(BaseModel):

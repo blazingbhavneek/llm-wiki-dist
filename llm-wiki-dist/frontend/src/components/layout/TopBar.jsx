@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Bookmark,
   ChevronLeft,
@@ -11,6 +11,7 @@ import {
 
 import { useT, LangToggle } from '../../i18n.jsx'
 import { STR } from './strings.js'
+import { api } from '../../api'
 
 export function TopBar({
   onSearch,
@@ -21,6 +22,11 @@ export function TopBar({
   const t = useT(STR)
   const [q, setQ] = useState('')
   const [searching, setSearching] = useState(false)
+  const [scopeData, setScopeData] = useState(null)
+
+  useEffect(() => {
+    api.scopes().then(setScopeData).catch(() => {})
+  }, [])
 
   const submitKeywordSearch = async () => {
     const clean = q.trim()
@@ -73,6 +79,18 @@ export function TopBar({
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        {scopeData?.urls && Object.keys(scopeData.urls).length > 1 && (
+          <select
+            value={scopeData.current || scopeData.all}
+            onChange={(e) => window.location.assign(scopeData.urls[e.target.value])}
+            className="h-9 max-w-[150px] rounded-xl border border-slate-200 bg-white px-2 text-[12px] font-semibold text-slate-600"
+            aria-label="Scope"
+          >
+            {Object.keys(scopeData.urls).map((scope) => (
+              <option key={scope} value={scope}>{scope}</option>
+            ))}
+          </select>
+        )}
         <ToolbarButton icon={Clock3} label={t.shell.history} />
         <ToolbarButton icon={Bookmark} label={t.shell.bookmark} />
 
@@ -117,4 +135,3 @@ function ToolbarButton({ icon: Icon, label }) {
     </button>
   )
 }
-

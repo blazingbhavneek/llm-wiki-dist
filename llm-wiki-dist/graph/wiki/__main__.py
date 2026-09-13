@@ -14,10 +14,14 @@ def main() -> None:
     parser.add_argument("source", help="source Markdown document")
     parser.add_argument("--output", default=".wiki/pages", help="output root")
     parser.add_argument("--slug", default="", help="output slug")
+    parser.add_argument("--kind", default=None, help="source format override")
     args = parser.parse_args()
+    from ..formats import kind_of
+
     config = WikiConfig(
         output_root=args.output,
         document_slug=args.slug,
+        source_kind=args.kind or kind_of(args.source),
     )
     def progress(event: dict) -> None:
         stage = event.get("stage", "work")

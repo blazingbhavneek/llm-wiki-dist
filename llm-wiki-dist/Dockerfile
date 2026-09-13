@@ -27,11 +27,9 @@ ENV APP_HOME=/home/seigyo/llm-wiki
 ENV PATH="${APP_HOME}/.venv/bin:/usr/local/bin:${PATH}"
 
 # llm-wiki runtime config — override at `docker run -e ...`
-#   WIKI_DB_DIR     dir holding <db>.sqlite files (relative to APP_HOME)
-#   WIKI_DEFAULT_DB db that bare /<prefix>/ redirects to
+#   WIKI_DATA_ROOT  project root containing mount/raw/wiki/graph.sqlite
 #   WIKI_PREFIX     reverse-proxy path prefix ("" = none)
-ENV WIKI_DB_DIR=.wiki
-ENV WIKI_DEFAULT_DB=wiki
+ENV WIKI_DATA_ROOT=/data
 ENV WIKI_PREFIX=/llm-wiki
 ENV REALTIME_TEMP=0.1
 
@@ -341,7 +339,7 @@ RUN --mount=type=cache,id=uv-cache-root,target=/root/.cache/uv \
     mkdir -p /opt/uv/python /root/.cache/uv; \
     uv python install 3.13; \
     uv sync --locked --no-install-project; \
-    mkdir -p ${APP_HOME}/.wiki /home/seigyo/.cache/uv; \
+    mkdir -p /data /home/seigyo/.cache/uv; \
     chown -R seigyo:seigyo ${APP_HOME} /home/seigyo/.cache; \
     chmod -R a+rX /opt/uv/python
 
@@ -380,7 +378,7 @@ COPY --chown=seigyo:seigyo frontend/ ${APP_HOME}/frontend/
 RUN --mount=type=cache,id=uv-cache-root,target=/root/.cache/uv \
     set -eux; \
     uv sync --locked; \
-    mkdir -p ${APP_HOME}/.wiki /home/seigyo/.cache/uv; \
+    mkdir -p /data /home/seigyo/.cache/uv; \
     chown -R seigyo:seigyo ${APP_HOME}/.wiki /home/seigyo/.cache; \
     chmod -R a+rX /opt/uv/python
 
@@ -415,8 +413,8 @@ echo "============================================================"
 mkdir -p /run/sshd
 ssh-keygen -A >/dev/null 2>&1 || true
 
-mkdir -p "${APP_HOME}/.wiki" "/home/seigyo/.cache/uv"
-chown -R seigyo:seigyo "${APP_HOME}/.wiki" "/home/seigyo/.cache"
+mkdir -p "${WIKI_DATA_ROOT:-/data}" "/home/seigyo/.cache/uv"
+chown -R seigyo:seigyo "${WIKI_DATA_ROOT:-/data}" "/home/seigyo/.cache"
 
 echo "Starting sshd..."
 /usr/sbin/sshd -e || echo "WARNING: sshd failed to start"
@@ -431,8 +429,7 @@ else
   sleep 1
 
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "cd ${APP_HOME}" C-m
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_DB_DIR=${WIKI_DB_DIR:-.wiki}" C-m
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_DEFAULT_DB=${WIKI_DEFAULT_DB:-wiki}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_DATA_ROOT=${WIKI_DATA_ROOT:-/data}" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export WIKI_PREFIX=${WIKI_PREFIX-/llm-wiki}" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export UV_CACHE_DIR=/home/seigyo/.cache/uv" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}" "export CHROME_BIN=/usr/local/bin/chrome-headless-shell" C-m
@@ -445,8 +442,7 @@ fi
 if ! runuser -u seigyo -- tmux list-windows -t "${SESSION_NAME}" -F '#{window_name}' | grep -qx mcp; then
   echo "Starting MCP tmux window..."
   runuser -u seigyo -- tmux new-window -t "${SESSION_NAME}" -n mcp -c "${APP_HOME}" bash
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export WIKI_DB_DIR=${WIKI_DB_DIR:-.wiki}" C-m
-  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export WIKI_DEFAULT_DB=${WIKI_DEFAULT_DB:-wiki}" C-m
+  runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export WIKI_DATA_ROOT=${WIKI_DATA_ROOT:-/data}" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export WIKI_PREFIX=${WIKI_PREFIX-/llm-wiki}" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export MCP_BACKEND_ORIGIN=${MCP_BACKEND_ORIGIN:-http://127.0.0.1:8000}" C-m
   runuser -u seigyo -- tmux send-keys -t "${SESSION_NAME}:mcp" "export UV_CACHE_DIR=/home/seigyo/.cache/uv" C-m
@@ -500,5 +496,6 @@ EOF
 RUN chmod +x /usr/local/bin/start-llm-wiki.sh
 
 EXPOSE 22 8000 8001
+VOLUME ["/data"]
 
 CMD ["/usr/local/bin/start-llm-wiki.sh"]

@@ -51,6 +51,7 @@ from graph.gateway import ModelGateway
 from graph.librarian import Librarian, job_to_dict
 from graph.researcher import AgentStopped, Researcher
 from graph.store import GraphStore
+from graph.project import RESERVED_TEAMS, Project
 from fastapi.staticfiles import StaticFiles
 
 log = logging.getLogger("app")
@@ -91,36 +92,30 @@ class AgentRunRegistry:
 
 
 # Per-db runtime config (reverse-proxy prefix + where the .sqlite files live).
-DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki_docker"))
-DATA_ROOT = (
-    Path(os.environ["WIKI_DATA_ROOT"]).resolve()
-    if os.environ.get("WIKI_DATA_ROOT")
-    else None
-)
-DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki_moove")
+DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki_docker"))  # legacy helper compatibility
+DATA_ROOT = Path(os.environ.get("WIKI_DATA_ROOT", "data")).resolve()
+PROJECT = Project(DATA_ROOT)
+ALL_SCOPE = "all"
+DEFAULT_DB = ALL_SCOPE  # legacy response field; routing uses ALL_SCOPE
 PREFIX = os.environ.get("WIKI_PREFIX", "/agent/llm-wiki").rstrip("/")  # e.g. "/llm-wiki"
 REALTIME_TEMP = float(os.environ.get("REALTIME_TEMP", "0.0"))
 _DB_RE = re.compile(r"[A-Za-z0-9_-]+")
-_RESERVED_DB_NAMES = {"admin", "assets"}
+_RESERVED_DB_NAMES = RESERVED_TEAMS
+# Compatibility flag for older integrations; the engine now always expects a
+# registered GROWI connection.  The safe default remains "false" (no bypass).
+GROWI_ENABLED = False
 
 ADMIN_PASSWORD = os.environ.get("WIKI_ADMIN_PASSWORD", "seigyo@rikiseisan")
 MAX_SQLITE_UPLOAD_BYTES = int(
     os.environ.get("WIKI_MAX_SQLITE_UPLOAD_BYTES", str(512 * 1024 * 1024))
 )
 ADMIN_DB_LOCK = asyncio.Lock()
-GROWI_ENABLED = os.environ.get("WIKI_GROWI_ENABLED", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-GROWI_ENGINE_DB = Path(
-    os.environ.get("WIKI_ENGINE_DB", str(DB_DIR / "engine.sqlite"))
-)
+GROWI_ENGINE_DB = Path(os.environ.get("WIKI_ENGINE_DB", str(PROJECT.engine_db)))
 _GROWI_REGISTRY: Any = None
+LIFESPAN_ACTIVE = False
 
 # The db for the current request; set by the db_routing middleware from the URL.
-current_db: ContextVar[str] = ContextVar("current_db", default=DEFAULT_DB)
+current_db: ContextVar[str] = ContextVar("current_db", default=ALL_SCOPE)
 
 # One stack per db, built lazily on first request and cached. Each value is a
 # dict: {"gateway", "write_store", "librarian", "read_store", "researcher"}.
@@ -145,12 +140,12 @@ def _not_ready_detail(db: str) -> dict[str, Any]:
     )
 
 
-def _build_stack(db_path: str, data_root: str | None = None) -> dict:
-    log.info("startup: building stack db=%s", db_path)
+def _build_stack(*_legacy: Any) -> dict:
+    log.info("startup: building one engine db=%s", PROJECT.database)
     settings = Settings.from_env()
-    settings.database_path = db_path  # pick the sqlite for this db
-    if data_root:
-        settings.data_root = data_root
+    settings.database_path = str(PROJECT.database)
+    settings.data_root = str(DATA_ROOT)
+    settings.engine_db = str(GROWI_ENGINE_DB)
 
     new_gateway = ModelGateway(settings)
     new_write_store = GraphStore(settings.database_path)  # rwc: created if missing
@@ -183,44 +178,45 @@ def _build_stack(db_path: str, data_root: str | None = None) -> dict:
     }
 
 
-async def _bootstrap_db(db: str) -> None:
-    """Build + start the stack for one db, caching it in STACKS."""
-    if db in building or db in STACKS:
+async def _bootstrap_engine() -> None:
+    """Build the one engine stack and schedule both sync directions."""
+    if ALL_SCOPE in building or ALL_SCOPE in STACKS:
         return
-
-    building.add(db)
-    errors[db] = None
-    stages[db] = "starting"
+    building.add(ALL_SCOPE)
+    errors[ALL_SCOPE] = None
+    stages[ALL_SCOPE] = "starting"
     try:
-        growi_connection = _registered_growi(db)
-        if growi_connection is not None:
-            from graph.growi import GrowiClient
+        connection = _growi_connection()
+        if connection is None:
+            stages[ALL_SCOPE] = "needs_growi"
+            errors[ALL_SCOPE] = "register a GROWI connection in /admin first"
+            return
+        from graph.growi import GrowiClient
 
-            stages[db] = "checking_growi"
-            client = GrowiClient(
-                growi_connection.url,
-                growi_connection.api_token,
-            )
-            if not await client.health():
-                raise RuntimeError("GROWI healthcheck failed")
-            cache_path = _growi_cache_path(db)
-            stack = await asyncio.to_thread(_build_stack, str(cache_path), _data_root(db))
-            stack["growi_connection"] = growi_connection
-        else:
-            stack = await asyncio.to_thread(_build_stack, str(_db_path(db)), _data_root(db))
+        stages[ALL_SCOPE] = "checking_growi"
+        if not await GrowiClient(connection.url, connection.api_token).health():
+            raise RuntimeError(f"GROWI healthcheck failed: {connection.url}")
+        PROJECT.ensure()
+        stack = await asyncio.to_thread(_build_stack)
+        stack["growi_connection"] = connection
         await stack["librarian"].start()
-        STACKS[db] = stack
-        stages[db] = "ready"
-        errors[db] = None
-        if growi_connection is not None:
-            await stack["librarian"].enqueue("sync_growi", {"name": db})
-        log.info("startup: ready db=%s, serving requests", db)
+        STACKS[ALL_SCOPE] = stack
+        stages[ALL_SCOPE] = "ready"
+        errors[ALL_SCOPE] = None
+        await stack["librarian"].enqueue("sync_raw", {})
+        await stack["librarian"].enqueue("sync_growi", {})
+        log.info("startup: engine ready, serving requests")
     except Exception as exc:
-        stages[db] = "failed"
-        errors[db] = f"{type(exc).__name__}: {exc}"
-        log.exception("startup/bootstrap failed db=%s", db)
+        stages[ALL_SCOPE] = "failed"
+        errors[ALL_SCOPE] = f"{type(exc).__name__}: {exc}"
+        log.exception("startup/bootstrap failed")
     finally:
-        building.discard(db)
+        building.discard(ALL_SCOPE)
+
+
+async def _bootstrap_db(_db: str = ALL_SCOPE) -> None:
+    """Compatibility alias for older admin callers."""
+    await _bootstrap_engine()
 
 
 async def _close_stack(db: str) -> None:
@@ -244,10 +240,34 @@ async def _close_stack(db: str) -> None:
     errors.pop(db, None)
 
 
-def _ensure_building(db: str) -> None:
-    """Kick off a lazy build for db if it isn't ready or already building."""
-    if db not in STACKS and db not in building:
-        asyncio.create_task(_bootstrap_db(db))
+async def _close_all() -> None:
+    engine = STACKS.get(ALL_SCOPE)
+    for name, stack in list(STACKS.items()):
+        if name == ALL_SCOPE:
+            continue
+        with suppress(Exception):
+            stack["researcher"].close()
+        with suppress(Exception):
+            stack["read_store"].close()
+    if engine is not None:
+        with suppress(Exception):
+            await engine["librarian"].stop()
+        with suppress(Exception):
+            engine["researcher"].close()
+        with suppress(Exception):
+            engine["read_store"].close()
+        with suppress(Exception):
+            engine["write_store"].close()
+        with suppress(Exception):
+            engine["gateway"].close()
+    STACKS.clear()
+    stages.clear()
+    errors.clear()
+
+
+def _ensure_building(_db: str = ALL_SCOPE) -> None:
+    if ALL_SCOPE not in STACKS and ALL_SCOPE not in building:
+        asyncio.create_task(_bootstrap_engine())
 
 
 @asynccontextmanager
@@ -261,153 +281,59 @@ async def lifespan(_: FastAPI):
     )
     logging.getLogger("graph_librarian").setLevel(logging.INFO)
 
-    (DATA_ROOT or DB_DIR).mkdir(parents=True, exist_ok=True)
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
     loop = asyncio.get_running_loop()
     loop.set_default_executor(
         ThreadPoolExecutor(max_workers=64, thread_name_prefix="default")
     )
 
-    # Preload existing SQLite DBs at startup so first users do not wait for
-    # lazy initialization.
-    #
-    # Optional env:
-    #   WIKI_STARTUP_BOOTSTRAP_CONCURRENCY=2
-    #   WIKI_STARTUP_REQUIRE_ALL_DBS=false
-    startup_concurrency = max(
-        1,
-        int(os.environ.get("WIKI_STARTUP_BOOTSTRAP_CONCURRENCY", "3")),
-    )
-
-    require_all_dbs_ready = os.environ.get(
-        "WIKI_STARTUP_REQUIRE_ALL_DBS",
-        "false",
-    ).lower() in {"1", "true", "yes", "on"}
-
+    timer: asyncio.Task | None = None  # old WIKI_GROWI_ENABLED="false" bypass is gone
+    global LIFESPAN_ACTIVE
     try:
-        existing_dbs: list[str] = []
+        await _bootstrap_engine()
+        LIFESPAN_ACTIVE = True
 
-        if DATA_ROOT is not None:
-            candidates = sorted(
-                (
-                    path.name,
-                    path / "graph.sqlite",
+        async def sync_timer() -> None:
+            interval = int(os.environ.get("WIKI_SYNC_INTERVAL_SECONDS", "300"))
+            if interval <= 0:
+                return
+            while True:
+                await asyncio.sleep(interval)
+                stack = STACKS.get(ALL_SCOPE)
+                if stack is None or stages.get(ALL_SCOPE) != "ready":
+                    continue
+                busy = any(
+                    job.type in {"sync_raw", "sync_growi"} and job.status in {"queued", "running"}
+                    for job in stack["librarian"].list_jobs(limit=500)
                 )
-                for path in DATA_ROOT.iterdir()
-                if path.is_dir()
-                and ((path / "graph.sqlite").is_file() or (path / "raw").is_dir())
-            )
-        else:
-            candidates = sorted(
-                (path.name[: -len(".sqlite")], path)
-                for path in DB_DIR.glob("*.sqlite")
-                if path.is_file()
-            )
+                if busy:
+                    continue
+                with suppress(RuntimeError):
+                    await stack["librarian"].enqueue("sync_raw", {})
+                    await stack["librarian"].enqueue("sync_growi", {})
 
-        for db, path in candidates:
-
-            # Do not preload invalid/reserved DB names. This matches your
-            # routing/admin validation behavior.
-            if not _DB_RE.fullmatch(db) or db in _RESERVED_DB_NAMES:
-                log.warning(
-                    "startup: skipping sqlite with invalid/reserved db name: %s",
-                    path.name,
-                )
-                continue
-
-            existing_dbs.append(db)
-
-        if GROWI_ENABLED:
-            try:
-                existing_dbs.extend(
-                    connection.name
-                    for connection in _growi_registry().list()
-                    if connection.name not in existing_dbs
-                )
-            except Exception as exc:
-                log.warning("startup: unable to enumerate GROWI connections: %s", exc)
-
-        if existing_dbs:
-            log.info(
-                "startup: preloading %d existing sqlite db(s): %s",
-                len(existing_dbs),
-                ", ".join(existing_dbs),
-            )
-
-            semaphore = asyncio.Semaphore(startup_concurrency)
-
-            async def preload_one(db: str) -> tuple[str, str | None]:
-                async with semaphore:
-                    log.info("startup: preloading db=%s", db)
-
-                    await _bootstrap_db(db)
-
-                    if stages.get(db) == "ready" and db in STACKS:
-                        log.info("startup: preloaded db=%s successfully", db)
-                        return db, None
-
-                    err = errors.get(db) or f"db did not become ready; stage={stages.get(db)}"
-                    log.error("startup: failed to preload db=%s: %s", db, err)
-                    return db, err
-
-            results = await asyncio.gather(
-                *(preload_one(db) for db in existing_dbs)
-            )
-
-            failed = {
-                db: err
-                for db, err in results
-                if err is not None
-            }
-
-            ready_count = len(existing_dbs) - len(failed)
-
-            log.info(
-                "startup: db preload complete: ready=%d failed=%d total=%d",
-                ready_count,
-                len(failed),
-                len(existing_dbs),
-            )
-
-            if failed and require_all_dbs_ready:
-                raise RuntimeError(
-                    "one or more dbs failed to preload: "
-                    + "; ".join(f"{db}: {err}" for db, err in failed.items())
-                )
-        else:
-            log.info(
-                "startup: no existing sqlite dbs found in %s; "
-                "normal wiki routes will 404 until an admin creates/uploads a db",
-                DATA_ROOT or DB_DIR,
-            )
+        timer = asyncio.create_task(sync_timer())
 
         yield
 
     finally:
-        for stack in list(STACKS.values()):
-            try:
-                await stack["librarian"].stop()
-            except Exception:
-                pass
-
-            with suppress(Exception):
-                stack["researcher"].close()
-            with suppress(Exception):
-                stack["write_store"].close()
-            with suppress(Exception):
-                stack["read_store"].close()
-            with suppress(Exception):
-                stack["gateway"].close()
-
-        STACKS.clear()
+        LIFESPAN_ACTIVE = False
+        if timer is not None:
+            timer.cancel()
+        await _close_all()
 
 
 def _ready_stack() -> dict:
-    db = current_db.get()
-    if stages.get(db) == "ready" and db in STACKS:
-        return STACKS[db]
-    _ensure_building(db)
-    raise HTTPException(status_code=503, detail=_not_ready_detail(db))
+    if stages.get(ALL_SCOPE) != "ready" or ALL_SCOPE not in STACKS:
+        _ensure_building()
+        raise HTTPException(status_code=503, detail=_not_ready_detail(ALL_SCOPE))
+    scope = current_db.get()
+    if scope not in STACKS:
+        engine = STACKS[ALL_SCOPE]
+        store = GraphStore(engine["write_store"].path, readonly=True, scope=None if scope == ALL_SCOPE else scope)
+        STACKS[scope] = {**engine, "read_store": store, "researcher": Researcher(engine["gateway"], store)}
+    return STACKS[scope]
 
 
 def _gateway() -> ModelGateway:
@@ -523,15 +449,7 @@ _validate_db_name = _validate_name
 
 
 def _require_growi_enabled() -> None:
-    if not GROWI_ENABLED:
-        raise HTTPException(
-            status_code=503,
-            detail=api_error(
-                "GROWI integration is disabled; set WIKI_GROWI_ENABLED=true",
-                False,
-                "growi_disabled",
-            ),
-        )
+    return
 
 
 def _growi_registry():
@@ -544,13 +462,32 @@ def _growi_registry():
 
 
 def _registered_growi(name: str):
-    if not GROWI_ENABLED:
-        return None
     try:
         return _growi_registry().get(name)
     except Exception as exc:
         log.warning("GROWI registry lookup failed for %s: %s", name, exc)
         return None
+
+
+def _growi_connection():
+    try:
+        name = os.environ.get("WIKI_GROWI_NAME", "")
+        if name:
+            return _growi_registry().get(name)
+        rows = _growi_registry().list()
+        return rows[0] if len(rows) == 1 else None
+    except Exception as exc:
+        log.warning("GROWI registry lookup failed: %s", exc)
+        return None
+
+
+def _known_scopes() -> set[str]:
+    scopes = {ALL_SCOPE, *PROJECT.teams()}
+    engine = STACKS.get(ALL_SCOPE)
+    if engine is not None:
+        with suppress(Exception):
+            scopes.update(engine["read_store"].teams())
+    return scopes
 
 
 def _growi_cache_path(name: str) -> Path:
@@ -990,18 +927,18 @@ async def db_routing(request: Request, call_next):
     stripped = path.strip("/")
 
     if stripped == "":
-        return RedirectResponse(f"{PREFIX}/{DEFAULT_DB}/", status_code=307)
+        return RedirectResponse(f"{PREFIX}/{ALL_SCOPE}/", status_code=307)
 
     seg, _, tail = stripped.partition("/")
 
     if not _DB_RE.fullmatch(seg):
         return PlainTextResponse("unknown wiki", status_code=404)
 
-    # Important: normal wiki traffic must never create a new empty DB because
-    # of a typo in the URL. Only admin create/upload may create DB files.
-    is_growi = _registered_growi(seg) is not None
-    if not is_growi and not _db_path(seg).exists():
-        return PlainTextResponse("unknown wiki", status_code=404)
+    if seg != ALL_SCOPE and seg not in _known_scopes():
+        # Legacy integrations may still expose a registered name before its
+        # team folder is indexed; normal routing remains scope-only.
+        if not (GROWI_ENABLED and _registered_growi(seg) is not None):
+            return PlainTextResponse("unknown scope", status_code=404)
 
     if tail == "" and not path.endswith("/"):
         return RedirectResponse(f"{PREFIX}/{seg}/", status_code=307)
@@ -1044,25 +981,63 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.get("/api/ready")
 async def ready() -> dict[str, Any]:
-    db = current_db.get()
-    _ensure_building(db)
-    stage = stages.get(db, "starting")
+    _ensure_building()
+    stage = stages.get(ALL_SCOPE, "starting")
     return {
         "ready": stage == "ready",
         "stage": stage,
-        "error": errors.get(db),
+        "error": errors.get(ALL_SCOPE),
         "retryable": stage != "ready",
     }
 
 
 @app.post("/api/admin/restart-bootstrap")
 async def restart_bootstrap() -> dict[str, Any]:
-    db = current_db.get()
-    if stages.get(db) == "ready":
+    if stages.get(ALL_SCOPE) == "ready":
         return {"ready": True, "stage": "ready", "error": None}
-    if db not in building:
-        asyncio.create_task(_bootstrap_db(db))
-    return {"ready": False, "stage": stages.get(db, "starting"), "error": errors.get(db)}
+    _ensure_building()
+    return {"ready": False, "stage": stages.get(ALL_SCOPE, "starting"), "error": errors.get(ALL_SCOPE)}
+
+
+@app.get("/api/scopes")
+async def scopes() -> dict[str, Any]:
+    known = _known_scopes()
+    return {
+        "current": current_db.get(),
+        "all": ALL_SCOPE,
+        "teams": sorted(known - {ALL_SCOPE}),
+        "urls": {name: _db_url(name) for name in sorted(known)},
+    }
+
+
+def _scope_team() -> str | None:
+    scope = current_db.get()
+    return None if scope == ALL_SCOPE else scope
+
+
+def _require_team() -> str:
+    team = _scope_team()
+    if team is None:
+        raise HTTPException(
+            status_code=400,
+            detail=api_error("open a team scope to write", False, "no_team"),
+        )
+    return team
+
+
+@app.get("/api/growi")
+async def growi_info() -> dict[str, Any]:
+    connection = _growi_connection()
+    if connection is None:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "name": connection.name,
+        "url": connection.url,
+        "mode": connection.mode,
+        "root_path": connection.root_path,
+        "write_path": connection.write_path,
+    }
 
 
 # ============================================================================
@@ -1092,8 +1067,8 @@ def _growi_public_summary(connection: Any) -> dict[str, Any]:
     data = _growi_registry().public(connection)
     data.update(
         {
-            "stage": stages.get(connection.name, "not_started"),
-            "error": errors.get(connection.name),
+            "stage": stages.get(ALL_SCOPE, "not_started"),
+            "error": errors.get(ALL_SCOPE),
             "page_count": _growi_registry().page_count(connection.name),
         }
     )
@@ -1125,6 +1100,9 @@ async def admin_register_connection(
             status_code=400,
             detail=api_error(str(exc), False, "invalid_connection"),
         ) from exc
+    if LIFESPAN_ACTIVE:
+        await _close_all()
+        await _bootstrap_engine()
     return _growi_public_summary(connection)
 
 
@@ -1150,6 +1128,9 @@ async def admin_patch_connection(
             status_code=400,
             detail=api_error(str(exc), False, "invalid_connection"),
         ) from exc
+    if LIFESPAN_ACTIVE:
+        await _close_all()
+        await _bootstrap_engine()
     return _growi_public_summary(connection)
 
 
@@ -1170,7 +1151,7 @@ async def admin_test_connection(
     reachable = await client.health()
     pages: list[Any] = []
     if reachable:
-        pages, _cursor = await client.list_pages(connection.root_path)
+        pages = await client.list_all_pages(connection.root_path)
     return {
         "name": name,
         "reachable": reachable,
@@ -1189,7 +1170,7 @@ async def admin_resync_connection(
     name = _validate_name(name)
     if _growi_registry().get(name) is None:
         raise HTTPException(status_code=404, detail=api_error("connection not found", False, "not_found"))
-    return await _enqueue("sync_growi", {"name": name})
+    return await _enqueue("sync_growi", {})
 
 
 @app.delete("/admin/api/connections/{name}")
@@ -1204,7 +1185,35 @@ async def admin_delete_connection(
     deleted = _growi_registry().delete(name)
     if not deleted:
         raise HTTPException(status_code=404, detail=api_error("connection not found", False, "not_found"))
-    return {"name": name, "deleted": True, "growi_untouched": True}
+    await _close_all()
+    for path in (PROJECT.database, PROJECT.database.with_name("graph.sqlite-wal"), PROJECT.database.with_name("graph.sqlite-shm")):
+        path.unlink(missing_ok=True)
+    return {"name": name, "deleted": True, "growi_untouched": True, "index_dropped": True}
+
+
+@app.get("/admin/api/status")
+async def admin_status(_: str | None = Header(default=None, alias="X-Admin-Password")):
+    _require_admin(_)
+    connection = _growi_connection()
+    return {
+        "stage": stages.get(ALL_SCOPE, "not_started"),
+        "error": errors.get(ALL_SCOPE),
+        "data_root": str(DATA_ROOT),
+        "teams": sorted(_known_scopes() - {ALL_SCOPE}),
+        "connection": _growi_public_summary(connection) if connection else None,
+        "urls": {name: _db_url(name) for name in sorted(_known_scopes())},
+    }
+
+
+@app.post("/admin/api/sync")
+async def admin_sync(_: str | None = Header(default=None, alias="X-Admin-Password")):
+    _require_admin(_)
+    stack = STACKS.get(ALL_SCOPE)
+    if stack is None:
+        raise HTTPException(status_code=503, detail=_not_ready_detail(ALL_SCOPE))
+    first = await stack["librarian"].enqueue("sync_raw", {})
+    await stack["librarian"].enqueue("sync_growi", {})
+    return _job_response(first)
 
 
 @app.get("/admin/api/dbs")
@@ -1773,16 +1782,7 @@ class DocumentBody(BaseModel):
     body: str
     title: str | None = None
     document_name: str | None = None
-    source_path: str | None = None
-    source_ranges: list[tuple[int, int]] | None = None
-    # Optional ChunkConfig overrides for the chunk-and-ingest path
-    # (ablation/speed switches; unknown keys are ignored server-side).
     chunk_options: dict[str, Any] | None = None
-
-
-# Documents longer than this many lines (~3 pages) always take the
-# chunk-and-ingest path: split into concept pages before node creation.
-CHUNK_LINE_THRESHOLD = int(os.environ.get("WIKI_CHUNK_THRESHOLD_LINES", "300"))
 
 
 class RecondBody(BaseModel):
@@ -2259,34 +2259,26 @@ async def create_exogenous(payload: ExogenousBody) -> dict:
             "source_node_ids": payload.source_node_ids,
             "origin": payload.origin,
             "question": payload.question,
+            "team": _scope_team(),
         },
     )
 
 
 @app.post("/api/document")
 async def create_document(payload: DocumentBody) -> dict:
-    if len(payload.body.splitlines()) > CHUNK_LINE_THRESHOLD:
-        return await _enqueue(
-            "chunk_and_ingest",
-            {
-                "body": payload.body,
-                "title": payload.title,
-                "document_name": payload.document_name,
-                "source_path": payload.source_path,
-                "chunk_options": payload.chunk_options or {},
-            },
-        )
+    from graph.sync import commit_raw
 
-    return await _enqueue(
-        "create_document",
-        {
-            "body": payload.body,
-            "title": payload.title,
-            "document_name": payload.document_name,
-            "source_path": payload.source_path,
-            "source_ranges": payload.source_ranges,
-        },
-    )
+    team = _require_team()
+    upload_name = re.sub(r"[^A-Za-z0-9_.\-\u3040-\u30ff\u4e00-\u9fff]+", "-", Path(payload.document_name or payload.title or "upload").stem).strip("-")
+    stem = upload_name or f"upload-{uuid.uuid4().hex[:8]}"
+    rel = f"{team}/uploads/{stem}.md"
+    target = PROJECT.raw_file(rel)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(target.write_text, payload.body, "utf-8")
+    await asyncio.to_thread(commit_raw, PROJECT, f"upload: {rel}")
+    job = await _enqueue("sync_raw", {"ingest_mode": (payload.chunk_options or {}).get("ingest_mode")})
+    await _enqueue("sync_growi", {})
+    return {**job, "raw": rel}
 
 
 @app.get("/api/assimilation")
@@ -2320,33 +2312,17 @@ async def ingest(payload: IngestBody) -> dict:
 
 @app.post("/api/sync")
 async def sync_project(payload: SyncBody | None = None) -> dict:
-    if DATA_ROOT is None:
-        raise HTTPException(
-            status_code=400,
-            detail=api_error(
-                "WIKI_DATA_ROOT is not configured", False, "no_data_root"
-            ),
-        )
-    return await _enqueue(
-        "sync_project",
-        {"ingest_mode": payload.ingest_mode if payload else None},
-    )
+    first = await _enqueue("sync_raw", {"ingest_mode": payload.ingest_mode if payload else None})
+    await _enqueue("sync_growi", {})
+    return first
 
 
 @app.get("/api/wiki.zip")
 async def wiki_zip() -> StreamingResponse:
-    if DATA_ROOT is None:
-        raise HTTPException(
-            status_code=400,
-            detail=api_error(
-                "WIKI_DATA_ROOT is not configured", False, "no_data_root"
-            ),
-        )
-    from graph.project import Project, zip_wiki
+    from graph.project import zip_wiki
 
-    project = Project(DATA_ROOT / current_db.get())
     return StreamingResponse(
-        io.BytesIO(zip_wiki(project)),
+        io.BytesIO(zip_wiki(PROJECT, _scope_team())),
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{current_db.get()}-wiki.zip"'

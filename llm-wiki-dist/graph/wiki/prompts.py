@@ -361,6 +361,7 @@ def section_write_prompt(
     image_context: str,
     output_language: str,
     feedback: Sequence[str] = (),
+    context: str = "",
 ) -> Prompt:
     """Rewrite one section losslessly; everything needed is in this prompt."""
 
@@ -371,6 +372,7 @@ def section_write_prompt(
             + "\n- ".join(item.strip() for item in feedback if item.strip())
             + "\n\n"
         )
+    context_block = f"{context}\n" if context else ""
     return Prompt(
         kind="section_write",
         version=REWRITE_PROMPT_VERSION,
@@ -390,7 +392,8 @@ def section_write_prompt(
             f"- ページ全体の要約: {page_summary or '要約なし'}\n"
             f"- この節: {index}/{count}（原文 {source_start}-{source_end}行）\n"
             f"- 本文は{output_language}で書く。\n\n"
-            "# 書き方\n"
+            + context_block
+            + "# 書き方\n"
             "- 見出しは`##`以下を使う。`# `（H1）は書かない。\n"
             "- 原文の見出しは残してよいが、内容が分かる名前に変えてよい。\n"
             "- 段落や箇条書きに整理し、何のための機能か、いつ使うか、何に注意するかが"
@@ -418,8 +421,11 @@ def intro_prompt(
     page_summary: str,
     body: str,
     output_language: str,
+    context: str = "",
 ) -> Prompt:
     """One additive lead paragraph written from the finished body only."""
+
+    context_block = f"{context}\n" if context else ""
 
     return Prompt(
         kind="intro",
@@ -434,6 +440,7 @@ def intro_prompt(
             f"本文にない事実、識別子、数値は書かない。{output_language}で書く。\n\n"
             f"# タイトル\n{page_title}\n\n"
             f"# 要約\n{page_summary or '要約なし'}\n\n"
-            f"# 本文\n{body}"
+            + context_block
+            + f"# 本文\n{body}"
         ),
     )

@@ -20,6 +20,3 @@ dependencies = [
     "tqdm>=4.68.4",
     "uvicorn>=0.51.0",
 ]
-
-[project.optional-dependencies]
-qdrant = ["qdrant-client>=1.14.2"]

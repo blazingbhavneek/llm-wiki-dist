@@ -25,6 +25,7 @@ from typing import Any, Callable, Sequence
 
 from .config import REWRITE_PROMPT_VERSION, SEED_PLAN_VERSION, WikiConfig
 from .document_map import build_seed_plan
+from .markdown_blocks import build_block_index
 from .ids import document_id, slugify
 from .images import ImageUnit, block_units, extract_image_units, restore_images
 from .model import ChatModelPort, ModelPort
@@ -83,10 +84,7 @@ class SeedPage:
     filename: str
     page_id: str
     reference_ranges: list[tuple[int, int]] = field(default_factory=list)
-
-    @property
-    def path(self) -> str:
-        return self.filename
+    path: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -231,11 +229,12 @@ def _plan_pages(plan: CompiledSeedPlan) -> list[SeedPage]:
             SeedPage(
                 number=number,
                 title=(entry.title or f"Document section {number}").strip(),
-                chapter=entry.chapter.strip(),
+                chapter=(entry.chapter or " › ".join(entry.path)).strip(),
                 summary=entry.summary.strip(),
                 owner_ranges=[(entry.source_start, entry.source_end)],
                 filename=filename,
                 page_id=f"page-{number:03d}",
+                path=list(entry.path),
             )
         )
     return pages
@@ -586,7 +585,9 @@ def _select_references(
         reverse=True,
     )
     picks = [item for score, _, item in scored[: max(0, limit)] if score > 0]
-    return sorted(adjacent + picks, key=lambda item: item.number)
+    family = [item for item in others if item.path and item.path[:-1] == page.path[:-1]]
+    unique = {item.number: item for item in adjacent + family[:limit] + picks}
+    return sorted(unique.values(), key=lambda item: item.number)
 
 
 async def _research_references(
@@ -736,6 +737,7 @@ def _load_seed_plan(
                 reference_ranges=_valid_reference_ranges(
                     item.get("reference_ranges", []), source_line_count
                 ),
+                path=[str(value) for value in item.get("path", [])],
             )
             for item in raw["pages"]
         ]
@@ -872,6 +874,12 @@ def _nav_footer(page: SeedPage, pages: Sequence[SeedPage]) -> str:
         parts.append(f"前のページ: [{previous.title}]({previous.filename})")
     if following:
         parts.append(f"次のページ: [{following.title}]({following.filename})")
+    if page.path[:-1]:
+        parent = next((item for item in pages if item.path == page.path[:-1]), None)
+        if parent is None:
+            parent = next((item for item in pages if item.path[: len(page.path) - 1] == page.path[:-1]), None)
+        if parent and parent.filename != page.filename:
+            parts.insert(0, f"親: [{parent.title}]({parent.filename})")
     return ("\n---\n\n" + " ｜ ".join(parts) + "\n") if parts else ""
 
 
@@ -890,6 +898,7 @@ async def _write_section(
     task_dir: Path,
     stop_check: StopCheck,
     on_progress: Progress,
+    context: str = "",
 ) -> _SectionResult:
     """Write one section until Python's lossless checks and the judge are satisfied."""
 
@@ -920,6 +929,7 @@ async def _write_section(
             image_context=_image_context(section_units, lines),
             output_language=config.output_language,
             feedback=feedback,
+            context=context,
         )
         write_text_atomic(
             task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md", prompt.render()
@@ -1030,6 +1040,7 @@ async def _write_intro(
     config: WikiConfig,
     task_dir: Path,
     stop_check: StopCheck,
+    context: str = "",
 ) -> str:
     """One lead paragraph. Anything it cannot justify from the body is dropped."""
 
@@ -1040,6 +1051,7 @@ async def _write_intro(
         page_summary=page.summary,
         body=body,
         output_language=config.output_language,
+        context=context,
     )
     write_text_atomic(task_dir / "intro-prompt.md", prompt.render())
     try:
@@ -1074,7 +1086,10 @@ async def _rewrite_page(
     source_line_count: int,
     stop_check: StopCheck,
     on_progress: Progress,
+    parents: dict[str, str] | None = None,
 ) -> RewriteResult:
+    from ..formats.context import context_block
+
     if len(page.owner_ranges) != 1:
         raise PipelineError(f"page {page.number} must own one contiguous range")
     start, end = page.owner_ranges[0]
@@ -1104,6 +1119,7 @@ async def _rewrite_page(
             page, s, e, index=index, count=len(sections), facts=section_facts,
             lines=lines, units=units, model=model, config=config, task_dir=task_dir,
             stop_check=stop_check, on_progress=on_progress,
+            context=context_block(page, pages, parents or {}),
         )
         drafts.append(result.markdown.rstrip())
         attempts += result.attempts
@@ -1115,7 +1131,8 @@ async def _rewrite_page(
 
     body = "\n\n".join(drafts)
     intro = await _write_intro(
-        page, body, model=model, config=config, task_dir=task_dir, stop_check=stop_check
+        page, body, model=model, config=config, task_dir=task_dir,
+        stop_check=stop_check, context=context_block(page, pages, parents or {}),
     )
     markdown = f"# {page.title}\n\n{intro.rstrip()}\n\n{body}\n"
     markdown = link_titles(
@@ -1157,6 +1174,7 @@ async def _rewrite_all(
     source_line_count: int,
     stop_check: StopCheck,
     on_progress: Progress,
+    parents: dict[str, str] | None = None,
 ) -> list[RewriteResult]:
     semaphore = asyncio.Semaphore(max(1, config.rewrite_concurrency))
     tokens = {
@@ -1199,6 +1217,7 @@ async def _rewrite_all(
                 model=model, config=config, work_root=work_root, seed_root=seed_root,
                 source_line_count=source_line_count,
                 stop_check=stop_check, on_progress=on_progress,
+                parents=parents,
             )
 
     for completed, task in enumerate(
@@ -1224,7 +1243,12 @@ async def _rewrite_all(
 
 def _index_text(title: str, pages: Sequence[SeedPage]) -> str:
     lines = [f"# {title}", "", "ページは原文での登場順に並んでいます。", ""]
+    seen: set[tuple[str, ...]] = set()
     for page in pages:
+        parent = tuple(page.path[:-1])
+        if page.path and parent not in seen:
+            lines.extend([f"## {' › '.join(parent) or page.path[0]}", ""])
+            seen.add(parent)
         lines.append(
             f"- [{page.title}]({page.filename}) — "
             f"{page.summary or '要約なし'} "
@@ -1341,27 +1365,66 @@ async def run_pipeline(
         if wiki_root.exists():
             shutil.rmtree(wiki_root)
         wiki_root.mkdir(parents=True, exist_ok=True)
-        observations = await observe_document(
-            source_text,
-            model=model,
+        from ..formats import structural_seed_plan
+        from .document_map import validate_seed_plan
+
+        structural = await structural_seed_plan(
+            lines,
+            kind=config.source_kind,
             config=config,
-            document=document_id(normalized),
-            checkpoint_dir=work_root / "observations" / "checkpoints",
-            live_output_dir=work_root / "observations" / "live",
+            model=model,
             on_progress=on_progress,
             stop_check=stop_check,
         )
-        seed_plan = await build_seed_plan(
-            observations,
-            lines=lines,
-            model=model,
-            config=config,
-            checkpoint_dir=work_root / "planning",
-            stop_check=stop_check,
-            on_progress=on_progress,
-        )
+        seed_plan = None
+        if structural is not None:
+            seed_plan, error = validate_seed_plan(
+                structural,
+                source_line_count=len(lines),
+                block_index=build_block_index(lines),
+                lines=lines,
+                page_target_lines=config.page_target_lines,
+            )
+            if seed_plan is None:
+                _emit(on_progress, "seed", "structural_rejected", reason=error)
+        if seed_plan is None:
+            observations = await observe_document(
+                source_text,
+                model=model,
+                config=config,
+                document=document_id(normalized),
+                checkpoint_dir=work_root / "observations" / "checkpoints",
+                live_output_dir=work_root / "observations" / "live",
+                on_progress=on_progress,
+                stop_check=stop_check,
+            )
+            seed_plan = await build_seed_plan(
+                observations,
+                lines=lines,
+                model=model,
+                config=config,
+                checkpoint_dir=work_root / "planning",
+                stop_check=stop_check,
+                on_progress=on_progress,
+            )
+        _emit(on_progress, "seed", "structural" if structural is not None and seed_plan is not None else "llm", pages=len(seed_plan.pages))
         pages = _plan_pages(seed_plan)
         _verify_ranges(pages, len(lines))
+
+    from ..formats.context import summarize_hierarchy
+
+    parents: dict[str, str] = {}
+    if any(page.path for page in pages):
+        _emit(on_progress, "context", "start", parents=len({tuple(page.path[:-1]) for page in pages}))
+        parents = await summarize_hierarchy(
+            pages,
+            lines,
+            model=model,
+            config=config,
+            checkpoint=state_root / "context.json",
+            stop_check=stop_check,
+        )
+        _emit(on_progress, "context", "done")
     units = extract_image_units(lines) + block_units(lines)
     seed_root = (work_root / "seeds").resolve()
     if not resumed_seed_plan:
@@ -1393,6 +1456,7 @@ async def run_pipeline(
                 "number": page.number,
                 "title": page.title,
                 "chapter": page.chapter,
+                "path": page.path,
                 "summary": page.summary,
                 "filename": page.filename,
                 "owner_ranges": _ranges_json(page.owner_ranges),
@@ -1428,6 +1492,7 @@ async def run_pipeline(
         source_line_count=len(lines),
         stop_check=stop_check,
         on_progress=on_progress,
+        parents=parents,
     )
     for item, page in zip(plan_json["pages"], pages):
         item["reference_ranges"] = _ranges_json(page.reference_ranges)

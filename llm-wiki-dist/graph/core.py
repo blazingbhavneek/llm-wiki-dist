@@ -109,11 +109,27 @@ class Settings(BaseModel):
     data_root: str = ""
     parser_base_url: str = ""
 
-    # --- vector storage ----------------------------------------------------
+    # Legacy read-only config fields. Runtime vector selection is deliberately
+    # sqlite-vec-only; keep these for callers that still deserialize Settings.
     vector_backend: Literal["sqlite", "qdrant"] = "sqlite"
     qdrant_url: str = ""
     qdrant_collection: str = "wiki_vectors"
     qdrant_growi_id: str = ""
+
+    # --- engine / sync -----------------------------------------------------
+    engine_db: str = ""
+    growi_name: str = ""
+    sync_interval_seconds: int = 300
+
+    # --- format-aware planning --------------------------------------------
+    structure_target_lines: int = 250
+    structure_min_lines: int = 40
+    slide_delimiter: str = r"^## Slide (\d+)\s*$"
+    slide_title: str = r"^### (.+?)\s*$"
+    pdf_use_headings: bool = False
+    tabular_slice_records: int = 40
+    tabular_preview_rows: int = 12
+    tabular_preview_cols: int = 12
 
     # bounded parallelism for the additive benchmark ingest path
     ingest_concurrency: int = 4
@@ -143,6 +159,7 @@ class Settings(BaseModel):
     weight_big_chunk_vec: float = 0.95
     weight_node_bm25: float = 0.90
     weight_body_vec: float = 0.75
+    weight_record_vec: float = 1.20
 
     #  evidence-first search: caps + rerank/MMR
     evidence_max_per_node: int = 3
@@ -232,6 +249,18 @@ class Settings(BaseModel):
             qdrant_url=env("QDRANT_URL", cls.qdrant_url),
             qdrant_collection=env("WIKI_QDRANT_COLLECTION", cls.qdrant_collection),
             qdrant_growi_id=env("WIKI_QDRANT_GROWI_ID", cls.qdrant_growi_id),
+            engine_db=env("WIKI_ENGINE_DB", cls.engine_db),
+            growi_name=env("WIKI_GROWI_NAME", cls.growi_name),
+            sync_interval_seconds=int(env("WIKI_SYNC_INTERVAL_SECONDS", cls.sync_interval_seconds)),
+            structure_target_lines=int(env("WIKI_STRUCTURE_TARGET_LINES", cls.structure_target_lines)),
+            structure_min_lines=int(env("WIKI_STRUCTURE_MIN_LINES", cls.structure_min_lines)),
+            slide_delimiter=env("WIKI_SLIDE_DELIMITER", cls.slide_delimiter),
+            slide_title=env("WIKI_SLIDE_TITLE", cls.slide_title),
+            pdf_use_headings=env("WIKI_PDF_USE_HEADINGS", "1" if cls.pdf_use_headings else "0")
+            not in {"0", "false", "False", ""},
+            tabular_slice_records=int(env("WIKI_TABULAR_SLICE_RECORDS", cls.tabular_slice_records)),
+            tabular_preview_rows=int(env("WIKI_TABULAR_PREVIEW_ROWS", cls.tabular_preview_rows)),
+            tabular_preview_cols=int(env("WIKI_TABULAR_PREVIEW_COLS", cls.tabular_preview_cols)),
             ingest_concurrency=max(
                 1, int(env("WIKI_INGEST_CONCURRENCY", cls.ingest_concurrency))
             ),
@@ -269,6 +298,7 @@ class Settings(BaseModel):
             ),
             weight_node_bm25=float(env("WIKI_W_NODE_BM25", cls.weight_node_bm25)),
             weight_body_vec=float(env("WIKI_W_BODY_VEC", cls.weight_body_vec)),
+            weight_record_vec=float(env("WIKI_W_RECORD_VEC", cls.weight_record_vec)),
             evidence_max_per_node=int(
                 env("WIKI_EVIDENCE_MAX_PER_NODE", cls.evidence_max_per_node)
             ),
@@ -333,6 +363,7 @@ class NodeType(str, Enum):
     endogenous = "endogenous"
     exogenous = "exogenous"
     page = "page"
+    table = "table"
 
 
 # whether a node is overruled by newer version, with updated version
@@ -359,6 +390,8 @@ class Node(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     summary: str = ""
     cluster: str | None = None
+    # First folder under mount/raw or after the configured GROWI write path.
+    team: str | None = None
     # HyDE-style probe: "what broader concept/field does this connect to",
     # embedded separately (vec_bridge) to surface analogically related nodes
     # that plain body/summary embeddings would never rank as neighbors.
@@ -1265,6 +1298,7 @@ def item_vec_weight(settings: Settings, field: str) -> float:
     return {
         "title": settings.weight_title_vec,
         "claim": settings.weight_claim_vec,
+        "record": settings.weight_record_vec,
         "small_chunk": settings.weight_small_chunk_vec,
         "summary": settings.weight_summary_vec,
         "big_chunk": settings.weight_big_chunk_vec,
@@ -1379,6 +1413,38 @@ def strip_image_media(text: str) -> str:
         return _IMAGE_MEDIA_RE.sub("", body).strip()
 
     return _IMAGE_UNIT_RE.sub(replace_image_unit, text).strip()
+
+
+_BIG_TABLE_RE = re.compile(r"<table>.*?</table>", re.DOTALL)
+
+
+def strip_big_tables(text: str, *, max_rows: int = 40) -> str:
+    """Keep large spreadsheet tables out of prompts, embeddings, and FTS."""
+    if not text:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        rows = match.group(0).count("<tr")
+        return match.group(0) if rows <= max_rows else f"[表: {rows} 行 — query_table で検索]"
+
+    text = _BIG_TABLE_RE.sub(replace, text)
+    lines = text.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].lstrip().startswith("|"):
+            output.append(lines[index])
+            index += 1
+            continue
+        end = index
+        while end < len(lines) and lines[end].lstrip().startswith("|"):
+            end += 1
+        if end - index > max_rows:
+            output.append(f"[表: {end - index} 行 — query_table で検索]\n")
+        else:
+            output.extend(lines[index:end])
+        index = end
+    return "".join(output)
 
 
 _IMAGE_BLOCK_TYPES = {

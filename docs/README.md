@@ -14,34 +14,38 @@ docker build -t llm-wiki-rikiseisan:latest .
 ```bash
 docker run -d --name llm-wiki-rikiseisan \
   -p 51025:8000 -p 51026:8001 -p 51024:22 \
-  -v "$PWD/.wiki_docker:/home/seigyo/llm-wiki/.wiki" \
+  -v "$PWD/data:/data" \
   llm-wiki-rikiseisan:latest
 ```
 
-Open http://localhost:8000/llm-wiki/ (redirects to `/llm-wiki/wiki/`).
-Any URL segment picks/creates a db: `/llm-wiki/manual/`, `/llm-wiki/meetings/`.
+Register one GROWI connection in `/llm-wiki/admin/`, then open
+`http://localhost:8000/llm-wiki/` (redirects to `/llm-wiki/all/`). GROWI is the
+wiki source of truth; SQLite (`data/graph.sqlite`) is the derived search index.
+Team scopes are top-level folders under `data/mount/` or `data/raw/`, for example
+`/llm-wiki/research/` and `/llm-wiki/all/`.
 
 The same database segment selects the stateless MCP endpoint:
 
 ```text
-http://localhost:8001/llm-wiki/manual/mcp
-http://localhost:8001/llm-wiki/meetings/mcp
+http://localhost:8001/llm-wiki/research/mcp
+http://localhost:8001/llm-wiki/all/mcp
 ```
 
 MCP reads are proxied to the backend, and `queue_agent_note` submits to the
-backend's existing per-wiki write queue and returns immediately. By default MCP
-only serves existing `<db>.sqlite` files; set `MCP_ALLOW_NEW_WIKIS=1` to allow
-MCP routes to create new wikis, or set `MCP_ALLOWED_WIKIS=manual,meetings` to
-restrict the service to an explicit allowlist.
+backend's write queue and returns immediately. Set `MCP_ALLOWED_WIKIS` only if
+you want to restrict the available scopes.
 
 ### Env overrides (optional)
 
+- `WIKI_DATA_ROOT` — project root containing `mount/`, `raw/`, `wiki/`, and `graph.sqlite` (default `data`)
+- `WIKI_ENGINE_DB` — encrypted GROWI connection registry (default `<root>/engine.sqlite`)
+- `WIKI_GROWI_NAME` — connection name; omitted when there is exactly one
+- `WIKI_INGEST_MODE` — source-to-wiki mode (`wiki` for the format-aware writer)
+- `WIKI_PARSER_BASE_URL` — optional doc-parser endpoint for converting `mount/`
+- `WIKI_SYNC_INTERVAL_SECONDS` — automatic raw/GROWI sync interval; `0` disables the timer
 - `WIKI_PREFIX` — reverse-proxy prefix (default `/llm-wiki`)
-- `WIKI_DEFAULT_DB` — db the bare prefix redirects to (default `wiki`)
-- `WIKI_DB_DIR` — dir of `<db>.sqlite` files (default `.wiki`)
 - `MCP_BACKEND_ORIGIN` — trusted `app.py` origin (default `http://127.0.0.1:8000`)
 - `MCP_ALLOWED_WIKIS` — optional comma-separated MCP wiki allowlist
-- `MCP_ALLOW_NEW_WIKIS` — allow MCP access before the sqlite file exists (default `0`)
 - Models default to `10.160.144.101` (chat 51029, embed 51024, rerank 51025).
   To point at local vllm (`./vllm_embed_reranker.sh`, embed 8081 / rerank 8082):
 
@@ -55,6 +59,8 @@ docker run -d --name llm-wiki-rikiseisan \
   # -e WIKI_EMBED_BASE_URL=http://host.docker.internal:8081/v1 \
   # -e WIKI_RERANK_BASE_URL=http://host.docker.internal:8082/v1 \
 ```
+
+For a local GROWI, start the companion stack with `cd ../growi-stack && docker compose up -d`.
 
 ---
 

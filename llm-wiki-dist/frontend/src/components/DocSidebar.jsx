@@ -1,5 +1,15 @@
 import { useState } from 'react'
-import { BookOpen, Download, ExternalLink, FileText, Trash2 } from 'lucide-react'
+import {
+  BookOpen,
+  ChevronDown,
+  ChevronRight,
+  Download,
+  ExternalLink,
+  FileText,
+  Folder,
+  FolderOpen,
+  Trash2,
+} from 'lucide-react'
 import { useT } from '../i18n.jsx'
 import { buildDocumentMarkdown, downloadMarkdown } from '../data/download.js'
 
@@ -57,6 +67,7 @@ export default function DocSidebar({
 
   const documents = Array.isArray(library?.documents) ? library.documents : []
   const topics = Array.isArray(library?.topics) ? library.topics : []
+  const scope = getCurrentScope()
 
   const q = filter.trim().toLowerCase()
 
@@ -74,19 +85,26 @@ export default function DocSidebar({
     )
   }
 
-  const filteredDocuments = documents.filter(matchDoc)
+  const filteredDocuments = documents
+    .filter((doc) => getWikiDocumentParts(doc, scope))
+    .filter(matchDoc)
+  const documentTree = buildDocumentTree(filteredDocuments, scope)
 
   const filteredTopics = topics
     .map((topic) => ({
       ...topic,
-      docs: Array.isArray(topic?.docs) ? topic.docs.filter(matchDoc) : [],
+      docs: Array.isArray(topic?.docs)
+        ? topic.docs.filter(
+            (doc) => getWikiDocumentParts(doc, scope) && matchDoc(doc),
+          )
+        : [],
     }))
     .filter((topic) => topic.docs.length > 0)
 
   const showingTopics = mode === 'topics'
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#f8fafc] px-[12px] py-[14px]">
+    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[#f8fafc] px-[12px] py-[14px]">
       <div className="mb-[14px] flex items-center justify-between gap-2">
         <div className="min-w-0 text-[13px] font-extrabold text-slate-800">
           {t.documents}
@@ -126,48 +144,196 @@ export default function DocSidebar({
         className="mb-[12px] w-full rounded-md border border-line bg-white px-[10px] py-[8px] text-[12.5px] outline-none focus:border-blue/45"
       />
 
-      <div className="min-h-0 flex-1 overflow-y-auto pr-[2px] pb-[20px]">
-        {!showingTopics &&
-          filteredDocuments.map((doc, index) => (
-            <KnowledgeCard
-              key={getDocumentKey(doc, index)}
-              doc={doc}
-              index={index}
+      <div className="min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-auto pr-[2px] pb-[20px]">
+        <div className="min-w-max">
+          {!showingTopics && filteredDocuments.length > 0 && (
+            <DocumentTree
+              node={documentTree}
+              query={q}
               onOpenNode={onOpenNode}
               onOpenFullDoc={onOpenFullDoc}
               onDeleteDocument={onDeleteDocument}
-              deleting={isDocDeleting(deletingDocs, doc)}
+              deletingDocs={deletingDocs}
               activeTabId={activeTabId}
             />
-          ))}
+          )}
 
-        {showingTopics &&
-          filteredTopics.map((topic) => (
-            <div key={topic.cluster || topic.name} className="mb-[16px]">
-              <div className="mb-[8px] px-[2px] text-[12px] font-extrabold text-slate-600">
-                {topic.cluster || topic.name}
+          {showingTopics &&
+            filteredTopics.map((topic) => (
+              <div key={topic.cluster || topic.name} className="mb-[16px]">
+                <div className="mb-[8px] px-[2px] text-[12px] font-extrabold text-slate-600">
+                  {topic.cluster || topic.name}
+                </div>
+
+                {topic.docs.map((doc, index) => (
+                  <KnowledgeCard
+                    key={getDocumentKey(doc, index)}
+                    doc={doc}
+                    index={index}
+                    displayName={getWikiDocumentLabel(doc, scope)}
+                    onOpenNode={onOpenNode}
+                    onOpenFullDoc={onOpenFullDoc}
+                    onDeleteDocument={onDeleteDocument}
+                    deleting={isDocDeleting(deletingDocs, doc)}
+                    activeTabId={activeTabId}
+                  />
+                ))}
               </div>
+            ))}
 
-              {topic.docs.map((doc, index) => (
-                <KnowledgeCard
-                  key={getDocumentKey(doc, index)}
-                  doc={doc}
-                  index={index}
+          {((!showingTopics && filteredDocuments.length === 0) ||
+            (showingTopics && filteredTopics.length === 0)) && (
+            <p className="py-[20px] text-[12.5px] text-muted">{t.empty}</p>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function DocumentTree({
+  node,
+  query,
+  onOpenNode,
+  onOpenFullDoc,
+  onDeleteDocument,
+  deletingDocs,
+  activeTabId,
+}) {
+  const [expanded, setExpanded] = useState(() => new Set())
+  const folders = [...node.folders.values()].sort(sortTreeItems)
+  const documents = [...node.documents].sort((a, b) =>
+    a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' }),
+  )
+
+  return (
+    <>
+      {folders.map((folder) => {
+        const open = query || expanded.has(folder.path)
+
+        return (
+          <div key={folder.path}>
+            <button
+              type="button"
+              onClick={() =>
+                setExpanded((current) => {
+                  const next = new Set(current)
+                  if (next.has(folder.path)) next.delete(folder.path)
+                  else next.add(folder.path)
+                  return next
+                })
+              }
+              className="mb-[3px] flex w-full items-center gap-[7px] rounded-lg px-[7px] py-[8px] text-left text-[12.5px] font-bold text-slate-700 hover:bg-blue/5"
+            >
+              {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              {open ? (
+                <FolderOpen size={17} className="shrink-0 text-amber-500" />
+              ) : (
+                <Folder size={17} className="shrink-0 text-amber-500" />
+              )}
+              <span className="min-w-0 flex-1 break-words">{folder.name}</span>
+            </button>
+
+            {open && (
+              <div className="ml-[11px] border-l border-slate-200 pl-[8px]">
+                <DocumentTree
+                  node={folder}
+                  query={query}
                   onOpenNode={onOpenNode}
                   onOpenFullDoc={onOpenFullDoc}
                   onDeleteDocument={onDeleteDocument}
-                  deleting={isDocDeleting(deletingDocs, doc)}
+                  deletingDocs={deletingDocs}
                   activeTabId={activeTabId}
                 />
-              ))}
-            </div>
-          ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
 
-        {documents.length === 0 && (
-          <p className="py-[20px] text-[12.5px] text-muted">{t.empty}</p>
-        )}
-      </div>
-    </div>
+      {documents.map(({ doc, label }, index) => (
+        <KnowledgeCard
+          key={getDocumentKey(doc, index)}
+          doc={doc}
+          index={index}
+          displayName={label}
+          onOpenNode={onOpenNode}
+          onOpenFullDoc={onOpenFullDoc}
+          onDeleteDocument={onDeleteDocument}
+          deleting={isDocDeleting(deletingDocs, doc)}
+          activeTabId={activeTabId}
+        />
+      ))}
+    </>
+  )
+}
+
+function buildDocumentTree(documents, scope) {
+  const root = makeTreeFolder('', '')
+
+  documents.forEach((doc) => {
+    const parts = getWikiDocumentParts(doc, scope)
+    if (!parts?.length) return
+
+    let folder = root
+
+    parts.slice(0, -1).forEach((part) => {
+      const path = folder.path ? `${folder.path}/${part}` : part
+      if (!folder.folders.has(part)) {
+        folder.folders.set(part, makeTreeFolder(part, path))
+      }
+      folder = folder.folders.get(part)
+    })
+
+    folder.documents.push({ doc, label: parts[parts.length - 1] })
+  })
+
+  return root
+}
+
+function makeTreeFolder(name, path) {
+  return { name, path, folders: new Map(), documents: [] }
+}
+
+function sortTreeItems(a, b) {
+  return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+}
+
+function getCurrentScope() {
+  if (typeof window === 'undefined') return 'all'
+  return window.location.pathname.replace(/\/+$/, '').split('/').pop() || 'all'
+}
+
+function getWikiDocumentParts(doc, scope) {
+  const name = getDocumentPath(doc).replaceAll('\\', '/')
+  if (!name.startsWith('/wiki/')) return null
+
+  const parts = name.slice('/wiki/'.length).split('/').filter(Boolean)
+  if (scope !== 'all' && parts[0] === scope) parts.shift()
+  return parts.length ? parts : null
+}
+
+function getWikiDocumentLabel(doc, scope) {
+  const parts = getWikiDocumentParts(doc, scope)
+  return parts?.[parts.length - 1] || getDocumentPath(doc)
+}
+
+function getDocumentPath(doc) {
+  const firstNode = Array.isArray(doc?.nodes) ? doc.nodes[0] : null
+
+  return String(
+    doc?.name ||
+      doc?.originalName ||
+      doc?.documentName ||
+      doc?.sourceName ||
+      doc?.filename ||
+      doc?.fileName ||
+      firstNode?.original_document_name ||
+      firstNode?.documentName ||
+      firstNode?.sourceName ||
+      firstNode?.filename ||
+      firstNode?.fileName ||
+      '',
   )
 }
 
@@ -179,13 +345,14 @@ function KnowledgeCard({
   onDeleteDocument,
   deleting,
   activeTabId,
+  displayName: displayNameOverride,
 }) {
   const t = useT(STR)
   const [open, setOpen] = useState(false)
 
   const nodes = Array.isArray(doc?.nodes) ? doc.nodes : []
   const isAgent = doc.type === 'exogenous'
-  const displayName = getOriginalDocName(doc, t)
+  const displayName = displayNameOverride || getOriginalDocName(doc, t)
 
   const handleDownload = () => {
     downloadMarkdown(

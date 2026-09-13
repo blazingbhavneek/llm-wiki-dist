@@ -32,8 +32,7 @@ DEFAULT_PREFIX = os.environ.get("WIKI_PREFIX", "/llm-wiki").rstrip("/")
 DEFAULT_BACKEND_ORIGIN = os.environ.get(
     "MCP_BACKEND_ORIGIN", "http://127.0.0.1:8000" # TODO Make this sync with backend auto
 ).rstrip("/")
-DEFAULT_DB = os.environ.get("WIKI_DEFAULT_DB", "wiki")
-DEFAULT_DB_DIR = Path(os.environ.get("WIKI_DB_DIR", ".wiki")).resolve()
+DEFAULT_DB = "all"
 
 BACKEND_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 BACKEND_READY_TIMEOUT_SECONDS = float(
@@ -189,13 +188,6 @@ def sanitize_markdown_for_text_llm(text: str) -> str:
     return cleaned.strip()
 
 
-# Reads an environment variable and returns a boolean (if its activated or not)
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
 # Get a list of allowed wiki names and make it a set
 def _env_wiki_allowlist() -> frozenset[str]:
     values = os.environ.get("MCP_ALLOWED_WIKIS", "").split(",")
@@ -209,8 +201,7 @@ def _env_wiki_allowlist() -> frozenset[str]:
 
 class WikiRoutingApp:
 
-    # Stores the wrapped ASGI app and routing/security config, such as URL prefix,
-    # DB directory, allowed wiki names, and whether unknown/new wikis are accepted.
+    # Stores the wrapped ASGI app and routing/security config.
     def __init__(
         self,
         app: ASGIApp,
@@ -218,17 +209,13 @@ class WikiRoutingApp:
         prefix: str = DEFAULT_PREFIX,
         backend_origin: str = DEFAULT_BACKEND_ORIGIN,
         default_db: str | None = DEFAULT_DB,
-        db_dir: Path = DEFAULT_DB_DIR,
         allowed_wikis: frozenset[str] | None = None,
-        allow_new_wikis: bool = False,
     ) -> None:
         self.app = app
         self.prefix = prefix.rstrip("/")
         self.backend_origin = backend_origin.rstrip("/")
         self.default_db = default_db
-        self.db_dir = db_dir.resolve()
         self.allowed_wikis = allowed_wikis or frozenset()
-        self.allow_new_wikis = allow_new_wikis
 
     # Extracts the wiki/database name from the request URL path.
     # Example: "/wiki/cats/mcp" -> "cats", "/mcp" -> default_db, invalid paths -> None.
@@ -250,7 +237,7 @@ class WikiRoutingApp:
         return parts[0]
 
     # Validates whether the extracted DB/wiki name is safe and permitted.
-    # It checks name format, allow-list, allow_new_wikis, or whether "db.sqlite" exists.
+    # The backend owns scope existence; MCP only validates the path token.
     def _is_allowed(self, db: str) -> bool:
         # Reject unsafe DB names before using them in a file path.
         if not _DB_RE.fullmatch(db):
@@ -259,10 +246,7 @@ class WikiRoutingApp:
         if self.allowed_wikis and db not in self.allowed_wikis:
             return False
 
-        if self.allow_new_wikis:
-            return True
-
-        return (self.db_dir / f"{db}.sqlite").is_file()
+        return db not in {"admin", "assets"}
 
     # Main ASGI entry point: receives the request, finds the wiki DB, rejects invalid ones,
     # rewrites the path to "/mcp", adds wiki info to scope["state"], then forwards to self.app.
@@ -1292,9 +1276,7 @@ def create_app(
     prefix: str = DEFAULT_PREFIX,
     backend_origin: str = DEFAULT_BACKEND_ORIGIN,
     default_db: str | None = DEFAULT_DB,
-    db_dir: Path = DEFAULT_DB_DIR,
     allowed_wikis: frozenset[str] | None = None,
-    allow_new_wikis: bool | None = None,
 ) -> ASGIApp:
     """Build the multi-wiki ASGI wrapper around FastMCP's static route."""
     inner = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
@@ -1303,14 +1285,8 @@ def create_app(
         prefix=prefix,
         backend_origin=backend_origin,
         default_db=default_db,
-        db_dir=db_dir,
         allowed_wikis=(
             _env_wiki_allowlist() if allowed_wikis is None else allowed_wikis
-        ),
-        allow_new_wikis=(
-            _env_flag("MCP_ALLOW_NEW_WIKIS")
-            if allow_new_wikis is None
-            else allow_new_wikis
         ),
     )
 
@@ -1338,19 +1314,6 @@ def main() -> None:
         "--backend-origin",
         default=DEFAULT_BACKEND_ORIGIN,
         help="Trusted app.py origin. Default: http://127.0.0.1:8000",
-    )
-
-    parser.add_argument(
-        "--db-dir",
-        default=str(DEFAULT_DB_DIR),
-        help="Directory containing <wiki>.sqlite files.",
-    )
-
-    parser.add_argument(
-        "--allow-new-wikis",
-        action="store_true",
-        default=_env_flag("MCP_ALLOW_NEW_WIKIS"),
-        help="Allow routes for sqlite names that do not exist yet.",
     )
 
     parser.add_argument(
@@ -1387,8 +1350,6 @@ def main() -> None:
             prefix=args.prefix,
             backend_origin=args.backend_origin,
             default_db=args.wiki,
-            db_dir=Path(args.db_dir),
-            allow_new_wikis=args.allow_new_wikis,
         ),
         host=args.host,
         port=args.port,

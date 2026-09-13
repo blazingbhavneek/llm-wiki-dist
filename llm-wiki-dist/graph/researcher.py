@@ -633,6 +633,27 @@ class SubagentContext:
     finished: dict[str, Any] = field(default_factory=dict)
 
 
+class QueryTableArgs(BaseModel):
+    """Run one read-only SQL query over a table node's extracted records."""
+
+    node_id: str = Field(..., description="Table node ID")
+    sql: str = Field(..., description="One SELECT statement over table t")
+
+
+def _query_table(session: Any, node_id: str, sql: str) -> str:
+    from .formats.tabular import query_records, records_from_page
+
+    node = session.read_node(clean_node_ref(str(node_id or "")))
+    if node is None:
+        return "error: table node not found"
+    parts = records_from_page(node.body)
+    if not parts:
+        return "error: this table page carries no records"
+    _spec, columns, records = parts[0]
+    header = "columns: key, label, " + ", ".join(columns) + "\n"
+    return _sanitize_tool_output(header + query_records(columns, records, sql))
+
+
 # same as above, atomic version of the tool which would be wrapped later with pre-determined context
 def _sub_search(ctx: SubagentContext, text: str) -> str:
     # Stop early if cancellation was requested.
@@ -818,6 +839,10 @@ def _sub_tools(ctx: SubagentContext) -> list[StructuredTool]:
     def finish_tool(answer: str, cited_node_ids: list[str] | None = None) -> str:
         return _sub_finish(ctx, answer, cited_node_ids)
 
+    def query_table_tool(node_id: str, sql: str) -> str:
+        _check_stop(ctx.stop_event)
+        return _query_table(ctx.session, node_id, sql)
+
     # Convert plain Python functions into LangChain StructuredTool objects.
     return [
         StructuredTool.from_function(
@@ -843,6 +868,12 @@ def _sub_tools(ctx: SubagentContext) -> list[StructuredTool]:
             name="finish",
             description=FinishArgs.__doc__ or "",
             args_schema=FinishArgs,
+        ),
+        StructuredTool.from_function(
+            query_table_tool,
+            name="query_table",
+            description=QueryTableArgs.__doc__ or "Query a table node.",
+            args_schema=QueryTableArgs,
         ),
     ]
 
@@ -1818,6 +1849,8 @@ class ResearchSession:
             "この領域がその質問について何を述べているかを報告してください。"
             + (f"\n\n{extra_instructions}" if extra_instructions else "")
         )
+        if start_node and start_node.type == NodeType.table:
+            user_prompt += "\n\nこの開始ノードは表です。数値の質問には必ず query_table(node_id, sql) で集計してから答えてください。"
 
         return run_subagent(
             self, run, question, user_prompt, emit, stop_event=stop_event

@@ -10,7 +10,7 @@ from typing import Any, Callable
 import requests
 
 from .project import Project, raw_name_for
-from .sync import git
+from .sync import commit_raw
 
 log = logging.getLogger(__name__)
 SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
@@ -114,8 +114,7 @@ def convert_mount(
             removed.append(rel)
 
     if converted or removed:
-        git(project, "add", "-A", ".")
-        git(project, "commit", "-qm", f"convert: +{len(converted)} -{len(removed)}")
+        commit_raw(project, f"convert: +{len(converted)} -{len(removed)}")
     project.metadata.mkdir(parents=True, exist_ok=True)
     log_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
     if unsupported:

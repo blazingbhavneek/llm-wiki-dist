@@ -51,10 +51,11 @@ from .core import (
     now_iso,
     short_hash,
     source_hash,
+    strip_big_tables,
     strip_image_media,
 )
 from .neighborhood import build_payload as build_neighborhood_payload
-from .vectors import QdrantIndex, SqliteVecIndex
+from .vectors import SqliteVecIndex
 
 if TYPE_CHECKING:
     from .gateway import ModelGateway
@@ -99,7 +100,7 @@ _BRIDGE_CONTEXT_RADIUS = 100
 
 # private key to change when to force a re-index
 # Bump when the search_items chunking scheme changes; forces a bootstrap rebuild.
-SEARCH_INDEX_VERSION = "chunk512-80-v1"
+SEARCH_INDEX_VERSION = "chunk512-80-v3"
 
 # DB meta key holding the count of endogenous nodes added since the last
 # recluster. Owned by the enrichment thread.
@@ -218,16 +219,7 @@ class Librarian:
         self.gateway = gateway  # GPU Stuff, LLM/Embed/Reranker
         self.store = store  # DB Connection
         settings = gateway.settings
-        if getattr(settings, "vector_backend", "sqlite") == "qdrant":
-            database_name = Path(settings.database_path).stem
-            growi_id = getattr(settings, "qdrant_growi_id", "") or database_name
-            self.vector_index = QdrantIndex(
-                getattr(settings, "qdrant_url", ""),
-                collection=getattr(settings, "qdrant_collection", "wiki_vectors"),
-                growi_id=growi_id,
-            )
-        else:
-            self.vector_index = SqliteVecIndex(store)
+        self.vector_index = SqliteVecIndex(store)
         self._inline_enrichment = (
             not background
         )  # Do inline enrichment when running on background is disabled, and vice versa
@@ -310,6 +302,20 @@ class Librarian:
         # Live view: PATCH /api/settings replaces gateway.settings and every
         # subsequent write op sees the new values.
         return self.gateway.settings
+
+    def registry(self):
+        from .registry import ConnectionRegistry
+
+        path = self.settings.engine_db or str(Path(self.settings.data_root) / "engine.sqlite")
+        return ConnectionRegistry(path)
+
+    def growi_connection(self):
+        """Return the configured GROWI, or the only registered connection."""
+        registry = self.registry()
+        if self.settings.growi_name:
+            return registry.get(self.settings.growi_name)
+        rows = registry.list()
+        return rows[0] if len(rows) == 1 else None
 
     # This starts the queue processor, start a while loop over the queue, and if there is any job there
     # Runs it, waits for it, then marks it done
@@ -435,11 +441,15 @@ class Librarian:
     # them in one transaction would hold a SQLite write-transaction open the
     # whole time (blocking WAL checkpointing). Instead they snapshot the DB up
     # front, commit incrementally, and revert from the snapshot on any failure.
-    _SNAPSHOT_JOB_TYPES = {"ingest_md_output", "chunk_and_ingest", "sync_project"}
+    _SNAPSHOT_JOB_TYPES = {"ingest_md_output", "chunk_and_ingest"}
+    _INCREMENTAL_JOB_TYPES = {"sync_raw", "sync_growi"}
 
     def _apply_job(self, job: WriteJob) -> Any:
         if job.type in self._SNAPSHOT_JOB_TYPES:
             return self._apply_job_snapshotted(job)
+        if job.type in self._INCREMENTAL_JOB_TYPES:
+            with self._write_lock:
+                return self._dispatch_job(job)
 
         # One job = one transaction: a failure rolls back every statement the
         # job made, so a crashed job can never leave half-written graph state.
@@ -553,6 +563,7 @@ class Librarian:
                 source_node_ids=job.payload.get("source_node_ids", []),
                 origin=job.payload.get("origin"),
                 question=job.payload.get("question"),
+                team=job.payload.get("team"),
             )
             return _assimilating_result(node)
 
@@ -587,11 +598,8 @@ class Librarian:
         if job.type == "chunk_and_ingest":
             return self.chunk_and_ingest(job)
 
-        if job.type == "sync_project":
-            return self.sync_project(job)
-
-        if job.type == "publish_to_growi":
-            return self.publish_to_growi(job)
+        if job.type == "sync_raw":
+            return self.sync_raw(job)
 
         if job.type == "sync_growi":
             return self.sync_growi(job)
@@ -946,9 +954,6 @@ class Librarian:
         model/dim changed or coverage is incomplete. Returns (active_nodes, reembedded).
         """
 
-        if isinstance(self.vector_index, QdrantIndex):
-            return self._bootstrap_qdrant_vectors()
-
         # Ensure vector tables exist with the current embedding dimension.
         self.store.ensure_vec_tables(self.gateway.embedder.dim)
 
@@ -1011,7 +1016,7 @@ class Librarian:
         for node in tqdm(active_nodes, desc="bootstrap: re-embedding", unit="node"):
             try:
                 self.store.set_vector(
-                    node.id, "vec_body", self.gateway.embedder.embed_document(node.body)
+                    node.id, "vec_body", self.gateway.embedder.embed_document(strip_big_tables(strip_image_media(node.body)))
                 )
 
                 # Only store summary vector if the node actually has summary text.
@@ -1019,7 +1024,7 @@ class Librarian:
                     self.store.set_vector(
                         node.id,
                         "vec_summary",
-                        self.gateway.embedder.embed_document(node.summary),
+                        self.gateway.embedder.embed_document(strip_big_tables(strip_image_media(node.summary))),
                     )
 
                 # Bridge-probe text is already generated; just re-embed it under
@@ -1029,7 +1034,7 @@ class Librarian:
                     self.store.set_vector(
                         node.id,
                         "vec_bridge",
-                        self.gateway.embedder.embed_document(node.bridge_probe),
+                    self.gateway.embedder.embed_document(strip_big_tables(strip_image_media(node.bridge_probe))),
                     )
             except Exception as exc:
                 # Best-effort per node: one failed node should not stop all bootstrap.
@@ -1212,6 +1217,7 @@ class Librarian:
             source_ranges=old.source_ranges,
             source_version=source_hash(body),
             cluster=old.cluster,
+            team=old.team,
         )
 
         # If ID did not change, update the same node directly.
@@ -1257,6 +1263,14 @@ class Librarian:
         `node_ids` covers documents that only exist as a client-side grouping
         (agent notes carry no original_document_name); it is merged with
         whatever the document name resolves to."""
+        if document_name and document_name.startswith("/"):
+            connection = self.growi_connection()
+            if connection is not None:
+                from .growi import GrowiClient, GrowiPublisher
+
+                publisher = GrowiPublisher(GrowiClient(connection.url, connection.api_token), connection)
+                asyncio.run(publisher._trash_under(document_name, keep=set()))
+                self._git_rm_upload(document_name, connection)
         chunk_ids = [
             n.id
             for n in (
@@ -1278,6 +1292,21 @@ class Librarian:
             "chunks": len(targets),
             "deleted": deleted,
         }
+
+    def _git_rm_upload(self, document: str, connection: Any) -> None:
+        from .project import Project
+        from .sync import commit_raw
+
+        base = "/" + connection.write_path.strip("/")
+        rel = document[len(base):].strip("/") if document.startswith(base + "/") else ""
+        parts = rel.split("/")
+        if len(parts) != 3 or parts[1] != "uploads":
+            return
+        project = Project(Path(self.settings.data_root))
+        raw = project.raw / parts[0] / "uploads" / f"{parts[2]}.md"
+        if raw.exists():
+            raw.unlink()
+            commit_raw(project, f"delete: {parts[0]}/uploads/{parts[2]}.md")
 
     def _delete_with_derived(self, node_ids: list[str]) -> int:
         # Expand the delete set across `supports` edges: an agent note built on
@@ -1358,6 +1387,7 @@ class Librarian:
         source_node_ids: list[str],
         origin: str | None = None,
         question: str | None = None,
+        team: str | None = None,
     ) -> Node:
         # Clean the question so title/identity generation is stable.
         clean_question = self._clean_optional_text(question)
@@ -1383,6 +1413,7 @@ class Librarian:
             title=self._exo_title_for_note(body, origin, clean_question),
             original_document_name=None,
             cluster="Agent Notes",
+            team=team,
         )
 
         # Fill cheap metadata first, then persist so vectors/links can reference it.
@@ -1525,7 +1556,7 @@ class Librarian:
         active_old = [
             n
             for n in self.store.get_nodes_by_document(doc_name, active_only=True)
-            if n.type in {NodeType.endogenous, NodeType.page}
+            if n.type in {NodeType.endogenous, NodeType.page, NodeType.table}
         ]
         state = _DocumentIngest(
             doc_name=doc_name, version=version, node=node, active_old=active_old
@@ -1821,16 +1852,20 @@ class Librarian:
             if result.out_dir.exists():
                 shutil.rmtree(result.out_dir)
 
-    def sync_project(self, job: WriteJob) -> dict[str, Any]:
-        """Bring one project folder and its graph in line with raw/ git."""
+    def sync_raw(self, job: WriteJob) -> dict[str, Any]:
+        """Convert raw files, write wiki pages, and publish them to GROWI."""
 
         from .chunk import make_llm
+        from .growi import GrowiClient, GrowiPublisher
         from .project import Project
-        from .sync import sync_project
+        from .sync import sync_raw
 
         data_root = getattr(self.settings, "data_root", "")
         if not data_root:
-            raise ValueError("sync_project needs WIKI_DATA_ROOT (Settings.data_root)")
+            raise ValueError("sync_raw needs WIKI_DATA_ROOT (Settings.data_root)")
+        connection = self.growi_connection()
+        if connection is None:
+            raise RuntimeError("no GROWI connection registered")
         project = Project(Path(data_root)).ensure()
         settings = self.settings
         llm = make_llm(
@@ -1843,137 +1878,78 @@ class Librarian:
         def on_progress(update: dict[str, Any]) -> None:
             job.progress = update
 
-        return sync_project(
-            project,
-            self,
-            mode=str(job.payload.get("ingest_mode") or getattr(settings, "ingest_mode", "chunks")),
-            settings=settings,
-            llm=llm,
-            embedder=self.gateway.embedder,
-            on_progress=on_progress,
-            stop_check=lambda: job.stop_event.is_set(),
-        )
-
-    def publish_to_growi(self, job: WriteJob) -> dict[str, Any]:
-        """Publish marked page bodies through the registry-backed GROWI client."""
-        import os
-
-        from .growi import publish_pages
-        from .registry import ConnectionRegistry
-
-        name = str(job.payload["name"])
-        registry_path = Path(
-            os.environ.get(
-                "WIKI_ENGINE_DB",
-                str(Path(self.settings.database_path).parent / "engine.sqlite"),
-            )
-        )
-        registry = ConnectionRegistry(registry_path)
-        connection = registry.get(name)
-        if connection is None:
-            raise KeyError(f"GROWI connection not found: {name}")
-
-        from .growi import GrowiClient
-
-        client = GrowiClient(connection.url, connection.api_token)
-        pages = list(job.payload.get("pages") or [])
-        if job.payload.get("from_wiki"):
-            data_root = getattr(self.settings, "data_root", "")
-            if not data_root:
-                raise ValueError("from_wiki needs WIKI_DATA_ROOT (Settings.data_root)")
-            pages = self.growi_pages_from_wiki(
-                Path(data_root) / "wiki", connection.write_path
-            )
         try:
-            results = asyncio.run(
-                publish_pages(
-                    client,
-                    pages,
-                    mode=connection.mode,
-                    write_path=connection.write_path,
-                    root_path=connection.root_path,
-                )
+            return sync_raw(
+                project,
+                GrowiPublisher(GrowiClient(connection.url, connection.api_token), connection),
+                mode=str(job.payload.get("ingest_mode") or getattr(settings, "ingest_mode", "chunks")),
+                settings=settings,
+                llm=llm,
+                embedder=self.gateway.embedder,
+                on_progress=on_progress,
+                stop_check=lambda: job.stop_event.is_set(),
             )
         except Exception as exc:
-            registry.record_sync(name, error=f"{type(exc).__name__}: {exc}")
+            self.registry().record_sync(connection.name, error=f"{type(exc).__name__}: {exc}")
             raise
-        registry.record_sync(name, error=None)
-        return {"name": name, "published": len(results)}
-
-    def growi_pages_from_wiki(
-        self, wiki_root: Path, write_path: str
-    ) -> list[dict[str, str]]:
-        """Build the page payload expected by ``publish_pages`` from wiki/."""
-
-        pages: list[dict[str, str]] = []
-        for md in sorted(Path(wiki_root).rglob("*.md")):
-            if "_planning" in md.parts or md.name == "index.md":
-                continue
-            rel = md.relative_to(wiki_root).with_suffix("").as_posix()
-            rel = rel.translate(_GROWI_PATH_SANITIZE)
-            pages.append(
-                {
-                    "path": f"{write_path.rstrip('/')}/{rel}",
-                    "body": md.read_text(encoding="utf-8"),
-                }
-            )
-        return pages
 
     def sync_growi(self, job: WriteJob) -> dict[str, Any]:
-        """Backfill or incrementally refresh one registered GROWI connection."""
-        import os
+        """Build the index from GROWI pages, one document folder at a time."""
+        from .growi import GrowiClient, source_ranges, sync_growi_pages, team_of_path
 
-        from .growi import sync_growi_pages
-        from .registry import ConnectionRegistry
-
-        name = str(job.payload["name"])
-        registry = ConnectionRegistry(
-            os.environ.get(
-                "WIKI_ENGINE_DB",
-                str(Path(self.settings.database_path).parent / "engine.sqlite"),
-            )
-        )
-        connection = registry.get(name)
+        connection = self.growi_connection()
         if connection is None:
-            raise KeyError(f"GROWI connection not found: {name}")
-        from .growi import GrowiClient
+            raise RuntimeError("no GROWI connection registered")
 
         client = GrowiClient(connection.url, connection.api_token)
-        document_name = f"growi:{name}"
+        registry = self.registry()
+        changed = False
 
-        def index_page(page: Any, previous: Any) -> None:
+        def node_from_page(page: Any, document: str) -> Node:
+            body = page.body.strip()
+            name = re.sub(r"^\d+-", "", page.path.rstrip("/").split("/")[-1])
+            node_type = NodeType.page
+            if "<!-- table-spec:" in body:
+                node_type = NodeType.table
+            return Node(
+                id=make_node_id(body, document),
+                body=body,
+                type=node_type,
+                title=self._title_from_markdown(body) or name,
+                original_document_name=document,
+                source_path=page.path,
+                source_ranges=source_ranges(body),
+                source_version=page.revision_id,
+                source_material_hash=source_hash(body),
+                cluster=document.strip("/").split("/")[-1] or "GROWI",
+                team=team_of_path(page.path, connection.write_path),
+            )
+
+        def revise(document: str, pages: list[Any]) -> None:
+            nonlocal changed
             if job.stop_event.is_set():
                 raise JobCancelled("GROWI sync cancelled")
-            old_nodes = [
-                node
-                for node in self.store.get_nodes_by_document(document_name, active_only=True)
-                if node.source_path == page.path
-            ]
-            for old in old_nodes:
-                self.store.set_node_status(old.id, NodeStatus.stale)
-            node = Node(
-                id=short_hash(f"{name}|{page.page_id}|{page.revision_id}"),
-                body=page.body,
-                type=NodeType.page,
-                title=page.title or page.path.rstrip("/").split("/")[-1],
-                original_document_name=document_name,
-                source_path=page.path,
-                source_version=page.revision_id,
-                source_material_hash=source_hash(page.body),
-                cluster="GROWI",
-            )
-            self._ingest_one(node)
+            nodes = [node_from_page(page, document) for page in pages]
+            nodes = [node for node in nodes if node.body]
+            edges = self._chain_edges([node.id for node in nodes], "Next page in the source document.")
+            version = source_hash("|".join(page.revision_id for page in pages))
+            stop = lambda: job.stop_event.is_set()
+            if self.store.get_nodes_by_document(document, active_only=True):
+                actions = self._revise_document(nodes, edges, document, version, stop_check=stop)
+            else:
+                for node in nodes:
+                    node.source_version = version
+                self._prepare_and_link_nodes(nodes, stop_check=stop, label=document)
+                self._replace_structural_edges(document, edges)
+                self.store.record_source(document, version)
+                actions = [f"ingested-new:{node.id}" for node in nodes]
+            changed = changed or any(not action.startswith("unchanged") for action in actions)
+            job.progress = {"stage": "growi_sync", "document": document, "actions": len(actions)}
 
-        def delete_page(indexed: Any) -> None:
-            for node in self.store.get_nodes_by_document(document_name, active_only=True):
-                if node.source_path == indexed.path:
-                    self.store.set_node_status(node.id, NodeStatus.deleted)
-
-        def rename_page(previous: Any, listed: Any) -> None:
-            for node in self.store.get_nodes_by_document(document_name, active_only=True):
-                if node.source_path == previous.path:
-                    node.source_path = listed.path
-                    self.store.upsert_node(node)
+        def drop(document: str) -> None:
+            nonlocal changed
+            self.delete_document(document)
+            changed = True
 
         try:
             result = asyncio.run(
@@ -1981,16 +1957,34 @@ class Librarian:
                     client,
                     registry,
                     connection,
-                    on_page=index_page,
-                    on_delete=delete_page,
-                    on_rename=rename_page,
+                    on_document=revise,
+                    on_delete_document=drop,
                 )
             )
         except Exception as exc:
-            registry.record_sync(name, error=f"{type(exc).__name__}: {exc}")
+            registry.record_sync(connection.name, error=f"{type(exc).__name__}: {exc}")
             raise
-        job.progress = {"stage": "growi_sync", **result}
-        return {"name": name, **result}
+        if changed and self._recluster_every > 0:
+            try:
+                self.recluster()
+                self.ensure_japanese_clusters()
+            except Exception as exc:
+                log.info("recluster skipped: %s", exc)
+        return result
+
+    def growi_pages_from_wiki(self, wiki_root: Path, write_path: str) -> list[dict[str, str]]:
+        """Compatibility view used by older callers; publishing now uses GrowiPublisher."""
+        from .growi import growi_path
+
+        root = Path(wiki_root)
+        return [
+            {
+                "path": growi_path(write_path, md.relative_to(root).with_suffix("" ).as_posix()),
+                "body": md.read_text(encoding="utf-8"),
+            }
+            for md in sorted(root.rglob("*.md"))
+            if "_planning" not in md.parts and md.name != "index.md"
+        ]
 
     def cascading_update(
         self,
@@ -2046,7 +2040,7 @@ class Librarian:
         active_old = [
             n
             for n in self.store.get_nodes_by_document(document_name, active_only=True)
-            if n.type in {NodeType.endogenous, NodeType.page}
+            if n.type in {NodeType.endogenous, NodeType.page, NodeType.table}
         ]
 
         # If this document has no active old nodes, ingest everything as new.
@@ -2181,7 +2175,7 @@ class Librarian:
         complete = (
             existing is not None
             and existing.status == NodeStatus.active
-            and self.store.has_vector(node.id)
+            and self.vector_index.has("body", node.id)
         )
         if complete:
             return []
@@ -2210,15 +2204,7 @@ class Librarian:
             self.vector_index.ensure("body", self.gateway.embedder.dim)
 
     def _get_vector(self, node_id: str, channel: str) -> list[float] | None:
-        fetch = getattr(self.vector_index, "get", None)
-        if fetch is not None:
-            return fetch(channel, node_id)
-        table = {
-            "body": "vec_body",
-            "summary": "vec_summary",
-            "bridge": "vec_bridge",
-        }[channel]
-        return self.store.get_vector(node_id, table)
+        return self.vector_index.get(channel, node_id)
 
     def _store_vectors(
         self, node: Node
@@ -2227,7 +2213,7 @@ class Librarian:
         # bridge-probe vector, and search-item vectors.
         self._ensure_vec()
 
-        body_vec = self.gateway.embedder.embed_document(node.body)
+        body_vec = self.gateway.embedder.embed_document(strip_big_tables(strip_image_media(node.body)))
         self.vector_index.upsert("body", [node.id], [body_vec])
 
         summary_vec = None
@@ -2293,7 +2279,7 @@ class Librarian:
         # embedded base64 images; sanitize before truncating, same reasoning
         # as _extract_claims/_extract_keywords.
         result = self.gateway.llm.complete_structured(
-            BRIDGE_PROBE_PROMPT, strip_image_media(context)[:6000], BridgeProbe
+            BRIDGE_PROBE_PROMPT, strip_big_tables(strip_image_media(context))[:6000], BridgeProbe
         )
 
         parsed = (
@@ -2330,6 +2316,21 @@ class Librarian:
                 }
             )
 
+        if node.type == NodeType.table:
+            from .formats.tabular import records_from_page
+
+            add("title", node.title, 0, None, None)
+            record_ordinal = 0
+            for spec, columns, records in records_from_page(node.body):
+                for record in records:
+                    text = (
+                        f"{spec.get('title', '')} {record.key} {record.label}: "
+                        + "; ".join(f"{key}={value}" for key, value in record.values.items())
+                    )
+                    add("record", text[:512], record_ordinal, None, None)
+                    record_ordinal += 1
+            return items
+
         # Add high-signal fields first.
         add("title", node.title, 0, None, None)
         add("summary", node.summary, 0, None, None)
@@ -2344,7 +2345,7 @@ class Librarian:
         # big_chunk/small_chunk rows. embed_documents() (unlike embed_document)
         # has no sanitizing/chunking fallback of its own, so this must happen
         # before the text reaches it.
-        body = strip_image_media(node.body or "")
+        body = strip_big_tables(strip_image_media(node.body or ""))
 
         # Add larger body chunks for broad semantic recall.
         for i, (start, end, chunk) in enumerate(
@@ -2405,11 +2406,6 @@ class Librarian:
                             "field": item["field"],
                         },
                     )
-                    # Researcher remains deliberately SQLite-backed, so keep
-                    # this compatibility mirror while Qdrant is opt-in.
-                    if isinstance(self.vector_index, QdrantIndex):
-                        self.store.ensure_vec_tables(self.gateway.embedder.dim)
-                        self.store.set_search_item_vector(item["id"], vector)
                 except Exception as exc:
                     log.info("set item vector failed %s: %s", item["id"], exc)
 
@@ -2457,7 +2453,7 @@ class Librarian:
         add_vec_channel("bridge", bridge_vec)
 
         lexical_text = " ".join(
-            filter(None, [node.title, strip_image_media(node.body)[:1500]])
+            filter(None, [node.title, strip_big_tables(strip_image_media(node.body))[:1500]])
         )
         text_channel = self._lexical_candidate_ids(lexical_text, node_id, k + 1)
         if text_channel:
@@ -2643,7 +2639,7 @@ class Librarian:
             node.source_material_hash = source_hash(node.body)
 
         if not node.summary.strip() and node.body.strip():
-            node.summary = self.gateway.llm.complete(SUMMARY_PROMPT, node.body).strip()
+            node.summary = self.gateway.llm.complete(SUMMARY_PROMPT, strip_big_tables(strip_image_media(node.body))).strip()
 
         if not node.keywords:
             node.keywords = self._extract_keywords(node.body)
@@ -2668,7 +2664,7 @@ class Librarian:
         # lands mid-blob, leave an unterminated <image-unit> that later
         # sanitization can no longer match (see graph/core.py strip_image_media).
         result = self.gateway.llm.complete_structured(
-            KEYWORD_PROMPT, strip_image_media(text)[:8000], Keywords
+            KEYWORD_PROMPT, strip_big_tables(strip_image_media(text))[:8000], Keywords
         )
 
         parsed = (
@@ -2694,7 +2690,7 @@ class Librarian:
 
         # Same ordering fix as _extract_keywords: sanitize before truncating.
         result = self.gateway.llm.complete_structured(
-            CLAIM_PROMPT, strip_image_media(text)[:12000], ClaimExtraction
+            CLAIM_PROMPT, strip_big_tables(strip_image_media(text))[:12000], ClaimExtraction
         )
 
         parsed = (
@@ -2769,7 +2765,7 @@ class Librarian:
                 "header": node.cluster or "",
                 # Sanitize before truncating: see _extract_claims for why order
                 # matters when a body may contain an embedded base64 image.
-                "body": strip_image_media(node.body)[:4000],
+                "body": strip_big_tables(strip_image_media(node.body))[:4000],
             },
             "candidates": [
                 {
@@ -2778,7 +2774,7 @@ class Librarian:
                     "summary": c.summary,
                     "keywords": c.keywords,
                     "header": c.cluster or "",
-                    "body": strip_image_media(c.body)[:1200],
+                    "body": strip_big_tables(strip_image_media(c.body))[:1200],
                 }
                 for c in group
             ],
@@ -3047,7 +3043,7 @@ class Librarian:
         if not node or node.status != NodeStatus.active or node.summary.strip():
             return
 
-        body = node.body.strip()
+        body = strip_big_tables(strip_image_media(node.body)).strip()
         if not body:
             return
 
@@ -3072,7 +3068,7 @@ class Librarian:
 
         body_vec = self._get_vector(node.id, "body")
         if body_vec is None:
-            body_vec = self.gateway.embedder.embed_document(node.body)
+            body_vec = self.gateway.embedder.embed_document(strip_big_tables(strip_image_media(node.body)))
 
         summary_vec = self._get_vector(node.id, "summary")
         bridge_vec = self._get_vector(node.id, "bridge")
@@ -3193,7 +3189,7 @@ class Librarian:
             node_ids = {
                 n.id
                 for n in self.store.get_nodes_by_document(document_name)
-                if n.type in {NodeType.endogenous, NodeType.page}
+                if n.type in {NodeType.endogenous, NodeType.page, NodeType.table}
             }
             self.store.delete_edges_by_label_for_nodes("follows", node_ids)
 
@@ -3332,14 +3328,14 @@ class Librarian:
                 "id": old.id,
                 "title": old.title,
                 "summary": old.summary,
-                "body": strip_image_media(old.body)[:4000],
+                "body": strip_big_tables(strip_image_media(old.body))[:4000],
             },
             "current_support_material": [
                 {
                     "id": n.id,
                     "title": n.title,
                     "summary": n.summary,
-                    "body": strip_image_media(n.body)[:2500],
+                    "body": strip_big_tables(strip_image_media(n.body))[:2500],
                 }
                 for n in support_nodes[:8]
             ],
@@ -3373,6 +3369,7 @@ class Librarian:
             original_document_name=old.original_document_name,
             source_version=version,
             cluster=old.cluster,
+            team=old.team,
         )
 
         if replacement.id == old.id:

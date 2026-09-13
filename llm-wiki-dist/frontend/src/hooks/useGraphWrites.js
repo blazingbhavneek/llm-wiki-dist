@@ -220,6 +220,12 @@ export function useGraphWrites({
         return node
       }
 
+      if (node?.raw) {
+        onStatus?.(t.mdAdded)
+        fireToast(t.mdAdded)
+        return node
+      }
+
       openNode(node)
 
       onStatus?.(t.mdAddedOpened)
@@ -303,6 +309,12 @@ export function useGraphWrites({
             )
 
       await reload()
+
+      if (node?.raw) {
+        updateWorkspace(item.id, { busy: false, busyMessage: t.addedToGraph })
+        fireToast(t.addedToGraph)
+        return
+      }
 
       if (item.answer?.id) {
         setSavedIds((prev) => new Set(prev).add(item.answer.id))

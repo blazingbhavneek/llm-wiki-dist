@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .core import Edge, Node, NodeStatus, now_iso
+from .core import Edge, Node, NodeStatus, now_iso, strip_big_tables, strip_image_media
 
 # endregion Imports
 
@@ -55,6 +55,7 @@ def _row_to_node(row: sqlite3.Row) -> Node:
         keywords=json.loads(row["keywords_json"] or "[]"),
         summary=row["summary"] or "",
         cluster=row["cluster"],
+        team=row["team"] if "team" in row.keys() else None,
         bridge_probe=(row["bridge_probe"] or "") if "bridge_probe" in row.keys() else "",
         status=row["status"],
         created_at=row["created_at"],
@@ -99,10 +100,14 @@ class GraphStore:
         self,
         path: str | Path = ".wiki/wiki.sqlite",  # Path of the sqlite file
         readonly: bool = False,  # Either for a researcher (read only, can have many "researchers" access at the same time, or librarian (can write) so 1 change at a time)
+        scope: str | None = None,
     ) -> None:
 
         self.path = Path(path)
         self.readonly = readonly
+        if scope and not readonly:
+            raise ValueError("a scoped GraphStore must be readonly")
+        self.scope = scope
 
         if not readonly:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,6 +240,21 @@ class GraphStore:
         # Since every thread has its own connection, every connection must load it.
         self._load_vec_extension(conn)
 
+        if self.scope:
+            team = self.scope.replace("'", "''")
+            conn.executescript(
+                f"""
+                CREATE TEMP VIEW nodes AS SELECT * FROM main.nodes WHERE team = '{team}';
+                CREATE TEMP VIEW edges AS
+                  SELECT e.* FROM main.edges e
+                  JOIN main.nodes s ON s.id = e.source_node_id AND s.team = '{team}'
+                  JOIN main.nodes t ON t.id = e.target_node_id AND t.team = '{team}';
+                CREATE TEMP VIEW search_items AS
+                  SELECT s.* FROM main.search_items s
+                  JOIN main.nodes n ON n.id = s.node_id AND n.team = '{team}';
+                """
+            )
+
         return conn
 
     def _load_vec_extension(self, conn: sqlite3.Connection | None = None) -> None:
@@ -284,6 +304,7 @@ class GraphStore:
                 keywords_json TEXT NOT NULL,
                 summary TEXT,
                 cluster TEXT,
+                team TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -404,6 +425,7 @@ class GraphStore:
             "entity": "TEXT",
             "claims_json": "TEXT NOT NULL DEFAULT '[]'",
             "bridge_probe": "TEXT",
+            "team": "TEXT",
         }
 
         # Add any missing columns to the existing nodes table.
@@ -423,6 +445,8 @@ class GraphStore:
 
             CREATE INDEX IF NOT EXISTS idx_nodes_entity
                 ON nodes(entity);
+            CREATE INDEX IF NOT EXISTS idx_nodes_team
+                ON nodes(team);
             """)
 
     def _ensure_edge_columns(self) -> None:
@@ -709,12 +733,13 @@ class GraphStore:
                 keywords_json,
                 summary,
                 cluster,
+                team,
                 bridge_probe,
                 status,
                 created_at,
                 updated_at
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 body=excluded.body,
                 type=excluded.type,
@@ -729,6 +754,7 @@ class GraphStore:
                 keywords_json=excluded.keywords_json,
                 summary=excluded.summary,
                 cluster=excluded.cluster,
+                team=excluded.team,
                 bridge_probe=excluded.bridge_probe,
                 status=excluded.status,
                 updated_at=excluded.updated_at
@@ -749,6 +775,7 @@ class GraphStore:
                 json.dumps(node.keywords),
                 node.summary,
                 node.cluster,
+                node.team,
                 node.bridge_probe,
                 node.status.value,
                 node.created_at,
@@ -1312,6 +1339,12 @@ class GraphStore:
 
         return f"{int(row['total'] or 0)}:{row['newest'] or ''}"
 
+    def teams(self) -> list[str]:
+        rows = self.connection.execute(
+            "SELECT DISTINCT team FROM main.nodes WHERE team IS NOT NULL AND status='active' ORDER BY team"
+        ).fetchall()
+        return [row["team"] for row in rows]
+
     def vocabulary_rows(self, limit: int = 20_000) -> Iterator[dict]:
         # Streamed, column-restricted scan for the realtime vocabulary sheet.
         # get_all_nodes() would materialize every Node object in the corpus for
@@ -1421,7 +1454,7 @@ class GraphStore:
                 [
                     node.title,
                     node.summary,
-                    node.body,
+                    strip_big_tables(strip_image_media(node.body)),
                     " ".join(node.keywords),
                 ],
             )
@@ -1589,8 +1622,9 @@ class GraphStore:
                 JOIN nodes n ON n.id = s.node_id
                 WHERE n.status = 'active'
                 ORDER BY m.distance
+                LIMIT ?
                 """,
-                (blob, limit),
+                (blob, limit * 4 if self.scope else limit, limit),
             ).fetchall()
 
             # Return search item IDs with their vector distance.
@@ -1614,8 +1648,9 @@ class GraphStore:
             JOIN nodes n ON n.id = m.node_id
             WHERE n.status = 'active'
             ORDER BY m.distance
+            LIMIT ?
             """,
-            (blob, limit),
+            (blob, limit * 4 if self.scope else limit, limit),
         ).fetchall()
 
         # Return node IDs with their vector distance.

@@ -81,6 +81,15 @@ class SqliteVecIndex:
         for item_id in ids:
             delete(item_id, table)
 
+    def get(self, channel: str, item_id: str) -> list[float] | None:
+        return self.store.get_vector(item_id, self._table(channel))
+
+    def has(self, channel: str, item_id: str) -> bool:
+        return self.store.has_vector(item_id, self._table(channel))
+
+    def count(self, channel: str) -> int:
+        return self.store.count_vectors(self._table(channel))
+
 
 class QdrantIndex:
     """Qdrant implementation of the vector storage seam.

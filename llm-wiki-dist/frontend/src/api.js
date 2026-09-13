@@ -91,6 +91,8 @@ function unwrapAdd(result, jobOpts) {
 
 export const api = {
   ready: () => req('/api/ready'),
+  scopes: () => req('/api/scopes'),
+  growi: () => req('/api/growi'),
   restartBootstrap: () => req('/api/admin/restart-bootstrap', { method: 'POST' }),
 
   graph: () => req('/api/graph'),
@@ -196,8 +198,6 @@ export const api = {
         body,
         title,
         document_name: documentName,
-        source_path: sourcePath,
-        source_ranges: sourceRanges,
         // Per-document ingest choices (e.g. {ingest_mode: "pages"}). Left out
         // when the caller has no opinion so the server setting decides.
         ...(chunkOptions ? { chunk_options: chunkOptions } : {}),

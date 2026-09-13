@@ -141,6 +141,12 @@ export default function UploadView({
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncStatus, setSyncStatus] = useState('')
   const [hasDataRoot, setHasDataRoot] = useState(null)
+  const [scopeData, setScopeData] = useState(null)
+  const noTeam = scopeData && scopeData.current === scopeData.all
+
+  useEffect(() => {
+    api.scopes().then(setScopeData).catch(() => {})
+  }, [])
 
   // What the server would do if this document were uploaded with no choice
   // made. Echoed inside the "follow settings" option so the picker never lies.
@@ -374,7 +380,8 @@ export default function UploadView({
 
             <button
               type="button"
-              disabled={busy}
+              disabled={busy || noTeam}
+              title={noTeam ? 'Open a team scope to upload' : undefined}
               onClick={() => mdRef.current?.click()}
               className="border border-blue/30 bg-blue px-[15px] py-[9px] text-[13px] font-extrabold text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -395,7 +402,7 @@ export default function UploadView({
 
                 <select
                   value={ingestMode}
-                  disabled={busy}
+                  disabled={busy || noTeam}
                   onChange={(e) => setIngestMode(e.target.value)}
                   className="border border-line bg-soft px-[10px] py-[7px] text-[13px] text-ink outline-none focus:border-blue/50 disabled:cursor-not-allowed disabled:opacity-60"
                 >
@@ -433,7 +440,8 @@ export default function UploadView({
 
                 <button
                   type="button"
-                  disabled={busy || !markdownDraft}
+                  disabled={busy || noTeam || !markdownDraft}
+                  title={noTeam ? 'Open a team scope to upload' : undefined}
                   onClick={uploadMd}
                   className="border border-blue/30 bg-blue px-[15px] py-[9px] text-[13px] font-extrabold text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
                 >

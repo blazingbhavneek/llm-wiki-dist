@@ -69,10 +69,9 @@ export function growiPageUrl(baseUrl, path) {
 export function growiLinkFor(node, connection) {
   if (!connection?.enabled || !connection?.url || !node) return null
 
-  const documentName = node.original_document_name || ''
   const path = node.source_path || ''
 
-  if (!documentName.startsWith('growi:') || !path.startsWith('/')) return null
+  if (!path.startsWith('/')) return null
 
   const view = growiPageUrl(connection.url, path)
   if (!view) return null

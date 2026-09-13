@@ -163,6 +163,7 @@ def validate_seed_plan(
                 chapter=page.chapter.strip(),
                 source_start=page.source_start,
                 source_end=page.source_end,
+                path=list(page.path),
             )
         )
         expected = page.source_end + 1

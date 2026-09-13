@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BookMarked } from 'lucide-react'
 
 import ChatPanel from './components/ChatPanel'
@@ -26,6 +26,7 @@ import { useGraphWrites } from './hooks/useGraphWrites'
 import { useOverrides } from './hooks/useOverrides'
 import { useSearch } from './hooks/useSearch'
 import { useWorkspace } from './hooks/useWorkspace'
+import { api } from './api'
 
 const pdfApiBase = import.meta.env.VITE_PDF_API_URL || 'http://10.160.144.101:51023'
 
@@ -48,6 +49,7 @@ export default function App() {
   const [answerMentionedIdsByAnswerId, setAnswerMentionedIdsByAnswerId] = useState(() => new Map())
   const [focusIds, setFocusIds] = useState(null)
   const [toast, setToast] = useState(null)
+  const [growiConnection, setGrowiConnection] = useState(null)
   const answerSeq = useRef(0)
 
   const fireToast = (text) => {
@@ -56,6 +58,9 @@ export default function App() {
   }
 
   const { overrides, applyOverrides } = useOverrides()
+  useEffect(() => {
+    api.growi().then(setGrowiConnection).catch(() => {})
+  }, [])
   const { rawById, graph, docLibrary, health, loading, error, errorRetryable, reload, retry } =
     useGraphData()
   const { assimPending, startAssimilationPolling } = useAssimilation()
@@ -469,6 +474,7 @@ export default function App() {
             busyMessage={workspace.busyMessage}
             refs={workspace.refs}
             rawById={rawById}
+            growiConnection={growiConnection}
             prevNodeId={
               workspace.kind === 'doc'
                 ? docLibrary?.prevOf?.get?.(workspace.nodeId) || null
@@ -592,7 +598,6 @@ export default function App() {
               onOpenFullDoc={openFullDoc}
               onDeleteDocument={writes.deleteDocument}
               deletingDocs={writes.deletingDocs}
-              rawById={rawById}
               onViewAnswer={(answer) => openAnswerTab(answer, true)}
               mentionedNodeIdsByAnswerId={answerMentionedIdsByAnswerId}
               onClose={() => setRightOpen(false)}

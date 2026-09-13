@@ -52,3 +52,14 @@ class WikiConfig(BaseModel):
     document_slug: str = ""
     # Keep project runs stable so changed sources can resume incrementally.
     run_dir: str = ""
+
+    # Format-aware structural planning.
+    source_kind: str = "md"
+    structure_target_lines: int = 250
+    structure_min_lines: int = 40
+    slide_delimiter: str = r"^## Slide (\d+)\s*$"
+    slide_title: str = r"^### (.+?)\s*$"
+    pdf_use_headings: bool = False
+    tabular_slice_records: int = 40
+    tabular_preview_rows: int = 12
+    tabular_preview_cols: int = 12

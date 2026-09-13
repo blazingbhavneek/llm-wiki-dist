@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight, Download } from 'lucide-react'
 import { useT } from '../i18n.jsx'
 import { downloadMarkdown } from '../data/download.js'
 import { STR } from './markdown/strings.js'
+import { growiLinkFor } from '../data/growi.js'
 import {
   MarkdownRenderer,
   stripCitedNodeIdsBlocks,
@@ -35,6 +36,7 @@ export default function MarkdownView({
   onOpenNode,
   onChangeTitle,
   onChangeBody,
+  growiConnection,
 }) {
   const t = useT(STR)
 
@@ -138,6 +140,15 @@ export default function MarkdownView({
             onChange={(e) => onChangeTitle?.(e.target.value)}
           />
         </div>
+
+        {(() => {
+          const link = growiLinkFor(doc, growiConnection)
+          return link ? (
+            <a href={link.view} target="_blank" rel="noreferrer" className="mt-2 inline-block text-[12px] font-semibold text-blue-700 hover:underline">
+              GROWIで開く / 編集
+            </a>
+          ) : null
+        })()}
 
         {!readOnly && (
           <div className="mt-[12px] flex flex-wrap items-center gap-2">

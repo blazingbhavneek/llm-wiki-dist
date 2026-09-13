@@ -308,5 +308,7 @@ export function docFromNode(n) {
           ? `Source: ${n.original_document_name}`
           : 'Click Edit to change this note.',
     markdown: n.body || `# ${n.title || n.id}\n\n${n.summary || ''}`,
+    source_path: n.source_path || '',
+    original_document_name: n.original_document_name || '',
   }
 }
