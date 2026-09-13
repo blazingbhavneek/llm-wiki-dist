@@ -182,6 +182,13 @@ def _assimilating_result(node: Node) -> dict[str, Any]:
 # endregion Global vars/helpers
 
 
+# GROWI rejects these in page paths (verified against a live instance: `+ # % ?`
+# all fail page creation with "could_not_create_page"), but wiki page titles
+# routinely contain them (e.g. "MPI+OpenMP"). Swap in the fullwidth lookalike
+# so the exported path stays valid and still readable.
+_GROWI_PATH_SANITIZE = str.maketrans({"+": "＋", "#": "＃", "%": "％", "?": "？"})
+
+
 # Just like a reseacher's job is to go through the relevant documents and report based on the query
 # The librarian's job is to manage all the source docs, and organize them for researcher to work on them
 # Since a librarian doesnt handle every book concurrently, as updating a book changes the state of the library, same way
@@ -1903,6 +1910,7 @@ class Librarian:
             if "_planning" in md.parts or md.name == "index.md":
                 continue
             rel = md.relative_to(wiki_root).with_suffix("").as_posix()
+            rel = rel.translate(_GROWI_PATH_SANITIZE)
             pages.append(
                 {
                     "path": f"{write_path.rstrip('/')}/{rel}",
