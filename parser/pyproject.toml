@@ -1,0 +1,22 @@
+[project]
+name = "doc-parser"
+version = "0.1.0"
+description = "Async mixed-format document parser with isolated GPU and external workers"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4",
+    "fastapi",
+    "httpx",
+    "openpyxl",
+    "pillow",
+    "pypdfium2",
+    "python-multipart",
+    "python-pptx",
+    "python-dotenv",
+    "uvicorn",
+    "xlsx2html>=0.6.4,<0.7",
+]
+
+[project.optional-dependencies]
+pdf = ["mineru[core]"]

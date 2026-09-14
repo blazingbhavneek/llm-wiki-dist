@@ -1,0 +1,11 @@
+.venv/
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/samples/_outputs/
+
+# frontend build output (npm run build emits this from frontend/)
+static/
+zip.py
+doc-parser.zip
