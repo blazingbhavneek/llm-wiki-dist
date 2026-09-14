@@ -105,6 +105,10 @@ class Settings(BaseModel):
     wiki_write_attempts: int = 3
     wiki_rewrite_concurrency: int = 4
     wiki_output_language: str = "Japanese (日本語)"
+    # pre-ingestion cross-document linker (see docs/LINKER.md)
+    wiki_linker_enabled: bool = True
+    wiki_linker_map_concurrency: int = 4
+    wiki_linker_research_concurrency: int = 2
     # project data folder (WP-S2); empty = legacy single-sqlite layout
     data_root: str = ""
     parser_base_url: str = ""
@@ -243,6 +247,15 @@ class Settings(BaseModel):
                 env("WIKI_REWRITE_CONCURRENCY", cls.wiki_rewrite_concurrency)
             ),
             wiki_output_language=env("WIKI_OUTPUT_LANGUAGE", cls.wiki_output_language),
+            wiki_linker_enabled=env(
+                "WIKI_LINKER_ENABLED", "1" if cls.wiki_linker_enabled else "0"
+            ).lower() in ("1", "true", "yes", "on"),
+            wiki_linker_map_concurrency=int(
+                env("WIKI_LINKER_MAP_CONCURRENCY", cls.wiki_linker_map_concurrency)
+            ),
+            wiki_linker_research_concurrency=int(
+                env("WIKI_LINKER_RESEARCH_CONCURRENCY", cls.wiki_linker_research_concurrency)
+            ),
             data_root=env("WIKI_DATA_ROOT", cls.data_root),
             parser_base_url=env("WIKI_PARSER_BASE_URL", cls.parser_base_url),
             vector_backend=env("WIKI_VECTOR_BACKEND", cls.vector_backend),

@@ -103,7 +103,10 @@ def code_tokens(text: str) -> set[str]:
             or any(char.isdigit() for char in token)
             or any(char.isupper() for char in token[1:])
         ):
-            found.add(token)
+            # OCR breaks macros like ``__FILE__`` into ``\_ \_FILE\_ \_``,
+            # which tokenizes as "_FILE_"; the rewrite correctly writes
+            # "__FILE__". Strip edge underscores so both compare equal.
+            found.add(token.strip("_") or token)
     return found
 
 

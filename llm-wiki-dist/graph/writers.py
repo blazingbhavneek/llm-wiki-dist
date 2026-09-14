@@ -191,10 +191,102 @@ def write_wiki(
         )
         target = project.wiki_dir(rel)
         publish_output(result.out_dir, target)
+        if mode == "wiki":
+            run_wiki_linker(
+                project,
+                rel,
+                settings=settings,
+                llm=llm,
+                embedder=embedder,
+                on_progress=on_progress,
+                stop_check=stop_check,
+            )
         write_source_stamp(target, project.raw_file(rel), rel)
         return target
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def run_wiki_linker(
+    project: Any,
+    rel: str,
+    *,
+    settings: Any,
+    llm: Any,
+    embedder: Any,
+    on_progress: Progress = None,
+    stop_check: StopCheck = None,
+) -> None:
+    """Pre-ingestion cross-document linker; stamp only after it succeeds."""
+
+    import os
+
+    from .wiki.linker import link_generated_document
+    from .wiki.storage import write_json_atomic
+
+    marker_path = project.wiki_dir(rel) / "_planning" / "linker.json"
+    if not getattr(settings, "wiki_linker_enabled", True):
+        # disabled mode constructs no services and never opens the catalog
+        write_json_atomic(
+            marker_path,
+            {"schema_version": 1, "status": "disabled", "links_added": 0, "links_removed": 0},
+        )
+        return
+
+    write_json_atomic(
+        marker_path,
+        {"schema_version": 1, "status": "pending", "links_added": 0, "links_removed": 0},
+    )
+
+    from .chunk import _run_async_blocking
+    from .wiki.model import ChatModelPort
+
+    if hasattr(llm, "structured") and hasattr(llm, "text"):
+        model = llm  # already a model port; no services to construct
+    else:
+        config = wiki_config(settings, run_dir=project.state_dir(rel))
+        model = ChatModelPort(config, llm=llm)
+    if embedder is None:
+        try:
+            from .gateway import Embedder
+
+            embedder = Embedder(settings)
+        except Exception:
+            embedder = None
+    reranker = None
+    try:
+        from .gateway import Reranker
+
+        reranker = Reranker(settings)
+    except Exception:
+        reranker = None
+    # Linker concurrency mirrors the wiki maker's rewrite concurrency so one
+    # WIKI_REWRITE_CONCURRENCY knob governs both phases; an explicit linker
+    # environment variable still wins.
+    rewrite = int(getattr(settings, "wiki_rewrite_concurrency", 4) or 4)
+    linker_settings = SimpleNamespace(
+        wiki_output_language=getattr(
+            settings, "wiki_output_language", "Japanese (日本語)"
+        ),
+        wiki_linker_map_concurrency=int(
+            os.environ.get("WIKI_LINKER_MAP_CONCURRENCY", rewrite)
+        ),
+        wiki_linker_research_concurrency=int(
+            os.environ.get("WIKI_LINKER_RESEARCH_CONCURRENCY", rewrite)
+        ),
+    )
+    _run_async_blocking(
+        link_generated_document(
+            project,
+            rel,
+            model=model,
+            settings=linker_settings,
+            embedder=embedder,
+            reranker=reranker,
+            on_progress=on_progress,
+            stop_check=stop_check,
+        )
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -218,9 +310,20 @@ def up_to_date(project: Any, rel: str) -> bool:
         if not path.exists():
             continue
         try:
-            return json.loads(path.read_text(encoding="utf-8")).get(key) == current
+            if json.loads(path.read_text(encoding="utf-8")).get(key) != current:
+                return False
         except (OSError, ValueError):
             return False
+        # A present pending/failed linker marker means the cross-document
+        # phase never finished; legacy output without any marker stays valid.
+        marker = planning / "linker.json"
+        if marker.exists():
+            try:
+                status = json.loads(marker.read_text(encoding="utf-8")).get("status")
+            except (OSError, ValueError):
+                return False
+            return status in ("complete", "disabled")
+        return True
     return False
 
 

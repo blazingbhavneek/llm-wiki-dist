@@ -923,3 +923,43 @@ After line-range changes, run the focused tests first, then:
 ~~~bash
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ~~~
+
+## 15. Pre-ingestion cross-document linker (`graph/wiki/linker.py`)
+
+Runs inside `writers.write_wiki` (mode `wiki`) after `publish_output` and before
+`write_source_stamp`, so `wiki_one.py` exercises it with no extra options.
+Full design and invariants live in `docs/LINKER.md`; this is the implemented reality.
+
+* One standalone SQLite catalog at `project.linker_database`
+  (`metadata/wiki-linker.sqlite`, plus WAL/SHM and `wiki-linker.lock`).
+  `LinkCatalog` is its only owner. It never opens `graph.sqlite`/`engine.sqlite`
+  and never imports Librarian/Researcher/GROWI.
+* Maps are reconstructed from writer artifacts only:
+  `_planning/manifest.json` (+`metadata.json`, `coverage.json`) joined with
+  `state/<doc>/state/plan.json` and `work/observations/live/*.json`; documents
+  without observation state get deterministic `derived`/`coverage_only` maps.
+* Candidate discovery: exhaustive per-document map scout (Lane A, required,
+  hash-cached in `map_comparisons`; a failed call is retried, never cached as
+  empty), FTS5+sqlite-vec RRF fusion, bridge-probe questions, optional rerank,
+  and one/two-hop traversal of `page_edges`. Retrieval only prioritizes; a
+  map-scout candidate is never dropped for a low score.
+* Research sends fully stripped page bodies; proposals must quote exact
+  evidence from both endpoints and pass the mechanical checks in
+  `validate_proposal` before the endpoint-only judge. Relation types are the
+  closed `LinkRelationType` literal; generic `related/similar` is impossible.
+* Edits are additive and marker-owned:
+  `<!-- llm-wiki-link:<pair>:start|end -->` blockquotes plus a
+  `<!-- llm-wiki-related:start|end -->` footer. Outside the markers files are
+  byte-for-byte unchanged; `strip_managed_links` is the exact inverse of the
+  renderer and raises on malformed markers.
+* Commit is bilateral: `link_runs` moves `researching → committing → complete`;
+  a crash mid-write is finished by `recover_pending_runs` on the next
+  invocation, and a caught error restores in-memory originals. The source
+  stamp is written only after linker success, and `writers.up_to_date` refuses
+  a `pending`/`failed` `wiki/<doc>/_planning/linker.json` marker.
+* `remove_document(project, raw_rel)` exists for raw-file deletion but is not
+  wired into `graph/sync.py` yet.
+
+Tests: `tests/test_wiki_linker.py` (maps, lanes, validation, renderer,
+commit/recovery, writer integration, and the deterministic A/B/C/D smoke
+corpus proving a retrieval-missed link is still found).

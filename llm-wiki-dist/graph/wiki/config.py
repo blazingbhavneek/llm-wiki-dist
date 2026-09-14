@@ -5,8 +5,16 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 PROMPT_VERSION = "wiki-overlap-plan-ja-6"
-SEED_PLAN_VERSION = "wiki-seed-plan-ja-9"
-REWRITE_PROMPT_VERSION = "wiki-sections-ja-2"
+SEED_PLAN_VERSION = "wiki-seed-plan-ja-11"
+REWRITE_PROMPT_VERSION = "wiki-sections-ja-3"
+
+# Cross-document linker versions. These are deliberately isolated from the
+# rewrite versions above: a linker prompt change must never invalidate seed or
+# rewrite resume state, and vice versa.
+LINKER_MAP_PROMPT_VERSION = "wiki-link-map-1"
+LINKER_BRIDGE_PROMPT_VERSION = "wiki-link-bridge-1"
+LINKER_RESEARCH_PROMPT_VERSION = "wiki-link-research-2"
+LINKER_JUDGE_PROMPT_VERSION = "wiki-link-judge-2"
 
 
 class WikiConfig(BaseModel):
@@ -21,7 +29,7 @@ class WikiConfig(BaseModel):
     planner_max_output_tokens: int = 4000
     map_max_output_tokens: int = 32000
     # Planner target per page; pages over twice this are split at headings by Python.
-    page_target_lines: int = 200
+    page_target_lines: int = 100
 
     # Section-wise page writing
     rewrite_concurrency: int = 4
@@ -30,9 +38,9 @@ class WikiConfig(BaseModel):
     write_attempts: int = 3
     write_max_output_tokens: int = 8000
     intro_max_output_tokens: int = 1500
-    reference_candidates: int = 3
+    reference_candidates: int = 6
     reference_attempts: int = 3
-    reference_max_output_tokens: int = 4000
+    reference_max_output_tokens: int = 8000
     judge_attempts: int = 2
     judge_max_output_tokens: int = 4000
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -930,6 +931,7 @@ async def _write_section(
             output_language=config.output_language,
             feedback=feedback,
             context=context,
+            code_identifiers=sorted(code_tokens(source_text)),
         )
         write_text_atomic(
             task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md", prompt.render()
@@ -945,6 +947,10 @@ async def _write_section(
             )
             continue
         draft = normalize_draft(raw)
+        # Gemma sometimes wraps the image token in inline code (`[[NEO-IMAGE:...]]`),
+        # which survives restoration as a base64 blob inside backticks and renders
+        # broken. Unwrap the token before any placeholder handling.
+        draft = re.sub(r"`+(\[\[NEO-IMAGE:[A-Za-z0-9_-]+\]\])`+", r"\1", draft)
         draft = PLACEHOLDER_RE.sub(
             lambda match: match.group(0) if match.group(0) in placeholders else "",
             draft,

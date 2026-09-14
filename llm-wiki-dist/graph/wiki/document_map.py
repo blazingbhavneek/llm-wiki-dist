@@ -34,7 +34,7 @@ class SeedPlanningError(RuntimeError):
     """The final range table does not own every source line exactly once."""
 
 
-MIN_SEED_LINES = 20
+MIN_SEED_LINES = 1
 
 
 def _window_reports_text(reports: Sequence[WindowReport]) -> str:

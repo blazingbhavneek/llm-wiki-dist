@@ -1090,3 +1090,35 @@ The graph database contains nodes, FTS5, and sqlite-vec data. Embedded image
 media should be stripped from FTS text by GraphStore._reindex_fts; do not
 replace SQLite with Qdrant for this problem. Inspect image payloads and FTS
 reindex behavior first.
+
+## 20. Cross-document linker
+
+`wiki_one.py <raw-relative-path>` and every other `write_wiki(mode="wiki")`
+caller automatically run the pre-ingestion cross-document linker after the
+document is published and before the source stamp is written. No extra option
+is needed, and no Librarian/Researcher/GROWI database is touched.
+
+Environment variables (all optional):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WIKI_LINKER_ENABLED` | `1` | `0` skips the linker entirely (writes a `disabled` marker, constructs no services) |
+| `WIKI_LINKER_MAP_CONCURRENCY` | = `WIKI_REWRITE_CONCURRENCY` | parallel map-scout model calls per target page |
+| `WIKI_LINKER_RESEARCH_CONCURRENCY` | = `WIKI_REWRITE_CONCURRENCY` | parallel full-page research calls |
+
+By default both linker phases mirror the wiki maker's rewrite concurrency, so
+one knob scales the whole pipeline; set the linker variables explicitly only
+to deviate (e.g. a weaker embedding/chat endpoint).
+
+Runtime files created: `metadata/wiki-linker.sqlite` (+`-wal`/`-shm`),
+`metadata/wiki-linker.lock`, `metadata/state/<doc>/work/linker/<run-id>/`
+(prompt/response artifacts and `run.json`), and
+`wiki/<doc>/_planning/linker.json` (status `pending|complete|failed|disabled`).
+Deleting `wiki-linker.sqlite` is safe: it is a rebuildable cache; the edited
+Markdown under `data/wiki/` is the product.
+
+Progress events stream through the normal callback as
+`{"stage": "linker", "step": "bootstrap|maps|embed|map_scout|bridge_probe|retrieve|hops|research|judge|commit|done", ...}`.
+
+If the linker fails, the document is not stamped as up to date; rerunning the
+same command resumes using cached map comparisons and research results.

@@ -21,3 +21,5 @@ test_wiki/
 inputs/
 /data/
 .env
+.github/
+data_backup/

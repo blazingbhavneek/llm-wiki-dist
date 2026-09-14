@@ -149,10 +149,11 @@ def regional_plan_prompt(
             f"各候補範囲は今回見えている {source_start}-{source_end}行の内側だけで示し、"
             "地域外へ続く場合はcontinues_before/continues_afterを使う。\n"
             "API関数、コマンド、メッセージ型、設定項目、実質的なエラー項目など、同じ書式で"
-            "繰り返される具体的エンティティは個別に把握する。ただし20行未満の候補は作らず、"
-            "短い隣接エンティティは同じ種類・目的のまとまりとしてグループ化する。"
-            "列挙の導入・共通規則も最も適切なまとまりへ含める。\n"
-            f"各候補は約{page_target_lines}行を目安にし、最大{2 * page_target_lines}行を超える章・節は"
+            "繰り返される具体的エンティティは個別に把握する。独立した具体的エンティティは"
+            "短くても1つ候補として立てる。概念・カテゴリ・導入文・前後の断片だけでは候補を作らず、"
+            "短い隣接エンティティは同じ種類・目的のまとまりとしてグループ化してよい。"
+            "列挙の導入・共通規則は最も適切なまとまりへ含める。\n"
+            f"1候補の最大は{2 * page_target_lines}行。超える章・節は"
             "見出しやエンティティの境界で複数の候補に分ける。\n"
             "ただし、普通の短いリスト、数段落だけの説明、抽象概念を機械的に細分化しない。"
             "行数を揃えるための切断や、エンティティ途中での切断を提案しない。\n"
@@ -193,15 +194,18 @@ def semantic_plan_prompt(
             "- 見出し、導入、注記、表、画像、例を、それが説明する本文・エンティティから切り離さない。\n"
             "- ページの長さを揃えるために関数や項目の途中で切らない。\n"
             "- 空行、見出しだけ、導入文だけ、前後の続きだけを独立ページにしない。見出しは原則として"
-            "その直後にある本文へ含める。全てのページを20行以上にする。短いエンティティは、"
-            "意味的に近い隣接エンティティまたは共通説明と一緒に一つのページにする。\n"
+            "その直後にある本文へ含める。独立した具体的エンティティ（関数、コマンド、メッセージ型、"
+            "定義ファイル、設定項目）は短くても1ページにしてよい。概念・章そのもの・導入文だけの"
+            "ページは作らない。意味的に密接に連続する短いエンティティは、1テーマとして"
+            "まとめてもよい。\n"
             "- 同一書式で列挙されるAPI関数、コマンド、メッセージ型、設定項目、実質的な"
-            "エラー項目は、20行以上あるものは独立Wikiページにする。20行未満のものは途中で切らず、"
-            "同じ種類・目的の隣接項目と意味のある単位へまとめる。\n"
+            "エラー項目は、個別に理解・参照できる単位なら1ページにする。ページが極端に"
+            "短くなる場合のみ、同じ種類・目的の隣接項目と意味のある単位へまとめる。\n"
             "- 普通の短い箇条書き、説明の一部、単なる抽象概念は独立ページにしない。\n"
             "- 地域境界を越えて続くエンティティを一つに戻し、重複観察を一件として扱う。\n"
-            f"- 各ページは約{page_target_lines}行を目安にし、最大{2 * page_target_lines}行を超えない。"
-            "長い章は見出し・エンティティの境界で複数ページに分ける（章全体を1ページにしない）。\n"
+            "- ページ境界は行数ではなくエンティティで決める。各ページは最大"
+            f"{2 * page_target_lines}行まで。長い章・まとまりは見出し・エンティティの"
+            "境界で分割する（章全体を1ページにしない）。\n"
             f"{correction}\n\n地域地図:\n{regional_reports}"
         ),
     )
@@ -248,13 +252,11 @@ def seed_plan_compile_prompt(
             "- 意味計画で独立指定された列挙エンティティを勝手に分断しない。\n"
             "- 空行、見出しだけ、導入文だけ、前後ページの断片だけを1ページにしない。見出しは"
             "通常、その直後の本文と同じページに入れる。\n"
-            "- 原文全体が20行未満の場合を除き、全ページを必ず20行以上にする。短い項目は"
-            "直前と直後の両方について題名、要約、章、種類を比較し、意味的により近い側とまとめる。"
-            "先頭なら次、末尾なら前の候補だけを検討する。単に20行へ届かせるため、別エンティティの一部や"
-            "空行だけを移動してはならない。\n"
+            "- 独立した具体的エンティティは短くても1ページとしてよい。ただし意味計画が"
+            "まとめた短い項目を勝手に分断せず、空行や断片だけでページを埋めない。\n"
             "- ページを空にせず、題名と短いsummaryを付ける。\n"
-            f"- 各ページは約{page_target_lines}行を目安にし、最大{2 * page_target_lines}行を超える"
-            "ページは見出し・エンティティの境界で分ける。\n"
+            "- ページは最大"
+            f"{2 * page_target_lines}行。超えるページは見出し・エンティティの境界で分ける。\n"
             f"{correction}\n\n意味計画:\n{semantic_plan}\n\n地域地図:\n{regional_reports}"
         ),
     )
@@ -286,9 +288,14 @@ def reference_research_prompt(
             f"対象: {target_number:03d} {target_title}（原文 {target_ranges}行）\n"
             f"説明は{output_language}で書くこと。\n\n"
             "判定規則:\n"
+            "- 目標は、この対象ページだけでエンティティを完全に理解・使用・実装・運用・"
+            "障害対応できる状態にすることである。参照原文に対象エンティティ関連の"
+            "情報が残っている限り、網羅的に拾うこと。遠慮して漏らす方が誤り。\n"
             "- 対象原文に既にある事実は追加候補にしない。\n"
-            "- 対象ページを単独で理解、利用、実装、運用、障害対応するために有用な"
-            "前提、用語、関係、使用条件、制約、注意だけを選ぶ。\n"
+            "- 前提、用語定義、関連エンティティとの関係、使用条件、制約、引数や"
+            "設定項目の意味、出力メッセージ、返回値、注意、障害事例など、"
+            "対象ページを単独で理解、利用、実装、運用、障害対応するために有用な"
+            "事実をすべて選ぶ。\n"
             "- 単なる関数一覧、章番号、同じ説明の言い換え、ナビゲーション用リンクは選ばない。\n"
             "- 各事実のsource_start/source_endは、必ずいずれかの参照原文に表示された正確な行番号にする。\n"
             "- target_lineには、その事実を本文へ入れるべき対象原文の行番号"
@@ -362,9 +369,21 @@ def section_write_prompt(
     output_language: str,
     feedback: Sequence[str] = (),
     context: str = "",
+    code_identifiers: Sequence[str] = (),
 ) -> Prompt:
     """Rewrite one section losslessly; everything needed is in this prompt."""
 
+    identifier_block = ""
+    if code_identifiers:
+        listing = "、".join(f"`{item}`" for item in code_identifiers[:60])
+        identifier_block = (
+            "# 必須識別子（一つも落とさない）\n"
+            "以下は原文に含まれる識別子・定数・コードトークンである。書き直し後も"
+            "それぞれ1回以上、大文字小文字・記号（_ など）を一字も変えずに本文へ"
+            "含めること。省略・言い換え・翻訳・要約は禁止。Markdown でイタリックや"
+            "太字として解釈されないよう、`バッククォート` で囲んでそのまま書くこと\n"
+            f"{listing}\n\n"
+        )
     feedback_block = ""
     if feedback:
         feedback_block = (
@@ -398,12 +417,18 @@ def section_write_prompt(
             "- 原文の見出しは残してよいが、内容が分かる名前に変えてよい。\n"
             "- 段落や箇条書きに整理し、何のための機能か、いつ使うか、何に注意するかが"
             "原文から分かる範囲で伝わるようにする。文の意味、条件、順序に関わる情報は変えない。\n"
+            "- 原文の語順や文をなぞる最小限の編集ではなく、この節が単独で完結するWikiページに"
+            "なっているかを基準に、導入・解説・手順・注意の構成へ書き直す。ただし原文にない"
+            "事実は書かない。\n"
             "- 先頭の行番号は出典を示すためのもので、本文には書かない。\n"
             "- リンク（`[...](...)`）は書かない。「関連ページ」などの一覧も作らない。\n"
             "- 章番号、頁番号、目次など技術的な意味のない体裁だけは省いてよい。\n"
+            "- 識別子・定数・エラーコード・`__FILE__`/`__LINE__` 系のマクロは"
+            "原文のまま正確に写し、`バッククォート` で囲む（イタリック化を防ぐ）。\n"
             "- トークン一覧（各1回だけ置く）:\n"
             f"{image_context}\n\n"
-            "# 他ページから追加する事実\n"
+            + identifier_block
+            + "# 他ページから追加する事実\n"
             f"{facts_text}\n"
             "各事実は本文の該当箇所へ自然に組み込み、その段落の直後に"
             "`（参照元: 原文 S-E行）`（SとEは各事実の出典行）と書く。"
@@ -442,5 +467,226 @@ def intro_prompt(
             f"# 要約\n{page_summary or '要約なし'}\n\n"
             + context_block
             + f"# 本文\n{body}"
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# Cross-document linker (docs/LINKER.md). All builders are pure.
+# --------------------------------------------------------------------------
+
+_LINKER_ANTI_NOOP = (
+    "禁止: 共有単語・共有エンティティ・同一トピック・検索スコアだけを根拠にした候補。\n"
+    "求める関係は 前提条件 / 上流入力 / 下流結果 / 機構 / 共有制約 / 障害原因 /\n"
+    "診断根拠 / 復旧処置 / ワークフロー次の手順 / 実装 / 検証 / 代替 / トレードオフ /\n"
+    "矛盾 / 反例 / 実際に機構を移す類推 のいずれかである。\n"
+    "「このリンクを追った結果、読者が理解・実行できることが何かが言えない」なら候補を出さない。\n"
+    "捏造した確信より、未確認の深い不確実性を優先する。 bridge が具体的でなければ候補ゼロが正解。"
+)
+
+_LINKER_ID_RULE = (
+    "参照できるIDは提供されたPAGE IDとMAP ENTRY IDの許可リスト内のみ。"
+    "ファイルパス・URL・未知のIDは不可。"
+)
+
+_LINKER_LINK_RULE = (
+    "bridge_template は {link} をちょうど1回だけ含む1段落2文以内の文章である。"
+    "{link} の位置には後でピアーページへのリンクが挿入される。"
+    "改行・見出し・表・リスト・HTML・パス・URLを含めてはならない。"
+    "方向A用と方向B用は別内容（読む方向の違いを説明する）とする。"
+)
+
+
+def map_link_scan_prompt(
+    *,
+    target_card: str,
+    block_cards: str,
+    document_label: str,
+    output_language: str,
+    last_error: str | None = None,
+) -> Prompt:
+    """Exhaustive map scout: one target card against one whole-document block."""
+
+    from .config import LINKER_MAP_PROMPT_VERSION
+    from .wire import MapLinkScanResult
+
+    correction = ""
+    if last_error:
+        correction = f"\n前回の回答は検証に失敗した。修正すること。\n検証エラー:\n{last_error}\n"
+
+    return Prompt(
+        kind="linker_map_scan",
+        version=LINKER_MAP_PROMPT_VERSION,
+        system=(
+            COMMON_RULES
+            + "\nあなたはWikiページ間の隠れた関係を探す研究員である。"
+            "地図(要約)だけに基づく三賞みを行い、全文精読に値する候補を高々3件選ぶ。"
+            "ノミネーションは『精読に値する』の意味であり『公開』ではない。"
+            "提供された地図以外から推論しない。"
+        ),
+        body=(
+            f"言語: {output_language}\n\n{_LINKER_ANTI_NOOP}\n\n{_LINKER_ID_RULE}\n\n"
+            "共有トピックだけでは不十分。時間・資源・リソース・寿命・順序の制約、"
+            "原因と結果、前提と手順、証拠と主張など、語彙が異なるかもしれない橋を探す。\n\n"
+            f"--- 対象ページ (document: {document_label} 以外と比較) ---\n{target_card}\n\n"
+            f"--- 既存ドキュメントの全ページ地図 ({document_label}) ---\n{block_cards}\n\n"
+            "各候補は candidate_page_id と target/candidate 両方の map entry ID を"
+            "許可リストから引用し、hypothesis(20-500字)、reader_value(20-500字)、"
+            "bridge_questions、priority(0-100) を埋める。候補がなければ"
+            " no_candidate_reason を書く。\n\n"
+            f"JSONスキーマ: {_schema_hint(MapLinkScanResult)}{correction}"
+        ),
+    )
+
+
+def bridge_probe_prompt(
+    *,
+    target_card: str,
+    output_language: str,
+    last_error: str | None = None,
+) -> Prompt:
+    """3..6 question-shaped bridge probes for one target page."""
+
+    from .config import LINKER_BRIDGE_PROMPT_VERSION
+    from .wire import BridgeProbeResult
+
+    correction = ""
+    if last_error:
+        correction = f"\n前回の回答は検証に失敗した。修正すること。\n検証エラー:\n{last_error}\n"
+
+    return Prompt(
+        kind="linker_bridge_probe",
+        version=LINKER_BRIDGE_PROMPT_VERSION,
+        system=(
+            COMMON_RULES
+            + "\nあなたは検索質問設計者である。ページ地図から、語彙の異なる文書へ届く"
+            "質問を作る。キーワードの羅列や要約は禁止。"
+        ),
+        body=(
+            f"言語: {output_language}\n\n対象ページ地図:\n{target_card}\n\n"
+            "3〜6個の独立した質問を生成する。内訳の目安: 前提条件 / 下流の結果 /\n"
+            "隠れた機構・共有リソース / 障害・診断・復旧 / 制約・トレードオフ・代替 /\n"
+            "有用な類推・証拠。\n"
+            "悪い例: 『タイムアウト処理』(NG: 質問でなく語句)。\n"
+            "良い例: 『設定より早くこのタイムアウトが満了し得る、独立したクロックや"
+            "スケジューリング挙動は何か?』\n"
+            f"各質問は20〜300字、重複除去済みであること。\n\n"
+            f"JSONスキーマ: {_schema_hint(BridgeProbeResult)}{correction}"
+        ),
+    )
+
+
+def deep_link_research_prompt(
+    *,
+    target_view: str,
+    candidate_views: str,
+    discovery_notes: str,
+    anchor_allowlist: str,
+    output_language: str,
+    last_error: str | None = None,
+) -> Prompt:
+    """Full-page deep research over complete endpoint bodies."""
+
+    from .config import LINKER_RESEARCH_PROMPT_VERSION
+    from .wire import DeepLinkResearchResult
+
+    correction = ""
+    if last_error:
+        correction = f"\n前回の回答は検証に失敗した。修正すること。\n検証エラー:\n{last_error}\n"
+
+    return Prompt(
+        kind="linker_research",
+        version=LINKER_RESEARCH_PROMPT_VERSION,
+        system=(
+            COMMON_RULES
+            + "\nあなたは2ページを全文精読して、相互リンクの是非を判定する研究員である。"
+            "全文が提供されたページだけを提案できる。発見経路の断片は手がかりであり証拠ではない。"
+        ),
+        body=(
+            f"言語: {output_language}\n\n{_LINKER_ANTI_NOOP}\n\n{_LINKER_ID_RULE}\n\n"
+            "手順:\n"
+            "1. 全文が与えられた対象ページと候補ページの間で具体的な関係を1件まで特定する。"
+            "発見経路上の中間ページは手がかりであり、この呼び出しの提案先ではない。\n"
+            "2. 両エンドポイントから逐語の証拠(exact excerpt, 10-500字)を引用する。"
+            "改変・省略・言い換えは不可。\n"
+            "3. リンを追った読者が何を学ぶか、なぜ共有トピックの重複でないかを説明する。\n"
+            f"4. anchor は許可リストから選ぶ: {anchor_allowlist}\n"
+            f"5. 双方向の bridge_template と footer_reason を書く。{_LINKER_LINK_RULE}\n"
+            "6. discovery_path は対象ページIDで始まりエンドページIDで終わる2〜4個の既知ID。\n"
+            "7. ブリッジが一般的・推測的なら提案せず、候補IDをrejected_page_idsへ入れる。\n"
+            "novelty/usefulness/confidence は正直に採点し、70未満は採用されない。\n\n"
+            f"--- 対象ページ(全文) ---\n{target_view}\n\n"
+            f"--- 精読候補ページ(全文) ---\n{candidate_views}\n\n"
+            f"--- 発見経路の要約(手がかり) ---\n{discovery_notes}\n\n"
+            f"JSONスキーマ: {_schema_hint(DeepLinkResearchResult)}{correction}"
+        ),
+    )
+
+
+def link_pair_judge_prompt(
+    *,
+    target_view: str,
+    endpoint_view: str,
+    proposal_json: str,
+    evidence: str,
+    anchor_allowlist: str,
+    output_language: str,
+) -> Prompt:
+    """Final endpoint-only judge over verified evidence context."""
+
+    from .config import LINKER_JUDGE_PROMPT_VERSION
+    from .wire import LinkJudgeResult
+
+    return Prompt(
+        kind="linker_judge",
+        version=LINKER_JUDGE_PROMPT_VERSION,
+        system=(
+            COMMON_RULES
+            + "\nあなたは最終審査員である。エンドポイント・関係種別・証拠・発見経路は変更できない。"
+            "全文精読は前段で完了している。ここでは検証済み引用とその周辺だけを使い、"
+            "拒否と、文章(anchor・bridge template・footer reason)の tighten だけが可能。"
+        ),
+        body=(
+            f"言語: {output_language}\n\n{_LINKER_ANTI_NOOP}\n\n"
+            "次の各項目を独立に判定し、1つでも false なら recommended は false。\n"
+            "- 両ページに裏付けがある / 具体的関係である / 共有トピック以上である /\n"
+            "  対象側読者に有用 / ピアー側読者に有用 / ブリッジ文が未裏付けの主張を足さない\n"
+            "検索スコアは提供しない。スコアは証拠ではない。\n"
+            f"修正プロースを出す場合も anchor は許可リスト: {anchor_allowlist}。"
+            f"{_LINKER_LINK_RULE}\n\n"
+            f"--- 対象ページ(検証済み証拠の周辺) ---\n{target_view}\n\n"
+            f"--- エンドポイントページ(検証済み証拠の周辺) ---\n{endpoint_view}\n\n"
+            f"--- 提案 ---\n{proposal_json}\n\n"
+            f"--- 逐語証拠 ---\n{evidence}\n\n"
+            f"JSONスキーマ: {_schema_hint(LinkJudgeResult)}"
+        ),
+    )
+
+
+def oversized_section_note_prompt(
+    *,
+    target_view: str,
+    section_id: str,
+    section_text: str,
+    output_language: str,
+) -> Prompt:
+    """Evidence note for one section of an oversized endpoint page."""
+
+    from .wire import OversizedSectionNote
+
+    return Prompt(
+        kind="linker_section_note",
+        version=LINKER_RESEARCH_PROMPT_VERSION,
+        system=(
+            COMMON_RULES
+            + "\nあなたは長いページの1セクションだけを読み、対象ページとの関係の"
+            "手がかりとなる逐語証拠を記録する係である。"
+        ),
+        body=(
+            f"言語: {output_language}\n\n対象ページ(全文):\n{target_view}\n\n"
+            f"セクション {section_id}(全文):\n{section_text}\n\n"
+            "対象ページと具体的な関係(機構・前提・結果・制約・証拠等)に関わる逐語抜粋を"
+            "最大3件記録する。なければ relevant=false。要約の書き換えは不可。\n\n"
+            f"JSONスキーマ: {_schema_hint(OversizedSectionNote)}"
         ),
     )

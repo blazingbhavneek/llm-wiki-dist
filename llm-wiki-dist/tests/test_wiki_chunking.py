@@ -215,7 +215,7 @@ class SeedPlanTests(unittest.TestCase):
         self.assertEqual(checked.pages[0].title, f"章（1/{len(sizes)}）")
         self.assertTrue(all(lines[p.source_start - 1].startswith("# ") for p in checked.pages))
 
-    def test_seed_validation_sends_under_twenty_lines_back_to_the_llm(self) -> None:
+    def test_seed_validation_allows_short_entity_seeds(self) -> None:
         lines = ["line"] * 50
         plan = SeedPlan(
             pages=[
@@ -230,9 +230,8 @@ class SeedPlanTests(unittest.TestCase):
             block_index=markdown_blocks.build_block_index(lines),
         )
 
-        self.assertIsNone(checked)
-        self.assertIn("at least 20", error)
-        self.assertIn("previous or next", error)
+        self.assertIsNotNone(checked)
+        self.assertEqual([page.source_end for page in checked.pages], [10, 50])
 
     def test_seed_validation_snaps_boundary_outside_atomic_block(self) -> None:
         lines = ["before", "```", "code", "```", "after"]
@@ -580,7 +579,7 @@ class SectionWriteTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(pages)
             self.assertTrue((wiki / "index.md").exists())
             self.assertFalse((wiki / "_review.md").exists())
-            text = (wiki / pages[0]).read_text(encoding="utf-8")
+            text = "\n".join((wiki / name).read_text(encoding="utf-8") for name in pages)
             self.assertIn("def function_1(): ...", text)
             self.assertIn(base64_run(), text)
             self.assertNotIn("[[NEO-IMAGE:", text)
@@ -751,11 +750,11 @@ class PlanningPromptTests(unittest.TestCase):
         ).render()
 
         self.assertIn("観察範囲は重複・包含してよい", inventory)
-        self.assertIn("20行以上あるものは独立Wikiページ", semantic)
+        self.assertIn("個別に理解・参照できる単位なら1ページ", semantic)
         self.assertIn("隣のシードへ行を漏らしたり", semantic)
-        self.assertIn("全てのページを20行以上", semantic)
+        self.assertIn("独立した具体的エンティティ", semantic)
         self.assertIn("空行、見出しだけ", compiler)
-        self.assertIn("直前と直後の両方", compiler)
+        self.assertNotIn("20行以上", compiler)
 
 class HierarchicalPlanningTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

@@ -57,6 +57,10 @@ class Project:
         return self.root / "engine.sqlite"
 
     @property
+    def linker_database(self) -> Path:
+        return self.metadata / "wiki-linker.sqlite"
+
+    @property
     def last_sha_path(self) -> Path:
         return self.metadata / "last_sha"
 
