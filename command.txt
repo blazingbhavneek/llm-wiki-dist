@@ -1,5 +1,0 @@
-  .venv/bin/python wiki_one.py 'rikiseisan/test/系統制御ミドルウェア（Ｍｏｏｖｅ）_構成制御ユーザーズマニュアル_pdf.md'
-
-  .venv/bin/python wiki_one.py 'rikiseisan/test/系統制御ミドルウェア（Ｍｏｏｖｅ）_システム運転情報管理ユーザーズマニュアル_pdf.md'
-
-  .venv/bin/python wiki_one.py 'rikiseisan/test/系統制御ミドルウェア（Ｍｏｏｖｅ）_エラー管理ユーザーズマニュアル_pdf.md'

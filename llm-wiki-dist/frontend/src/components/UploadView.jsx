@@ -135,7 +135,7 @@ export default function UploadView({
   const [markdownName, setMarkdownName] = useState('')
   const [markdownDraft, setMarkdownDraft] = useState(null)
   const [ingestMode, setIngestMode] = useState('')
-  const [serverMode, setServerMode] = useState('chunks')
+  const [serverMode, setServerMode] = useState('wiki')
   const [status, setStatus] = useState('')
   const [error, setError] = useState(null)
   const [syncBusy, setSyncBusy] = useState(false)
@@ -152,9 +152,7 @@ export default function UploadView({
   // made. Echoed inside the "follow settings" option so the picker never lies.
   const activeServerMode = settingsSource.ingest_mode || serverMode
   const settingsMode =
-    activeServerMode === 'pages'
-      ? t.modePages
-      : activeServerMode === 'wiki'
+    activeServerMode === 'wiki'
         ? t.modeWiki
         : t.modeChunks
 
@@ -184,7 +182,7 @@ export default function UploadView({
       .then((server) => {
         if (alive && server?.ingest_mode) {
           setServerMode(
-            ['chunks', 'pages', 'wiki'].includes(server.ingest_mode)
+            ['chunks', 'wiki'].includes(server.ingest_mode)
               ? server.ingest_mode
               : 'chunks',
           )
@@ -216,7 +214,7 @@ export default function UploadView({
 
       if (detail && detail.ingest_mode !== undefined) {
         setServerMode(
-          ['chunks', 'pages', 'wiki'].includes(detail.ingest_mode)
+          ['chunks', 'wiki'].includes(detail.ingest_mode)
             ? detail.ingest_mode
             : 'chunks',
         )
@@ -408,7 +406,6 @@ export default function UploadView({
                 >
                   <option value="">{t.modeDefault(settingsMode)}</option>
                   <option value="chunks">{t.modeChunks}</option>
-                  <option value="pages">{t.modePages}</option>
                   <option value="wiki">{t.modeWiki}</option>
                 </select>
               </div>

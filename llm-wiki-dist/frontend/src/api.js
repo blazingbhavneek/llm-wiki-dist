@@ -198,7 +198,7 @@ export const api = {
         body,
         title,
         document_name: documentName,
-        // Per-document ingest choices (e.g. {ingest_mode: "pages"}). Left out
+        // Per-document ingest choices (chunks or wiki). Left out
         // when the caller has no opinion so the server setting decides.
         ...(chunkOptions ? { chunk_options: chunkOptions } : {}),
       }),

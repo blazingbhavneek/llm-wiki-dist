@@ -64,16 +64,10 @@ const COOKIE_FIELDS = [
 
 // Ingest settings (WP-F1) are NOT cookie overrides: they change what the
 // server does when it writes, so they live on the server and round-trip
-// through PATCH /api/settings. Defaults match graph/core.py Settings, i.e.
-// today's behaviour — chunks, no stitching.
+// through PATCH /api/settings. Defaults match graph/config.py Settings.
 const INGEST_DEFAULTS = {
-  ingest_mode: 'chunks',
-  page_stitch: false,
-  page_min_chunks: 3,
-  page_max_chunks: 8,
-  page_min_lines: 150,
-  page_max_lines: 900,
-  page_route_candidates: 5,
+  ingest_mode: 'wiki',
+  wiki_linker_mode: 'legacy',
   wiki_section_target_lines: 80,
   wiki_write_attempts: 3,
   wiki_rewrite_concurrency: 4,
@@ -81,11 +75,6 @@ const INGEST_DEFAULTS = {
 }
 
 const INGEST_INT_BOUNDS = {
-  page_min_chunks: [1, 100],
-  page_max_chunks: [1, 200],
-  page_min_lines: [1, 20000],
-  page_max_lines: [1, 100000],
-  page_route_candidates: [1, 50],
   wiki_section_target_lines: [10, 1000],
   wiki_write_attempts: [1, 10],
   wiki_rewrite_concurrency: [1, 32],
@@ -94,38 +83,23 @@ const INGEST_INT_BOUNDS = {
 function readIngestSettings(source) {
   const out = { ...INGEST_DEFAULTS, ...(source || {}) }
 
-  out.ingest_mode = ['chunks', 'pages', 'wiki'].includes(out.ingest_mode)
+  out.ingest_mode = ['chunks', 'wiki'].includes(out.ingest_mode)
     ? out.ingest_mode
-    : 'chunks'
-  out.page_stitch = Boolean(out.page_stitch)
+    : INGEST_DEFAULTS.ingest_mode
+  out.wiki_linker_mode = ['legacy', 'neo'].includes(out.wiki_linker_mode)
+    ? out.wiki_linker_mode
+    : INGEST_DEFAULTS.wiki_linker_mode
 
   for (const [field, [min, max]] of Object.entries(INGEST_INT_BOUNDS)) {
     out[field] = clampInt(out[field], min, max, INGEST_DEFAULTS[field])
   }
 
-  // page_min_chunks must not exceed page_max_chunks, or sizing can never be
-  // satisfied. Keep the pair self-consistent instead of sending nonsense.
-  if (out.page_min_chunks > out.page_max_chunks) {
-    out.page_min_chunks = INGEST_DEFAULTS.page_min_chunks
-  }
-  if (out.page_min_lines > out.page_max_lines) {
-    out.page_min_lines = INGEST_DEFAULTS.page_min_lines
-  }
-
   return out
 }
 
-// The pages pipeline never stitches unless pages mode is on, so a saved
-// "true" while in chunks mode would silently reappear the next time pages
-// mode is switched on. Force it off in the payload we send.
 const ingestPatch = (ingest) => ({
   ingest_mode: ingest.ingest_mode,
-  page_stitch: ingest.ingest_mode === 'pages' ? ingest.page_stitch : false,
-  page_min_chunks: ingest.page_min_chunks,
-  page_max_chunks: ingest.page_max_chunks,
-  page_min_lines: ingest.page_min_lines,
-  page_max_lines: ingest.page_max_lines,
-  page_route_candidates: ingest.page_route_candidates,
+  wiki_linker_mode: ingest.wiki_linker_mode,
   wiki_section_target_lines: ingest.wiki_section_target_lines,
   wiki_write_attempts: ingest.wiki_write_attempts,
   wiki_rewrite_concurrency: ingest.wiki_rewrite_concurrency,
@@ -350,28 +324,20 @@ const STR = {
     ingestMode: '取り込みモード',
     ingestModeHint: 'アップロード画面では、この文書だけを指定することもできます。',
     modeChunks: 'チャンク',
-    modePages: 'ページ',
     modeWiki: 'Wiki',
     modeChunksHelp:
       '元の文章をそのまま、章ごとに分割して取り込みます（従来の動作）',
-    modePagesHelp:
-      '関連する内容をまとめて、1つのWikiページに組み立てます',
     modeWikiHelp:
       '原文を失わずにセクション単位でWikiページへ書き換えます',
     modeSafe:
       '切り替えても既に取り込んだ文書には影響しません。文書ごとに、取り込んだ当時のモードが記録されています。',
 
-    pageStitch: 'つなぎ文章の補整',
-    pageStitchHint:
-      '導入文や見出しなど、つなぎの文章だけを追加します。引用した本文は1文字も変更しません。',
-    pageStitchNeedsPages: 'ページモードのときだけ選択できます。',
+    linkerMode: '横断リンクモード',
+    linkerModeHint: '文書間リンクの候補生成方式です。切り替え後はリンクを再構築してください。',
+    linkerLegacy: 'Legacy',
+    linkerNeo: 'Neo',
 
     advanced: '詳細',
-    pageMinChunks: '1ページあたりの最小チャンク数',
-    pageMaxChunks: '最大チャンク数',
-    pageMinLines: '1ページの最小行数',
-    pageMaxLines: '1ページの最大行数',
-    pageRouteCandidates: '振り分けの候補ページ数',
     wikiWriter: 'Wiki ライター',
     wikiSectionTargetLines: 'セクション目標行数',
     wikiWriteAttempts: '書き直し試行回数',
@@ -475,28 +441,20 @@ const STR = {
     ingestMode: 'Ingest mode',
     ingestModeHint: 'The upload screen can override this for a single document.',
     modeChunks: 'Chunks',
-    modePages: 'Pages',
     modeWiki: 'Wiki',
     modeChunksHelp:
       'Keep the original wording, split chapter by chapter (the original behaviour)',
-    modePagesHelp:
-      'Group related content together and assemble it into one wiki page',
     modeWikiHelp:
       'Rewrite source sections into wiki pages while preserving every source line',
     modeSafe:
       'Switching never changes documents already ingested. Each document keeps the mode it was ingested with.',
 
-    pageStitch: 'Connective-text stitching',
-    pageStitchHint:
-      'Adds only connective text such as an intro or headings. Quoted source text is never changed.',
-    pageStitchNeedsPages: 'Only available in pages mode.',
+    linkerMode: 'Cross-document linker mode',
+    linkerModeHint: 'Select how document links are discovered. Rebuild links after switching.',
+    linkerLegacy: 'Legacy',
+    linkerNeo: 'Neo',
 
     advanced: 'Advanced',
-    pageMinChunks: 'Minimum chunks per page',
-    pageMaxChunks: 'Maximum chunks per page',
-    pageMinLines: 'Minimum lines per page',
-    pageMaxLines: 'Maximum lines per page',
-    pageRouteCandidates: 'Candidate pages per chunk when routing',
     wikiWriter: 'Wiki writer',
     wikiSectionTargetLines: 'Target lines per section',
     wikiWriteAttempts: 'Write attempts',
@@ -1156,9 +1114,8 @@ export default function SettingsView({ overrides, onApply }) {
       agents: nextAgents,
     })
 
-    // Cookie overrides are not the whole story: put the server-side ingest
-    // mode back to the shipped default too, otherwise "reset" would quietly
-    // leave pages mode switched on.
+    // Cookie overrides are not the whole story: restore the server-side ingest
+    // and linker defaults too.
     ingestDirty.current = true
     setIngestSaved(false)
     setIngest(INGEST_DEFAULTS)
@@ -1392,7 +1349,6 @@ export default function SettingsView({ overrides, onApply }) {
           <div className="inline-flex border border-line bg-soft p-[3px]">
             {[
               { value: 'chunks', label: t.modeChunks },
-              { value: 'pages', label: t.modePages },
               { value: 'wiki', label: t.modeWiki },
             ].map((option) => {
               const active = ingest.ingest_mode === option.value
@@ -1416,42 +1372,29 @@ export default function SettingsView({ overrides, onApply }) {
           </div>
 
           <p className="mt-[10px] text-[12.5px] leading-[1.5] text-ink">
-            {ingest.ingest_mode === 'pages'
-              ? t.modePagesHelp
-              : ingest.ingest_mode === 'wiki'
-                ? t.modeWikiHelp
-                : t.modeChunksHelp}
+            {ingest.ingest_mode === 'wiki' ? t.modeWikiHelp : t.modeChunksHelp}
           </p>
 
           <p className="mt-[8px] border border-line bg-soft px-[10px] py-[8px] text-[12px] leading-[1.5] text-muted">
             {t.modeSafe}
           </p>
 
-          <label
-            className={`mt-[14px] flex items-start gap-[10px] ${
-              ingest.ingest_mode === 'pages' ? '' : 'opacity-50'
-            }`}
-          >
-            <input
-              type="checkbox"
-              className="mt-[2px] accent-blue"
-              disabled={ingest.ingest_mode !== 'pages'}
-              checked={ingest.ingest_mode === 'pages' && ingest.page_stitch}
-              onChange={(e) => setIngestField('page_stitch', e.target.checked)}
-            />
-
-            <span>
-              <span className="block text-[13px] font-bold text-ink">
-                {t.pageStitch}
-              </span>
-
-              <span className="block text-[12px] leading-[1.5] text-muted">
-                {ingest.ingest_mode === 'pages'
-                  ? t.pageStitchHint
-                  : t.pageStitchNeedsPages}
-              </span>
-            </span>
-          </label>
+          <div className="mt-[14px] border-t border-line pt-[12px]">
+            <h4 className="mb-[4px] mt-0 text-[13px] font-extrabold text-ink">
+              {t.linkerMode}
+            </h4>
+            <p className="mb-[8px] mt-0 text-[12px] text-muted">
+              {t.linkerModeHint}
+            </p>
+            <select
+              value={ingest.wiki_linker_mode}
+              onChange={(event) => setIngestField('wiki_linker_mode', event.target.value)}
+              className="border border-line bg-white px-[10px] py-[7px] text-[13px] text-ink"
+            >
+              <option value="legacy">{t.linkerLegacy}</option>
+              <option value="neo">{t.linkerNeo}</option>
+            </select>
+          </div>
 
           <details className="mt-[14px] border border-line bg-soft p-[12px]">
             <summary className="cursor-pointer text-[12.5px] font-bold text-ink">
@@ -1459,38 +1402,6 @@ export default function SettingsView({ overrides, onApply }) {
             </summary>
 
             <div className="mt-[12px] grid grid-cols-1 gap-[12px] md:grid-cols-2">
-              <NumberField
-                label={t.pageMinChunks}
-                value={ingest.page_min_chunks}
-                onChange={(v) => setIngestNumberField('page_min_chunks', v)}
-              />
-
-              <NumberField
-                label={t.pageMaxChunks}
-                value={ingest.page_max_chunks}
-                onChange={(v) => setIngestNumberField('page_max_chunks', v)}
-              />
-
-              <NumberField
-                label={t.pageMinLines}
-                value={ingest.page_min_lines}
-                onChange={(v) => setIngestNumberField('page_min_lines', v)}
-              />
-
-              <NumberField
-                label={t.pageMaxLines}
-                value={ingest.page_max_lines}
-                onChange={(v) => setIngestNumberField('page_max_lines', v)}
-              />
-
-              <NumberField
-                label={t.pageRouteCandidates}
-                value={ingest.page_route_candidates}
-                onChange={(v) =>
-                  setIngestNumberField('page_route_candidates', v)
-                }
-                />
-
               {ingest.ingest_mode === 'wiki' && (
                 <div className="col-span-full border-t border-line pt-[12px]">
                   <h4 className="mb-[10px] mt-0 text-[13px] font-extrabold text-ink">

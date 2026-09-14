@@ -1,10 +1,12 @@
 # Developer guide
 
-This document maps the implemented system to files and current line ranges. Line
-ranges are a snapshot of the current tree; after a large edit, rerun the
-commands in the final section to refresh them.
+This document maps the implemented system to files. Line ranges are given only
+for files that did not move in the 2026-09 reorganization; for everything else
+use the symbol lists in the final section.
 
-The four implementation plans describe intent and acceptance criteria:
+The plan of record is ORG_AND_PORT.md (package layout, the one-phase linker with
+its legacy/neo modes, and the minimal `llm-wiki-air` port). The
+older plans describe intent for their phases:
 
 - PLAN_SYNC.md: one data root, mount conversion, raw Git changes, wiki output.
 - PLAN_FORMATS.md: DOCX/PPTX/PDF/table-aware structure and Excel records.
@@ -13,32 +15,62 @@ The four implementation plans describe intent and acceptance criteria:
 
 The code is the final authority when a plan and implementation differ.
 
+## 0. Where the code actually lives (transition map)
+
+The reorganization is half physical, half re-export. Edit the file in the
+"real code" column; the other path is an import-only shim kept for one
+transition and must stay logic-free.
+
+| Import path | Real code | Notes |
+| --- | --- | --- |
+| `graph.config` | `graph/config.py` | Settings **and** the former `graph/core.py` content (Node/Edge models, engine prompts, text helpers) |
+| `graph.core` | shim -> `graph/config.py` | |
+| `graph.common.{hashing,markdown,async_tools,prompts}` | real | extracted from chunk.py/core.py; `prompts.py` holds SUMMARY/KEYWORD/CLAIM/BRIDGE_PROBE/EDGE prompts |
+| `graph.clients.chat` | real | `make_llm`, `structured_ainvoke` (thinking off by default) |
+| `graph.clients.embeddings` | real | small OpenAI-compatible `Embedder` used by the linker and the downstream port |
+| `graph.clients.reranker` | shim -> `graph/gateway.py` | engine only |
+| `graph.gateway` | real | engine `LlmClient`, `ModelGateway`, engine `Embedder`/`Reranker` (server + HF fallback) |
+| `graph.workspace.{project,parser_client,convert,writer}` | real | |
+| `graph.workspace.git_sync` | shim -> `graph/sync.py` | engine only |
+| `graph.writers`, `graph.project`, `graph.convert` | shims | old paths |
+| `graph.wiki.*` | real | `graph/wiki/legacy.py` is the old `graph/chunk.py`; `graph.chunk` is a shim |
+| `graph.linker.*` | real | new package, section 15 |
+| `graph.growi.client` | real | the whole former `graph/growi.py` |
+| `graph.growi.{paths,publisher,reverse_sync}` | shims -> `graph/growi/client.py` | |
+| `graph.growi.registry` | shim -> `graph/registry.py` | |
+| `graph.knowledge.*` | shims -> `graph/{librarian,researcher,realtime,store,vectors,vocab,neighborhood,gateway}.py` | engine only |
+
+`tests/test_boundaries.py` imports every factory package in a subprocess and
+fails if any engine module (`graph.librarian`, `graph.store`, `graph.knowledge`,
+`app`, torch) gets loaded. Keep it green when adding imports.
+
 ## 1. Architecture in one page
 
 ~~~text
 mount/
   original DOCX/PPTX/PDF/XLSX/CSV files
        |
-       | graph/convert.py -> parser/server.py /parse
+       | graph/workspace/convert.py -> parser/server.py /parse
        v
 raw/                         normalized Markdown, one Git repository
        |
        | graph/sync.py
        v
-graph/writers.py             chooses format and ingest mode
+graph/workspace/writer.py    chooses format, links, and ingest mode
        |
        +--> graph/formats/   structural/table-aware seed planning
-       +--> graph/wiki/      lossless wiki writer
-       +--> graph/pages.py   shelf/page writer
-       +--> graph/chunk.py   historical chunk writer
+       +--> graph/wiki/      lossless wiki writer (mode wiki)
+       +--> graph/wiki/legacy.py  concept chunk writer (mode chunks)
+       +--> graph/linker/    one-phase cross-document linker: footers + inline links,
+       |                     also rewrites older documents' pages (returned as touched)
        v
-wiki/                        local generated/export Markdown
+wiki/                        local generated/export Markdown (+ _planning/ sidecars)
        |
-       | graph/growi.py -> GROWI HTTP API
+       | graph/growi/ -> GROWI HTTP API
        v
 GROWI                       editable/canonical wiki pages
        |
-       | graph/growi.py + graph/librarian.py
+       | graph/growi/ + graph/knowledge/librarian.py
        v
 graph.sqlite                 nodes, edges, FTS5, sqlite-vec vectors
        |
@@ -62,25 +94,18 @@ same graph file.
 
 ## 2. Data and ownership contracts
 
-### Project paths: graph/project.py
+### Project paths: graph/workspace/project.py
 
-graph/project.py lines 1-113 owns the data-root contract:
+graph/workspace/project.py owns the data-root contract:
 
-- lines 9-15: raw filename <-> original extension mapping.
-- lines 23-29: reserved team names and fallback general team extraction.
-- lines 31-72: Project paths:
-  - root
-  - mount
-  - raw
-  - metadata
-  - wiki
-  - graph.sqlite
-  - engine.sqlite
-  - metadata/last_sha
-  - metadata/convert.json
-- lines 74-102: raw-file, wiki-folder, state-folder, work-folder, directory
-  creation, raw-file listing, and team discovery.
-- lines 105-113: ZIP export; _planning files are omitted.
+- `raw_name_for` / `wiki_folder_name`: raw filename <-> original extension
+  mapping (`Input1.docx` <-> `Input1_docx.md` <-> wiki folder `Input1.docx`).
+- `RESERVED_TEAMS`, `team_of`: reserved names and the fallback `general` team.
+- `Project`: root, mount, raw, metadata, wiki, `database` (graph.sqlite),
+  `engine_db`, `linker_database` (metadata/wiki-linker.sqlite),
+  `last_sha_path`, `convert_log_path`, `raw_file`, `wiki_dir`, `state_dir`,
+  `work_dir`, `ensure`, `raw_files`, `teams`.
+- `zip_wiki`: ZIP export; `_planning` files are omitted.
 
 Change this file when changing a path contract, extension mapping, scope-folder
 discovery, or ZIP contents. Do not put parser, GROWI, or graph logic here.
@@ -94,9 +119,12 @@ data/mount/                       external/source files
 data/raw/                         parser Markdown + .git
 data/metadata/convert.json       mount conversion ledger
 data/metadata/last_sha           raw commit consumed by sync
-data/metadata/state/              resumable wiki writer state
+data/metadata/state/              resumable wiki writer state (+ work/linker/<run> artifacts)
 data/metadata/work/               temporary writer staging
-data/wiki/                        generated local wiki/export
+data/metadata/wiki-linker.sqlite  linker catalog; rebuildable from _planning/
+data/wiki/<doc>/NNN-*.md          published pages = render(_planning/pages, edges)
+data/wiki/<doc>/_planning/        metadata/coverage/manifest/source.json,
+                                  pages/ (pre-link originals), chunks.json, links.json, linker.json
 data/graph.sqlite                 derived graph/index/vector store
 data/engine.sqlite                encrypted GROWI registry/page ledger
 ~~~
@@ -208,75 +236,71 @@ If changing URL layout, update all of:
 - mcp_server.py routing;
 - app and routing tests.
 
-### Settings: graph/core.py
+### Settings: graph/config.py
 
-graph/core.py is the shared configuration and domain model module:
+graph/config.py is the former graph/core.py: `Settings` + `from_env`, then the
+engine domain models (`NodeType`, `NodeStatus`, `Node`, `Edge`, structured
+output models), the engine prompts, and hashing/matching/text helpers.
+`graph/core.py` re-exports all of it.
 
-- lines 25-89: Settings defaults for chat, embeddings, reranking, database,
-  edges, and search.
-- lines 91-138: ingest modes, data root, parser, legacy vector fields,
-  GROWI/sync fields, format settings, concurrency, and retrieval settings.
-- lines 140-185: retrieval weights, evidence, agent, service, and Mermaid
-  settings.
-- lines 187-348: Settings.from_env mapping.
-- lines 361-367: NodeType values: endogenous, exogenous, page, table.
-- lines 369-375: NodeStatus values.
-- lines 377-401: Node model and source/team/version fields.
-- lines 404 onward: Edge and domain helpers.
-- approximately lines 1067 onward: hashing, node IDs, chunk sizing, and
-  image/table search-text helpers.
+Settings that changed in the reorganization:
+
+- `ingest_mode`: `wiki` (default) or `chunks`; the `pages` mode and every
+  `page_*` field are gone.
+- `wiki_linker_enabled`, `wiki_linker_mode` (`legacy`|`neo`),
+  `wiki_linker_concurrency` (0 = rewrite concurrency).
+- `engine_semantic_edges` (default False): the engine parses link footers
+  instead of calling the edge model.
 
 If adding a setting, add the typed default, environment mapping, runtime
 serialization behavior, UI control if user-facing, and a focused test. Keep
-secrets out of settings responses; app.py redacts them around lines 1805-1879.
+secrets out of settings responses; app.py redacts them.
 
 ## 4. Conversion, sync, and writer dispatch
 
-### Conversion: graph/convert.py
+### Conversion: graph/workspace/convert.py + parser_client.py
 
-- lines 1-16: imports and parser skip names.
-- lines 19-20: unsupported-document error.
-- lines 23-50: parser /parse HTTP request, multipart upload, parser headers,
-  timeout, and Markdown response validation.
-- lines 53-60: file stat key and raw target naming.
-- lines 62-127: mount scan, incremental conversion ledger, raw writes,
-  unsupported/failure handling, vanished-file cleanup, and raw Git commit.
+- `parser_client.py`: `parse_document` — the doc-parser `/parse` HTTP request
+  (multipart upload, model headers, timeout, Markdown response validation) and
+  `UnsupportedDocument`.
+- `convert.py`: `convert_mount` — mount scan, incremental conversion ledger,
+  raw writes, unsupported/failure handling, vanished-file cleanup, raw Git
+  commit.
 
-Change this file for parser request shape, mount exclusions, conversion caching,
-or conversion failure policy. Add/update tests/test_convert.py.
+Change these for parser request shape, mount exclusions, conversion caching, or
+conversion failure policy. Add/update tests/test_convert.py.
 
-### Git source tracking: graph/sync.py
+### Git source tracking: graph/sync.py (shim: graph/workspace/git_sync.py)
 
-- lines 1-27: Git helper types and identity.
-- lines 29-43: subprocess Git wrapper and repository initialization.
-- lines 45-67: HEAD/last_sha and raw commit helpers.
-- lines 70-90: A/M/D raw change planning.
-- lines 93-109: changed-hunk extraction.
-- lines 112-206: sync_raw orchestration:
-  - optional mount conversion;
-  - changed raw-file selection;
-  - deletion;
-  - wiki invalidation;
-  - wiki generation;
-  - GROWI publication;
-  - index regeneration;
-  - last_sha update.
-- lines 209 onward: status/progress and compatibility adapter behavior.
+- Git helper types, subprocess wrapper, repository initialization.
+- HEAD/last_sha and `commit_raw`.
+- `plan_changes`: A/M/D raw change planning; `changed_hunks`.
+- `sync_raw`: optional mount conversion; per change: on delete
+  `graph.linker.remove_document` **before** `rmtree`, then remote delete; on
+  modify, incremental invalidation; `write_wiki` (which runs the linker);
+  publication of the changed document; then publication of every document the
+  linker touched (`status: "L"` rows); index regeneration; last_sha update.
 
 Change this file when changing what counts as a source change or the order of
-conversion/writer/publication. The raw repository is a deliberate incremental
-ledger; do not bypass it with mtime-only graph ingestion.
+conversion/writer/linker/publication. The raw repository is a deliberate
+incremental ledger; do not bypass it with mtime-only graph ingestion.
 
-### Writer dispatch and publication: graph/writers.py
+### Writer dispatch and publication: graph/workspace/writer.py (shim: graph/writers.py)
 
-- lines 16-39: Settings -> WikiConfig conversion.
-- lines 42-67: wiki pipeline invocation.
-- lines 70-141: build_wiki_output; tabular format dispatch, wiki mode,
-  page mode, and chunk mode selection.
-- lines 144-158: staged docs/_planning publication.
-- lines 161-197: write one document, clean work output, publish, and stamp.
-- lines 200-224: source hash stamps and up-to-date checks.
-- lines 227-239: generated wiki index.
+- `wiki_config`: Settings -> WikiConfig.
+- `run_wiki`: wiki pipeline invocation.
+- `build_wiki_output`: tabular format dispatch, `wiki` mode
+  (`graph.wiki.pipeline` + `export_ingest_layout`), `chunks` mode
+  (`graph.wiki.legacy.run_chunk_pipeline`).
+- `publish_output`: staged `docs/*.md` + `_planning/` -> `wiki/<doc>/`,
+  preserving `_planning/{chunks,links,linker}.json` across a republish.
+- `write_wiki`: build -> publish local -> `run_linker` -> `write_source_stamp`;
+  returns `WriteResult(target, touched)`.
+- `run_linker`: writes a `disabled` marker when `wiki_linker_enabled` is off;
+  otherwise builds `ChatModelPort`/`Embedder` and calls
+  `graph.linker.link_document`.
+- `up_to_date`: source hash + `linker.json` status (`pending`/`failed` are
+  never up to date); `write_index`.
 
 If a new format or mode is needed, start here only to select it; put its
 algorithm in graph/formats or its own pipeline. Update tests/test_writers.py
@@ -424,72 +448,64 @@ or covered by ranges, generated text is checked, protected blocks are
 restored, and invalid pages are retried/fallbacked. Do not weaken validation
 to make a model response look better.
 
-### Legacy page/chunk modes
+### Chunks ingest mode: graph/wiki/legacy.py (shim: graph/chunk.py)
 
-- graph/pages.py lines 40-119: shelf/page/route/stitch models.
-- lines 128-382: chunk summaries and shelf planning.
-- lines 396-521: semantic routing and parked-chunk handling.
-- lines 537-613: page sizing and marker helpers.
-- lines 619-743: page assembly and output.
-- lines 744-856: chunk preservation and stitch operations.
-- lines 857-986: async/synchronous page pipeline entry points.
+The old concept-chunk writer, moved whole (`WIKI_INGEST_MODE=chunks`): concept
+split schemas and prompts, safe boundaries/fences/tables, partition validation
+and repair, enrichment, `docs/` + `_planning/{manifest,coverage,metadata}.json`
+output, `run_chunk_pipeline` / `arun_chunk_pipeline`. It keeps its own
+`make_llm`/`structured_ainvoke`; the writer passes the raw LangChain LLM
+(`ModelPort.llm`). Its output folder contract is the same as wiki mode, so the
+linker and GROWI publication work on it unchanged.
 
-- graph/chunk.py lines 57-153: historical chunk models.
-- lines 155-365: source/file/chunk utility functions.
-- lines 370-976: safe boundaries, tables, fences, and source windows.
-- lines 976-1075: LLM construction and structured invocation.
-- lines 1076-1204: concept split schemas.
-- lines 1231-1671: partition validation and repair.
-- lines 1721-2051: split prompts and concept planning.
-- lines 2052-2290: output/manifest rendering.
-- lines 2291-2551: enrichment and coverage metadata.
-- lines 2551-2625: rendered/source assertions.
-- lines 2626-2860: chunk pipeline entry points and async blocking bridge.
-
-Do not delete these modes merely because wiki mode is the current default; tests
-and existing callers still use them. Do not put new format logic into the
-legacy chunker.
+Do not put new format logic into the legacy chunker. The `pages` shelf mode
+(`graph/pages.py`) was deleted.
 
 ## 7. GROWI authority and synchronization
 
-### HTTP client and publication: graph/growi.py
+### HTTP client and publication: graph/growi/client.py
 
-- lines 19-38: GROWI API error and page models.
-- lines 40-128: HTTP client, authentication, request timeout, and retries.
-- lines 129-230: health, page fetch, pagination, create/update/delete.
-- lines 231-257: safe path segments, path construction, and team extraction.
-- lines 258-293: generated-page markers, source ranges, and publish-boundary
-  validation.
-- lines 294-325: generated-section merge and marker handling.
-- lines 326-363: page publication helpers.
-- lines 364-383: generated file canonical names and coverage.
-- lines 385-437: GrowiPublisher; local wiki document -> GROWI pages and
-  generated-page cleanup.
-- lines 438-524: legacy page sync compatibility.
-- lines 525-586: current folder-grouped GROWI diff sync.
-- lines 587-606: async callback and registry-page adapters.
+All GROWI code is in `graph/growi/client.py` (the former `graph/growi.py`);
+`paths.py`, `publisher.py` and `reverse_sync.py` re-export slices of it so the
+downstream port can copy only the shared names:
+
+- `GrowiAPIError`, `GrowiPage`, `GrowiClient`: HTTP client, authentication,
+  request timeout, retries, health, page fetch, pagination, create/update/delete.
+- `growi_segment`, `growi_path`, `team_of_path`, `assert_publish_path`:
+  safe path segments, path construction, team extraction, attach/own boundary.
+- `wrap_page`, `source_ranges`, `split_footer`, `wrap_links`,
+  `merge_marked_sections`: chunk-marked blocks. Every published page is the
+  generated body block (`<!-- chunk: <page-id> lines a-b hash:… -->`) followed
+  by the links block (`<!-- chunk: <page-id>-links hash:… -->`), always emitted
+  even when the footer is empty so a removed footer clears remotely.
+- `publish_pages`, `GrowiPublisher.publish_document` / `delete_document`:
+  one generated document -> GROWI, trash only owned pages.
+- `sync_growi_pages`, `registry_page`: engine-only reverse sync
+  (folder-grouped GROWI diff), re-exported by `reverse_sync.py` and guarded in
+  `graph/growi/__init__.py` so the downstream copy imports without it.
 
 Change this file for GROWI API shape, path boundaries, publication markers,
 remote deletion, or remote page grouping. Test client behavior in
 tests/test_growi_client.py, publication in tests/test_growi_publish.py,
 sync in tests/test_growi_sync.py, and routing separately.
 
-### Registry: graph/registry.py
+### Registry: graph/registry.py (shim: graph/growi/registry.py)
 
-- lines 18-39: GrowiConnection and GrowiPageIndex models.
-- lines 41-80: engine.sqlite schema and connection.
-- lines 82-115: WIKI_SECRET_KEY-derived token encryption/decryption.
-- lines 117-168: register/upsert validation.
-- lines 170-217: get/list/update/delete/public redacted summaries.
-- lines 219-263: remote-page ledger and sync cursor/error tracking.
+- GrowiConnection and GrowiPageIndex models.
+- engine.sqlite schema and connection.
+- WIKI_SECRET_KEY-derived token encryption/decryption.
+- register/upsert validation; get/list/update/delete/public redacted summaries.
+- remote-page ledger and sync cursor/error tracking.
 
 The registry is the durable connection/page ledger. Never log or return the
 decrypted API token. If changing fields, update the schema migration path and
 tests/test_registry.py plus tests/test_admin_connections.py.
 
-### Librarian: graph/librarian.py
+### Librarian: graph/librarian.py (shim: graph/knowledge/librarian.py)
 
-This is the write coordinator and graph ingestion implementation:
+This is the write coordinator and graph ingestion implementation. Line ranges
+below predate the reorganization and drift by a few dozen lines; use
+`rg -n '^    def '` to refresh.
 
 - lines 113-156: errors, document-ingest, and WriteJob models.
 - lines 157-200: job serialization and worker support types.
@@ -505,7 +521,7 @@ This is the write coordinator and graph ingestion implementation:
 - lines 1089-1190: search-item/vector bootstrap and cluster preparation.
 - lines 1195-1382: node update/delete, document delete, and exogenous node
   creation.
-- lines 1506-1657: ingest preparation, concurrent node processing, and linking.
+- lines 1506-1657: ingest preparation and concurrent node processing.
 - lines 1658-1737: legacy Markdown-output ingestion.
 - lines 1738-1854: chunk-and-ingest compatibility path.
 - lines 1855-1894: sync_raw job adapter; calls graph.sync.sync_raw and publishes
@@ -514,17 +530,26 @@ This is the write coordinator and graph ingestion implementation:
   page/table nodes and revises the graph.
 - lines 2019-2171: document revision matching, unchanged/superseded/stale
   decisions, and source versioning.
-- lines 2172-2420: one-node ingestion, vector storage, KNN candidates, and
-  semantic edges.
-- lines 2420-2635: search-item/KNN retrieval.
-- lines 2636-3221: derived fields, semantic edges, supersession, support,
-  references, clusters, neighborhoods, and structural edges.
+- lines 2172-2420: one-node ingestion and vector storage.
+- lines 2420-2635: search-item/KNN retrieval (still used by search).
+- lines 2636-3221: derived fields (summary/keywords/claims still come from the
+  model: search needs them), supersession, support, references, clusters,
+  neighborhoods, and structural edges. `_build_semantic_edges`,
+  `_link_entity_duplicates` and the bridge probe return immediately unless
+  `settings.engine_semantic_edges` is true.
+- `_footer_edges` (near the structural-edge helpers): parses each page's
+  `<!-- llm-wiki-links -->` footer with `graph.linker.render.parse_footer`,
+  resolves the peer by `source_path` (`GraphStore.get_node_by_source_path`),
+  and appends labelled edges in both directions to the document's structural
+  edges. Called from `ingest_md_output` and `sync_growi`.
 - lines 3222-end: cascades, reclustering, legacy loaders, planning-document
-  loaders, and chain edges.
+  loaders (`ingest_mode` `pages` or `wiki` manifests become `NodeType.page`),
+  and chain edges.
 
 When changing ingestion concurrency, keep the single SQLite write lock and
-snapshot/recovery behavior. When changing GROWI sync node typing, preserve the
-table marker check around lines 1908-1926 and source/team/version fields.
+snapshot/recovery behavior. The Librarian must not call the linker edge model;
+links are created once, by the writer. When changing GROWI sync node typing,
+preserve the table marker check and source/team/version fields.
 
 The important revision behavior is in lines 2019 onward:
 
@@ -700,7 +725,7 @@ logic and its layout classes; do not add a separate global layout manager.
 - remaining lines: static/service startup and runtime configuration.
 
 The parser's /parse endpoint and its PDF queue endpoints are different
-interfaces. graph/convert.py calls /parse; the PDF parser UI uses the PDF queue.
+interfaces. graph/workspace/parser_client.py calls /parse; the PDF parser UI uses the PDF queue.
 
 ### parser/Dockerfile
 
@@ -740,7 +765,7 @@ cd /mnt/common/Code/llm-wiki-dist/llm-wiki-dist
 .venv/bin/python -m unittest tests.test_writers tests.test_wiki_chunking tests.test_wiki_page tests.test_wiki_incremental
 .venv/bin/python -m unittest tests.test_growi_client tests.test_growi_publish tests.test_growi_sync tests.test_growi_routing tests.test_registry tests.test_admin_connections
 .venv/bin/python -m unittest tests.test_vectors tests.test_neighborhood tests.test_vocab
-.venv/bin/python -m unittest tests.test_pages_shelf tests.test_pages_router tests.test_pages_assemble tests.test_pages_stitch tests.test_pages_wire
+.venv/bin/python -m unittest tests.test_linker tests.test_boundaries
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ~~~
 Test module map:
@@ -755,12 +780,11 @@ Test module map:
   links.
 - test_wiki_incremental.py: same-line-count incremental invalidation and
   full-rewrite fallback.
-- test_page_settings.py: page-mode settings.
-- test_pages_shelf.py: shelf creation/finalization/size behavior.
-- test_pages_router.py: page routing decisions.
-- test_pages_assemble.py: page assembly and source markers.
-- test_pages_stitch.py: page stitch operations.
-- test_pages_wire.py: page schema serialization.
+- test_linker.py: linker end to end with a fake model/embedder — chunking,
+  metadata validation, first document, bilateral footers, free rerun,
+  removal, catalog rebuild from `_planning/`, mode mismatch, neo inline link,
+  publisher footer block.
+- test_boundaries.py: factory packages import without the knowledge engine.
 - test_growi_client.py: HTTP client request/auth/pagination/path operations.
 - test_growi_publish.py: generated page publication and cleanup markers.
 - test_growi_sync.py: remote page ledger, touched document grouping, revision,
@@ -790,9 +814,9 @@ developer's current data/ directory.
 
 Edit:
 
-1. graph/project.py, lines 9-20 for naming.
-2. graph/convert.py, lines 53-127 for conversion targets/ledger.
-3. graph/sync.py, lines 70-206 for Git change selection.
+1. graph/workspace/project.py for naming.
+2. graph/workspace/convert.py for conversion targets/ledger.
+3. graph/sync.py for Git change selection.
 4. tests/test_project.py and tests/test_convert.py.
 5. docs/RUNNING.md data-layout section.
 
@@ -829,8 +853,8 @@ Keep the query in-memory, SELECT-only, and bounded.
 Edit:
 
 1. graph/registry.py connection fields and validation.
-2. graph/growi.py path boundary/publication/sync helpers.
-3. graph/project.py only if local document paths change.
+2. graph/growi/client.py path boundary/publication/sync helpers.
+3. graph/workspace/project.py only if local document paths change.
 4. graph/librarian.py lines 1855-1973 for job integration.
 5. app.py lines 1028-1191 for admin API.
 6. tests/test_growi_*.py, test_registry.py, and routing tests.
@@ -844,7 +868,7 @@ Edit:
 1. graph/store.py search/vector/FTS operations.
 2. graph/librarian.py vector/search-item creation.
 3. graph/researcher.py candidate pool, reranking, evidence, and agent reads.
-4. graph/core.py settings/weights.
+4. graph/config.py settings/weights.
 5. app.py only for API parameters/serialization.
 6. frontend search/answer files only for display.
 
@@ -867,7 +891,7 @@ Edit:
 
 Edit:
 
-1. graph/core.py typed field and from_env mapping.
+1. graph/config.py typed field and from_env mapping.
 2. app.py settings endpoints/redaction.
 3. frontend/src/components/SettingsView.jsx form and patch builder.
 4. relevant writer/researcher consumer.
@@ -906,6 +930,11 @@ Keep explicit citation IDs and source-node normalization intact.
 - Do not expose API keys/tokens to frontend settings responses or logs.
 - Do not add an unbounded write endpoint outside the Librarian queue.
 - Do not make tests depend on the current real data/ or live services.
+- Do not create cross-document links anywhere but `graph/linker/`; the engine
+  parses footers, it never calls `EDGE_PROMPT`.
+- Do not patch a published page in place; change the edges and re-render from
+  `_planning/pages/`.
+- Do not put logic into a shim module (section 0); move the real code instead.
 
 ## 14. Refreshing this map
 
@@ -913,7 +942,7 @@ From the application directory:
 
 ~~~bash
 rg -n '^class |^def |^async def |^@app\\.' app.py graph parser/server.py
-rg -n '^class |^def |^async def ' graph/growi.py graph/registry.py graph/store.py graph/writers.py graph/formats/*.py graph/wiki/*.py graph/pages.py graph/chunk.py graph/researcher.py
+rg -n '^class |^def |^async def ' graph/growi/client.py graph/registry.py graph/store.py graph/workspace/*.py graph/formats/*.py graph/wiki/*.py graph/linker/*.py graph/researcher.py
 rg -n '^function |^const |^export |export default' frontend/src --glob '*.js' --glob '*.jsx'
 nl -ba path/to/file.py | sed -n 'start,endp'
 ~~~
@@ -924,42 +953,58 @@ After line-range changes, run the focused tests first, then:
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ~~~
 
-## 15. Pre-ingestion cross-document linker (`graph/wiki/linker.py`)
+## 15. Cross-document linker: graph/linker/
 
-Runs inside `writers.write_wiki` (mode `wiki`) after `publish_output` and before
-`write_source_stamp`, so `wiki_one.py` exercises it with no extra options.
-Full design and invariants live in `docs/LINKER.md`; this is the implemented reality.
+The only place links between documents are created. Called by
+`graph/workspace/writer.py::run_linker` after `publish_output` and before
+`write_source_stamp`; full contract in ORG_AND_PORT.md §7–§9.
 
-* One standalone SQLite catalog at `project.linker_database`
-  (`metadata/wiki-linker.sqlite`, plus WAL/SHM and `wiki-linker.lock`).
-  `LinkCatalog` is its only owner. It never opens `graph.sqlite`/`engine.sqlite`
-  and never imports Librarian/Researcher/GROWI.
-* Maps are reconstructed from writer artifacts only:
-  `_planning/manifest.json` (+`metadata.json`, `coverage.json`) joined with
-  `state/<doc>/state/plan.json` and `work/observations/live/*.json`; documents
-  without observation state get deterministic `derived`/`coverage_only` maps.
-* Candidate discovery: exhaustive per-document map scout (Lane A, required,
-  hash-cached in `map_comparisons`; a failed call is retried, never cached as
-  empty), FTS5+sqlite-vec RRF fusion, bridge-probe questions, optional rerank,
-  and one/two-hop traversal of `page_edges`. Retrieval only prioritizes; a
-  map-scout candidate is never dropped for a low score.
-* Research sends fully stripped page bodies; proposals must quote exact
-  evidence from both endpoints and pass the mechanical checks in
-  `validate_proposal` before the endpoint-only judge. Relation types are the
-  closed `LinkRelationType` literal; generic `related/similar` is impossible.
-* Edits are additive and marker-owned:
-  `<!-- llm-wiki-link:<pair>:start|end -->` blockquotes plus a
-  `<!-- llm-wiki-related:start|end -->` footer. Outside the markers files are
-  byte-for-byte unchanged; `strip_managed_links` is the exact inverse of the
-  renderer and raises on malformed markers.
-* Commit is bilateral: `link_runs` moves `researching → committing → complete`;
-  a crash mid-write is finished by `recover_pending_runs` on the next
-  invocation, and a caught error restores in-memory originals. The source
-  stamp is written only after linker success, and `writers.up_to_date` refuses
-  a `pending`/`failed` `wiki/<doc>/_planning/linker.json` marker.
-* `remove_document(project, raw_rel)` exists for raw-file deletion but is not
-  wired into `graph/sync.py` yet.
+| File | Owns |
+| --- | --- |
+| `__init__.py` | public API: `link_document`, `remove_document`, `LinkResult`, `LinkerCancelled`, `LinkerModeMismatch` |
+| `service.py` | `link_document` orchestration (below), `remove_document`, `_filter_groups` (one edge call per group of 4 candidates, decision cache) |
+| `chunks.py` | `split_page` (H2 split outside fences), `make_chunks`/`chunk_id`, `model_text` (nav footer stripped, images/big tables stripped, 12k chars), `validate_meta` (entities must occur verbatim; behaviours reference surviving entities; dedupe), `describe_all` (one `ChunkMeta` call per chunk under a semaphore, artifacts, fallback meta), `snapshot_originals`, `cache_by_hash`, `to_json` |
+| `catalog.py` | `Catalog`: `metadata/wiki-linker.sqlite` (documents, pages, chunks, `chunks_fts` **trigram**, `vec_*` sqlite-vec tables + JSON fallback, entities, behaviours, edges, `edge_decisions`), `lock` (flock), `sync_from_planning` (rebuild from every `_planning/chunks.json` + `links.json`), `reconcile` (unchanged/changed/new/removed chunks, drops edges of invalidated chunks, returns their peers), `restore_edges`, `embed_pending` (3 channels, per-batch fault tolerance, 4000-char cap, model/dimension change resets vectors), `fts_search`, `vec_search`, `entity_chunks`, `behaviour_*`, `edges_for_page`, `write_links_json`, `delete_document`, `stored_mode` |
+| `legacy.py` | `Candidate`, `rrf_fuse`, `candidates` = the old `Librarian._knn_candidates` + `_bridge_candidate_ids` on the catalog (`LEGACY_K=50`, `MAX_FUSED_CANDIDATES=16`, `BRIDGE_CANDIDATE_CAP=5`, `EDGE_GROUP_SIZE=4`) |
+| `neo.py` | `candidates`: unique definer ⇄ users (programmatic, `MAX_USERS_PER_DEFINITION=12`), `NEO_SIMILAR_K=5` similar chunks (programmatic), behaviour hops 1–3 minus the RRF top-16 (`HOP1_MAX=8`, `HOP2_MAX=8`, `HOP3_MAX=4`) for the model |
+| `render.py` | `render_page(original, edges, mode)` (pure), `footer_edges` (one line per peer page/reason, ≤5 similar, ≤30 total), `display`/`peer_defines` (define/use edges read from each page's side; inline `link_titles` targets in neo mode), `parse_footer` (inverse, used by the engine), `relative_link`, `write_if_changed` |
+| `prompts.py` | `CHUNK_META_VERSION`, `EDGE_VERSION_LEGACY`, `EDGE_VERSION_NEO`, `chunk_meta_prompt` (composed from the legacy SUMMARY/KEYWORD/CLAIM/BRIDGE_PROBE prompts + entity/behaviour rules), `legacy_edge_messages` (`EDGE_PROMPT` + output-language rule), `neo_edge_messages` (`NEO_EDGE_PROMPT`) |
+| `wire.py` | `ChunkMeta`, `ChunkEntity`, `ChunkBehaviour`, `EdgeSuggestion(s)`, `NeoEdgeSuggestion(s)`, `NeoLabel` |
+| `__main__.py` | `python -m graph.linker status | relink <doc> | rebuild --mode m [--no-edges]` |
 
-Tests: `tests/test_wiki_linker.py` (maps, lanes, validation, renderer,
-commit/recovery, writer integration, and the deterministic A/B/C/D smoke
-corpus proving a retrieval-missed link is still found).
+`link_document(project, rel, model, embedder, settings)` in order: pending
+marker → lock → `Catalog.open` (mode mismatch is an error) → `sync_from_planning`
+for other documents → `snapshot_originals` → `make_chunks` → reuse metadata by
+text hash (`chunks.json`, then catalog rows) → `reconcile` → `describe_all` for
+new/changed chunks (all chunks when the previous marker was not `complete`) →
+write `chunks.json` → `upsert_chunks` + `restore_edges(links.json)` →
+`embed_pending` → mode `candidates` per chunk → programmatic edges and cached
+decisions → `_filter_groups` for the rest → insert edges → render every page of
+this document and of every peer that gained/lost an edge → `links.json` for all
+documents involved → complete marker → `LinkResult(touched_documents, …)`.
+
+Invariants to keep:
+
+- the published page is always `render(original, edges)`; never read a
+  published page to compute anything;
+- one metadata call per chunk, one edge call per group of four; no other model
+  calls;
+- every edge is written to both documents' `links.json` and rendered on both
+  pages or neither;
+- a document deleted from the catalog cascades to its chunks/edges; collect the
+  peers **before** deleting so they can be re-rendered (`delete_document`).
+
+Tests: `tests/test_linker.py` (fake model/embedder), `tests/test_boundaries.py`.
+Live behaviour and timings are recorded in RUNNING.md §20.
+
+## 16. Downstream publisher: llm-wiki-air
+
+`llm-wiki-air/` mirrors this folder's layout: `graph/` is a byte-for-byte copy
+of the factory allowlist (`graph/config.py`, `graph/common/`,
+`graph/clients/{chat,embeddings}.py`, `graph/formats/`, `graph/wiki/`,
+`graph/linker/`, `graph/workspace/{project,parser_client,convert,writer}.py`,
+`graph/growi/{__init__,client,paths,publisher}.py`); `publisher/` (ledger,
+scanner, pipeline) and `main.py` are downstream-only; `data/` is the runtime
+root (`mount/ raw/ wiki/ metadata/`). Copying is done by hand (or by an agent)
+after upstream changes to those files — there is no sync script. See
+ORG_AND_PORT.md §12.

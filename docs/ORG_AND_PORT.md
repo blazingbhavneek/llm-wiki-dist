@@ -1,12 +1,36 @@
 # Neo organization, one-phase linker, and minimal GROWI publisher port
 
-Status: implementation plan. It replaces `docs/LINKER.md` (deleted) and the previous
-version of this document. The four older plans (`PLAN_SYNC`, `PLAN_FORMATS`, `PLAN_GROWI`,
-`PLAN_NEO`) stay as history; where they disagree with this document, this document wins.
+Status: implemented and live-tested on 2026-09-14 (full suite: 202 tests OK; legacy and neo
+modes exercised against local gemma-4-12B / ruri-v3, see `docs/RUNNING.md` §20). The
+deviations from the plan are listed below; everything else in this document remains the
+contract. It replaces `docs/LINKER.md` (deleted) and the previous version of this document.
+The four older plans (`PLAN_SYNC`, `PLAN_FORMATS`, `PLAN_GROWI`, `PLAN_NEO`) stay as history;
+where they disagree with this document, this document wins.
 
-The current repository (`llm-wiki-dist`) remains the source of truth until every gate in
-this plan passes. The downstream target is a new sibling folder under
-`/home/seigyo/c_repo/bhavneek/llm-wiki-air/`; its working name is `wiki-publisher/`.
+Implementation status (exact file map in `docs/DEV.md` §0):
+
+- §6 tree: the factory packages (`common`, `clients`, `workspace`, `wiki`, `linker`,
+  `growi`) exist with real code. `graph/config.py` holds the whole former `core.py`
+  (Settings plus engine models/prompts/helpers), not Settings alone. `graph/growi/client.py`
+  holds the whole former `growi.py`; `paths/publisher/reverse_sync/registry` are re-export
+  shims. `graph/knowledge/*` are re-export shims over the unmoved engine modules
+  (`graph/librarian.py`, `graph/store.py`, …). Physical moves of those can follow as pure
+  `git mv` commits; nothing depends on them.
+- §8 linker: implemented as specified in `graph/linker/` (`service.py` holds
+  `link_document`), with `chunks_fts` using the `trigram` tokenizer (unicode61 cannot
+  match inside Japanese runs), a 4000-character cap on embedding input, per-batch
+  embedding fault tolerance, and define/use footer lines rendered from each page's side.
+- §10 engine: semantic-edge, bridge-probe and entity-dedup calls are gated off by
+  `engine_semantic_edges=False` (raising if turned on) rather than deleted;
+  `_footer_edges` is implemented and tested.
+- §12 downstream: `llm-wiki-air` exists with `publisher/{ledger,scanner,
+  pipeline}.py` and `main.py` (allowlist copied by hand, no sync script); its own test suite
+  (§12.10 P2–P9) is still to be written.
+- Structured model calls send `enable_thinking: false` (3× faster on gemma-4); the chunk
+  writer's private copy in `graph/wiki/legacy.py` is unchanged.
+
+The current repository (`llm-wiki-dist`) remains the source of truth. The downstream target
+is the local sibling folder `llm-wiki-air/`.
 
 Written for an implementer working one work package at a time. Where this document gives
 code, type that code. Where it says delete, delete. If a snippet cannot fit the real file
@@ -42,7 +66,7 @@ Two products live in `graph/`:
 2. a **knowledge engine**: GROWI pages → SQLite graph/FTS/vectors → Librarian/Researcher
    queries.
 
-The full product (`llm-wiki-dist`) has both. The minimal product (`wiki-publisher`) has only
+The full product (`llm-wiki-dist`) has both. The minimal product (`llm-wiki-air`) has only
 the factory, and a cloud model reads GROWI directly. Because the minimal product has no
 engine, everything a reader needs — including links — must be produced by the factory and
 must be visible in the page Markdown. That is why linking moves to wiki creation (D-2) and why
@@ -219,7 +243,7 @@ them) and stops building semantic edges (D-2).
 
 ```text
 llm-wiki-dist/
-  wiki_one.py            CLI: one raw file -> wiki -> links               shared
+  main.py                CLI: check/serve/mcp/convert/wiki/sync/index/link  shared shape
   app.py                 FastAPI                                          engine only
   mcp_server.py          MCP proxy                                        engine only
 
@@ -306,7 +330,7 @@ llm-wiki-dist/
   docs/                  DEV.md RUNNING.md ORG_AND_PORT.md (this file) + historical plans
 ```
 
-`app.py`, `mcp_server.py`, `wiki_one.py` are adapters: imports and argument handling only.
+`app.py`, `mcp_server.py`, `main.py wiki` are adapters: imports and argument handling only.
 
 ### 6.1 Import direction
 
@@ -1295,7 +1319,7 @@ Commit after every work package: `neo-org WP-N: <goal line>`.
 1. `git status` clean, on branch `neo-hardcoded`.
 2. Run the whole suite; record failures (expected none besides linker tests that will be
    deleted).
-3. Generate one small fixture through `wiki_one.py` with the fake model used by
+3. Generate one small fixture through `main.py wiki` with the fake model used by
    `tests/test_writers.py`; save SHA-256 of every file under its `wiki/<doc>/` and
    `_planning/` to `tests/fixtures/baseline-hashes.json`. These must not change through
    WP-2..WP-7.
@@ -1327,10 +1351,10 @@ Files: deletions plus the minimum edits that keep imports valid.
 9. `app.py` / frontend `SettingsView.jsx`: remove the `pages` option and `page_*` controls.
 10. `docs/DEV.md` §15 and `docs/RUNNING.md` §20: replace with one line "cross-document
     linker: see ORG_AND_PORT.md §8; being rebuilt".
-11. `rg -n "linker|LINKER|pages_pipeline|page_min_chunks" graph app.py wiki_one.py tests`
+11. `rg -n "linker|LINKER|pages_pipeline|page_min_chunks" graph app.py main.py wiki tests`
     must show only this document's references and the temporary `disabled` marker.
 
-**Verify:** whole suite green; `wiki_one.py` runs end to end and writes a `disabled` marker;
+**Verify:** whole suite green; `main.py wiki` runs end to end and writes a `disabled` marker;
 baseline hashes unchanged for `wiki/<doc>/*.md`.
 
 ### WP-2 — Extract shared primitives (moves only)
@@ -1370,7 +1394,7 @@ baseline hashes unchanged.
 2. `graph/core.py`: `from .config import Settings` re-export.
 3. `tests/test_config.py`: every env name and default in a table; `WIKI_LINKER_MODE=neo`
    parses; `WIKI_INGEST_MODE=pages` raises.
-4. `wiki_one.py`, `app.py`: import `Settings` from `graph.config`.
+4. `main.py wiki`, `app.py`: import `Settings` from `graph.config`.
 
 **Verify:** importing `graph.config` does not import `langchain`, `torch`, `fastapi`.
 
@@ -1384,7 +1408,7 @@ baseline hashes unchanged.
 4. `git mv graph/writers.py graph/workspace/writer.py`.
 5. Re-export shims: `graph/project.py`, `graph/convert.py`, `graph/sync.py`,
    `graph/writers.py` (imports + `__all__` only).
-6. Update imports in `app.py`, `wiki_one.py`, `graph/librarian.py`, `graph/cli.py`, tests.
+6. Update imports in `app.py`, `main.py wiki`, `graph/librarian.py`, `graph/cli.py`, tests.
 
 **Verify:** `tests.test_project tests.test_convert tests.test_sync tests.test_writers`
 green; baseline hashes unchanged.
@@ -1439,7 +1463,7 @@ tests.test_realtime tests.test_ask_realtime tests.test_ingestion_concurrency` gr
 6. `tests/test_ingestion_concurrency.py`: change `from graph import chunk` to
    `from graph.wiki import legacy as chunk`; nothing else.
 
-**Verify:** `wiki_one.py` with `WIKI_INGEST_MODE=chunks` produces `wiki/<doc>/NNN-*.md` and
+**Verify:** `main.py wiki` with `WIKI_INGEST_MODE=chunks` produces `wiki/<doc>/NNN-*.md` and
 `_planning/`; `WIKI_INGEST_MODE=wiki` output hashes match baseline.
 
 ### WP-8 — Linker package, legacy mode, writer hook, publication
@@ -1509,7 +1533,7 @@ def run_linker(project, rel, *, settings, llm, embedder, on_progress, stop_check
    `up_to_date` unchanged except it reads `schema_version` 2 markers (`disabled` and
    `complete` are up to date; `pending`/`failed` are not; no marker = legacy output, up to
    date). `write_wiki` now returns `WriteResult` instead of `Path`; update its three callers
-   (`workspace/git_sync.py`, `wiki_one.py`, `tests/test_writers.py`) in the same commit.
+   (`workspace/git_sync.py`, `main.py wiki`, `tests/test_writers.py`) in the same commit.
 8. `workspace/git_sync.py`: §9.2. `growi/publisher.py`: §9.1. Tests: `test_sync` gains
    "touched document is published"; `test_growi_publish` gains "footer becomes its own
    block", "empty footer emits an empty links block", "body block unchanged when only the
@@ -1526,7 +1550,7 @@ def run_linker(project, rel, *, settings, llm, embedder, on_progress, stop_check
    - `WIKI_LINKER_MODE=neo` against a `legacy` catalog → `LinkerModeMismatch`;
    - cancellation mid-meta → marker `failed`, `up_to_date` false, rerun completes.
 
-**Verify:** all of the above; `wiki_one.py` on two real small documents produces reciprocal
+**Verify:** all of the above; `main.py wiki` on two real small documents produces reciprocal
 footers (record the run in `docs/RUNNING.md` §20).
 
 ### WP-9 — Neo mode
@@ -1561,7 +1585,7 @@ graph/knowledge` → no hits.
    `graph/writers.py`, `graph/chunk.py`, `graph/core.py`, `graph/gateway.py`,
    `graph/growi.py`, `graph/registry.py`, `graph/librarian.py` …) after `rg` shows no
    internal importer.
-2. `wiki_one.py`: imports `graph.config`, `graph.workspace.project`, `graph.workspace.writer`,
+2. `main.py wiki`: imports `graph.config`, `graph.workspace.project`, `graph.workspace.writer`,
    `graph.formats`, `graph.wiki.model` only; prints `touched` documents.
 3. `docs/DEV.md`: rewrite the file map for the new tree; §15 becomes "Linker" pointing to
    this document's §7–§9. `docs/RUNNING.md`: env table (§8.13), `python -m graph.linker`
@@ -1573,7 +1597,7 @@ graph/knowledge` → no hits.
 1. Whole suite green.
 2. `tests/test_boundaries.py` green.
 3. Baseline hashes for wiki-mode page bodies **above the footer** unchanged.
-4. `wiki_one.py` on three real documents (A, unrelated C, B related to A) in `legacy` mode:
+4. `main.py wiki` on three real documents (A, unrelated C, B related to A) in `legacy` mode:
    reciprocal footers, rerun is a no-op, `rebuild --mode neo` converts and produces inline
    links; record calls and wall time in `docs/RUNNING.md`.
 5. App startup builds the engine; `sync_growi` ingests footer edges; no `EDGE_PROMPT`
@@ -1582,30 +1606,30 @@ graph/knowledge` → no hits.
 
 ---
 
-## 12. Downstream port — `llm-wiki-air/wiki-publisher`
+## 12. Downstream port — `llm-wiki-air`
 
-Create only after WP-12 passes.
+The local target is created here after the upstream port work; its shared files are kept in
+sync by copying the allowlist by hand (no sync script).
 
 ### 12.1 Structure
 
 ```text
-/home/seigyo/c_repo/bhavneek/llm-wiki-air/
-  doc-parser/                       existing separate service
-  wiki-publisher/
-    README.md  pyproject.toml  uv.lock  .env.example
-    graph/                          copied folders, byte-identical
-      __init__.py  config.py
-      common/  clients/  formats/  wiki/  linker/
-      workspace/   __init__.py  project.py  parser_client.py  convert.py  writer.py
-      growi/       __init__.py  client.py  paths.py  publisher.py
-    publisher/
-      __init__.py  cli.py  ledger.py  scanner.py  pipeline.py
-    tools/sync_upstream.py
-    tests/
-      test_boundaries.py  test_ledger.py  test_scanner.py  test_parser_client.py
-      test_pipeline.py  test_publish.py  test_sync_parity.py
-      test_wiki_*.py  test_linker_*.py  test_common.py  test_config.py   (copied)
-    data/                           runtime, ignored by Git
+llm-wiki-air/                       same shape as the full product's app folder
+  README.md  pyproject.toml  uv.lock  .env.example  .gitignore
+  graph/                            copied folders, byte-identical
+    __init__.py  config.py
+    common/  clients/  formats/  wiki/  linker/
+    workspace/   __init__.py  project.py  parser_client.py  convert.py  writer.py
+    growi/       __init__.py  client.py  paths.py  publisher.py
+  publisher/
+    __init__.py  cli.py  ledger.py  scanner.py  pipeline.py
+  main.py                           check | sync | watch | wiki | publish | link
+  tests/
+    test_boundaries.py  test_ledger.py  test_scanner.py  test_parser_client.py
+    test_pipeline.py  test_publish.py  test_sync_parity.py
+    test_wiki_*.py  test_linker_*.py  test_common.py  test_config.py   (copied)
+  data/                             runtime (mount/ raw/ wiki/ metadata/), ignored by Git;
+                                    doc-parser stays a separate service
 ```
 
 Keep the `graph` namespace; renaming it buys nothing.
@@ -1636,7 +1660,7 @@ reads (§12.3).
 `WIKI_EMBED_DIM`, `GROWI_URL`, `GROWI_TOKEN`, `GROWI_WRITE_PATH`, `GROWI_ROOT_PATH`,
 `GROWI_MODE`, `GROWI_TIMEOUT`, `PUBLISHER_INTERVAL_SECONDS`. Use the exact names
 `Settings.from_env` already reads for the shared ones; add the `GROWI_*`/`PUBLISHER_*`
-ones in `publisher/cli.py`.
+ones in `main.py`.
 
 ### 12.4 Data contract
 
@@ -1724,8 +1748,8 @@ row unchanged and the whole document retries next run.
 ### 12.8 Runner
 
 ```text
-python -m publisher.cli sync-once            # one reconciliation, non-zero on partial/failed
-python -m publisher.cli run --interval 60    # loop; SIGTERM/SIGINT between documents
+python main.py sync                          # one reconciliation, non-zero on partial/failed
+python main.py watch --interval 60           # loop; SIGTERM/SIGINT between documents
 python -m graph.linker rebuild --mode neo    # same command as upstream
 ```
 
@@ -1734,10 +1758,9 @@ exception class/message. Never tokens, prompts, pages, base64.
 
 ### 12.9 Keeping both repositories in sync
 
-`tools/sync_upstream.py --source <upstream>/llm-wiki-dist --check|--apply`: explicit
-allowlist (§12.2), byte comparison, copies only allowlisted paths, records the upstream
-commit SHA in `tools/upstream.json`, never deletes downstream-only files. No submodules, no
-shared package yet.
+The allowlist (§12.2) is copied by hand (or by an agent) after upstream changes:
+copy only allowlisted paths, verify with `diff -r`, never delete downstream-only files.
+No sync script, no submodules, no shared package yet.
 
 ### 12.10 Downstream work packages
 
@@ -1747,7 +1770,7 @@ shared package yet.
 | P1 | copy allowlist + upstream tests | copied `test_wiki_*`, `test_linker_*`, `test_common`, `test_config` green unchanged |
 | P2 | ledger + scanner | unchanged scan is a no-op; rename = delete + add; corrupt ledger stops; lock contention exits |
 | P3 | parser client integration | 415/5xx/timeout/invalid JSON/heartbeat/source race covered; last good raw kept |
-| P4 | `write_wiki` call site (both ingest modes) | same local layout as upstream `wiki_one.py` |
+| P4 | `write_wiki` call site (both ingest modes) | same local layout as upstream `main.py wiki` |
 | P5 | linker exercised | two-document run yields reciprocal footers; `remove_document` cleans the peer; no `knowledge` import |
 | P6 | one-way GROWI replacement | only owned pages touched; `.md` path test; 409 retry; partial failure dirty |
 | P7 | publication sweep | X new, Y touched → both published; crash after Y publishes retries only X |
@@ -1779,7 +1802,7 @@ Normalize only timestamps and run ids in parity comparisons; never page bytes.
 
 1. Start doc-parser; `GET /health`.
 2. Configure chat + embedding endpoints (reranker not needed).
-3. `mount/team-smoke/A.docx` → `sync-once` (downstream) or `wiki_one.py` (upstream):
+3. `mount/team-smoke/A.docx` → `main.py sync` (downstream) or `main.py wiki` (upstream):
    `_planning/pages/`, `chunks.json`, `linker.json complete`, no footer (first document).
 4. Add `B.docx` that uses a term `A` defines → run: A and B both have a footer, B's footer
    entry points at A's page; in neo mode B's first mention is an inline link.
@@ -1825,7 +1848,7 @@ Current repository:
 
 Downstream:
 
-- [ ] only the allowlist is copied and byte-identical (`sync_upstream --check` clean).
+- [ ] only the allowlist is copied and byte-identical (`diff -r` against upstream clean).
 - [ ] no Git, no `graph.sqlite`, no `knowledge` import.
 - [ ] add/change/delete without Git; parser failures retry-safe.
 - [ ] linker complete and bilateral; publication sweep republishes touched documents.

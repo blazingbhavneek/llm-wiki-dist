@@ -46,12 +46,12 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel, Field, field_validator
 
-from graph.core import Settings
-from graph.gateway import ModelGateway
-from graph.librarian import Librarian, job_to_dict
-from graph.researcher import AgentStopped, Researcher
-from graph.store import GraphStore
-from graph.project import RESERVED_TEAMS, Project
+from graph.config import Settings
+from graph.knowledge.gateway import ModelGateway
+from graph.knowledge.librarian import Librarian, job_to_dict
+from graph.knowledge.researcher import AgentStopped, Researcher
+from graph.knowledge.store import GraphStore
+from graph.workspace.project import RESERVED_TEAMS, Project
 from fastapi.staticfiles import StaticFiles
 
 log = logging.getLogger("app")

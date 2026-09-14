@@ -57,5 +57,5 @@ class ExportTests(unittest.TestCase):
             manifest = json.loads(
                 (dest / "_planning" / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["planning"]["ingest_mode"], "pages")
+            self.assertEqual(manifest["planning"]["ingest_mode"], "wiki")
             self.assertEqual(manifest["files"][0]["judge_score"], 95)

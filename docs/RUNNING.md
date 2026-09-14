@@ -1,13 +1,16 @@
 # Running LLM-Wiki
 
 This is the operator guide for the current repository. It describes the
-implemented data-root, GROWI, format-aware wiki, and graph-ingestion flow.
+implemented data-root, format-aware wiki writer, cross-document linker, GROWI
+publication, and graph-ingestion flow.
 
 The short version is:
 
 ~~~text
 mounted files -> parser -> raw Markdown + raw Git commit
-             -> wiki writer -> data/wiki + GROWI pages
+             -> wiki writer -> data/wiki (pristine pages)
+             -> linker      -> footers + inline links on this AND older documents
+             -> GROWI publish (changed documents + documents the linker touched)
              -> GROWI sync -> graph.sqlite nodes/edges/FTS5/sqlite-vec
              -> scoped search/research/UI/MCP
 ~~~
@@ -20,10 +23,9 @@ database for this phase.
 
 For design rationale and phase details, see:
 
-- PLAN_SYNC.md
-- PLAN_FORMATS.md
-- PLAN_GROWI.md
-- PLAN_NEO.md
+- ORG_AND_PORT.md — package layout, the linker (legacy/neo modes), and the
+  minimal `llm-wiki-air` port; the current plan of record.
+- PLAN_SYNC.md, PLAN_FORMATS.md, PLAN_GROWI.md, PLAN_NEO.md — historical.
 
 ## 1. Repository locations
 
@@ -129,9 +131,14 @@ WIKI_RERANK_MODEL=your-reranker-model
 # Parser; leave empty only when raw Markdown is supplied manually.
 WIKI_PARSER_BASE_URL=http://127.0.0.1:8003
 
-# Writer mode
+# Writer mode: wiki (lossless section rewrite) or chunks (old concept chunker)
 WIKI_INGEST_MODE=wiki
 WIKI_OUTPUT_LANGUAGE=Japanese (日本語)
+
+# Cross-document linker (runs inside the writer; see section 20)
+WIKI_LINKER_ENABLED=1
+WIKI_LINKER_MODE=legacy
+WIKI_LINKER_CONCURRENCY=0
 ~~~
 
 The names used in the checked-in local configuration may differ from the
@@ -160,16 +167,20 @@ OpenAI-compatible HTTP APIs; they are not GROWI credentials.
 
 ### Useful runtime settings
 
-The full mapping is in graph/core.py, Settings.from_env, approximately lines
-187-348. The settings most often changed by operators are:
+The full mapping is in graph/config.py, Settings.from_env. The settings most
+often changed by operators are:
 
 | Variable | Purpose |
 | --- | --- |
-| WIKI_INGEST_MODE | chunks, pages, or wiki for ordinary Markdown/documents |
-| WIKI_PAGE_STITCH | Allow the page writer to stitch related page fragments |
+| WIKI_INGEST_MODE | wiki (default) or chunks for ordinary Markdown/documents |
+| WIKI_LINKER_ENABLED | 0 skips the cross-document linker (writes a disabled marker) |
+| WIKI_LINKER_MODE | legacy (RRF + edge prompt) or neo (entities/behaviours); one per data root |
+| WIKI_LINKER_CONCURRENCY | Concurrent linker metadata/edge calls; 0 follows WIKI_REWRITE_CONCURRENCY |
+| WIKI_ENGINE_SEMANTIC_EDGES | 1 re-enables the engine's own model-built edges (off; links come from the writer) |
 | WIKI_SECTION_TARGET_LINES | Target size of a wiki section rewrite |
 | WIKI_WRITE_ATTEMPTS | Writer validation/retry count |
 | WIKI_REWRITE_CONCURRENCY | Concurrent section rewrite calls |
+| WIKI_REQUEST_TIMEOUT | Seconds per wiki/linker model call (default 300); raise it for slow local models, a timed-out call is retried by the caller's attempt budget |
 | WIKI_STRUCTURE_TARGET_LINES | Format-aware structural page target |
 | WIKI_STRUCTURE_MIN_LINES | Minimum structural page size |
 | WIKI_SLIDE_DELIMITER | PPTX-to-Markdown slide delimiter |
@@ -226,18 +237,24 @@ data/
 │       └── docx/Input1.docx/
 │           ├── 001-*.md
 │           └── _planning/
+│               ├── metadata.json coverage.json manifest.json source.json
+│               ├── pages/           pre-link originals (the linker renders from these)
+│               ├── chunks.json      per-section metadata (summary/keywords/claims/entities)
+│               ├── links.json       every edge touching this document
+│               └── linker.json      linker status: pending|complete|failed|disabled
 ├── metadata/
 │   ├── convert.json                mount conversion ledger
 │   ├── last_sha                    last raw Git commit consumed
 │   ├── state/                       resumable writer state
 │   └── work/                        temporary writer output
-├── graph.sqlite                    derived nodes/edges/search/vectors
+├── graph.sqlite                    derived engine nodes/edges/search/vectors
+├── metadata/wiki-linker.sqlite     rebuildable linker catalog
 ├── graph.sqlite-wal                transient SQLite WAL, if present
 ├── graph.sqlite-shm                transient SQLite shared memory, if present
 └── engine.sqlite                   encrypted GROWI registry and page ledger
 ~~~
 
-The path rules are implemented in graph/project.py:
+The path rules are implemented in graph/workspace/project.py:
 
 - A mounted Input1.docx becomes raw/.../Input1_docx.md.
 - The raw name Input1_docx.md maps to the wiki folder Input1.docx.
@@ -554,7 +571,7 @@ mkdir -p /mnt/common/Code/llm-wiki-dist/data/raw/test/md
 cp notes.md /mnt/common/Code/llm-wiki-dist/data/raw/test/md/notes.md
 cd /mnt/common/Code/llm-wiki-dist/llm-wiki-dist
 .venv/bin/python -c \
-  'from graph.project import Project; from graph.sync import commit_raw; commit_raw(Project("/mnt/common/Code/llm-wiki-dist/data"), "manual raw Markdown")'
+  'from graph.workspace.project import Project; from graph.workspace.git_sync import commit_raw; commit_raw(Project("/mnt/common/Code/llm-wiki-dist/data"), "manual raw Markdown")'
 ~~~
 
 Then call /api/sync. For a source named notes.docx, the expected raw name is
@@ -570,9 +587,9 @@ cd /mnt/common/Code/llm-wiki-dist/llm-wiki-dist
 set -a; source .env; set +a
 .venv/bin/python - <<'PY'
 from pathlib import Path
-from graph.convert import convert_mount
-from graph.core import Settings
-from graph.project import Project
+from graph.config import Settings
+from graph.workspace.convert import convert_mount
+from graph.workspace.project import Project
 
 settings = Settings.from_env()
 project = Project(Path(settings.data_root)).ensure()
@@ -585,14 +602,13 @@ with the API sync to generate wiki pages, publish GROWI, and update the graph.
 
 ## 11. Wiki generation and ingest modes
 
-The writer dispatch is in graph/writers.py:
+The writer dispatch is in graph/workspace/writer.py:
 
 - wiki: the lossless section-wise writer in graph/wiki/pipeline.py. It
   observes overlapping windows, compiles a source-covering seed plan, rewrites
   sections, restores protected images, validates coverage, and writes
   references/navigation/index metadata.
-- pages: the shelf/router/stitch pipeline in graph/pages.py.
-- chunks: the historical concept/chunk writer in graph/chunk.py.
+- chunks: the historical concept/chunk writer in graph/wiki/legacy.py.
 - xlsx and csv: format-aware tabular generation in
   graph/formats/tabular.py. Format dispatch happens before ordinary mode
   dispatch, so tabular files use the table pipeline even when the default mode
@@ -615,15 +631,47 @@ data/wiki/test/docx/Input1.docx/
 The writer deletes temporary metadata/work output after publication. Resumable
 per-document state remains under metadata/state.
 
+After local pages are published, `graph/linker/` (section 20) copies them to
+`_planning/pages/`, describes every `##` section once, links sections across
+documents of the same team, and rewrites the published pages of this document
+and of every older document that gained or lost a link. Only then is
+`source.json` stamped; a failed linker leaves the document not up to date, and
+the next sync retries it.
+
+To generate one document without the app or GROWI:
+
+~~~bash
+cd /mnt/common/Code/llm-wiki-dist/llm-wiki-dist
+set -a; source .env; set +a
+.venv/bin/python main.py wiki test/docx/Input2_docx.md
+~~~
+
+`main.py wiki` takes several paths, `--from-file list.txt`, or `--all`
+(skips up-to-date documents unless `--force`); `--mode wiki|chunks`,
+`--linker legacy|neo|off` and `--timeout` override the `.env` values for that
+run. The last line prints the published folder and `touched=[...]`, the raw
+paths of older documents whose pages changed because of reciprocal links.
+`python main.py -h` lists every command; `../commands.md` is the cheat sheet.
+
 ## 12. GROWI publication and graph ingestion
 
 After a raw change, sync_raw does the following for each changed Markdown file:
 
-1. Deletes or invalidates old local wiki/state output when needed.
-2. Generates the new local wiki folder.
-3. Publishes generated pages below the registered GROWI write_path.
-4. Deletes only pages previously marked as generated and no longer present.
-5. Rebuilds wiki/index.md.
+1. For a deleted file, first removes its links from every peer page
+   (`graph.linker.remove_document`), then deletes local wiki/state output.
+2. Deletes or invalidates old local wiki/state output when needed.
+3. Generates the new local wiki folder and runs the linker.
+4. Publishes generated pages below the registered GROWI write_path.
+5. Deletes only pages previously marked as generated and no longer present.
+6. Publishes every older document the linker touched (status `L` in the job
+   result), so reciprocal footers reach GROWI.
+7. Rebuilds wiki/index.md.
+
+Each GROWI page carries two chunk-marked blocks: the generated body
+(`<!-- chunk: page... -->`) and the links footer (`<!-- chunk: page...-links -->`).
+A footer-only change replaces only the `-links` block, so human edits inside
+the body block survive it. A `neo`-mode inline link is part of the body and
+does replace the body block.
 
 Then sync_growi:
 
@@ -634,7 +682,10 @@ Then sync_growi:
 4. Fetches the full changed document folder.
 5. Creates or revises page nodes, recognizing table pages as table nodes from
    the table-spec marker.
-6. Rebuilds chain/structural relationships and derived fields.
+6. Rebuilds chain/structural relationships and derived fields, and parses the
+   page's links footer into labelled edges (both directions). The engine no
+   longer asks a model for edges; `WIKI_ENGINE_SEMANTIC_EDGES=1` is the only
+   way to re-enable that path.
 7. Stores FTS5 text and sqlite-vec embeddings in graph.sqlite.
 8. Marks old node versions stale/superseded and cascades dependent graph work
    when a document changed.
@@ -888,6 +939,11 @@ Use this only when the application is stopped or when the target is not being
 written by an active job. The next sync regenerates raw-derived wiki output,
 publishes it to GROWI, and then indexes it.
 
+Regeneration keeps `_planning/chunks.json`, `links.json` and `linker.json`, so
+unchanged sections are not described again and unchanged links are restored
+without model calls. `_planning/pages/` is re-snapshotted from the fresh
+pristine pages. Deleting `metadata/wiki-linker.sqlite` is always safe (section 20).
+
 ### Reconvert all mount files
 
 If raw output was deleted or corrupted, also remove metadata/convert.json
@@ -935,7 +991,7 @@ git add test/docx/Input1_docx.md
 git -c user.name=llm-wiki -c user.email=llm-wiki@localhost \
   commit -m 'test: deterministic sync check'
 
-cd ../../llm-wiki-dist
+cd ../llm-wiki-dist
 curl -f -X POST "$SCOPE/api/sync" \
   -H 'Content-Type: application/json' \
   -d '{"ingest_mode":"wiki"}' | jq
@@ -970,7 +1026,7 @@ cd data/raw
 git add test/docx/Input1_docx.md
 git -c user.name=llm-wiki -c user.email=llm-wiki@localhost \
   commit -m 'test: restore deterministic sync fixture'
-cd ../../llm-wiki-dist
+cd ../llm-wiki-dist
 curl -f -X POST "$SCOPE/api/sync" \
   -H 'Content-Type: application/json' \
   -d '{"ingest_mode":"wiki"}' | jq
@@ -1026,11 +1082,15 @@ Run the main plan groups:
   tests.test_growi_routing \
   tests.test_registry \
   tests.test_vectors \
-  tests.test_pages_shelf \
-  tests.test_pages_router \
-  tests.test_pages_stitch \
+  tests.test_linker \
+  tests.test_boundaries \
   tests.test_neighborhood
 ~~~
+
+`tests.test_linker` runs the linker end to end with a fake model and a fake
+embedder (two documents, reciprocal footers, free rerun, removal, catalog
+rebuild, mode mismatch, neo inline link). `tests.test_boundaries` proves the
+wiki factory imports without the knowledge engine.
 
 The tests that call live model, parser, or GROWI services are separate from
 pure unit tests and should be run only when those services are available.
@@ -1093,32 +1153,122 @@ reindex behavior first.
 
 ## 20. Cross-document linker
 
-`wiki_one.py <raw-relative-path>` and every other `write_wiki(mode="wiki")`
-caller automatically run the pre-ingestion cross-document linker after the
-document is published and before the source stamp is written. No extra option
-is needed, and no Librarian/Researcher/GROWI database is touched.
+The linker is the only place that creates links between documents. It runs
+inside `write_wiki` (so `main.py wiki`, `main.py sync`, the app's sync_raw job, and the
+downstream publisher all get it) after the pristine pages are published and
+before `source.json` is stamped. The knowledge engine only parses the result.
 
-Environment variables (all optional):
+### What it does
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `WIKI_LINKER_ENABLED` | `1` | `0` skips the linker entirely (writes a `disabled` marker, constructs no services) |
-| `WIKI_LINKER_MAP_CONCURRENCY` | = `WIKI_REWRITE_CONCURRENCY` | parallel map-scout model calls per target page |
-| `WIKI_LINKER_RESEARCH_CONCURRENCY` | = `WIKI_REWRITE_CONCURRENCY` | parallel full-page research calls |
+For the document just published:
 
-By default both linker phases mirror the wiki maker's rewrite concurrency, so
-one knob scales the whole pipeline; set the linker variables explicitly only
-to deviate (e.g. a weaker embedding/chat endpoint).
+1. copies the pristine pages to `_planning/pages/` (the originals; published
+   pages are always re-rendered from them, never patched);
+2. splits every page at `## ` headings into chunks (chunk 0 = title + intro);
+3. makes one structured model call per new/changed chunk returning summary,
+   keywords, claims, main entity, bridge probe, named entities (`defines` /
+   `uses`) and behaviours; cached by chunk text hash in `_planning/chunks.json`;
+4. embeds body/summary/bridge text and indexes FTS5 (trigram, so Japanese
+   substrings match) in `metadata/wiki-linker.sqlite`;
+5. finds candidate peer chunks in other pages of the same team, depending on
+   the mode;
+6. asks the model, four candidates at a time, which candidates deserve a link;
+   answers are cached per text-hash pair, so a re-linked or moved section costs
+   no call;
+7. renders a `## 関連リンク` footer on both endpoint pages and, in `neo` mode,
+   an inline link at the first plain mention of a used entity pointing at the
+   page that defines it;
+8. writes `_planning/links.json` for every document involved and
+   `_planning/linker.json` for this document.
 
-Runtime files created: `metadata/wiki-linker.sqlite` (+`-wal`/`-shm`),
-`metadata/wiki-linker.lock`, `metadata/state/<doc>/work/linker/<run-id>/`
-(prompt/response artifacts and `run.json`), and
-`wiki/<doc>/_planning/linker.json` (status `pending|complete|failed|disabled`).
-Deleting `wiki-linker.sqlite` is safe: it is a rebuildable cache; the edited
-Markdown under `data/wiki/` is the product.
+Documents whose pages changed because of reciprocal links are returned as
+`touched` and republished by the caller.
 
-Progress events stream through the normal callback as
-`{"stage": "linker", "step": "bootstrap|maps|embed|map_scout|bridge_probe|retrieve|hops|research|judge|commit|done", ...}`.
+### Modes
 
-If the linker fails, the document is not stamped as up to date; rerunning the
-same command resumes using cached map comparisons and research results.
+| `WIKI_LINKER_MODE` | Candidates | Model calls per chunk | Footer |
+| --- | --- | --- | --- |
+| `legacy` (default) | the old engine algorithm: 3 dense channels + 2 FTS channels fused by RRF (top 16), plus up to 5 bridge candidates (same main entity, 2-hop through existing edges) | 1 metadata + up to 6 edge calls | free verb-phrase labels from the model, e.g. `introduces: …` |
+| `neo` | programmatic: unique entity definition ⇄ usage; top-5 similar chunks; behaviour graph 1–3 hops minus the obvious similarity hits | 1 metadata + edge calls only for hop candidates | `defines` / `uses` / `similar` plus a closed label set for hop links; inline `[entity](definition page)` links |
+
+One mode per data root. `WIKI_LINKER_MODE=neo` against a catalog built in
+`legacy` mode raises `LinkerModeMismatch`; switch with `rebuild` below.
+
+### Commands
+
+~~~bash
+cd /mnt/common/Code/llm-wiki-dist/llm-wiki-dist
+set -a; source .env; set +a
+.venv/bin/python -m graph.linker status                      # mode, documents, chunks, edges
+.venv/bin/python -m graph.linker relink test/docx/Input2.docx   # one document (wiki folder or raw path)
+.venv/bin/python -m graph.linker rebuild --mode neo         # delete catalog + links, relink every document
+.venv/bin/python -m graph.linker rebuild --mode legacy --no-edges   # render every page link-free
+~~~
+
+`relink` and `rebuild` reuse `chunks.json` metadata whenever the section text
+is unchanged, so switching modes on an already described corpus makes edge
+calls only.
+
+### Footer format
+
+~~~markdown
+<!-- llm-wiki-links:start -->
+## 関連リンク
+
+- [Wordの基本機能](../Input1.docx/001-Wordの基本機能.md) — defines: 「Word」の定義
+- [導入・概要 › 導入と概要](../Input2.docx/001-導入・概要.md) — introduces: 導入・概要は…
+- [別の文書](../Other.docx/003-x.md) — ← provides-details-for: …
+<!-- llm-wiki-links:end -->
+~~~
+
+`ページ › 節` names the peer chunk; `←` marks the reverse reading of a label
+the model wrote from the other page's point of view. One line per peer page and
+reason; at most 5 `similar` lines and 30 lines in total.
+
+### Runtime files
+
+- `metadata/wiki-linker.sqlite` (+ `-wal`/`-shm`): chunks, FTS5, sqlite-vec
+  vectors, entities, behaviours, edges, cached edge decisions. A rebuildable
+  cache: deleting it costs embeddings only, because every document's
+  `_planning/chunks.json` + `links.json` is read back on the next run.
+- `metadata/wiki-linker.lock`: `flock` held for the whole run.
+- `metadata/state/<doc>/work/linker/<run-id>/`: every prompt and response
+  (`meta-*.prompt.md`, `meta-*.json`, `edge-*.prompt.md`, `*-error.txt`).
+- `wiki/<doc>/_planning/{pages/,chunks.json,links.json,linker.json}` — see
+  section 5. `linker.json` holds counts (`meta_calls`, `edge_calls`,
+  `edges_added`, `touched_documents`) and `status`.
+
+Progress events: `{"stage": "linker", "step": "pending|chunks|done|failed", ...}`.
+
+### Cost and speed (measured, gemma-4-12B on 127.0.0.1:8000, thinking off)
+
+- One metadata call ≈ 100 s; one edge call ≈ 100 s. Structured calls now send
+  `enable_thinking: false`; with thinking on the same call took 340 s.
+- `Input2.docx` (2 sections) as the second document: 2 metadata + 2 edge calls,
+  7.5 min, 1 edge, `Input1.docx` republished.
+- `Valid.docx` as the third document: 2 + 2 calls, 7.8 min, 2 edges, both
+  older documents republished with Japanese summaries.
+- Unchanged rerun of any document: 0 calls, <1 s, no byte changes.
+- `rebuild --mode neo` on three described documents: 0 metadata calls, 1 s.
+
+Calls run `WIKI_LINKER_CONCURRENCY` at a time (default: the rewrite
+concurrency); the local gemma endpoint serves three requests concurrently.
+
+### Human edits and GROWI
+
+The linker works on `data/wiki`, never on GROWI. Republishing a page replaces
+its generated body block and its `-links` block separately: footer-only changes
+never touch a human edit inside the body; a `neo` inline link does replace the
+body block. Text outside the two marked blocks is preserved by
+`merge_marked_sections` as before.
+
+### Disabling
+
+`WIKI_LINKER_ENABLED=0` writes `{"status": "disabled"}` markers, constructs no
+embedder and never opens the catalog. To strip links from already rendered
+pages run `rebuild --no-edges`.
+
+For the standalone no-Git publisher, run `python main.py sync`
+from `llm-wiki-air`. It scans `data/mount`, writes raw/wiki
+output, links it, and publishes only owned pages to GROWI by content hash, so
+documents the linker touched are republished without a change list.

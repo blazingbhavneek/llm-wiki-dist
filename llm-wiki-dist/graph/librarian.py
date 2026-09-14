@@ -1685,6 +1685,7 @@ class Librarian:
         # Use the first node to infer document identity/version.
         document_name = nodes[0].original_document_name or out_path.name
         version = self._source_version_for_nodes(nodes)
+        structural_edges += self._footer_edges(nodes)
 
         if document_name and self.store.get_source(document_name):
             if stop_check and stop_check():
@@ -1736,7 +1737,7 @@ class Librarian:
         return nodes
 
     def chunk_and_ingest(self, job: WriteJob) -> dict[str, Any]:
-        from .chunk import make_llm
+        from .clients.chat import make_llm
 
         body = job.payload["body"]
         settings = self.settings
@@ -1855,7 +1856,7 @@ class Librarian:
     def sync_raw(self, job: WriteJob) -> dict[str, Any]:
         """Convert raw files, write wiki pages, and publish them to GROWI."""
 
-        from .chunk import make_llm
+        from .clients.chat import make_llm
         from .growi import GrowiClient, GrowiPublisher
         from .project import Project
         from .sync import sync_raw
@@ -1895,7 +1896,8 @@ class Librarian:
 
     def sync_growi(self, job: WriteJob) -> dict[str, Any]:
         """Build the index from GROWI pages, one document folder at a time."""
-        from .growi import GrowiClient, source_ranges, sync_growi_pages, team_of_path
+        from .growi import GrowiClient, source_ranges, team_of_path
+        from .growi.reverse_sync import sync_growi_pages
 
         connection = self.growi_connection()
         if connection is None:
@@ -1932,6 +1934,7 @@ class Librarian:
             nodes = [node_from_page(page, document) for page in pages]
             nodes = [node for node in nodes if node.body]
             edges = self._chain_edges([node.id for node in nodes], "Next page in the source document.")
+            edges += self._footer_edges(nodes)
             version = source_hash("|".join(page.revision_id for page in pages))
             stop = lambda: job.stop_event.is_set()
             if self.store.get_nodes_by_document(document, active_only=True):
@@ -2221,19 +2224,9 @@ class Librarian:
             summary_vec = self.gateway.embedder.embed_document(node.summary)
             self.vector_index.upsert("summary", [node.id], [summary_vec])
 
-        if not node.bridge_probe.strip():
-            try:
-                node.bridge_probe = self._generate_bridge_probe(node)
-            except Exception as exc:
-                # Best-effort: a failed probe should not break ingestion.
-                log.info("bridge probe generation failed for %s: %s", node.id, exc)
-                node.bridge_probe = ""
-            self.store.upsert_node(node)
-
+        # Semantic cross-document links are now parsed from the Markdown
+        # footer written by graph.linker; the engine keeps only search vectors.
         bridge_vec = None
-        if node.bridge_probe.strip():
-            bridge_vec = self.gateway.embedder.embed_document(node.bridge_probe)
-            self.vector_index.upsert("bridge", [node.id], [bridge_vec])
 
         # Also rebuild chunk/title/claim search rows for this node.
         self._store_search_items(node)
@@ -2542,6 +2535,9 @@ class Librarian:
 
     def _link_entity_duplicates(self, node: Node, candidates: list[Node]) -> list[Edge]:
         # Ask the LLM whether the new node is the same real-world entity as a candidate.
+        if not getattr(self.settings, "engine_semantic_edges", False):
+            return []
+        raise RuntimeError("engine semantic edges were removed; links come from the wiki linker")
         if not candidates:
             return []
 
@@ -2741,6 +2737,9 @@ class Librarian:
         node: Node,
         candidates: list[Node],
     ) -> list[Edge]:
+        if not getattr(self.settings, "engine_semantic_edges", False):
+            return []
+        raise RuntimeError("engine semantic edges were removed; links come from the wiki linker")
         # Candidates are resolved by the caller so the same search can be reused
         # by entity deduplication in the same ingest phase.
         if not candidates:
@@ -2866,10 +2865,9 @@ class Librarian:
         vectors: tuple[list[float], list[float] | None, list[float] | None],
     ) -> list[Node]:
         """Resolve neighbours and create semantic edges for a prepared node."""
-        body_vec, summary_vec, bridge_vec = vectors
-        candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
-        self._build_semantic_edges(node, candidates)
-        return candidates
+        if getattr(self.settings, "engine_semantic_edges", False):
+            raise RuntimeError("engine semantic edges were removed; links come from the wiki linker")
+        return []
 
     def _supersede(self, old: Node, new: Node) -> None:
         # Link old -> new and new -> old so history/revision lineage is preserved.
@@ -3062,19 +3060,9 @@ class Librarian:
 
     def enrich_entity_dedup(self, node_id: str) -> None:
         # Background duplicate/entity check for an active node.
-        node = self.store.get_node(node_id)
-        if not node or node.status != NodeStatus.active:
-            return
-
-        body_vec = self._get_vector(node.id, "body")
-        if body_vec is None:
-            body_vec = self.gateway.embedder.embed_document(strip_big_tables(strip_image_media(node.body)))
-
-        summary_vec = self._get_vector(node.id, "summary")
-        bridge_vec = self._get_vector(node.id, "bridge")
-
-        candidates = self._knn_candidates(node, body_vec, summary_vec, bridge_vec)
-        self._link_entity_duplicates(node, candidates)
+        if getattr(self.settings, "engine_semantic_edges", False):
+            raise RuntimeError("engine semantic edges were removed; links come from the wiki linker")
+        return
 
     def enrich_cascade(
         self, replacements: dict[str, str], stale_sources: list[str]
@@ -3214,6 +3202,41 @@ class Librarian:
                 self.refresh_neighborhood(document_name=document_name)
             else:
                 self.enqueue_neighborhood(document_name=document_name)
+
+    def _footer_edges(self, nodes: list[Node]) -> list[Edge]:
+        """Project the writer-owned Markdown footer into the engine graph."""
+        import posixpath
+
+        from graph.linker.render import parse_footer
+
+        by_path = {node.source_path: node for node in nodes if node.source_path}
+        edges: list[Edge] = []
+        for node in nodes:
+            source = node.source_path or ""
+            for link in parse_footer(node.body):
+                peer_path = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(source), link.peer_path)
+                )
+                if not source.endswith(".md"):
+                    peer_path = peer_path.removesuffix(".md")
+                peer = by_path.get(peer_path) or self.store.get_node_by_source_path(peer_path)
+                if peer is None or peer.status != NodeStatus.active:
+                    continue
+                src, dst = (node, peer) if not link.reverse else (peer, node)
+                stamp = now_iso()
+                for left, right in ((src, dst), (dst, src)):
+                    edges.append(
+                        Edge(
+                            id=make_edge_id(left.id, right.id, link.label),
+                            source_node_id=left.id,
+                            target_node_id=right.id,
+                            label=link.label,
+                            summary=link.summary,
+                            valid_at=stamp,
+                            source_episode_ids=[node.id, peer.id],
+                        )
+                    )
+        return edges
 
     # endregion Revision Metadata / Structural Edges
 
@@ -3909,7 +3932,7 @@ class Librarian:
         coverage = self._read_json(planning_dir / "coverage.json", default={})
         manifest = self._read_json(planning_dir / "manifest.json", default={})
         is_page_output = (
-            manifest.get("planning", {}).get("ingest_mode") == "pages"
+            manifest.get("planning", {}).get("ingest_mode") in ("pages", "wiki")
         )
 
         document_name = (

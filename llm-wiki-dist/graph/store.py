@@ -800,6 +800,13 @@ class GraphStore:
         # Return None if no node exists with this id.
         return _row_to_node(row) if row else None
 
+    def get_node_by_source_path(self, source_path: str) -> Node | None:
+        row = self.connection.execute(
+            "SELECT * FROM nodes WHERE source_path=? AND status='active' LIMIT 1",
+            (source_path,),
+        ).fetchone()
+        return _row_to_node(row) if row else None
+
     def set_node_status(self, node_id: str, status: NodeStatus) -> None:
         # Status update writes to the database,
         # so it is not allowed in readonly mode.

@@ -57,12 +57,12 @@ class SyncTests(unittest.TestCase):
         (target / "001-a.md").write_text("# a\n", encoding="utf-8")
         (target / "_planning").mkdir(exist_ok=True)
         (target / "_planning" / "metadata.json").write_text("{}", encoding="utf-8")
-        return target
+        return SimpleNamespace(target=target, touched=[])
 
     def test_first_sync_adds_everything_and_records_head(self) -> None:
         self.assertEqual(sync.plan_changes(self.project), [sync.Change("A", "f1/a_docx.md")])
         librarian = FakeLibrarian()
-        with mock.patch("graph.writers.write_wiki", side_effect=self.fake_write):
+        with mock.patch("graph.workspace.writer.write_wiki", side_effect=self.fake_write):
             result = sync.sync_project(
                 self.project,
                 librarian,
@@ -91,7 +91,7 @@ class SyncTests(unittest.TestCase):
         git(self.project.raw, "rm", "-q", "f1/a_docx.md")
         git(self.project.raw, "commit", "-qm", "three")
         librarian = FakeLibrarian()
-        with mock.patch("graph.writers.write_wiki", side_effect=self.fake_write):
+        with mock.patch("graph.workspace.writer.write_wiki", side_effect=self.fake_write):
             sync.sync_project(
                 self.project,
                 librarian,
@@ -106,7 +106,7 @@ class SyncTests(unittest.TestCase):
 
     def test_failed_write_does_not_move_last_sha(self) -> None:
         librarian = FakeLibrarian()
-        with mock.patch("graph.writers.write_wiki", side_effect=RuntimeError("boom")):
+        with mock.patch("graph.workspace.writer.write_wiki", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 sync.sync_project(
                     self.project,

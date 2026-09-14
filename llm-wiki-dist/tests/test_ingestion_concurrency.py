@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from graph import chunk
+from graph.wiki import legacy as chunk
 from graph.core import Settings
 from graph.librarian import Librarian
 
@@ -115,3 +115,22 @@ class IngestSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FooterEdgeTests(unittest.TestCase):
+    """The engine projects the writer's links footer into edges; it never asks a model."""
+
+    def test_footer_becomes_labelled_edges_both_ways(self) -> None:
+        from graph.core import Node, NodeStatus
+        from graph.linker.render import FOOTER_END, FOOTER_START
+
+        librarian = object.__new__(Librarian)
+        librarian.store = SimpleNamespace(get_node_by_source_path=lambda path: None)
+        librarian.gateway = SimpleNamespace(settings=SimpleNamespace(engine_semantic_edges=False))
+        a = Node(id="a", body="# a\n\ntext\n\n" + FOOTER_START + "\n## 関連リンク\n\n- [b](../b.docx/001-b.md) — uses: 「X」を使用\n" + FOOTER_END + "\n", source_path="/wiki/t/a.docx/001-a.md")
+        b = Node(id="b", body="# b\n", source_path="/wiki/t/b.docx/001-b.md")
+        edges = librarian._footer_edges([a, b])
+        self.assertEqual({(e.source_node_id, e.target_node_id, e.label) for e in edges}, {("a", "b", "uses"), ("b", "a", "uses")})
+        self.assertTrue(all(e.summary == "「X」を使用" for e in edges))
+        # semantic edges are off: no candidates means no model call and no edges
+        self.assertEqual(librarian._build_semantic_edges(a, [b]), [])

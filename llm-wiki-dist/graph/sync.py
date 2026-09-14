@@ -120,7 +120,7 @@ def sync_raw(
     on_progress: Progress = None,
     stop_check: StopCheck = None,
 ) -> dict[str, Any]:
-    from .writers import up_to_date, write_index, write_wiki
+    from .workspace.writer import up_to_date, write_index, write_wiki
 
     def emit(**event: Any) -> None:
         if on_progress:
@@ -147,6 +147,7 @@ def sync_raw(
     changes = plan_changes(project)
     head = head_sha(project)
     done: list[dict[str, Any]] = []
+    touched: set[str] = set()
     for index, change in enumerate(changes, start=1):
         if stop():
             raise RuntimeError("sync cancelled")
@@ -158,6 +159,11 @@ def sync_raw(
             file=change.rel,
         )
         if change.status == "D":
+            try:
+                from .linker import remove_document
+                touched.update(remove_document(project, change.rel))
+            except FileNotFoundError:
+                pass
             shutil.rmtree(project.wiki_dir(change.rel), ignore_errors=True)
             shutil.rmtree(project.state_dir(change.rel), ignore_errors=True)
             if legacy_librarian:
@@ -178,7 +184,7 @@ def sync_raw(
             )
             emit(stage="sync", step="invalidate", file=change.rel, result=result)
         if not up_to_date(project, change.rel):
-            write_wiki(
+            result = write_wiki(
                 project,
                 change.rel,
                 mode=mode,
@@ -188,6 +194,7 @@ def sync_raw(
                 on_progress=lambda event, rel=change.rel: emit(file=rel, **event),
                 stop_check=stop_check,
             )
+            touched.update(result.touched)
         if legacy_librarian:
             nodes = publisher.ingest_md_output(
                 project.wiki_dir(change.rel),
@@ -199,6 +206,17 @@ def sync_raw(
             emit(stage="publish", file=change.rel)
             published = publisher.publish_document(project, change.rel)
             done.append({"file": change.rel, "status": change.status, "pages": len(published)})
+    touched.difference_update(change.rel for change in changes)
+    for rel in sorted(touched):
+        if stop():
+            raise RuntimeError("sync cancelled")
+        if legacy_librarian:
+            nodes = publisher.ingest_md_output(project.wiki_dir(rel), stop_check=stop_check, raw_source_path=project.raw_file(rel))
+            done.append({"file": rel, "status": "L", "pages": len(nodes)})
+        else:
+            emit(stage="publish", file=rel, reason="touched-by-linker")
+            pages = publisher.publish_document(project, rel)
+            done.append({"file": rel, "status": "L", "pages": len(pages)})
     write_index(project)
     if head is not None:
         project.metadata.mkdir(parents=True, exist_ok=True)
