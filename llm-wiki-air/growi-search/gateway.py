@@ -185,6 +185,47 @@ def normalize_scores(values: list[float]) -> list[float]:
     return [(v - low) / (high - low) for v in values]
 
 
+class Embedder:
+    """OpenAI-compatible /v1/embeddings client; None when unavailable."""
+
+    def __init__(self, settings: Settings) -> None:
+        from langchain_openai import OpenAIEmbeddings
+
+        self._client = OpenAIEmbeddings(
+            model=settings.embed_model,
+            base_url=_normalize_base_url(settings.embed_base_url),
+            api_key=settings.embed_api_key or "local",
+            timeout=60,
+            max_retries=0,
+            check_embedding_ctx_length=False,
+        )
+
+    @classmethod
+    def build(cls, settings: Settings) -> "Embedder | None":
+        if not (settings.embed_base_url and settings.embed_model):
+            return None
+        try:
+            embedder = cls(settings)
+            embedder.embed_query("availability probe")
+            return embedder
+        except Exception as exc:  # noqa: BLE001 - degrade to keyword overlap
+            log.info("embedder unavailable: %s", exc)
+            return None
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._client.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._client.embed_query(text)
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
 class Reranker:
     """Server-side cross-encoder only. HF/local fallback intentionally removed."""
 

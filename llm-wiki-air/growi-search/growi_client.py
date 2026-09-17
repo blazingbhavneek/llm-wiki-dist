@@ -155,6 +155,31 @@ class GrowiSearchClient:
             return str(payload.get("status", "up")).lower() in {"up", "okay", "ok", "true"} or payload.get("ok") is not False
         return True
 
+    def fetch_attachment(self, attachment_id: str) -> tuple[bytes, str] | None:
+        """Bytes + content-type of one GROWI attachment, or None when missing."""
+        headers = {**self._headers(), "Accept": "*/*"}
+        try:
+            with self._request_slots:
+                response = self._client.get(
+                    f"/attachment/{attachment_id}",
+                    headers=headers,
+                    params={"access_token": self.api_token},
+                    follow_redirects=True,
+                )
+        except httpx.HTTPError as exc:
+            raise GrowiAPIError(0, "GET", "/attachment", str(exc)) from exc
+        if response.status_code == 404:
+            return None
+        content_type = response.headers.get("content-type", "application/octet-stream")
+        if response.is_error or content_type.startswith("text/html"):
+            raise GrowiAPIError(
+                response.status_code if response.is_error else 401,
+                "GET",
+                "/attachment",
+                "not an attachment response",
+            )
+        return response.content, content_type
+
     def search_pages(
         self,
         query: str,

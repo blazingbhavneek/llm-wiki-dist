@@ -6,6 +6,7 @@ import configparser
 import os
 import shutil
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -59,6 +60,17 @@ class Settings(BaseModel):
     rerank_api_key: str = ""
     rerank_model: str = ""
     rerank_timeout: int = 15
+
+    # Embeddings for the index map (optional; keyword overlap is used when absent)
+    embed_base_url: str = ""
+    embed_model: str = ""
+    embed_api_key: str = "local"
+
+    # Index pages published by `main.py index`
+    index_page_name: str = "00-目次"
+    index_cache_ttl: int = 600
+    index_map_top_k: int = 20
+    index_map_embed_k: int = 60
 
     # Retrieval limits
     search_candidates: int = 30
@@ -131,8 +143,15 @@ class Settings(BaseModel):
             rerank_api_key=env("WIKI_RERANK_API_KEY") or "",
             rerank_model=env("WIKI_RERANK_MODEL") or "",
             rerank_timeout=int(env("WIKI_RERANK_TIMEOUT") or 15),
+            embed_base_url=(env("WIKI_EMBED_BASE_URL") or "").rstrip("/"),
+            embed_model=env("WIKI_EMBED_MODEL") or "",
+            embed_api_key=env("WIKI_EMBED_API_KEY") or "local",
+            index_page_name=env("WIKI_INDEX_PAGE_NAME") or "00-目次",
+            index_cache_ttl=int(env("WIKI_INDEX_CACHE_TTL") or 600),
+            index_map_top_k=int(env("WIKI_INDEX_MAP_TOP_K") or 20),
+            index_map_embed_k=int(env("WIKI_INDEX_MAP_EMBED_K") or 60),
             search_candidates=_clamp(int(env("WIKI_SEARCH_CANDIDATES") or 30), 1, 50),
-            rerank_top_k=_clamp(int(env("WIKI_RERANK_TOP_K") or 8), 1, 30),
+            rerank_top_k=_clamp(int(env("WIKI_RERANK_TOP_K") or 8), 1, 40),
             shallow_page_reads=_clamp(int(env("WIKI_SHALLOW_PAGE_READS") or 2), 1, 3),
             evidence_per_page=_clamp(int(env("WIKI_EVIDENCE_PER_PAGE") or 2), 1, 8),
             link_expand_limit=_clamp(int(env("WIKI_LINK_EXPAND_LIMIT") or 12), 1, 50),
@@ -178,4 +197,13 @@ class Settings(BaseModel):
 
     @property
     def allowed_hosts(self) -> set[str]:
-        return {h.strip().lower() for h in self.allowed_llm_hosts.split(",") if h.strip()}
+        from urllib.parse import urlparse
+
+        hosts = {h.strip().lower() for h in self.allowed_llm_hosts.split(",") if h.strip()}
+        own = urlparse(self.chat_base_url).hostname
+        if own:
+            hosts.add(own.lower())
+        return hosts
+
+    def public_dict(self) -> dict[str, Any]:
+        return self.model_dump(exclude={"growi_token", "chat_api_key", "rerank_api_key", "embed_api_key", "usage_log_path"})

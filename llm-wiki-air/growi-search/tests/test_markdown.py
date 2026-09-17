@@ -79,6 +79,42 @@ class ExtractLinks(unittest.TestCase):
         links = md.extract_links("[a](/same) and [b](/same)")
         self.assertEqual(len(links), 1)
 
+    def test_navigation_links_are_typed(self):
+        body = "---\n\n前のページ: [a](/aaaaaaaaaaaaaaaaaaaaaaaa) ｜ 次のページ: [b](/bbbbbbbbbbbbbbbbbbbbbbbb)"
+        self.assertEqual([link.kind for link in md.extract_links(body)], ["nav", "nav"])
+
+    def test_index_footer_link_is_markdown(self):
+        link = md.extract_links("- [t](/cccccccccccccccccccccccc) — s")[0]
+        self.assertEqual(link.kind, "markdown")
+
+
+class IndexPages(unittest.TestCase):
+    BODY = """# Manual
+
+<span hidden data-llm-wiki-index="document"></span>
+
+- [概要](/6aab1ff0d4652631606ec418) — summary
+  - 章: 第1章 はじめに
+  - キーワード: 運転モード、状態遷移、構成制御
+  - エンティティ: 運転モード管理、状態遷移
+- [外部ページ](/Moove/Manual/001-概要) — other
+  - ページ数: 4
+"""
+
+    def test_parse_index(self):
+        cards = md.parse_index(self.BODY)
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(cards[0].target, "/6aab1ff0d4652631606ec418")
+        self.assertEqual(cards[0].chapter, "第1章 はじめに")
+        self.assertGreaterEqual(len(cards[0].keywords), 3)
+        self.assertEqual(cards[0].entities, ["運転モード管理", "状態遷移"])
+        self.assertEqual(cards[1].target, "/Moove/Manual/001-概要")
+        self.assertEqual(cards[1].pages, 4)
+
+    def test_marker_detection(self):
+        self.assertTrue(md.is_index_page(self.BODY))
+        self.assertFalse(md.is_index_page("# ordinary page\n"))
+
 
 class ResolveTarget(unittest.TestCase):
     def test_id(self):

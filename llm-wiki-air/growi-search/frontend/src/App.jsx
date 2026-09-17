@@ -1,824 +1,469 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  BookMarked,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  Download,
-  ExternalLink,
-  FolderTree,
-  Loader2,
-  MessageCircle,
-  PanelLeftClose,
-  PanelLeftOpen,
-  RefreshCw,
-  Search as SearchIcon,
-  Send,
-  Settings as SettingsIcon,
-  Square,
-} from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import ChatPanel from './components/ChatPanel'
+import { DocumentCenter } from './components/layout/DocumentCenter'
+import MarkdownView from './components/MarkdownView'
 import ErrorBoundary from './components/ErrorBoundary'
-import { Centered, PageHeader, PlaceholderPage } from './components/layout/Shell'
+import SettingsView from './components/SettingsView'
+import { AppFooter } from './components/layout/AppFooter'
+import { LeftSidebar } from './components/layout/LeftSidebar'
 import { MarkdownWorkspaceFrame } from './components/layout/MarkdownWorkspaceFrame'
-import { MarkdownRenderer, stripCitedNodeIdsBlocks } from './components/markdown/MarkdownRenderer.jsx'
+import { RightDocumentRail } from './components/layout/RightDocumentRail'
+import { SearchResultsCenter } from './components/layout/SearchResults'
+import { SettingsCenter } from './components/layout/SettingsCenter'
 import { STR } from './components/layout/strings.js'
-import { downloadMarkdown } from './data/download.js'
-import { growiLinkFor, growiPageUrl } from './data/growi.js'
-import { faviconUrl } from './data/utils'
-import { LangToggle, useT } from './i18n.jsx'
+import { TopBar } from './components/layout/TopBar'
+import { Centered } from './components/layout/Shell'
+import { useT } from './i18n.jsx'
 import { useAskStream } from './hooks/useAskStream'
 import { useOverrides } from './hooks/useOverrides'
-import { useWikiData } from './hooks/useWikiData'
+import { useSearch } from './hooks/useSearch'
+import { useWorkspace } from './hooks/useWorkspace'
+import { parentOf, useWikiData } from './hooks/useWikiData'
 import { api } from './api'
 
 export default function App() {
   const t = useT(STR)
 
+  /**
+   * Shell state.
+   *
+   * centerView (inside useWorkspace) controls the main center area.
+   * No tab bar anymore.
+   */
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightOpen, setRightOpen] = useState(true)
-  const [centerView, setCenterView] = useState('chat') // chat | search | page | settings
-  const [history, setHistory] = useState([])
-  const [workspace, setWorkspace] = useState(null)
-  const [searchQuery, setSearchQuery] = useState('')
-  const [searchResults, setSearchResults] = useState([])
-  const [searchLoading, setSearchLoading] = useState(false)
-  const [growi, setGrowi] = useState(null)
+  const [rightTabs, setRightTabs] = useState([])
+  const [activeRightTabId, setActiveRightTabId] = useState('explorer')
+
+  const [activeAnswerId, setActiveAnswerId] = useState(null)
+  const [answerMentionedIdsByAnswerId, setAnswerMentionedIdsByAnswerId] = useState(() => new Map())
+  const [, setFocusIds] = useState(null)
   const [toast, setToast] = useState(null)
-  const searchSeq = useRef(0)
+  const [growiConnection, setGrowiConnection] = useState(null)
+  const [growiError, setGrowiError] = useState(null)
+  const answerSeq = useRef(0)
 
   const fireToast = useCallback((text) => {
     setToast(text)
     setTimeout(() => setToast(null), 3600)
   }, [])
 
-  const { overrides, persisted, apiKey, applyOverrides, clearOverrides } = useOverrides()
+  const { overrides, applyOverrides } = useOverrides()
+  const loadGrowi = useCallback(() => {
+    setGrowiError(null)
+    api.growi().then(setGrowiConnection).catch((e) => setGrowiError(String(e.message || e)))
+  }, [])
+  useEffect(() => {
+    loadGrowi()
+  }, [loadGrowi])
+  const wiki = useWikiData({ rootPath: growiConnection?.root_path, fireToast, t })
+  const { rawById, loading, error, retry } = wiki
+  const errorRetryable = true
+  const ws = useWorkspace({ t, fireToast, setFocusIds, rememberNodes: wiki.rememberNodes })
+  const {
+    workspace,
+    setWorkspace,
+    centerView,
+    setCenterView,
+    centerHistory,
+    closeWorkspace,
+    openWorkspace,
+    goBackFromWorkspace,
+    openNodeById,
+    openSearchResult,
+    openDocument,
+  } = ws
+
+  const search = useSearch({ t, fireToast, setCenterView })
 
   useEffect(() => {
-    api.growi().then(setGrowi).catch((e) => fireToast(e.message))
-  }, [fireToast])
-
-  const wiki = useWikiData({ rootPath: growi?.root_path || '/', fireToast, t })
-
-  // ---------------------------------------------------------------------------
-  // Page / answer workspaces (history for the markdown frame's back button)
-  // ---------------------------------------------------------------------------
-
-  const pushHistory = useCallback(() => {
-    setHistory((h) =>
-      [...h, centerView === 'page' ? { centerView, workspace } : { centerView }].slice(-20),
-    )
-  }, [centerView, workspace])
-
-  const openNode = useCallback(
-    async (idOrPath) => {
-      try {
-        const node = await api.node(idOrPath)
-        pushHistory()
-        setWorkspace({
-          id: node.id || idOrPath,
-          kind: 'page',
-          title: node.title || idOrPath,
-          doc: {
-            title: node.title || node.path || idOrPath,
-            badge: 'GROWI',
-            meta: node.path,
-            markdown: node.body || '',
-            source_path: node.path,
-          },
-          links: Array.isArray(node.links) ? node.links : [],
-        })
-        setCenterView('page')
-      } catch (e) {
-        fireToast(t.couldNotOpen(e.message))
-      }
-    },
-    [pushHistory, fireToast, t],
-  )
-
-  const openAnswer = (answer) => {
-    pushHistory()
-    setWorkspace({
-      id: `answer:${answer.id}`,
-      kind: 'answer',
-      title: answer.question,
-      doc: {
-        title: answer.question,
-        badge: t.app.answerBadge,
-        meta: answer.steps ? t.answerReady(answer.steps) : '',
-        markdown: answer.markdown,
-      },
-      links: [],
-      citedIds: answer.citedIds || [],
-    })
-    setCenterView('page')
-  }
-
-  const goBack = () => {
-    const target = history[history.length - 1]
-    if (!target) return
-    setHistory((h) => h.slice(0, -1))
-    setWorkspace(target.workspace || null)
-    setCenterView(target.centerView || 'chat')
-  }
-
-  const closeWorkspace = () => {
-    setWorkspace(null)
-    setHistory([])
-    setCenterView('chat')
-  }
-
-  // ---------------------------------------------------------------------------
-  // Search (fast path: one ES call server-side; no agent, no page bodies)
-  // ---------------------------------------------------------------------------
-
-  const onSearch = async (text) => {
-    const clean = String(text || '').trim()
-    if (!clean) return
-
-    const seq = ++searchSeq.current
-    setSearchQuery(clean)
-    setSearchResults([])
-    setSearchLoading(true)
-    setCenterView('search')
-
-    try {
-      const results = await api.search(clean, 12)
-      if (seq === searchSeq.current) setSearchResults(Array.isArray(results) ? results : [])
-    } catch (e) {
-      if (seq === searchSeq.current) setSearchResults([])
-      fireToast(t.searchFailed(e.message))
-    } finally {
-      if (seq === searchSeq.current) setSearchLoading(false)
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Chat / agent run (SSE)
-  // ---------------------------------------------------------------------------
-
-  const finalize = useCallback(
-    (ev, activity, q) => {
-      const cited = Array.isArray(ev.cited_node_ids) ? ev.cited_node_ids : []
-      const has = !!(ev.answer && ev.answer.trim())
-
-      return chat.patchLast(() => ({
-        role: 'assistant',
-        streaming: false,
-        title: has ? t.answerReady(ev.steps) : t.foundNoBody,
-        markdown: has ? ev.answer : '',
-        emptyText: has ? '' : t.foundNoBodyText(cited.length, ev.steps),
-        activity,
-        answer: has ? { id: q, question: q, markdown: ev.answer, steps: ev.steps, citedIds: cited } : null,
-      }))
-    },
+    const path = workspace?.kind === 'doc' ? workspace.node?.path : null
+    if (path && !wiki.childrenByPath[parentOf(path)]) wiki.load(parentOf(path))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t],
-  )
+  }, [workspace?.id])
+
+  const [prevNodeId, nextNodeId] = useMemo(() => {
+    if (workspace?.kind !== 'doc') return [null, null]
+    const siblings = wiki.siblingsOf(workspace.node)
+    const i = siblings.findIndex((p) => p.id === workspace.nodeId)
+    return [i > 0 ? siblings[i - 1].id : null, i >= 0 && i < siblings.length - 1 ? siblings[i + 1].id : null]
+  }, [workspace, wiki])
 
   const chat = useAskStream({
     t,
     overrides,
     fireToast,
     onAskStart: () => setCenterView('chat'),
-    onAnswer: (ev, activity, q) => finalize(ev, activity, q),
+    onAnswer: (ans, activity, q) => finalizeAnswer(ans, activity, q),
   })
 
-  const parserUrl = growi?.doc_parser_url
-    ? new URL(growi.doc_parser_url, window.location.origin).href
-    : null
+  // ---------------------------------------------------------------------------
+  // Answers: chat ↔ workspace ↔ right-rail glue
+  // ---------------------------------------------------------------------------
 
-  const navItems = [
-    { id: 'chat', label: t.shell.chat, icon: MessageCircle, go: () => setCenterView('chat'), active: centerView === 'chat' },
-    {
-      id: 'pages',
-      label: t.app.pages,
-      icon: FolderTree,
-      go: () => {
-        setRightOpen(true)
-        wiki.loadRoot()
+  /**
+   * Answers are stored as the current workspace, but by default we do not
+   * force navigation away from chat when an answer arrives.
+   *
+   * - Generated answer: stays in chat.
+   * - User clicks "view answer": opens full markdown workspace.
+   */
+  const openAnswerTab = (answer, expand = true) => {
+    if (!answer) return
+
+    const id = `answer:${answer.id}`
+    const title = answer.title || answer.question || t.answer
+    const markdown = answer.markdown || ''
+
+    const next = {
+      id,
+      kind: 'answer',
+      title: title.slice(0, 28),
+      sourceType: 'exogenous',
+      sourceIds: answer.citedIds || [],
+      sourceName: title,
+      answer,
+      doc: {
+        title,
+        badge: t.agentNote,
+        meta: answer.steps ? t.answerMetaSteps(answer.steps) : t.answerMeta,
+        markdown,
       },
-      active: false,
-    },
-    { id: 'parser', label: t.app.parser, icon: BookMarked, href: parserUrl, active: false },
-    { id: 'settings', label: t.shell.settings, icon: SettingsIcon, go: () => setCenterView('settings'), active: centerView === 'settings' },
-  ]
+      refs: answer.refs || [],
+    }
+
+    setActiveAnswerId(answer.id)
+    setFocusIds(new Set(answer.citedIds || []))
+
+    if (expand) {
+      openWorkspace(next)
+    } else {
+      setWorkspace(next)
+    }
+  }
+
+  const openAnswerSourcesTab = (answer) => {
+    const citedIds = Array.isArray(answer?.citedIds) ? answer.citedIds : []
+    const refs = Array.isArray(answer?.refs) ? answer.refs : []
+
+    if (!answer || (citedIds.length === 0 && refs.length === 0)) return false
+
+    const id = `sources:${answer.id}`
+    const title = answer.title || answer.question || t.answer
+
+    setRightTabs((prev) => {
+      const nextTab = {
+        id,
+        kind: 'sources',
+        title: title.slice(0, 26),
+        answer,
+      }
+      const existing = prev.findIndex((tab) => tab.id === id)
+
+      if (existing === -1) {
+        return [...prev, nextTab]
+      }
+
+      const next = prev.slice()
+      next[existing] = nextTab
+      return next
+    })
+
+    setActiveRightTabId(id)
+    setRightOpen(true)
+    setActiveAnswerId(answer.id)
+    setFocusIds(new Set(citedIds))
+
+    return true
+  }
+
+  const closeRightTab = (id) => {
+    if (id === 'explorer') return
+
+    setRightTabs((prev) => prev.filter((tab) => tab.id !== id))
+    setActiveRightTabId((current) => (current === id ? 'explorer' : current))
+  }
+
+  const finalizeAnswer = (ans, activity, q) => {
+    const cited = ans.cited_node_ids || []
+    const citedNodes = Array.isArray(ans.cited_nodes) ? ans.cited_nodes : []
+    wiki.rememberNodes(citedNodes)
+    const byId = new Map([
+      ...rawById,
+      ...citedNodes.filter((n) => n?.id).map((n) => [n.id, n]),
+    ])
+    const refs = cited.map((id) => {
+      const n = byId.get(id)
+      return { id, label: n?.title || id, note: n?.summary || n?.path || t.sourceNote }
+    })
+    const hasAnswer = !!(ans.answer && ans.answer.trim())
+
+    setFocusIds(new Set(cited))
+
+    if (hasAnswer) {
+      answerSeq.current += 1
+
+      const id = answerSeq.current
+
+      const answer = {
+        id,
+        question: q,
+        title: q,
+        markdown: ans.answer,
+        refs,
+        steps: ans.steps,
+        citedIds: cited,
+      }
+
+      // Keep map/visitedIds collected while streaming.
+      chat.patchLast((m) => ({
+        ...m,
+        streaming: false,
+        role: 'assistant',
+        title: t.answerReady(ans.steps),
+        text: ans.answer,
+        activity,
+        answer,
+      }))
+
+      // Store as workspace data, but do not force full markdown view.
+      openAnswerTab(answer, false)
+      openAnswerSourcesTab(answer)
+    } else {
+      if (cited.length) {
+        answerSeq.current += 1
+      }
+
+      const sourceOnlyAnswer = cited.length
+        ? {
+            id: answerSeq.current,
+            question: q,
+            title: q,
+            markdown: '',
+            refs,
+            steps: ans.steps,
+            citedIds: cited,
+          }
+        : null
+
+      chat.patchLast((m) => ({
+        ...m,
+        streaming: false,
+        role: 'assistant',
+        title: t.foundNoBody,
+        text: t.foundNoBodyText(cited.length, ans.steps),
+        refs,
+        activity,
+      }))
+
+      if (sourceOnlyAnswer) {
+        openAnswerSourcesTab(sourceOnlyAnswer)
+      } else if (cited[0]) {
+        openNodeById(cited[0])
+      }
+    }
+  }
 
   // ---------------------------------------------------------------------------
-  // Center views
+  // Navigation
   // ---------------------------------------------------------------------------
+
+  const handleNav = (view) => {
+    if (view === 'explorer') {
+      setActiveRightTabId('explorer')
+      setRightOpen(true)
+      return
+    }
+
+    setCenterView(view)
+  }
+
+  const handleNewChat = () => {
+    chat.resetChat()
+    setWorkspace(null)
+    setActiveAnswerId(null)
+    setRightTabs([])
+    setAnswerMentionedIdsByAnswerId(new Map())
+    setActiveRightTabId('explorer')
+    setCenterView('chat')
+  }
+
+  const handleAnswerMentionedIds = useCallback((answerId, ids) => {
+    if (!answerId) return
+
+    const cleanIds = Array.from(
+      new Set(Array.isArray(ids) ? ids.filter(Boolean) : []),
+    )
+
+    setAnswerMentionedIdsByAnswerId((prev) => {
+      const prevIds = prev.get(answerId) || []
+      const prevKey = prevIds.join('|')
+      const nextKey = cleanIds.join('|')
+
+      if (prevKey === nextKey) return prev
+
+      const next = new Map(prev)
+      next.set(answerId, cleanIds)
+      return next
+    })
+  }, [])
 
   const renderCenter = () => {
+    if (loading && !growiError) {
+      return <Centered>{t.loadingGraph}</Centered>
+    }
+
+    if (error || growiError) {
+      return (
+        <Centered>
+          <div className="max-w-[420px] text-center">
+            <p className="font-bold text-red">{t.cannotReach}</p>
+            <p className="mt-2 text-[13px] text-muted">{growiError || error}</p>
+            {errorRetryable && (
+              <button
+                type="button"
+                onClick={growiError ? loadGrowi : retry}
+                className="mt-4 border border-line bg-white px-[13px] py-[8px] text-[13px] font-bold text-neutral-700 hover:border-line2"
+              >
+                {t.retry}
+              </button>
+            )}
+          </div>
+        </Centered>
+      )
+    }
+
     if (centerView === 'search') {
       return (
-        <SearchCenter
-          query={searchQuery}
-          results={searchResults}
-          loading={searchLoading}
-          connection={growi}
-          onOpenNode={openNode}
-          t={t}
+        <SearchResultsCenter
+          query={search.searchQuery}
+          results={search.searchResults}
+          loading={search.searchLoading}
+          connection={growiConnection}
+          onOpenNode={openSearchResult}
         />
+      )
+    }
+
+    if (centerView === 'document' && workspace?.kind === 'document') {
+      return (
+        <MarkdownWorkspaceFrame item={workspace} canGoBack={centerHistory.length > 0} onBack={goBackFromWorkspace} onClose={closeWorkspace}>
+          <DocumentCenter path={workspace.path} connection={growiConnection} onOpenNode={openSearchResult} />
+        </MarkdownWorkspaceFrame>
       )
     }
 
     if (centerView === 'settings') {
       return (
-        <SettingsCenterNew
-          persisted={persisted}
-          apiKey={apiKey}
-          onApply={applyOverrides}
-          onClear={clearOverrides}
-          fireToast={fireToast}
-          t={t}
-        />
+        <SettingsCenter>
+          <SettingsView overrides={overrides} onApply={applyOverrides} />
+        </SettingsCenter>
       )
     }
 
-    if (centerView === 'page' && workspace) {
+    if (centerView === 'markdown' && workspace) {
       return (
         <MarkdownWorkspaceFrame
           item={workspace}
-          canGoBack={history.length > 0}
-          onBack={goBack}
+          canGoBack={centerHistory.length > 0}
+          onBack={goBackFromWorkspace}
           onClose={closeWorkspace}
         >
-          <PageView workspace={workspace} connection={growi} onOpenNode={openNode} t={t} />
+          <MarkdownView
+            doc={workspace.doc}
+            mode={workspace.kind}
+            rawById={rawById}
+            growiConnection={growiConnection}
+            prevNodeId={prevNodeId}
+            nextNodeId={nextNodeId}
+            onOpenNode={openNodeById}
+          />
         </MarkdownWorkspaceFrame>
       )
     }
 
-    return <ChatArea chat={chat} t={t} onViewAnswer={openAnswer} />
+    return (
+      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-white">
+        <div className="flex h-full min-h-0 w-full flex-col px-0 pt-6 pb-0">
+          <div className="flex min-h-0 flex-1 flex-col">
+            <ChatPanel
+              messages={chat.messages}
+              onAsk={chat.ask}
+              onOpenNode={openNodeById}
+              onViewAnswer={(answer) => openAnswerTab(answer, true)}
+              activeAnswerId={activeAnswerId}
+              agentRunning={chat.agentRunning}
+              agentCanStop={!!chat.agentRunId}
+              agentStopping={chat.agentStopping}
+              onStopAgent={chat.stopAgent}
+              rawById={rawById}
+              onAnswerMentionedIds={handleAnswerMentionedIds}
+            />
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#f6f8fc] text-slate-900">
-      {/* Left sidebar: Chat / Pages / Parser / Settings (read-only service) */}
-      <aside
-        className={`flex h-full shrink-0 flex-col border-r border-slate-200 bg-white transition-[width] duration-300 ${
-          leftCollapsed ? 'w-[76px]' : 'w-[240px]'
-        }`}
-      >
-        <div className="border-b border-slate-100 px-3 py-4">
-          <div className="flex w-full justify-center">
-            <img src={faviconUrl()} alt="Logo" className="block h-[90px] w-[90px] max-w-full object-contain" />
-          </div>
-          <button
-            onClick={() => setLeftCollapsed((v) => !v)}
-            className={`mt-3 grid h-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100 ${
-              leftCollapsed ? 'mx-auto w-10' : 'w-full'
-            }`}
-            title={leftCollapsed ? t.shell.expandSidebar : t.shell.collapseSidebar}
-          >
-            {leftCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
-          </button>
-        </div>
-
-        <nav className="flex-1 overflow-y-auto px-3 py-4">
-          <div className="space-y-1">
-            {navItems.map((item) => {
-              const Icon = item.icon
-              const content = (
-                <>
-                  <Icon size={18} className={item.active ? 'text-blue-600' : 'text-slate-500'} />
-                  {!leftCollapsed && <span className="truncate">{item.label}</span>}
-                </>
-              )
-              const cls = `group flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left text-[14px] font-semibold transition ${
-                item.active ? 'bg-blue-50 text-blue-700' : 'text-slate-600 hover:bg-slate-100'
-              } ${leftCollapsed ? 'justify-center' : ''}`
-
-              return item.href ? (
-                <a key={item.id} href={item.href} target="_blank" rel="noreferrer" className={cls} title={item.label}>
-                  {content}
-                </a>
-              ) : (
-                <button key={item.id} onClick={item.go} className={cls} title={item.label}>
-                  {content}
-                </button>
-              )
-            })}
-          </div>
-        </nav>
-      </aside>
+    <div className="flex h-screen w-screen overflow-hidden bg-white text-neutral-900">
+      <LeftSidebar
+        collapsed={leftCollapsed}
+        activeView={centerView}
+        activeRightTabId={activeRightTabId}
+        rightOpen={rightOpen}
+        recentQuestions={chat.recentQuestions}
+        onToggle={() => setLeftCollapsed((v) => !v)}
+        onNavigate={handleNav}
+        onNewChat={handleNewChat}
+      />
 
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* Top bar */}
-        <header className="flex h-[70px] shrink-0 items-center gap-4 border-b border-slate-200 bg-white px-5">
-          <div className="flex min-w-0 flex-1 items-center">
-            <div className="flex h-11 w-full max-w-[760px] items-center rounded-xl border border-slate-300 bg-white shadow-sm focus-within:border-blue-500">
-              <SearchIcon size={18} className="ml-4 shrink-0 text-slate-400" />
-              <input
-                onKeyDown={(e) => e.key === 'Enter' && onSearch(e.currentTarget.value)}
-                placeholder={t.topbar.placeholder}
-                className="h-full min-w-0 flex-1 bg-transparent px-3 text-[14px] font-medium outline-none"
-                aria-label={t.topbar.keywordSearch}
-              />
-              <button
-                onClick={(e) => onSearch(e.currentTarget.previousSibling?.value)}
-                className="mr-1.5 rounded-lg bg-blue-600 px-5 py-2 text-[13px] font-extrabold text-white hover:bg-blue-700"
-              >
-                {t.topbar.searchDocs}
-              </button>
-            </div>
-          </div>
-
-          <div className="ml-auto flex items-center gap-2">
-            <span
-              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-[12px] font-bold text-slate-500"
-              title={t.app.scopeHint}
-            >
-              GROWI {growi?.root_path || '/'}
-            </span>
-            <LangToggle />
-            <button
-              onClick={() => setRightOpen((v) => !v)}
-              className={`grid h-9 w-9 place-items-center rounded-xl border transition ${
-                rightOpen ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'
-              }`}
-              title={rightOpen ? t.shell.collapseDocuments : t.shell.showDocuments}
-            >
-              {rightOpen ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
-            </button>
-          </div>
-        </header>
+        <TopBar
+          onSearch={search.onSearch}
+          onSearchResults={search.showResults}
+          rightOpen={rightOpen}
+          onToggleRight={() => setRightOpen((v) => !v)}
+          rootPath={growiConnection?.root_path}
+        />
 
         <div className="relative flex min-h-0 flex-1 overflow-hidden">
           <main className="relative min-w-0 flex-1 overflow-hidden bg-white">
-            <ErrorBoundary resetKey={`${centerView}:${workspace?.id || 'none'}:${searchQuery}`}>{renderCenter()}</ErrorBoundary>
+            <ErrorBoundary
+              resetKey={`${centerView}:${workspace?.id || 'none'}:${search.searchQuery}`}
+            >
+              {renderCenter()}
+            </ErrorBoundary>
 
             {toast && (
-              <div className="absolute bottom-[22px] right-[22px] z-30 max-w-[390px] rounded-xl border border-emerald-200 bg-emerald-50 px-[14px] py-[13px] text-[13px] text-emerald-800 shadow-xl">
+              <div className="absolute bottom-[22px] right-[22px] z-30 max-w-[390px] rounded-xl border border-blue-200 bg-blue-50 px-[14px] py-[13px] text-[13px] leading-[1.45] text-blue-800 shadow-xl">
                 {toast}
               </div>
             )}
+
           </main>
 
-          {rightOpen && <PageRail wiki={wiki} growi={growi} openNode={openNode} t={t} onClose={() => setRightOpen(false)} />}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// -----------------------------------------------------------------------------
-// Right rail: lazy GROWI folder tree (one /api/pages/children call per expand)
-// -----------------------------------------------------------------------------
-
-function PageRail({ wiki, growi, openNode, t, onClose }) {
-  return (
-    <aside className="flex h-full w-[300px] shrink-0 flex-col border-l border-slate-200 bg-white">
-      <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
-        <div className="text-[14px] font-extrabold">{t.app.pages}</div>
-        <div className="flex items-center gap-1">
-          <button
-            onClick={wiki.refresh}
-            className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100"
-            title={t.app.refresh}
-          >
-            <RefreshCw size={15} />
-          </button>
-          <button
-            onClick={onClose}
-            className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100"
-            title={t.shell.closeRightSidebar}
-          >
-            <ChevronRight size={16} />
-          </button>
-        </div>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto py-2 text-[13px]">
-        <RailFolder path={growi?.root_path || '/'} depth={0} wiki={wiki} openNode={openNode} t={t} top />
-      </div>
-    </aside>
-  )
-}
-
-function RailFolder({ path, depth, wiki, openNode, t, top = false }) {
-  const state = wiki.childrenByPath[path]
-  const expanded = wiki.expanded[path]
-
-  useEffect(() => {
-    if (top) wiki.loadRoot()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [top, path])
-
-  if (top && !state) return <div className="px-4 py-2 text-slate-400">{t.app.loading}</div>
-
-  const pages = state?.pages
-  const label = top ? (path === '/' ? t.app.root : path) : path.split('/').filter(Boolean).pop()
-
-  return (
-    <div>
-      {top && <div className="px-3 pb-1 text-[11px] font-bold uppercase text-slate-400">{path}</div>}
-      {state?.loading && (
-        <div className="flex items-center gap-2 py-1 text-slate-400" style={{ paddingLeft: 12 + depth * 14 }}>
-          <Loader2 size={13} className="animate-spin" />
-        </div>
-      )}
-      {state?.error && <div className="px-4 py-1 text-red-500">{state.error}</div>}
-      {!state?.loading && pages?.length === 0 && !top && (
-        <div className="py-1 text-slate-300" style={{ paddingLeft: 34 + depth * 14 }}>
-          {t.app.empty}
-        </div>
-      )}
-      {(pages || []).map((child) => {
-        const hasKids = (child.descendant_count || 0) > 0
-        const childLabel = String(child.path || child.title).split('/').filter(Boolean).pop() || child.title
-        return (
-          <div key={child.id || child.path}>
-            <div className="group flex items-center gap-1 rounded-lg hover:bg-slate-50" style={{ paddingLeft: 6 + depth * 14 }}>
-              {hasKids ? (
-                <button
-                  onClick={() => wiki.toggle(child.path)}
-                  className="grid h-6 w-5 shrink-0 place-items-center text-slate-400"
-                  aria-label="expand"
-                >
-                  {wiki.expanded[child.path] ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                </button>
-              ) : (
-                <span className="w-5 shrink-0" />
-              )}
-              <button
-                onClick={() => openNode(child.id || child.path)}
-                className="min-w-0 flex-1 truncate py-1.5 pr-2 text-left text-slate-700 hover:text-blue-700"
-                title={child.path}
-              >
-                {childLabel}
-              </button>
-            </div>
-            {hasKids && wiki.expanded[child.path] && (
-              <RailFolder path={child.path} depth={depth + 1} wiki={wiki} openNode={openNode} t={t} />
-            )}
-          </div>
-        )
-      })}
-      {top && expanded === undefined && null}
-    </div>
-  )
-}
-
-// -----------------------------------------------------------------------------
-// Search results
-// -----------------------------------------------------------------------------
-
-function SearchCenter({ query, results, loading, connection, onOpenNode, t }) {
-  if (loading) {
-    return (
-      <Centered>
-        <span className="flex items-center gap-2 font-bold text-slate-500">
-          <Loader2 size={16} className="animate-spin text-blue-600" /> {t.topbar.searching}
-        </span>
-      </Centered>
-    )
-  }
-  if (!query) return <PlaceholderPage icon={SearchIcon} title={t.pages.searchIdleTitle} text={t.pages.searchIdleText} />
-  if (!results.length) return <PlaceholderPage icon={SearchIcon} title={t.pages.searchEmptyTitle} text={t.pages.searchEmptyText(query)} />
-
-  return (
-    <div className="h-full overflow-y-auto bg-gradient-to-b from-white to-[#f8fbff]">
-      <div className="mx-auto max-w-[960px] px-6 py-6">
-        <PageHeader icon={SearchIcon} title={t.pages.searchTitle} text={t.pages.searchText(query, results.length)} />
-        <div className="grid gap-3">
-          {results.map((node) => {
-            const growiUrl = growiPageUrl(connection?.url, node.path)
-            const evidence = (node.evidence || []).map((e) => e.text).filter(Boolean)
-            return (
-              <div key={node.id} className="w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <div className="flex items-start justify-between gap-3">
-                  <button className="min-w-0 text-left hover:text-blue-700" onClick={() => onOpenNode(node.id)}>
-                    <h3 className="text-[15px] font-extrabold text-slate-950">{node.title || node.path || node.id}</h3>
-                    <div className="mt-0.5 truncate text-[11px] font-bold text-slate-400">{node.path}</div>
-                  </button>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        onOpenNode(node.id)
-                      }}
-                      className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-[12px] font-extrabold text-blue-700"
-                    >
-                      {t.searchResults.open}
-                    </button>
-                    {growiUrl && (
-                      <a
-                        href={growiUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-[12px] font-bold text-slate-600 hover:bg-slate-50"
-                      >
-                        <ExternalLink size={12} /> {t.app.openInGrowi}
-                      </a>
-                    )}
-                  </div>
-                </div>
-                {evidence.length > 0 && (
-                  <ul className="mt-3 space-y-1 text-[13px] leading-6 text-slate-600">
-                    {evidence.slice(0, 3).map((text, i) => (
-                      <li key={i} className="line-clamp-2">
-                        · {text}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )
-          })}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// -----------------------------------------------------------------------------
-// Page / answer view (read-only)
-// -----------------------------------------------------------------------------
-
-function PageView({ workspace, connection, onOpenNode, t }) {
-  const { doc, links = [], citedIds, kind } = workspace
-  const link = kind === 'page' ? growiLinkFor(doc, connection) : null
-
-  return (
-    <div className="grid h-full w-full grid-rows-[auto_minmax(0,1fr)] bg-white">
-      <div className="border-b border-line bg-white px-[26px] pb-[14px] pt-[18px]">
-        <div className="mb-[8px] flex flex-wrap items-center gap-2 text-[12px] text-muted">
-          <span className="inline-flex items-center gap-[6px] border border-green/20 bg-green/10 px-[8px] py-[5px] font-bold text-[#08785a]">
-            {doc.badge || 'GROWI'}
-          </span>
-          <span className="truncate">{doc.meta}</span>
-          {link && (
-            <a
-              href={link.view}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 font-semibold text-blue-700 hover:underline"
-            >
-              <ExternalLink size={12} /> {t.app.openInGrowi}
-            </a>
-          )}
-          <button
-            className="inline-flex items-center gap-1 font-semibold text-slate-500 hover:text-slate-800"
-            onClick={() => downloadMarkdown(doc.title, stripCitedNodeIdsBlocks(doc.markdown || ''), t.app.untitled)}
-            title={t.app.download}
-          >
-            <Download size={13} /> {t.app.download}
-          </button>
-        </div>
-        <div className="truncate text-[27px] font-extrabold tracking-tight text-ink">{doc.title}</div>
-      </div>
-
-      <div className="min-h-0 overflow-auto bg-gradient-to-b from-white to-[#fbfdff]">
-        <article className="md w-full max-w-none px-[36px] pb-[90px] pt-[36px]">
-          <MarkdownRenderer markdown={doc.markdown || ''} onOpenNode={onOpenNode} rawById={{}} referenceLabel={t.app.cited} />
-
-          {citedIds?.length > 0 && (
-            <div className="mt-[28px] border-t border-line pt-[14px] text-[13px]">
-              <h3 className="mb-2 text-[12px] font-bold uppercase tracking-wider text-muted">{t.app.cited}</h3>
-              <div className="flex flex-wrap gap-2">
-                {citedIds.map((id) => (
-                  <button
-                    key={id}
-                    onClick={() => onOpenNode(id)}
-                    className="rounded-lg border border-slate-200 px-3 py-1.5 font-bold text-blue-700 hover:bg-blue-50"
-                  >
-                    {id}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {links.length > 0 && (
-            <div className="mt-[28px] border-t border-line pt-[14px] text-[13px]">
-              <h3 className="mb-2 text-[12px] font-bold uppercase tracking-wider text-muted">{t.app.links}</h3>
-              <ul className="space-y-1">
-                {links.map((l) => (
-                  <li key={l.id}>
-                    <button
-                      className="text-left font-semibold text-blue-700 hover:underline disabled:font-normal disabled:text-slate-400 disabled:no-underline"
-                      disabled={!l.target_node_id && !l.target_path}
-                      onClick={() => onOpenNode(l.target_node_id || l.target_path)}
-                    >
-                      {l.label || l.target_path || l.target_node_id}
-                      {l.summary ? <span className="font-normal text-slate-400"> — {l.summary}</span> : null}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </article>
-      </div>
-    </div>
-  )
-}
-
-// -----------------------------------------------------------------------------
-// Chat
-// -----------------------------------------------------------------------------
-
-function ChatArea({ chat, t, onViewAnswer }) {
-  const [question, setQuestion] = useState('')
-  const endRef = useRef(null)
-
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [chat.messages])
-
-  const submit = () => {
-    const clean = question.trim()
-    if (!clean || chat.agentRunning) return
-    chat.ask(clean)
-    setQuestion('')
-  }
-
-  return (
-    <div className="flex h-full min-h-0 flex-col bg-gradient-to-b from-white to-[#f8fbff] px-6 pt-6">
-      <div className="min-h-0 flex-1 overflow-y-auto pb-4">
-        {chat.messages.length === 0 && (
-          <div className="mx-auto mt-10 max-w-[520px] rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center shadow-sm">
-            <h2 className="text-[20px] font-extrabold">{t.app.chatTitle}</h2>
-            <p className="mt-2 text-[14px] leading-6 text-slate-500">{t.app.chatText}</p>
-          </div>
-        )}
-
-        <div className="w-full space-y-4">
-          {chat.messages.map((m, i) =>
-            m.role === 'user' ? (
-              <div key={i} className="flex justify-end">
-                <div className="max-w-[78%] whitespace-pre-wrap rounded-2xl border border-blue-100 bg-blue-50 px-4 py-3 text-[14px] font-semibold">
-                  {m.text}
-                </div>
-              </div>
-            ) : (
-              <div key={i} className="w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <div className="mb-2 text-[12px] font-bold text-slate-400">{m.title || t.working}</div>
-
-                {m.activity?.length > 0 && (
-                  <ul className="mb-3 list-none space-y-1 border-l-2 border-slate-100 pl-3 text-[12.5px] text-slate-500">
-                    {m.activity.map((line, idx) => (
-                      <li key={idx} className={m.streaming && idx === m.activity.length - 1 ? 'text-slate-900' : ''}>
-                        {line}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                {m.error && <div className="text-[14px] text-red-600">{m.text}</div>}
-                {!m.error && m.emptyText && <div className="text-[14px] text-slate-500">{m.emptyText}</div>}
-                {m.markdown && (
-                  <>
-                    <article className="md max-w-none text-[14px]">
-                      <MarkdownRenderer markdown={m.markdown} onOpenNode={null} rawById={{}} referenceLabel={t.app.cited} />
-                    </article>
-                    {m.answer && (
-                      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3">
-                        <button
-                          onClick={() => onViewAnswer(m.answer)}
-                          className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-[12px] font-extrabold text-blue-700"
-                        >
-                          {t.app.viewFull}
-                        </button>
-                        {(m.answer.citedIds || []).slice(0, 8).map((id) => (
-                          <button
-                            key={id}
-                            onClick={() => onViewAnswer(m.answer)}
-                            className="rounded border border-slate-200 px-2 py-1 text-[11px] text-slate-500 hover:text-blue-700"
-                            title={id}
-                          >
-                            {id.slice(0, 8)}…
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            ),
+          {rightOpen && (
+            <RightDocumentRail
+              wiki={wiki}
+              rootPath={growiConnection?.root_path || '/'}
+              workspace={workspace}
+              tabs={rightTabs}
+              activeTabId={activeRightTabId}
+              onActivateTab={setActiveRightTabId}
+              onCloseTab={closeRightTab}
+              onOpenNode={(n) => openNodeById(n.id)}
+              onOpenDocument={openDocument}
+              rawById={rawById}
+              onViewAnswer={(answer) => openAnswerTab(answer, true)}
+              mentionedNodeIdsByAnswerId={answerMentionedIdsByAnswerId}
+              onClose={() => setRightOpen(false)}
+            />
           )}
         </div>
-        <div ref={endRef} />
-      </div>
 
-      <div className="shrink-0 border-t border-blue-100/70 px-0 pb-4 pt-3">
-        <div className="flex min-h-[58px] items-end gap-3 rounded-2xl border border-blue-100 bg-blue-50/80 px-4 py-3 focus-within:border-blue-400">
-          <textarea
-            rows={1}
-            className="max-h-[180px] min-h-[34px] min-w-0 flex-1 resize-none bg-transparent py-1 text-[14px] outline-none"
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-                e.preventDefault()
-                submit()
-              }
-            }}
-            placeholder={t.app.askPlaceholder}
-          />
-          {chat.agentRunning ? (
-            <button
-              className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-red-600 text-white disabled:opacity-50"
-              onClick={chat.stopAgent}
-              disabled={!chat.agentRunId || chat.agentStopping}
-              title={chat.agentStopping ? t.app.stopping : t.app.stop}
-            >
-              {chat.agentStopping ? <Loader2 size={18} className="animate-spin" /> : <Square size={16} fill="currentColor" />}
-            </button>
-          ) : (
-            <button
-              className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-blue-600 text-white disabled:opacity-50"
-              onClick={submit}
-              disabled={!question.trim()}
-              title={t.app.ask}
-            >
-              <Send size={18} />
-            </button>
-          )}
-        </div>
-        <p className="mt-2 text-center text-[11px] text-slate-400">{t.app.disclaimer}</p>
-      </div>
-    </div>
-  )
-}
-
-// -----------------------------------------------------------------------------
-// Settings: per-request LLM overrides (sessionStorage; key never persisted)
-// -----------------------------------------------------------------------------
-
-const FIELDS = [
-  ['chat_base_url', 'API Base URL', 'text'],
-  ['chat_model', 'Model', 'text'],
-  ['chat_temperature', 'Temperature', 'number'],
-  ['subagent_count', 'Subagents', 'number'],
-  ['subagent_concurrency', 'Subagent concurrency', 'number'],
-  ['agent_max_steps', 'Agent max steps', 'number'],
-]
-
-function SettingsCenterNew({ persisted, apiKey, onApply, onClear, fireToast, t }) {
-  const [values, setValues] = useState(() => ({ chat_base_url: '', chat_model: '', chat_temperature: '', subagent_count: '', subagent_concurrency: '', agent_max_steps: '', ...persisted }))
-  const [key, setKey] = useState(apiKey ? '********' : '')
-
-  const apply = () => {
-    const out = {}
-    for (const [name] of FIELDS) {
-      const v = values[name]
-      if (v !== '' && v !== null) out[name] = v
-    }
-    onApply({ values: out, key: key && key !== '********' ? key : undefined })
-    fireToast(t.app.settingsApplied)
-  }
-
-  return (
-    <div className="h-full overflow-y-auto bg-gradient-to-b from-white to-[#f8fbff]">
-      <div className="mx-auto max-w-[720px] px-6 py-6">
-        <PageHeader icon={SettingsIcon} title={t.pages.settingsTitle} text={t.app.settingsText} />
-
-        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <div className="grid gap-3 sm:grid-cols-2">
-            {FIELDS.map(([name, label, type]) => (
-              <label key={name} className="text-[12px] font-bold text-slate-500">
-                {label}
-                <input
-                  type={type}
-                  value={values[name] ?? ''}
-                  onChange={(e) => setValues((v) => ({ ...v, [name]: e.target.value }))}
-                  className="mt-1 h-10 w-full rounded-lg border border-slate-200 px-3 text-[14px] font-medium outline-none focus:border-blue-400"
-                />
-              </label>
-            ))}
-            <label className="text-[12px] font-bold text-slate-500 sm:col-span-2">
-              API Key
-              <input
-                type="password"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                placeholder={apiKey ? '••••••••' : ''}
-                className="mt-1 h-10 w-full rounded-lg border border-slate-200 px-3 text-[14px] font-medium outline-none focus:border-blue-400"
-              />
-            </label>
-          </div>
-
-          <p className="mt-3 text-[12px] text-slate-400">{t.app.settingsNote}</p>
-
-          <div className="mt-4 flex gap-2">
-            <button onClick={apply} className="rounded-lg bg-blue-600 px-4 py-2 text-[13px] font-extrabold text-white hover:bg-blue-700">
-              {t.app.settingsApply}
-            </button>
-            <button
-              onClick={() => {
-                onClear()
-                setValues({})
-                setKey('')
-                fireToast(t.app.settingsCleared)
-              }}
-              className="rounded-lg border border-slate-200 px-4 py-2 text-[13px] font-bold text-slate-600 hover:bg-slate-50"
-            >
-              {t.app.settingsClear}
-            </button>
-          </div>
-        </div>
+        <AppFooter />
       </div>
     </div>
   )

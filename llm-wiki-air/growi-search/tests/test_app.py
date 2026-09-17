@@ -23,9 +23,11 @@ TOKEN = "SEKRET-9f3a"
 ID1 = "507f1f77bcf86cd799439011"
 
 
-def mock_transport():
+def mock_transport(callback=None):
+    callback = callback or (lambda request: httpx.Response(200, json={"ok": True}))
+
     def handler(request):
-        return httpx.Response(200, json={"ok": True})
+        return callback(request)
 
     return httpx.MockTransport(handler)
 
@@ -56,7 +58,18 @@ class FakeResearcher:
 
     async def children(self, *, page_id=None, path=None):
         self.calls.append(("children", page_id, path))
-        return [WikiPage(id=ID1, path="/Moove/x/child", title="child")]
+        return [
+            WikiPage(id="507f1f77bcf86cd799439099", path="/Moove/x/00-目次", title="00-目次"),
+            WikiPage(id=ID1, path="/Moove/x/child", title="child"),
+        ]
+
+    async def document_view(self, path):
+        self.calls.append(("document", path))
+        return {
+            "path": path,
+            "title": "doc",
+            "pages": [{**WikiPage(id=ID1, path=f"{path}/child", title="child").public_dict(), "summary": "card summary", "keywords": ["one"]}],
+        }
 
     async def ask(self, question, on_event=None, overrides=None, stop_event=None):
         self.calls.append(("ask", question))
@@ -69,11 +82,11 @@ class FakeResearcher:
         return self.answers[0]
 
 
-def make_app(settings=None, researcher=None):
+def make_app(settings=None, researcher=None, transport=None):
     settings = settings or Settings(growi_url="http://growi.test", growi_token=TOKEN, prefix="")
     fake = researcher or FakeResearcher()
     # Inject through create_app so lifespan keeps the fake.
-    application = appmod.create_app(settings, transport=mock_transport(), researcher=fake)
+    application = appmod.create_app(settings, transport=transport or mock_transport(), researcher=fake)
     return application, fake
 
 
@@ -92,7 +105,7 @@ class Readiness(unittest.TestCase):
         with TestClient(application) as client:
             data = client.get("/api/ready").json()
             self.assertEqual(
-                set(data), {"ready", "growi", "search", "llm", "reranker", "root_path"}
+                set(data), {"ready", "growi", "search", "llm", "reranker", "embedder", "root_path"}
             )
             self.assertTrue(data["growi"])
             self.assertFalse(data["llm"])  # no chat_base_url in test settings
@@ -137,6 +150,14 @@ class Pages(unittest.TestCase):
             self.assertEqual(ok.status_code, 200)
             self.assertEqual(ok.json()["children"][0]["path"], "/Moove/x/child")
 
+    def test_document_view(self):
+        application, _ = make_app()
+        with TestClient(application) as client:
+            out = client.get("/api/document?path=/Moove/doc")
+            self.assertEqual(out.status_code, 200)
+            self.assertEqual(out.json()["pages"][0]["summary"], "card summary")
+            self.assertEqual(out.json()["pages"][0]["keywords"], ["one"])
+
     def test_node_includes_links_without_second_fetch(self):
         application, fake = make_app()
         with TestClient(application) as client:
@@ -160,7 +181,7 @@ class Ask(unittest.TestCase):
             self.assertEqual(res.status_code, 200)
             self.assertEqual(
                 res.json(),
-                {"question": "q", "answer": "ANSWER-TEXT", "cited_node_ids": [ID1], "steps": 2},
+                {"question": "q", "answer": "ANSWER-TEXT", "cited_node_ids": [ID1], "cited_nodes": [], "steps": 2},
             )
 
     def test_empty_question_and_bad_override(self):
@@ -241,6 +262,36 @@ class SSE(unittest.TestCase):
         self.assertIsNone(appmod._queue_get(_q.Queue(), 0.05))
 
 
+class NewReadOnlyRoutes(unittest.TestCase):
+    ATTACHMENT_ID = "507f1f77bcf86cd799439026"
+
+    def test_settings_hides_secrets(self):
+        application, _ = make_app()
+        with TestClient(application) as client:
+            data = client.get("/api/settings").json()
+            self.assertIn("chat_model", data)
+            for secret in ("growi_token", "chat_api_key", "rerank_api_key"):
+                self.assertNotIn(secret, data)
+
+    def test_attachment_proxy_and_validation(self):
+        def handler(request):
+            if request.url.path.endswith(self.ATTACHMENT_ID):
+                return httpx.Response(200, content=b"PNG", headers={"content-type": "image/png"})
+            if request.url.path.endswith("507f1f77bcf86cd799439027"):
+                return httpx.Response(200, text="<html>login</html>", headers={"content-type": "text/html"})
+            return httpx.Response(200, json={"ok": True})
+
+        application, _ = make_app(transport=mock_transport(handler))
+        with TestClient(application) as client:
+            response = client.get(f"/api/attachment/{self.ATTACHMENT_ID}")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, b"PNG")
+            self.assertEqual(response.headers["content-type"], "image/png")
+            self.assertEqual(client.get("/api/attachment/not-an-id").status_code, 404)
+            html = client.get("/api/attachment/507f1f77bcf86cd799439027")
+            self.assertEqual(html.status_code, 502)
+
+
 class StaticAndPrefix(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -276,7 +327,9 @@ class StaticAndPrefix(unittest.TestCase):
         with TestClient(application) as client:
             self.assertEqual(client.get("/growi-search/api/ready").status_code, 200)
             self.assertEqual(client.get("/growi-search/health").status_code, 200)
-            self.assertEqual(client.get("/growi-search").status_code, 200)
+            redirect = client.get("/growi-search", follow_redirects=False)
+            self.assertEqual(redirect.status_code, 307)
+            self.assertEqual(redirect.headers["location"], "/growi-search/")
             # Prefix must strip only once: doubled prefix is not rewritten twice.
             self.assertEqual(client.get("/growi-search/growi-search/api/ready").status_code, 404)
 

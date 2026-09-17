@@ -6,6 +6,7 @@ build wiki [<raw-rel>...]   raw/ -> wiki pages only
 build link [<raw-rel>...]   link pending wiki pages only
 build all [<raw-rel>...]    wiki batch first, then link batch (bare build is an alias)
 publish                     publish the current wiki/ tree to GROWI
+index [<raw-rel>...]        publish per-document + root index pages for growi-search
 sync [<mount-rel>...]       one pass: external mount -> raw/ -> wiki/ -> links -> GROWI
 watch [<mount-rel>...]      queued 10-second metadata watcher + worker
 queue scan|work|status      operate the persistent watcher queue
@@ -193,6 +194,16 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return _report(publish_only(_settings(args)))
 
 
+def cmd_index(args: argparse.Namespace) -> int:
+    from publisher.index import build_index, delete_index_pages
+
+    settings = _settings(args)
+    if args.delete:
+        return _report(delete_index_pages(settings))
+    return _report(build_index(settings, only=args.items or None, publish=not args.no_publish,
+                               on_progress=_progress if args.verbose else None))
+
+
 def cmd_reset(args: argparse.Namespace) -> int:
     from publisher.pipeline import reset_growi
 
@@ -284,6 +295,11 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--force", action="store_true", help="regenerate even when the raw source is unchanged")
     build.set_defaults(fn=cmd_build)
     publish = sub.add_parser("publish", help="publish the current wiki tree only"); project_flags(publish); publish.set_defaults(fn=cmd_publish)
+    index = sub.add_parser("index", help="publish per-document + root index pages for growi-search"); project_flags(index)
+    index.add_argument("items", nargs="*", metavar="raw-rel", help="raw-relative paths; omit for every linked document")
+    index.add_argument("--no-publish", action="store_true", help="only write metadata/index/, do not touch GROWI")
+    index.add_argument("--delete", action="store_true", help="remove index pages from GROWI")
+    index.set_defaults(fn=cmd_index)
     reset = sub.add_parser("reset", help="trash publisher-owned GROWI pages and reset publish state"); project_flags(reset); reset.set_defaults(fn=cmd_reset)
 
     link = sub.add_parser("link", help="cross-document linker")

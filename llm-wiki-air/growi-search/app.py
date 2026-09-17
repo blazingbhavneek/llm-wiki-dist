@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import queue
+import re
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -17,12 +18,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import Settings
-from gateway import Reranker
+from gateway import Embedder, Reranker
 from growi_client import GrowiAPIError, GrowiSearchClient
 from researcher import AgentStopped, Researcher
 
@@ -71,6 +72,11 @@ class PrefixMiddleware:
                 scope = dict(scope)
                 scope["path"] = path[len(self.prefix):] or "/"
                 scope["raw_path"] = scope["path"].encode("utf-8")
+            elif path == self.prefix and scope["type"] == "http":
+                await send({"type": "http.response.start", "status": 307,
+                            "headers": [(b"location", (self.prefix + "/").encode())]})
+                await send({"type": "http.response.body", "body": b""})
+                return
             elif path == self.prefix:
                 scope = dict(scope)
                 scope["path"] = "/"
@@ -93,11 +99,15 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         )
         # A test transport means offline mode: skip the live reranker probe.
         reranker = None if transport is not None else Reranker.build(settings)
+        embedder = None if transport is not None else Embedder.build(settings)
         app.state.settings = settings
         app.state.client = client
         app.state.reranker = reranker
-        app.state.researcher = researcher or Researcher(client, settings, reranker)
+        app.state.embedder = embedder
+        app.state.researcher = researcher or Researcher(client, settings, reranker, embedder)
         app.state.runs = {}
+        if transport is None:  # warm the 00-目次 index map in the background (offline tests skip it)
+            threading.Thread(target=app.state.researcher.index_map.snapshot, name="index-map-warmup", daemon=True).start()
         try:
             app.state.growi_ok = bool(await asyncio.to_thread(client.health))
         except Exception as exc:  # noqa: BLE001 - startup probe is informational
@@ -127,6 +137,7 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
                 "search": bool(app.state.growi_ok),
                 "llm": st.llm_ready,
                 "reranker": app.state.reranker is not None,
+                "embedder": app.state.embedder is not None,
                 "root_path": st.growi_root_path,
             }
         )
@@ -148,6 +159,10 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
             "doc_parser_url": st.doc_parser_url,
         }
 
+    @app.get("/api/settings")
+    async def get_settings() -> dict[str, Any]:
+        return app.state.settings.public_dict()
+
     # -- read-only page views --------------------------------------------------
 
     @app.get("/api/pages/children")
@@ -164,7 +179,32 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
             pages = await researcher.children(page_id=page_id or None, path=path or None)
         except GrowiAPIError as exc:
             return growi_http_error(exc)
+        settings = app.state.settings
+        pages = [page for page in pages if page.path.rstrip("/").rsplit("/", 1)[-1] != settings.index_page_name]
         return JSONResponse({"children": [page.public_dict() for page in pages]})
+
+    @app.get("/api/document")
+    async def document(request: Request) -> JSONResponse:
+        path = (request.query_params.get("path") or "").strip()
+        if not path.startswith("/"):
+            return JSONResponse(status_code=400, content=api_error("path is required", False, "bad_request"))
+        try:
+            return JSONResponse(await app.state.researcher.document_view(path))
+        except GrowiAPIError as exc:
+            return growi_http_error(exc)
+
+    @app.get("/api/attachment/{attachment_id}")
+    async def attachment(attachment_id: str) -> Response:
+        if not re.fullmatch(r"[0-9a-fA-F]{24}", attachment_id):
+            return JSONResponse(status_code=404, content=api_error("attachment not found", False, "not_found"))
+        try:
+            found = await asyncio.to_thread(app.state.client.fetch_attachment, attachment_id)
+        except GrowiAPIError as exc:
+            return growi_http_error(exc)
+        if found is None:
+            return JSONResponse(status_code=404, content=api_error("attachment not found", False, "not_found"))
+        content, content_type = found
+        return Response(content=content, media_type=content_type, headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/api/node/{page_id:path}")
     async def node(page_id: str) -> JSONResponse:
@@ -221,7 +261,8 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         except RuntimeError:
             return JSONResponse(status_code=503, content=api_error("LLM is unavailable", True, "llm_unavailable"))
         return JSONResponse(
-            {"question": answer.question, "answer": answer.answer, "cited_node_ids": answer.cited_node_ids, "steps": answer.steps}
+            {"question": answer.question, "answer": answer.answer, "cited_node_ids": answer.cited_node_ids,
+             "cited_nodes": answer.cited_nodes, "steps": answer.steps}
         )
 
     @app.post("/api/ask/stream")

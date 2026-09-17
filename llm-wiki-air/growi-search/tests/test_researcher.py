@@ -11,7 +11,7 @@ os.environ.setdefault("GROWI_TOKEN", "t")
 import researcher as R
 from config import Settings
 from growi_client import GrowiAPIError, SearchHit
-from models import WikiPage
+from models import AgentAnswer, WikiPage
 
 ID1 = "507f1f77bcf86cd799439011"
 ID2 = "507f1f77bcf86cd799439012"
@@ -63,6 +63,60 @@ class FakeClient:
         return [PAGES[ID3]]
 
 
+class IndexClient(FakeClient):
+    ROOT_ID = "507f1f77bcf86cd799439021"
+    DOC_A_ID = "507f1f77bcf86cd799439022"
+    DOC_B_ID = "507f1f77bcf86cd799439023"
+
+    def __init__(self):
+        super().__init__()
+        self.index_pages = {
+            self.ROOT_ID: page_of(
+                self.ROOT_ID,
+                "/Moove/00-目次",
+                '<span hidden data-llm-wiki-index="root"></span>\n'
+                f"- [A](/{self.DOC_A_ID}) — A summary\n"
+                f"- [B](/{self.DOC_B_ID}) — B summary\n",
+            ),
+            self.DOC_A_ID: page_of(
+                self.DOC_A_ID,
+                "/Moove/A/00-目次",
+                '<span hidden data-llm-wiki-index="document"></span>\n'
+                f"- [Alpha](/6aab1ff0d4652631606ec418) — alpha\n"
+                "  - キーワード: alpha, beta\n",
+            ),
+            self.DOC_B_ID: page_of(
+                self.DOC_B_ID,
+                "/Moove/B/00-目次",
+                '<span hidden data-llm-wiki-index="document"></span>\n'
+                f"- [Beta](/6aab1ff0d4652631606ec419) — beta\n"
+                "  - キーワード: beta, gamma\n",
+            ),
+        }
+
+    def get_page(self, *, page_id=None, path=None):
+        self.page_calls.append(page_id or path)
+        key = page_id or path
+        if key == "/Moove/00-目次":
+            return self.index_pages[self.ROOT_ID]
+        if key == "/Moove/A/00-目次":
+            return self.index_pages[self.DOC_A_ID]
+        if key == "/Moove/B/00-目次":
+            return self.index_pages[self.DOC_B_ID]
+        if key == self.DOC_A_ID:
+            return self.index_pages[self.DOC_A_ID]
+        if key == self.DOC_B_ID:
+            return self.index_pages[self.DOC_B_ID]
+        if key in {"6aab1ff0d4652631606ec418", "6aab1ff0d4652631606ec419"}:
+            return page_of(key, f"/Moove/{key}", body=f"# {key}\nbody")
+        return super().get_page(page_id=page_id, path=path)
+
+    def search_pages(self, query, *, path, limit, offset=0):
+        return [
+            hit("507f1f77bcf86cd799439024", "/Moove/00-目次", "index should be hidden", 1),
+        ]
+
+
 class FakeReranker:
     """Prefers documents containing ``prefer``; reverses order otherwise."""
 
@@ -75,6 +129,68 @@ class FakeReranker:
         if self.prefer is None:
             return list(reversed(range(len(texts))))
         return [float(t.count(self.prefer)) for t in texts]
+
+
+class IndexMapTests(unittest.TestCase):
+    def make_index(self, reranker=None):
+        client = IndexClient()
+        settings = Settings(growi_url="http://growi.test", growi_token="t", growi_root_path="/Moove", index_cache_ttl=120)
+        index = R.IndexMap(client, settings, None, reranker)
+        return client, settings, index
+
+    def test_term_overlap_and_reranker(self):
+        _client, _settings, index = self.make_index()
+        self.assertEqual(index.rank("gamma", 2)[0]["node"].title, "Beta")
+        _client, _settings, index = self.make_index(FakeReranker(prefer="alpha"))
+        self.assertEqual(index.rank("anything", 2)[0]["node"].title, "Alpha")
+
+    def test_refresh_reads_root_and_each_document_once(self):
+        client, _settings, index = self.make_index()
+        index.rank("beta", 2)
+        self.assertEqual(len(client.page_calls), 3)
+        index.rank("alpha", 2)
+        self.assertEqual(len(client.page_calls), 3)
+
+    def test_fast_search_merges_map_and_hides_index_pages(self):
+        client, settings, index = self.make_index()
+        session = R.ResearchSession(client, settings, R.PageCache(120, 256), None, index_map=index)
+        ids = [item["node"].id for item in session.fast_search("beta", 5)]
+        self.assertNotIn(IndexClient.ROOT_ID, ids)
+        self.assertIn("6aab1ff0d4652631606ec419", ids)
+
+    def test_route_emits_map_evidence(self):
+        client, settings, index = self.make_index()
+        session = R.ResearchSession(client, settings, R.PageCache(120, 256), None, index_map=index)
+        session.llm = FakeLLM(route_mode="deep")
+        events = []
+        session._try_route("beta", events.append, None, "beta")
+        self.assertTrue(any(event.get("type") == "map" for event in events))
+        self.assertIn("index_map", session.llm.structured_calls[-1][1])
+
+    def test_citations_use_pages_read_during_the_run(self):
+        session = make_session()
+        session.read_node(ID1)
+        session._try_route = lambda *_args: AgentAnswer(question="q", answer="a", cited_node_ids=[ID1], steps=1)
+        answer = session.ask("q", None, None)
+        self.assertEqual(answer.cited_nodes[0]["title"], PAGES[ID1].title)
+
+
+class LinkKinds(unittest.TestCase):
+    def test_follow_link_filters_navigation_but_links_for_keeps_it(self):
+        nav_id = "507f1f77bcf86cd799439025"
+        PAGES[nav_id] = page_of(
+            nav_id,
+            "/Moove/nav",
+            f"前のページ: [a](/{ID2}) ｜ 次のページ: [b](/{ID3})\n- [t](/{ID5}) — related\n",
+        )
+        try:
+            session = make_session()
+            all_links = session.links_for(PAGES[nav_id])
+            followed = session.follow_link(nav_id)
+            self.assertEqual([link.kind for link in all_links], ["nav", "nav", "markdown"])
+            self.assertEqual([link.kind for link in followed], ["markdown"])
+        finally:
+            PAGES.pop(nav_id, None)
 
 
 class FakeLLM:
@@ -311,7 +427,10 @@ class AskRouting(unittest.TestCase):
         self.assertIsNone(result)  # deep -> lead agent path
         self.assertTrue(session._seed_ids)
         events.clear()
-        report = session._run_subagents([ID2, ID3], "質問", [], emit, None)
+        from unittest.mock import patch
+
+        with patch.object(R, "_run_subagent", return_value={"start": ID2, "answer": "報告", "cited": [ID2]}):
+            report = session._run_subagents([ID2, ID3], "質問", [], emit, None)
         self.assertIn("サブエージェント", report)
         types = [e["type"] for e in events]
         self.assertIn("subagents_spawned", types)
@@ -328,16 +447,30 @@ class Overrides(unittest.TestCase):
         with self.assertRaises(ValueError):
             R._sanitize_overrides({"chat_base_url": "http://169.254.169.254/v1"}, settings)
 
-    def test_unknown_key_rejected(self):
+    def test_blocked_loopback_host(self):
+        settings = Settings(allowed_llm_hosts="127.0.0.1")
         with self.assertRaises(ValueError):
-            R._sanitize_overrides({"nonsense": 1}, Settings())
+            R._sanitize_overrides({"chat_base_url": "http://127.0.0.1/v1"}, settings)
+
+    def test_unknown_key_ignored(self):
+        self.assertEqual(R._sanitize_overrides({"nonsense": 1}, Settings()), {})
+
+    def test_extended_overrides_are_hard_capped(self):
+        values = R._sanitize_overrides({"subagent_count": 9, "subagent_max_steps": 35}, Settings())
+        self.assertEqual(values["subagent_count"], 6)
+        self.assertEqual(values["subagent_max_steps"], 35)
+
+    def test_own_chat_host_is_allowed_without_allowlist(self):
+        settings = Settings(chat_base_url="http://growi.test", allowed_llm_hosts="")
+        values = R._sanitize_overrides({"chat_base_url": "http://growi.test/v1"}, settings)
+        self.assertEqual(values["chat_base_url"], "http://growi.test/v1")
 
     def test_overrides_do_not_mutate_defaults(self):
         settings = Settings(growi_url="http://growi.test", growi_token="t", chat_model="base-model", subagent_count=2)
         session = make_session(settings=settings)
         session.apply_overrides({"chat_model": "other", "subagent_count": 99})
         self.assertEqual(session.settings.chat_model, "other")
-        self.assertEqual(session.settings.subagent_count, 2)  # clamped to server max
+        self.assertEqual(session.settings.subagent_count, 6)
         self.assertEqual(settings.chat_model, "base-model")
         other = make_session(settings=settings)
         self.assertEqual(other.settings.chat_model, "base-model")

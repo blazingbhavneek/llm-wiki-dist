@@ -1,6 +1,6 @@
 """Cross-deployment equivalence for the XLSM lineage builder.
 
-The graph and doc-parser deployments ship independent copies of the static
+The graph and parser deployments ship independent copies of the static
 lineage analysis (see plan §25); this test locks their public schemas so the
 generic final-output pages and the llm-wiki manifest stay aligned even as the
 two services evolve independently.
@@ -20,7 +20,8 @@ from graph.workspace import xlsm as graph_lineage
 
 _PARSER_MODULE_PATH = (
     Path(__file__).resolve().parents[1]
-    / "doc-parser"
+    .parent
+    / "parser"
     / "formats"
     / "xlsm_lineage.py"
 )

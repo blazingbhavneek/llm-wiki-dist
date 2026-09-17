@@ -11,6 +11,14 @@ function activityLine(ev, t) {
       return t.searching(who, ev.query)
     case 'candidates':
       return t.pagesFound(ev.count)
+    case 'map':
+      return t.mapScanned(ev.documents, ev.pages, ev.selected)
+    case 'budget':
+      return ev.message ? t.budgetNote(ev.pages_used) : null
+    case 'budget_search_exhausted':
+      return t.budgetSearch
+    case 'queued_for_agent':
+      return t.queuedForAgent
     case 'route':
       return ev.mode === 'reuse'
         ? t.routeReuse
@@ -116,6 +124,13 @@ export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) 
             title: t.requestFailed,
             text: ev.detail || ev.message || t.requestFailed,
           }))
+        }
+
+        if (ev.type === 'map') {
+          patchLast((m) => ({ ...m, map: { documents: ev.documents, pages: ev.pages, nodes: ev.nodes || [] } }))
+        } else if (ev.type === 'subagent_start' || ev.type === 'read') {
+          const id = ev.node?.id
+          if (id) patchLast((m) => ({ ...m, visitedIds: [...new Set([...(m.visitedIds || []), id])] }))
         }
 
         if (ev.type === 'diagram_pending') {

@@ -68,12 +68,12 @@ class WikiLink(BaseModel):
     source_heading: str = ""
     fragment: str = ""
     target_path: str = ""
-    kind: Literal["markdown", "parent", "child"] = "markdown"
+    kind: Literal["markdown", "parent", "child", "nav"] = "markdown"
 
 
 class Evidence(BaseModel):
     page_id: str
-    field: Literal["growi_es", "title_path", "section", "linked_context"]
+    field: Literal["growi_es", "title_path", "section", "linked_context", "index_map"]
     text: str
     heading: str = ""
     start_line: int | None = None
@@ -86,6 +86,7 @@ class AgentAnswer(BaseModel):
     question: str
     answer: str = ""
     cited_node_ids: list[str] = Field(default_factory=list)
+    cited_nodes: list[dict[str, str]] = Field(default_factory=list)
     steps: int = 0
 
 

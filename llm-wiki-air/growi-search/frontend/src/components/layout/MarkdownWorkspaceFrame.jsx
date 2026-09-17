@@ -15,11 +15,11 @@ export function MarkdownWorkspaceFrame({
 
   return (
     <div className="flex h-full flex-col bg-white">
-      <div className="flex h-[54px] shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4">
+      <div className="flex h-[54px] shrink-0 items-center gap-3 border-b border-neutral-200 bg-white px-4">
         {canGoBack && (
           <button
             onClick={onBack}
-            className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-[12px] font-bold text-slate-600 hover:bg-slate-50 hover:text-slate-950"
+            className="flex items-center gap-2 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-[12px] font-bold text-neutral-600 hover:bg-neutral-50 hover:text-neutral-950"
             title={t.markdownFrame.backTitle}
             aria-label={t.markdownFrame.backTitle}
           >
@@ -33,10 +33,10 @@ export function MarkdownWorkspaceFrame({
         </div>
 
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[14px] font-extrabold text-slate-950">
+          <div className="truncate text-[14px] font-semibold text-neutral-950">
             {item?.doc?.title || item?.title || t.markdownFrame.fallbackTitle}
           </div>
-          <div className="truncate text-[11px] font-medium text-slate-400">
+          <div className="truncate text-[11px] font-medium text-neutral-400">
             {t.markdownFrame.hint}
           </div>
         </div>
@@ -50,7 +50,7 @@ export function MarkdownWorkspaceFrame({
 
         <button
           onClick={onClose}
-          className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-[12px] font-bold text-slate-600 hover:bg-slate-50 hover:text-slate-950"
+          className="flex items-center gap-2 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-[12px] font-bold text-neutral-600 hover:bg-neutral-50 hover:text-neutral-950"
           title={t.markdownFrame.collapseTitle}
           aria-label={t.markdownFrame.collapseTitle}
         >

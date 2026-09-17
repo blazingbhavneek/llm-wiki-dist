@@ -8,6 +8,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 
 import MermaidDiagram from '../MermaidDiagram'
+import { api } from '../../api'
 import { useT } from '../../i18n.jsx'
 import { STR } from './strings.js'
 import {
@@ -197,14 +198,33 @@ const CITED_NODE_IDS_BLOCK_RE =
 const REFERENCE_NODES_LINE_RE =
   /(^|\n)\s*(?:参照ノード|引用ノード|reference\s*nodes?|cited\s*nodes?)\s*[:：]\s*([^\n]*)/gi
 
-function buildMarkdownComponents(onOpenNode, rawById) {
+function buildMarkdownComponents(onOpenNode, rawById, sourcePath, links) {
   return {
     img: ({ node, src = '', alt = '', title, width, height }) => (
-      <SafeImage src={src} alt={alt} title={title} width={width} height={height} />
+      <SafeImage src={String(src).startsWith('/attachment/') ? api.attachmentUrl(src) : src} alt={alt} title={title} width={width} height={height} />
     ),
 
     a: ({ node, href = '', children, ...props }) => {
       const rawHref = String(href || '')
+      const growiId = rawHref.match(/^\/([0-9a-f]{24})(?:#.*)?$/i)
+      if (growiId && onOpenNode) {
+        return (
+          <button type="button" className="font-semibold text-blue underline underline-offset-2 hover:opacity-80"
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); onOpenNode(growiId[1]) }}>
+            {children}
+          </button>
+        )
+      }
+
+      const wikiTarget = resolveWikiTarget(rawHref, sourcePath, rawById, links)
+      if (wikiTarget && onOpenNode) {
+        return (
+          <button type="button" className="font-semibold text-blue underline underline-offset-2 hover:opacity-80"
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); onOpenNode(wikiTarget) }}>
+            {children}
+          </button>
+        )
+      }
       const candidateId = parseNodeHref(rawHref)
 
       if (candidateId) {
@@ -333,15 +353,15 @@ function buildMarkdownComponents(onOpenNode, rawById) {
   }
 }
 
-function MarkdownChunk({ markdown, onOpenNode, rawById }) {
+function MarkdownChunk({ markdown, sourcePath, links, onOpenNode, rawById }) {
   const safeMarkdown = String(markdown || '')
   const linkedMarkdown = useMemo(
     () => linkifyNodeIdsInMarkdown(safeMarkdown, rawById),
     [safeMarkdown, rawById],
   )
   const markdownComponents = useMemo(
-    () => buildMarkdownComponents(onOpenNode, rawById),
-    [onOpenNode, rawById],
+    () => buildMarkdownComponents(onOpenNode, rawById, sourcePath, links),
+    [onOpenNode, rawById, sourcePath, links],
   )
   if (!safeMarkdown) return null
 
@@ -369,6 +389,8 @@ function MarkdownChunk({ markdown, onOpenNode, rawById }) {
 
 export function MarkdownRenderer({
   markdown,
+  sourcePath = '',
+  links = [],
   onOpenNode,
   rawById,
   referenceLabel = 'Reference',
@@ -400,6 +422,8 @@ export function MarkdownRenderer({
           <MarkdownChunk
             key={`markdown-${index}`}
             markdown={part.content}
+            sourcePath={sourcePath}
+            links={links}
             onOpenNode={onOpenNode}
             rawById={rawById}
           />
@@ -490,6 +514,53 @@ function parseNodeHref(href) {
   if (looksLikeNodeId(raw)) return raw
 
   return ''
+}
+
+function resolveWikiTarget(href, sourcePath, rawById, links) {
+  const path = normalizeWikiPath(href, sourcePath)
+  if (!path || path.startsWith('/attachment/')) return ''
+
+  const link = (Array.isArray(links) ? links : []).find(
+    (item) => normalizeStoredPath(item?.target_path) === path,
+  )
+  if (link?.target_node_id) return link.target_node_id
+
+  const nodes = rawById instanceof Map ? rawById.values() : Object.values(rawById || {})
+  const known = [...nodes].find(
+    (node) => normalizeStoredPath(node?.path || node?.source_path) === path,
+  )
+  return known?.id || path
+}
+
+function normalizeStoredPath(value) {
+  const raw = String(value || '').trim()
+  if (!raw || !raw.startsWith('/')) return ''
+  return normalizeWikiPath(raw, '')
+}
+
+function normalizeWikiPath(href, sourcePath) {
+  const raw = String(href || '').trim()
+  if (!raw || raw.startsWith('#') || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(raw)) return ''
+
+  const path = raw.split('#', 1)[0]
+  if (!path) return ''
+
+  const source = String(sourcePath || '')
+  const directory = source.includes('/') ? source.slice(0, source.lastIndexOf('/') + 1) : '/'
+  let resolved
+  try {
+    resolved = new URL(path, `http://growi.local${directory}`).pathname
+  } catch {
+    return ''
+  }
+
+  try {
+    let clean = decodeURIComponent(resolved).replace(/\/+$/, '') || '/'
+    if (clean.toLowerCase().endsWith('.md')) clean = clean.slice(0, -3) || '/'
+    return clean
+  } catch {
+    return ''
+  }
 }
 
 function getReferenceLabel(id, rawById) {

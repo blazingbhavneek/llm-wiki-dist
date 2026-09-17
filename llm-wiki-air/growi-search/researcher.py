@@ -10,13 +10,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
+import unicodedata
 from urllib.parse import quote
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any, Callable
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
@@ -26,7 +28,7 @@ from pydantic import BaseModel, Field
 
 import markdown as md
 from config import Settings
-from gateway import LlmClient, Reranker, normalize_scores
+from gateway import Embedder, LlmClient, Reranker, cosine, normalize_scores
 from growi_client import GrowiAPIError, GrowiSearchClient
 from models import AgentAnswer, Evidence, WikiLink, WikiPage, make_link_id
 from prompts import (
@@ -164,6 +166,185 @@ class PageCache:
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
+
+
+@dataclass
+class _MapState:
+    """One immutable snapshot of the index map; swapped atomically on refresh."""
+    docs: list[md.IndexCard] = field(default_factory=list)
+    cards: list[md.IndexCard] = field(default_factory=list)
+    vectors: list[list[float]] = field(default_factory=list)
+    grams: list[set[str]] = field(default_factory=list)
+    df: Counter = field(default_factory=Counter)
+
+
+class IndexMap:
+    """Cards from <root>/00-目次 and every <doc>/00-目次, cached in memory with a TTL.
+
+    Nothing is written to disk. A refresh reads 1 + N index pages in parallel and
+    embeds only cards whose text changed; while it runs, questions keep using the
+    previous snapshot (stale-while-revalidate). Only the very first load blocks."""
+
+    def __init__(self, client: GrowiSearchClient, settings: Settings, embedder: Embedder | None, reranker: Reranker | None) -> None:
+        self.client, self.settings, self.embedder, self.reranker = client, settings, embedder, reranker
+        self._lock = Lock()
+        self._expires = 0.0
+        self._refreshing = False
+        self._state = _MapState()
+        self._vector_cache: dict[str, list[float]] = {}  # card text -> vector, reused across refreshes
+
+    @staticmethod
+    def grams(text: str) -> set[str]:
+        """Keyword units that work without a Japanese tokenizer: latin/digit words plus
+        character bigrams of everything else (same idea as the linker's trigram FTS)."""
+        text = unicodedata.normalize("NFKC", text or "").lower()
+        out = set(re.findall(r"[a-z0-9]{2,}", text))
+        run = re.sub(r"[a-z0-9\s\W]+", " ", text)
+        for chunk in run.split():
+            out.update(chunk[i:i + 2] for i in range(len(chunk) - 1))
+            if len(chunk) == 1:
+                out.add(chunk)
+        return out
+
+    @staticmethod
+    def card_text(card: md.IndexCard) -> str:
+        return (f"{card.document} > {card.title}\n{card.summary}\n"
+                f"キーワード: {'、'.join(card.keywords)}\nエンティティ: {'、'.join(card.entities)}")
+
+    @staticmethod
+    def card_page(card: md.IndexCard) -> WikiPage:
+        ref = card.target.strip("/")
+        is_id = bool(re.fullmatch(r"[0-9a-fA-F]{24}", ref))
+        return WikiPage(id=ref if is_id else card.target, path="" if is_id else card.target,
+                        title=card.title, summary=card.summary, document=card.document, cluster=card.chapter)
+
+    def _read(self, target: str) -> WikiPage | None:
+        ref = target.strip("/")
+        try:
+            if re.fullmatch(r"[0-9a-fA-F]{24}", ref):
+                return self.client.get_page(page_id=ref)
+            return self.client.get_page(path=target)
+        except GrowiAPIError as exc:
+            log.info("index page read failed (%s): %s", target, exc)
+            return None
+
+    def _build(self) -> _MapState:
+        """Fetch + parse + embed into a fresh state. Touches no shared fields except the vector cache."""
+        root = self.settings.growi_root_path.rstrip("/")
+        page = self.client.get_page(path=f"{root}/{self.settings.index_page_name}")
+        if page is None or not md.is_index_page(page.body):
+            return _MapState()
+        docs = md.parse_index(page.body)
+        with ThreadPoolExecutor(max_workers=max(1, self.settings.growi_concurrency), thread_name_prefix="index-map") as pool:
+            subs = list(pool.map(lambda doc: self._read(doc.target), docs))
+        cards: list[md.IndexCard] = []
+        for doc, sub in zip(docs, subs):
+            if sub is None or not md.is_index_page(sub.body):
+                continue
+            for card in md.parse_index(sub.body):
+                card.document = doc.title
+                cards.append(card)
+        texts = [self.card_text(c) for c in cards]
+        vectors: list[list[float]] = []
+        if self.embedder is not None and cards:
+            cache = self._vector_cache
+            missing = [t for t in dict.fromkeys(texts) if t not in cache]
+            try:
+                for start in range(0, len(missing), 64):
+                    batch = missing[start:start + 64]
+                    cache.update(zip(batch, self.embedder.embed_documents(batch)))
+                vectors = [cache[t] for t in texts]
+            except Exception as exc:  # noqa: BLE001 - fall back to keyword overlap
+                log.info("index embed failed: %s", exc)
+                vectors = []
+            self._vector_cache = {t: cache[t] for t in set(texts) if t in cache}  # drop vanished cards
+        grams = [self.grams(t) for t in texts]
+        df: Counter = Counter()
+        for g in grams:
+            df.update(g)
+        return _MapState(docs=docs, cards=cards, vectors=vectors, grams=grams, df=df)
+
+    def _refresh(self) -> None:
+        state: _MapState | None = None
+        try:
+            state = self._build()
+        except GrowiAPIError as exc:
+            log.info("index map load failed: %s", exc)
+        except Exception:  # noqa: BLE001 - never leave _refreshing stuck
+            log.exception("index map refresh failed")
+        with self._lock:
+            if state is not None:
+                self._state = state
+            self._expires = time.monotonic() + self.settings.index_cache_ttl
+            self._refreshing = False
+
+    def snapshot(self) -> _MapState:
+        """Current state; expired + warm -> refresh in the background, expired + cold -> block."""
+        with self._lock:
+            if time.monotonic() <= self._expires or self._refreshing:
+                return self._state
+            self._refreshing = True
+            warm = bool(self._state.cards)
+        if warm:
+            Thread(target=self._refresh, name="index-map-refresh", daemon=True).start()
+        else:
+            self._refresh()
+        with self._lock:
+            return self._state
+
+    @staticmethod
+    def keyword_scores(query: str, state: _MapState) -> list[float]:
+        """IDF-weighted overlap between the question's grams and each card's grams."""
+        q = IndexMap.grams(query)
+        n = max(1, len(state.grams))
+        return [
+            sum(math.log(1 + n / state.df[g]) for g in q & card) if card else 0.0
+            for card in state.grams
+        ]
+
+    def card_for(self, page_id: str) -> md.IndexCard | None:
+        return next((c for c in self.snapshot().cards if c.target.strip("/") == page_id), None)
+
+    def rank(self, query: str, k: int) -> list[dict[str, Any]]:
+        state = self.snapshot()
+        cards, vectors = state.cards, state.vectors
+        if not cards or k <= 0:
+            return []
+        # Keyword channel over the 00-目次 cards (the "ES over index pages only" you would
+        # otherwise want): IDF-weighted bigram overlap, no network.
+        kw = self.keyword_scores(query, state)
+        kw_order = sorted(range(len(cards)), key=lambda i: kw[i], reverse=True)
+        fused = {i: 1.0 / (60 + pos) for pos, i in enumerate(kw_order) if kw[i] > 0}
+        if vectors and self.embedder is not None:
+            try:
+                q = self.embedder.embed_query(query)
+                sims = [cosine(q, v) for v in vectors]
+                for pos, i in enumerate(sorted(range(len(cards)), key=lambda i: sims[i], reverse=True)):
+                    fused[i] = fused.get(i, 0.0) + 1.0 / (60 + pos)
+            except Exception as exc:  # noqa: BLE001
+                log.info("query embed failed: %s", exc)
+        if fused:
+            order = sorted(fused, key=lambda i: fused[i], reverse=True)[: self.settings.index_map_embed_k]
+        else:  # nothing matched by keyword/embedding: let the reranker judge the first cards
+            order = list(range(min(len(cards), self.settings.index_map_embed_k)))
+        scores = {i: 1.0 / (1 + pos) for pos, i in enumerate(order)}
+        if self.reranker is not None:
+            try:
+                ranked = normalize_scores(self.reranker.score(query, [self.card_text(cards[i]) for i in order]))
+                scores = dict(zip(order, ranked))
+                order.sort(key=lambda i: scores[i], reverse=True)
+            except Exception as exc:  # noqa: BLE001
+                log.info("index rerank failed: %s", exc)
+        results: list[dict[str, Any]] = []
+        for rank, i in enumerate(order[:k], start=1):
+            page = self.card_page(cards[i])
+            results.append({
+                "node": page, "score": scores[i],
+                "why": [{"field": "index_map", "rank": rank}],
+                "evidence": [Evidence(page_id=page.id, field="index_map", text=self.card_text(cards[i]),
+                                         source_rank=rank, score=scores[i]).model_dump()],
+            })
+        return results
 
 
 class RouteDecision(BaseModel):
@@ -345,6 +526,7 @@ def _describe(result: dict[str, Any]) -> dict[str, Any]:
         "title": page.title,
         "summary": page.summary,
         "evidence": [" ".join((ev.get("text") or "").split())[:280] for ev in result.get("evidence", [])[:3]],
+        "evidence_fields": [ev.get("field", "") for ev in result.get("evidence", [])[:3]],
     }
 
 
@@ -354,11 +536,12 @@ def _describe(result: dict[str, Any]) -> dict[str, Any]:
 class ResearchSession:
     """Per-ask execution context sharing a GROWI client and a RunBudget."""
 
-    def __init__(self, client: GrowiSearchClient, settings: Settings, cache: PageCache, reranker: Reranker | None) -> None:
+    def __init__(self, client: GrowiSearchClient, settings: Settings, cache: PageCache, reranker: Reranker | None, index_map: IndexMap | None = None) -> None:
         self.client = client
         self.settings = settings
         self.cache = cache
         self.reranker = reranker
+        self.index_map = index_map
         self.llm = LlmClient(
             settings.chat_model,
             settings.chat_base_url,
@@ -452,9 +635,38 @@ class ResearchSession:
         self._search_memo[key] = results
         return results
 
+    def _merge_map(self, query: str, results: list[dict[str, Any]], limit: int, emit: Callable | None = None) -> list[dict[str, Any]]:
+        if self.index_map is None:
+            return results
+        mapped = self.index_map.rank(query, limit)
+        if emit:
+            state = self.index_map.snapshot()
+            docs, cards = state.docs, state.cards
+            # The research map: which documents/pages of the 00-目次 index were picked for this question.
+            emit({
+                "type": "map", "documents": len(docs), "pages": len(cards), "selected": len(mapped),
+                "nodes": [
+                    {"id": m["node"].id, "title": m["node"].title, "document": m["node"].document,
+                     "chapter": m["node"].cluster, "score": round(float(m["score"]), 3)}
+                    for m in mapped
+                ],
+            })
+        by_id = {r["node"].id: r for r in results}
+        for item in mapped:
+            hit = by_id.get(item["node"].id)
+            if hit is None:
+                results.append(item)
+                by_id[item["node"].id] = item
+            else:
+                hit["node"].summary = hit["node"].summary or item["node"].summary
+                hit["why"].append(item["why"][0])
+                hit["evidence"].extend(item["evidence"])
+        return results
+
     # -- ranking -------------------------------------------------------------
 
     def _rank_candidates(self, query: str, hits: list, limit: int) -> list[dict[str, Any]]:
+        hits = [h for h in hits if h.page.path.rstrip("/").rsplit("/", 1)[-1] != self.settings.index_page_name]
         if not hits:
             return []
         texts = [f"{h.page.title}\n{h.page.path}\n{h.snippet}" for h in hits]
@@ -503,7 +715,7 @@ class ResearchSession:
             return []
         query = " ".join(query.split())
         hits = self.client.search_pages(query, path=self.settings.growi_root_path, limit=self.settings.search_candidates)
-        return self._rank_candidates(query, hits, limit)
+        return self._merge_map(query, self._rank_candidates(query, hits, limit), limit)
 
     def search(self, query: str, limit: int | None = None) -> list[WikiPage]:
         limit = limit or self.settings.rerank_top_k
@@ -656,7 +868,7 @@ class ResearchSession:
                     source_heading=parsed.heading,
                     fragment=parsed.fragment,
                     target_path=target.path or "",
-                    kind="markdown",
+                    kind=parsed.kind,
                 )
             )
             if len(links) >= self.settings.link_expand_limit:
@@ -675,6 +887,7 @@ class ResearchSession:
         else:
             anchor = self._fetch_ref(page_id)
             links = self.links_for(anchor) if anchor is not None else []
+            links = [l for l in links if l.kind != "nav"]
             with self._lock:
                 self._links_memo[key] = links
         if anchor is None:
@@ -738,9 +951,23 @@ class ResearchSession:
         answer = self._try_route(question, emit, stop_event, question)
         if answer is None:
             answer = self._run_lead(question, emit, stop_event)
+        answer.cited_nodes = [self._cite(node_id) for node_id in answer.cited_node_ids]
         usages = [*self._usage_cb.usage_metadata.values(), *self._extra_usage]
         _log_usage(question, answer.answer, answer.steps, usages, self.settings)
         return answer
+
+    def _cite(self, page_id: str) -> dict[str, str]:
+        page = self._memo_page(page_id)
+        if page is None:
+            for results in self._search_memo.values():
+                page = next((r["node"] for r in results if r["node"].id == page_id), None)
+                if page:
+                    break
+        if page is None and self.index_map is not None:
+            card = self.index_map.card_for(page_id)
+            page = IndexMap.card_page(card) if card else None
+        return {"id": page_id, "title": page.title if page else page_id, "path": page.path if page else "",
+                "summary": page.summary if page else ""}
 
     def _record_usage(self) -> None:
         if getattr(self.llm, "last_usage", None):
@@ -753,6 +980,7 @@ class ResearchSession:
         if self.budget.pages_exhausted:
             emit({"type": "budget", "pages_used": self.budget.pages_used, "message": "ページ取得上限到達"})
         results = self.search_with_evidence(question, self.settings.rerank_top_k)
+        results = self._merge_map(question, results, self.settings.index_map_top_k, emit)
         if not results:
             emit({"type": "route", "mode": "deep", "reason": "no candidates"})
             return None
@@ -1114,33 +1342,27 @@ def _run_subagent(session: ResearchSession, run: Subrun, question: str, prompt: 
 # --- override sanitization / SSRF guard ------------------------------------
 
 
-_OVERRIDE_KEYS = {
-    "chat_base_url",
-    "chat_api_key",
-    "chat_model",
-    "chat_temperature",
-    "subagent_count",
-    "subagent_concurrency",
-    "subagent_min_reads",
-    "subagent_max_reads",
-    "agent_max_steps",
-    "rerank_top_k",
+_OVERRIDE_MAX = {
+    "subagent_count": 6, "subagent_concurrency": 4, "subagent_min_reads": 10, "subagent_max_reads": 20,
+    "subagent_max_steps": 40, "agent_max_steps": 60, "agent_patience": 30, "rerank_top_k": 40,
+    "search_candidates": 50, "shallow_page_reads": 3, "index_map_top_k": 40,
 }
+_OVERRIDE_KEYS = {"chat_base_url", "chat_api_key", "chat_model", "chat_temperature", *_OVERRIDE_MAX}
 
 
 def _sanitize_overrides(overrides: dict[str, Any], settings: Settings) -> dict[str, Any]:
     clean: dict[str, Any] = {}
     for key, raw in (overrides or {}).items():
-        if raw is None or key not in _OVERRIDE_KEYS:
-            if key not in _OVERRIDE_KEYS:
-                raise ValueError(f"unknown override key: {key}")
+        if raw is None or raw == "":
+            continue
+        if key not in _OVERRIDE_KEYS:
+            log.info("ignoring unknown override key: %s", key)
             continue
         try:
             if key == "chat_temperature":
                 clean[key] = max(0.0, min(2.0, float(raw)))
-            elif key in {"subagent_count", "subagent_concurrency", "subagent_min_reads", "subagent_max_reads", "agent_max_steps", "rerank_top_k"}:
-                clean[key] = max(0, int(raw))
-                continue
+            elif key in _OVERRIDE_MAX:
+                clean[key] = max(1, min(int(float(raw)), _OVERRIDE_MAX[key]))
             else:
                 text = str(raw).strip()
                 if not text:
@@ -1148,18 +1370,6 @@ def _sanitize_overrides(overrides: dict[str, Any], settings: Settings) -> dict[s
                 clean[key] = text
         except (TypeError, ValueError):
             continue
-
-    # Clamp overrides within server limits (never exceed the server's configured bounds).
-    if int(clean.get("subagent_count", 0) or 0) > settings.subagent_count:
-        clean["subagent_count"] = settings.subagent_count
-    if int(clean.get("subagent_concurrency", 0) or 0) > settings.subagent_concurrency:
-        clean["subagent_concurrency"] = settings.subagent_concurrency
-    if int(clean.get("subagent_max_reads", 0) or 0) > settings.subagent_max_reads:
-        clean["subagent_max_reads"] = settings.subagent_max_reads
-    if int(clean.get("agent_max_steps", 0) or 0) > settings.agent_max_steps:
-        clean["agent_max_steps"] = settings.agent_max_steps
-    if int(clean.get("rerank_top_k", 0) or 0) > settings.rerank_top_k:
-        clean["rerank_top_k"] = settings.rerank_top_k
 
     if "chat_base_url" in clean:
         _validate_llm_url(clean["chat_base_url"], settings)
@@ -1175,7 +1385,7 @@ def _validate_llm_url(url: str, settings: Settings) -> None:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     allowed = settings.allowed_hosts
-    if host in _BLOCKED_NETS or host.endswith(".local") or host.startswith("169.254."):
+    if host.startswith(_BLOCKED_NETS) or host.endswith(".local"):
         raise ValueError("LLM endpoint host is not permitted")
     if not allowed:
         raise ValueError("LLM base_url is not configured on the server.")
@@ -1212,16 +1422,18 @@ def _seeded(settings: Settings, question: str, seed_context: str, seed_ids: list
 
 
 class Researcher:
-    def __init__(self, client: GrowiSearchClient, settings: Settings, reranker: Reranker | None) -> None:
+    def __init__(self, client: GrowiSearchClient, settings: Settings, reranker: Reranker | None, embedder: Embedder | None = None) -> None:
         self.settings = settings
         self.cache = PageCache(settings.page_cache_ttl, settings.page_cache_max)
         self.reranker = reranker
+        self.embedder = embedder
+        self.index_map = IndexMap(client, settings, embedder, reranker)
         self.client = client
         self.read_sem = asyncio.Semaphore(settings.service_max_reads)
         self.agent_sem = asyncio.Semaphore(settings.service_max_agents)
 
     def session(self, overrides: dict | None = None) -> ResearchSession:
-        session = ResearchSession(self.client, self.settings, self.cache, self.reranker)
+        session = ResearchSession(self.client, self.settings, self.cache, self.reranker, index_map=self.index_map)
         session.apply_overrides(overrides)
         return session
 
@@ -1251,6 +1463,27 @@ class Researcher:
 
     async def children(self, *, page_id: str | None = None, path: str | None = None) -> list[WikiPage]:
         return await self._read(lambda s: s.children(page_id=page_id, path=path))
+
+    async def document_view(self, path: str) -> dict:
+        st = self.settings
+
+        def work(session: ResearchSession) -> dict:
+            children = [c for c in session.children(path=path) if c.path.rstrip("/").rsplit("/", 1)[-1] != st.index_page_name]
+            index = self.client.get_page(path=f"{path.rstrip('/')}/{st.index_page_name}")
+            cards = md.parse_index(index.body) if index and md.is_index_page(index.body) else []
+            by_ref = {c.target.strip("/"): c for c in cards}
+            pages = []
+            for child in sorted(children, key=lambda c: c.path):
+                row = child.public_dict()
+                card = by_ref.get(child.id) or by_ref.get(child.path.strip("/"))
+                if card:
+                    row.update({"summary": card.summary, "keywords": card.keywords, "cluster": card.chapter})
+                row["source_url"] = session._source_url(child)
+                pages.append(row)
+            folder = WikiPage(id="", path=path)
+            return {"path": path, "title": path.rstrip("/").rsplit("/", 1)[-1], "pages": pages, "source_url": session._source_url(folder)}
+
+        return await self._read(work)
 
     async def ask(self, question, on_event=None, overrides=None, stop_event=None) -> AgentAnswer:
         def work():

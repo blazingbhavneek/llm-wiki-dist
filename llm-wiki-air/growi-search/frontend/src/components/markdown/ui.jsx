@@ -22,7 +22,7 @@ export function SmallBtn({
       : confirm && !disabled
         ? 'border-green/25 bg-[#ecfdf5] text-[#065f46]'
         : active
-          ? 'border-blue/25 bg-blue/10 text-[#244a9d]'
+          ? 'border-blue/25 bg-blue/10 text-blue'
           : 'border-line bg-white text-muted hover:border-line2 hover:text-ink'
 
   return (

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import unquote
 
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
@@ -15,6 +15,10 @@ _LINK_RE = re.compile(
     r"(?<!!)\[(?P<anchor>[^\]\n]*)\]\(\s*(?P<target>[^)\s]*)(?:[ \t]+\"[^\")]*\")?\s*\)"
 )
 _ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+_NAV_LABEL_RE = re.compile(r"(?:前のページ|次のページ|親)\s*[:：]\s*$")
+_INDEX_ITEM_RE = re.compile(r"^- \[(?P<title>[^\]]*)\]\((?P<target>[^)\s]+)\)(?:\s+[—–-]\s*(?P<summary>.*))?\s*$")
+_INDEX_FIELD_RE = re.compile(r"^\s{2,}- (?P<label>[^:：]+)[:：]\s*(?P<value>.*)$")
+_INDEX_FIELDS = {"章": "chapter", "キーワード": "keywords", "エンティティ": "entities", "ページ数": "pages"}
 
 
 def strip_search_highlights(text: str) -> str:
@@ -55,6 +59,19 @@ class ParsedLink:
     heading: str = ""        # breadcrumb at the link's location
     summary: str = ""        # em-dash trailing text on the same line
     line: int = 0
+    kind: str = "markdown"
+
+
+@dataclass
+class IndexCard:
+    target: str
+    title: str
+    summary: str = ""
+    chapter: str = ""
+    keywords: list[str] = field(default_factory=list)
+    entities: list[str] = field(default_factory=list)
+    pages: int = 0
+    document: str = ""
 
 
 @dataclass
@@ -233,6 +250,8 @@ def extract_links(body: str) -> list[ParsedLink]:
                     summary = tail[len(dash):].strip(" \t-–—―:：").strip()
                     break
 
+            kind = "nav" if _NAV_LABEL_RE.search(raw_line[: match.start()]) else "markdown"
+
             out.append(
                 ParsedLink(
                     anchor=anchor,
@@ -241,9 +260,35 @@ def extract_links(body: str) -> list[ParsedLink]:
                     heading=breadcrumb,
                     summary=summary,
                     line=number,
+                    kind=kind,
                 )
             )
     return out
+
+
+def is_index_page(body: str) -> bool:
+    return 'data-llm-wiki-index="' in (body or "")
+
+
+def parse_index(body: str) -> list[IndexCard]:
+    cards: list[IndexCard] = []
+    for line in (body or "").splitlines():
+        item = _INDEX_ITEM_RE.match(line)
+        if item:
+            cards.append(IndexCard(target=item["target"], title=item["title"].strip(), summary=(item["summary"] or "").strip()))
+            continue
+        fld = _INDEX_FIELD_RE.match(line)
+        if not (fld and cards):
+            continue
+        key = _INDEX_FIELDS.get(fld["label"].strip())
+        value = fld["value"].strip()
+        if key == "chapter":
+            cards[-1].chapter = value
+        elif key in ("keywords", "entities"):
+            setattr(cards[-1], key, [v.strip() for v in re.split(r"[、,]", value) if v.strip()])
+        elif key == "pages":
+            cards[-1].pages = int(value) if value.isdigit() else 0
+    return cards
 
 
 def resolve_target(source_path: str, raw_target: str, root: str | None = None) -> ResolvedTarget | None:

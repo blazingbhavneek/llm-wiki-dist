@@ -220,8 +220,23 @@ Quick map — the numbered sections below explain each command in detail:
 | keep a project continuously fresh | `watch` (or cron + `watch`) |
 | inspect or drive the queue by hand | `queue scan\|work\|status\|retry` |
 | push the current wiki tree as it is | `publish` |
+| refresh growi-search index pages | `index [<raw-rel>...]` |
 | fix one document's links | `link relink <doc>` |
 | remove this publisher's GROWI pages | `reset` |
+
+### Refresh growi-search index pages
+
+After any sync or publish, refresh the index pages read by growi-search
+(`<document>/00-目次` per document plus `/<target>/00-目次`; `001-…` stays the first real page):
+
+```bash
+# publish per-document and root index pages
+.venv/bin/python main.py -v index --project projectA
+# dry run: write data/<target>/metadata/index/**/index.md only
+.venv/bin/python main.py index --project projectA --no-publish
+# remove the index pages
+.venv/bin/python main.py index --project projectA --delete
+```
 
 ### 1. Mount a source directory manually
 

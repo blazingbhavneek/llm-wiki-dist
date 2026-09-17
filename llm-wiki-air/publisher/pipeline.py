@@ -681,6 +681,8 @@ def reset_growi(settings: Any) -> dict[str, Any]:
     ledger_path = project.metadata / "pipeline.json"
     with _lock(project):
         deleted = publisher.reset()
+        from publisher.index import delete_index_pages
+        delete_index_pages(settings)  # index pages carry no chunk marker, reset() skips them
         ledger = load_ledger(ledger_path)
         ledger.published_documents.clear()
         ledger.published_pages.clear()

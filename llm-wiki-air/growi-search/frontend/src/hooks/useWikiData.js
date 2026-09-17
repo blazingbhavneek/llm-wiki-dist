@@ -1,39 +1,46 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 import { api } from '../api'
 
-/**
- * Lazy GROWI folder browser for the right document rail.
- * Replaces useGraphData: there is no /api/graph and no full-library scan.
- * Each expand fetches exactly one /api/pages/children call for one path.
- */
+export const parentOf = (p) => String(p || '').replace(/\/[^/]+$/, '') || '/'
+
+/** Backend readiness + lazy GROWI folder browser + citation node cache. */
 export function useWikiData({ rootPath, fireToast, t }) {
-  const [childrenByPath, setChildrenByPath] = useState({}) // path -> {loading, pages, error}
-  const [expanded, setExpanded] = useState({}) // path -> true
-  const [rootStatus, setRootStatus] = useState(null)
+  const [ready, setReady] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [childrenByPath, setChildrenByPath] = useState({})
+  const [expanded, setExpanded] = useState({})
+  const [rawById, setRawById] = useState(() => new Map())
+
+  const rememberNodes = useCallback((nodes) => {
+    const list = (Array.isArray(nodes) ? nodes : [nodes]).filter((n) => n?.id)
+    if (!list.length) return
+    setRawById((prev) => {
+      const next = new Map(prev)
+      for (const n of list) next.set(n.id, { ...(prev.get(n.id) || {}), ...n })
+      return next
+    })
+  }, [])
 
   const load = useCallback(
     async (path) => {
-      setChildrenByPath((prev) =>
-        prev[path]?.pages || prev[path]?.loading ? prev : { ...prev, [path]: { loading: true } },
-      )
+      setChildrenByPath((prev) => ({ ...prev, [path]: { ...(prev[path] || {}), loading: true } }))
       try {
         const data = await api.children({ path })
-        const pages = Array.isArray(data?.children) ? data.children : []
-        // Path depth 1 sorts "001-" style numeric prefixes naturally via localeCompare.
-        pages.sort((a, b) => String(a.path).localeCompare(String(b.path), 'ja'))
+        const pages = (Array.isArray(data?.children) ? data.children : [])
+          .sort((a, b) => String(a.path).localeCompare(String(b.path), 'ja', { numeric: true }))
         setChildrenByPath((prev) => ({ ...prev, [path]: { loading: false, pages } }))
+        rememberNodes(pages)
         return pages
       } catch (e) {
         setChildrenByPath((prev) => ({ ...prev, [path]: { loading: false, pages: [], error: e.message } }))
-        fireToast?.(t?.couldNotOpen ? t.couldNotOpen(e.message) : e.message)
+        fireToast?.(t.couldNotOpen(e.message))
         return []
       }
     },
-    [fireToast, t],
+    [fireToast, t, rememberNodes],
   )
-
-  const loadRoot = useCallback(() => load(rootPath || '/'), [load, rootPath])
 
   const toggle = useCallback(
     (path) => {
@@ -44,11 +51,52 @@ export function useWikiData({ rootPath, fireToast, t }) {
     [expanded, childrenByPath, load],
   )
 
-  const refresh = useCallback(() => {
-    setExpanded({})
+  const reload = useCallback(async () => {
+    if (!rootPath) return
+    setError(null)
+    const r = await api.ready()
+    setReady(r)
+    if (!r.ready) {
+      const err = new Error(r.error || t.cannotReach)
+      err.retryable = true
+      throw err
+    }
     setChildrenByPath({})
-    setRootStatus(load(rootPath || '/'))
-  }, [load, rootPath])
+    setExpanded({})
+    await load(rootPath)
+  }, [load, rootPath, t])
 
-  return { childrenByPath, expanded, toggle, loadRoot, load, refresh, rootStatus }
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        await reload()
+      } catch (e) {
+        if (!cancelled) setError(String(e.message || e))
+      } finally {
+        if (!cancelled && rootPath) setLoading(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [reload, rootPath])
+
+  const retry = useCallback(async () => {
+    setLoading(true)
+    try {
+      await reload()
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setLoading(false)
+    }
+  }, [reload])
+
+  const siblingsOf = useCallback(
+    (node) => childrenByPath[parentOf(node?.path)]?.pages || [],
+    [childrenByPath],
+  )
+
+  return { ready, loading, error, retry, reload, childrenByPath, expanded, toggle, load, rawById, rememberNodes, siblingsOf }
 }

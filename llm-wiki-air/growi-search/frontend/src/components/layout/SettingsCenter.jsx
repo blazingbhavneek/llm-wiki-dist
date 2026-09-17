@@ -8,7 +8,7 @@ export function SettingsCenter({ children }) {
   const t = useT(STR)
 
   return (
-    <div className="h-full overflow-y-auto bg-gradient-to-b from-white to-[#f8fbff]">
+    <div className="h-full overflow-y-auto bg-white">
       <div className="mx-auto max-w-[920px] px-6 py-6">
         <PageHeader
           icon={Settings}

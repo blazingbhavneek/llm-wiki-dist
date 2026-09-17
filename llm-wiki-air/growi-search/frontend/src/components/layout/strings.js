@@ -5,37 +5,15 @@
 // i18n.jsx for the per-file-dict convention this otherwise follows.
 export const STR = {
   ja: {
-    brand: 'GROWI Search',
-    brandSubtitle: '読み取り専用サーチサービス',
+    brand: 'LLM Wiki',
+    brandSubtitle: 'ナレッジワークスペース',
 
     app: {
-      pages: 'ページ',
-      parser: 'Document Parser',
-      openInGrowi: 'GROWI で開く',
-      scopeHint: '参照している GROWI のルートパス',
-      root: 'ルート',
-      empty: '（子ページなし）',
-      loading: '読み込み中…',
-      refresh: 'フォルダーツリーを再読み込み',
-      answerBadge: 'エージェント回答',
-      cited: '引用',
-      links: '発リンク',
-      untitled: '無題',
-      download: 'Markdown をダウンロード',
-      viewFull: '全画面で表示',
-      chatTitle: 'GROWI に質問する',
-      chatText: '上部の検索バーでキーワード検索、または下の入力欄でリサーチャーに質問できます。',
-      askPlaceholder: '質問を入力してください…',
-      ask: '質問',
-      stop: '停止',
-      stopping: '停止中…',
-      disclaimer: 'AI 生成の回答です。重要な内容は原典（GROWI ページ）を確認してください。Ctrl/Cmd + Enter で送信。',
-      settingsText: 'このリクエストに限り LLM エンドポイントとエージェント設定を上書きします（セッション内のみ、再読み込みで消えます）。',
-      settingsNote: 'APIキーはこのタブのセッションストレージにのみ保存され、リロードで失われます。サーバー既定値に戻すにはクリアしてください。',
-      settingsApply: '適用',
-      settingsClear: 'クリア',
-      settingsApplied: 'リクエスト設定を適用しました。',
-      settingsCleared: 'リクエスト設定をクリアしました。',
+      parser: 'ドキュメントパーサー',
+      scopeHint: 'GROWI のルート',
+      documentPages: (n) => `${n} ページ`,
+      noPages: 'この文書にはページがありません。',
+      openDocument: '文書のページ一覧',
     },
 
     pinned: {
@@ -78,7 +56,7 @@ export const STR = {
     },
 
     topbar: {
-      placeholder: 'ノートまたはトピックを検索…',
+      placeholder: 'ページを検索…',
       keywordSearch: 'キーワード検索',
       searchDocs: '検索',
       searching: '検索中…',
@@ -93,11 +71,11 @@ export const STR = {
       glossaryTitle: '用語集',
       glossaryText: '用語集は後で実装します。',
       searchTitle: '検索結果',
-      searchText: (q, n) => `「${q}」に一致するノートが ${n} 件見つかりました。`,
+      searchText: (q, n) => `「${q}」に一致するページが ${n} 件見つかりました。`,
       searchEmptyTitle: '検索結果がありません',
-      searchEmptyText: (q) => `「${q}」に一致するノートは見つかりませんでした。`,
+      searchEmptyText: (q) => `「${q}」に一致するページは見つかりませんでした。`,
       searchIdleTitle: '検索してください',
-      searchIdleText: '上部の検索バーからノートまたはトピックを検索できます。',
+      searchIdleText: '上部の検索バーからページを検索できます。',
     },
 
     rightRail: {
@@ -117,7 +95,7 @@ export const STR = {
 
     markdownFrame: {
       fallbackTitle: 'ドキュメント',
-      hint: 'ドキュメント領域をダブルクリックすると編集できます。折りたたむとこの表示を閉じます。',
+      hint: 'GROWI から読み込んだ読み取り専用ページです。',
       working: '処理中…',
       back: '戻る',
       backTitle: '前の画面に戻る',
@@ -132,6 +110,7 @@ export const STR = {
       unknownSource: 'ソース不明',
       noSummary: '概要はありません。',
       resultCount: (n) => `${n} 件`,
+      openInGrowi: 'GROWI で開く',
     },
 
     startingWrite: '書き込みジョブを開始中...',
@@ -183,6 +162,10 @@ export const STR = {
     explorer: (n) => `エクスプローラー ${n}`,
     searching: (who, q) => (who ? `${who} · “${q}” を検索中` : `“${q}” を検索中`),
     pagesFound: (c) => `${c} 件のページが見つかりました`,
+    mapScanned: (d, p, s) => `索引から ${d} 文書 / ${p} ページを走査し、${s} 件を候補に追加`,
+    budgetNote: (n) => `ページ取得上限に到達しました（${n} 件）`,
+    budgetSearch: '検索回数の上限に到達しました',
+    queuedForAgent: '他の質問の完了を待っています…',
     spawned: (n) => `${n} 人のエクスプローラーを起動`,
     exploring: (who, n) => `${who} · ${n} を探索中`,
     reading: (who, n) => `${who} · ${n} を読み中`,
@@ -209,8 +192,9 @@ export const STR = {
 
     collapseDocs: 'ドキュメントを隠す',
     showDocs: 'ドキュメントを表示',
-    loadingGraph: 'グラフを読み込み中…',
+    loadingGraph: '読み込み中…',
     cannotReach: 'バックエンドに接続できません',
+    retry: '再試行',
 
     closeTab: 'タブを閉じる',
     nothingOpen: '何も開いていません',
@@ -223,37 +207,15 @@ export const STR = {
   },
 
   en: {
-    brand: 'GROWI Search',
-    brandSubtitle: 'Read-only search service',
+    brand: 'LLM Wiki',
+    brandSubtitle: 'Knowledge workspace',
 
     app: {
-      pages: 'Pages',
       parser: 'Document Parser',
-      openInGrowi: 'Open in GROWI',
-      scopeHint: 'GROWI root path this service reads',
-      root: 'Root',
-      empty: '(no child pages)',
-      loading: 'Loading…',
-      refresh: 'Reload folder tree',
-      answerBadge: 'Agent answer',
-      cited: 'Citations',
-      links: 'Outgoing links',
-      untitled: 'Untitled',
-      download: 'Download Markdown',
-      viewFull: 'View full',
-      chatTitle: 'Ask GROWI',
-      chatText: 'Use the search bar above, or ask the researcher below.',
-      askPlaceholder: 'Ask a question…',
-      ask: 'Ask',
-      stop: 'Stop',
-      stopping: 'Stopping…',
-      disclaimer: 'AI-generated answer. Verify critical content against the GROWI page. Ctrl/Cmd + Enter to send.',
-      settingsText: 'Override the LLM endpoint and agent settings for this request only (session-scoped, lost on reload).',
-      settingsNote: 'The API key is kept only in this tab\'s session storage and is lost on reload. Clear to return to server defaults.',
-      settingsApply: 'Apply',
-      settingsClear: 'Clear',
-      settingsApplied: 'Request settings applied.',
-      settingsCleared: 'Request settings cleared.',
+      scopeHint: 'GROWI root',
+      documentPages: (n) => `${n} pages`,
+      noPages: 'This document has no pages.',
+      openDocument: 'Document pages',
     },
 
     pinned: {
@@ -296,7 +258,7 @@ export const STR = {
     },
 
     topbar: {
-      placeholder: 'Search notes or topics…',
+      placeholder: 'Search pages…',
       keywordSearch: 'Keyword search',
       searchDocs: 'Search docs',
       searching: 'Searching…',
@@ -311,11 +273,11 @@ export const STR = {
       glossaryTitle: 'Glossary',
       glossaryText: 'Glossary will be implemented later.',
       searchTitle: 'Search results',
-      searchText: (q, n) => `${n} matching notes found for “${q}”.`,
+      searchText: (q, n) => `${n} matching pages found for “${q}”.`,
       searchEmptyTitle: 'No search results',
-      searchEmptyText: (q) => `No matching notes were found for “${q}”.`,
+      searchEmptyText: (q) => `No matching pages were found for “${q}”.`,
       searchIdleTitle: 'Search knowledge',
-      searchIdleText: 'Use the top search bar to find notes or topics.',
+      searchIdleText: 'Use the top search bar to find pages.',
     },
 
     rightRail: {
@@ -335,7 +297,7 @@ export const STR = {
 
     markdownFrame: {
       fallbackTitle: 'Document',
-      hint: 'Double-click the document area to edit. Collapse closes this view.',
+      hint: 'Read-only page loaded from GROWI.',
       working: 'Working…',
       back: 'Back',
       backTitle: 'Back to previous screen',
@@ -350,6 +312,7 @@ export const STR = {
       unknownSource: 'Unknown source',
       noSummary: 'No summary available.',
       resultCount: (n) => `${n} results`,
+      openInGrowi: 'Open in GROWI',
     },
 
     startingWrite: 'Starting write job...',
@@ -401,6 +364,10 @@ export const STR = {
     explorer: (n) => `Explorer ${n}`,
     searching: (who, q) => (who ? `${who} · searching “${q}”` : `searching “${q}”`),
     pagesFound: (c) => `${c} pages found`,
+    mapScanned: (d, p, s) => `Scanned ${d} documents / ${p} pages from the index, added ${s} candidates`,
+    budgetNote: (n) => `Page fetch budget reached (${n})`,
+    budgetSearch: 'Search budget reached',
+    queuedForAgent: 'Waiting for another question to finish…',
     spawned: (n) => `spawned ${n} explorers`,
     exploring: (who, n) => `${who} · exploring ${n}`,
     reading: (who, n) => `${who} · reading ${n}`,
@@ -427,8 +394,9 @@ export const STR = {
 
     collapseDocs: 'Collapse documents',
     showDocs: 'Show documents',
-    loadingGraph: 'Loading graph…',
+    loadingGraph: 'Loading…',
     cannotReach: 'Cannot reach the backend',
+    retry: 'Retry',
 
     closeTab: 'Close tab',
     nothingOpen: 'Nothing open',
