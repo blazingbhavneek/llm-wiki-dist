@@ -1,0 +1,7 @@
+# Offline install: Java plugin downloader does not work on this network, so
+# the zips are vendored in ../plugins (downloaded once via corporate proxy).
+plugins:
+    - id: analysis-kuromoji
+      location: file:/opt/plugins/analysis-kuromoji-9.3.3.zip
+    - id: analysis-icu
+      location: file:/opt/plugins/analysis-icu-9.3.3.zip

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -106,6 +106,7 @@ async def workers(request: Request) -> dict:
 async def parse(
     request: Request,
     file: Annotated[UploadFile, File()],
+    manifest: Annotated[str | None, Form()] = None,
     images: Annotated[
         bool,
         Query(description="on: base64 image blocks, off: descriptions only"),
@@ -122,6 +123,13 @@ async def parse(
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    try:
+        parsed_manifest = json.loads(manifest) if manifest else None
+        if parsed_manifest is not None and not isinstance(parsed_manifest, dict):
+            raise ValueError("manifest must be an object")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid manifest: {exc}") from exc
+
     options = ParseOptions(
         images=images,
         describe_images=describe_images,
@@ -129,6 +137,7 @@ async def parse(
         llm_api_key=llm_api_key,
         llm_model=llm_model,
         filename=file.filename,
+        manifest=parsed_manifest,
     )
 
     try:

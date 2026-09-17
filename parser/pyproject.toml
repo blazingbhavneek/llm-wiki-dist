@@ -8,6 +8,7 @@ dependencies = [
     "beautifulsoup4",
     "fastapi",
     "httpx",
+    "oletools>=0.60.2",
     "openpyxl",
     "pillow",
     "pypdfium2",

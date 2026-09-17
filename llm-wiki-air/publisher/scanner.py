@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-SUPPORTED = {".md", ".docx", ".pdf", ".pptx", ".xlsx", ".csv"}
+SUPPORTED = {".md", ".docx", ".pdf", ".pptx", ".xlsx", ".xlsm", ".csv"}
 IGNORED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORED_DIRS = {".git", ".hg", ".svn"}
 

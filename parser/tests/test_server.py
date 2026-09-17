@@ -83,6 +83,14 @@ class UrlPrefixTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 415)
 
+    def test_invalid_manifest_is_rejected_before_parsing(self) -> None:
+        response = self.client.post(
+            "/agent/doc-parser/parse",
+            data={"manifest": "[not-json"},
+            files={"file": ("source.xlsm", b"PK", "application/octet-stream")},
+        )
+        self.assertEqual(response.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

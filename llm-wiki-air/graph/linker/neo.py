@@ -12,7 +12,6 @@ from .wire import NeoEdgeSuggestions
 from .chunks import normalize_name
 
 NEO_SIMILAR_K = 5
-MAX_USERS_PER_DEFINITION = 12
 HOP1_MAX, HOP2_MAX, HOP3_MAX = 8, 8, 4
 
 
@@ -57,19 +56,13 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None) -> list
             definers = catalog.entity_chunks(team, name, role="defines", exclude_page=chunk.page_rel)
             if len(definers) == 1:
                 selected.append(Candidate(definers[0], "use", [entity.name], True, "defines", f"「{entity.name}」の定義")); selected_ids.add(definers[0])
-            elif 2 <= len(definers) <= EDGE_GROUP_SIZE:
+            elif len(definers) >= 2:
                 for definer in definers:
                     selected.append(Candidate(definer, "use", [entity.name])); selected_ids.add(definer)
         else:
-            users = catalog.entity_chunks(team, name, role="uses", exclude_page=chunk.page_rel)[:MAX_USERS_PER_DEFINITION]
+            users = catalog.entity_chunks(team, name, role="uses", exclude_page=chunk.page_rel)
             for user in users:
                 selected.append(Candidate(user, "define", [entity.name], True, "uses", f"「{entity.name}」を使用")); selected_ids.add(user)
-    for cid in _similar_ids(catalog, chunk, team)[:NEO_SIMILAR_K]:
-        if cid not in selected_ids and catalog.page_of(cid) != chunk.page_rel:
-            row = catalog.chunk(cid)
-            summary = str(row["summary"] or "")[:120] if row else ""
-            selected.append(Candidate(cid, "similar", [], True, "similar", summary)); selected_ids.add(cid)
-
     entity_names = {normalize_name(item.name) for item in chunk.entities}
     obvious = set(_similar_ids(catalog, chunk, team))
     for cid, _score in catalog.behaviour_chunks(team, entity_names, exclude_page=chunk.page_rel)[:HOP1_MAX]:
@@ -159,4 +152,4 @@ def inline_targets(page_rel: str, edges: list[Any]) -> list[tuple[str, str]]:
     return [(edge.via[0], relative_link(page_rel, edge.peer_page_rel)) for edge in edges if peer_defines(edge) and edge.peer_page_rel != page_rel]
 
 
-__all__ = ["EDGE_VERSION_NEO", "HOP1_MAX", "HOP2_MAX", "HOP3_MAX", "MAX_USERS_PER_DEFINITION", "NEO_SIMILAR_K", "candidates", "filter_candidates", "inline_targets"]
+__all__ = ["EDGE_VERSION_NEO", "HOP1_MAX", "HOP2_MAX", "HOP3_MAX", "NEO_SIMILAR_K", "candidates", "filter_candidates", "inline_targets"]

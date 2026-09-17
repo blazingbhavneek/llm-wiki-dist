@@ -6,7 +6,7 @@ from pathlib import Path
 
 from graph.common.async_tools import run_async_blocking
 from graph.config import Settings
-from graph.workspace.project import Project
+from graph.workspace.project import Project, open_project
 from graph.workspace.writer import wiki_config
 from graph.wiki.model import ChatModelPort
 
@@ -53,10 +53,12 @@ def _model_and_embedder(settings: Settings, project: Project, document: str):
 def rebuild(project: Project, settings: Settings, mode: str, no_edges: bool = False) -> None:
     if project.linker_database.exists():
         project.linker_database.unlink()
-    for document in _documents(project):
+    documents = _documents(project)
+    for document in documents:
+        (project.wiki / document / "_planning" / "links.json").unlink(missing_ok=True)
+    settings.wiki_linker_mode = mode
+    for document in documents:
         planning = project.wiki / document / "_planning"
-        (planning / "links.json").unlink(missing_ok=True)
-        settings.wiki_linker_mode = mode
         if no_edges:
             run_async_blocking(link_document(project, _raw_rel(project, document), model=None, embedder=None, settings=settings))
             continue
@@ -67,6 +69,8 @@ def rebuild(project: Project, settings: Settings, mode: str, no_edges: bool = Fa
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m graph.linker")
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--data-root", help="override selected INI data_root")
     sub = parser.add_subparsers(dest="command", required=True)
     rebuild_parser = sub.add_parser("rebuild")
     rebuild_parser.add_argument("--mode", choices=("legacy", "neo"), required=True)
@@ -75,8 +79,10 @@ def main() -> None:
     relink_parser.add_argument("document")
     sub.add_parser("status")
     args = parser.parse_args()
-    settings = Settings.from_env()
-    project = Project(Path(settings.data_root)).ensure()
+    settings = Settings.from_env(args.project)
+    if args.data_root:
+        settings.data_root = args.data_root
+    project = open_project(settings)
     if args.command == "status":
         if not project.linker_database.exists():
             print({"mode": None, "documents": 0, "chunks": 0, "edges": 0})

@@ -17,7 +17,7 @@ from typing import Any
 
 from graph.common.async_tools import run_async_blocking
 from graph.linker import link_document, remove_document
-from graph.linker.chunks import split_page, validate_meta
+from graph.linker.chunks import describe_all, make_chunks, split_page, validate_meta
 from graph.linker.render import FOOTER_END, FOOTER_START, parse_footer
 from graph.linker.wire import ChunkMeta, EdgeSuggestion, EdgeSuggestions, NeoEdgeSuggestion, NeoEdgeSuggestions
 from graph.workspace.project import Project
@@ -151,6 +151,45 @@ class LinkerTests(unittest.TestCase):
         self.assertEqual([e.name for e in clean.entities], ["X-Term"])
         self.assertEqual([(b.subject, b.object) for b in clean.behaviours], [("X-Term", "")])
 
+    def test_entity_extraction_is_uncapped_and_later_chunks_can_split_names(self) -> None:
+        names = [f"Entity-{i}" for i in range(25)]
+        text = " ".join(names)
+        meta = ChunkMeta(
+            entities=[{"name": name, "kind": "concept"} for name in names],
+            behaviours=[{"subject": name, "action": "appears"} for name in names],
+        )
+        clean = validate_meta(meta, text)
+        self.assertEqual(len(clean.entities), 25)
+        self.assertEqual(len(clean.behaviours), 25)
+
+        class RollingModel:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            async def structured(self, schema: Any, messages: Any) -> ChunkMeta:
+                prompt = str(messages[-1].content)
+                self.prompts.append(prompt)
+                body = prompt.split("--- 本文 ---", 1)[-1]
+                if "revealed separately" not in body:
+                    return ChunkMeta(entities=[{"name": "Alpha-Beta", "kind": "component", "role": "defines"}])
+                return ChunkMeta(entities=[
+                    {"name": "Alpha", "kind": "component", "replaces": ["Alpha-Beta"]},
+                    {"name": "Beta", "kind": "component", "replaces": ["Alpha-Beta"]},
+                ])
+
+        chunks = [
+            *make_chunks("doc", "team", "001.md", "# First\n\nAlpha-Beta is introduced."),
+            *make_chunks("doc", "team", "002.md", "# Second\n\nAlpha and Beta are revealed separately."),
+        ]
+        model = RollingModel()
+        calls, fallbacks = run_async_blocking(describe_all(
+            chunks, model=model, output_language="en", concurrency=4,
+        ))
+        self.assertEqual((calls, fallbacks), (2, 0))
+        self.assertIn('"name": "Alpha-Beta"', model.prompts[1])
+        self.assertEqual([entity.name for entity in chunks[0].entities], ["Alpha", "Beta"])
+        self.assertEqual([entity.role for entity in chunks[0].entities], ["defines", "defines"])
+
     # --- end to end ---------------------------------------------------
 
     def test_first_document_links_nothing_and_writes_planning(self) -> None:
@@ -235,11 +274,10 @@ class LinkerTests(unittest.TestCase):
         result = self.link("t/b_docx.md", mode="neo")
         b_text = (b / "001-b.md").read_text(encoding="utf-8")
         a_text = (a / "001-a.md").read_text(encoding="utf-8")
-        # programmatic define/use edge: inline link at the first plain mention only
-        self.assertEqual(b_text.count("[X-Term](../a.docx/001-a.md)"), 1)
-        self.assertIn("— defines: 「X-Term」の定義", b_text)   # using page points at the definition
-        self.assertIn("— uses: 「X-Term」を使用", a_text)       # defining page lists its users
-        self.assertIn("t/a_docx.md", result.touched)
+        # Entity links wrap existing mentions two or three times and do not add footer prose.
+        self.assertEqual(b_text.count("[X-Term](../a.docx/001-a.md)"), 2)
+        self.assertNotIn("「X-Term」の定義", b_text)
+        self.assertNotIn("「X-Term」を使用", a_text)
         # the unrelated page is never an inline target and its footer, if any, is similarity only
         c_text = (self.project.wiki / "t" / "c.docx" / "001-c.md").read_text(encoding="utf-8")
         self.assertNotIn("[X-Term](", c_text)

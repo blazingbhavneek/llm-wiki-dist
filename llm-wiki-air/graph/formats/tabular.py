@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv as _csv
 import io
 import json
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, Field
+
+from graph.config import app_concurrency
 
 Cell = tuple[int, int]
 
@@ -82,9 +85,28 @@ class _TableParser(HTMLParser):
             self._cell.append(data)
 
 
-def grid_from_html(table_html: str) -> Grid:
+def grid_from_html(table_html: str, *, origin: Cell = (1, 1)) -> Grid:
     parser = _TableParser()
     parser.feed(table_html)
+    if not parser.headers or parser.headers[0].casefold() != "row":
+        cells: dict[Cell, str] = {}
+        covered: set[Cell] = set()
+        for row, raw in enumerate(parser.rows, origin[0]):
+            col = origin[1]
+            for text, rowspan, colspan in raw:
+                while (row, col) in covered:
+                    col += 1
+                if text:
+                    cells[(row, col)] = text
+                for dr in range(rowspan):
+                    for dc in range(colspan):
+                        if dr or dc:
+                            covered.add((row + dr, col + dc))
+                col += colspan
+        return Grid(
+            cells=cells,
+            col_letters={col: _letter(col) for col in {col for _, col in cells}},
+        )
     letters = {i: name for i, name in enumerate(parser.headers[1:], 1)}
     cells: dict[Cell, str] = {}
     covered: set[Cell] = set()
@@ -102,6 +124,16 @@ def grid_from_html(table_html: str) -> Grid:
                         covered.add((row_number + dr, col + dc))
             col += colspan
     return Grid(cells=cells, col_letters=letters)
+
+
+def _table_origin(body: str) -> Cell:
+    match = re.search(r"_元範囲:\s*([A-Z]+)(\d+):", body)
+    if not match:
+        return (1, 1)
+    col = 0
+    for character in match.group(1):
+        col = col * 26 + ord(character) - 64
+    return int(match.group(2)), col
 
 
 def grid_from_gfm(lines: Sequence[str]) -> Grid:
@@ -200,25 +232,9 @@ class SheetStructure(BaseModel):
     ignore: list[int] = Field(default_factory=list)
 
 
-def validate_structure(structure: SheetStructure, regions: Sequence[Region]) -> str | None:
-    by_id = {r.id: r for r in regions}
-    if not structure.tables:
-        return "no tables identified; every sheet with data has at least one"
-    for spec in structure.tables:
-        region = by_id.get(spec.region)
-        if region is None:
-            return f"table '{spec.title}' names unknown region {spec.region}"
-        if len(spec.data_rows) != 2 or len(spec.data_cols) != 2:
-            return f"table '{spec.title}': data_rows and data_cols must be [first, last]"
-        r1, r2 = spec.data_rows
-        c1, c2 = spec.data_cols
-        if not (region.r1 <= r1 <= r2 <= region.r2 and region.c1 <= c1 <= c2 <= region.c2):
-            return f"table '{spec.title}': data range leaves region {region.id}"
-        if spec.orientation == "rows" and any(not (region.r1 <= h < r1) for h in spec.header_rows):
-            return f"table '{spec.title}': header_rows must lie above the data rows"
-        if spec.orientation == "columns" and any(not (region.c1 <= h < c1) for h in spec.label_cols):
-            return f"table '{spec.title}': label_cols must lie left of the data columns"
-    return None
+class VbaDescription(BaseModel):
+    title: str = Field(description="VBA処理の内容を表す短い日本語名")
+    summary: str = Field(description="VBA処理の日本語説明")
 
 
 def _numeric(text: str) -> float | None:
@@ -231,47 +247,63 @@ def _numeric(text: str) -> float | None:
         return None
 
 
-def heuristic_structure(regions: Sequence[Region], grid: Grid, *, header_row: bool = True) -> SheetStructure:
-    return SheetStructure(
-        summary="（自動判定）",
-        tables=[
-            TableSpec(
+def heuristic_structure(
+    regions: Sequence[Region],
+    grid: Grid,
+    *,
+    header_row: bool = True,
+    orientation: Literal["rows", "columns"] = "rows",
+) -> SheetStructure:
+    def spec(region: Region) -> TableSpec:
+        if orientation == "columns":
+            return TableSpec(
                 region=region.id,
                 title=f"領域 {region.id}",
-                header_rows=[region.r1] if header_row else [],
-                label_cols=[region.c1],
-                data_rows=[min(region.r1 + 1, region.r2) if header_row else region.r1, region.r2],
-                data_cols=[region.c1, region.c2],
+                orientation="columns",
+                header_rows=[region.r1],
+                label_cols=[region.c1] if region.c1 < region.c2 else [],
+                data_rows=[region.r1, region.r2],
+                data_cols=[min(region.c1 + 1, region.c2), region.c2],
             )
-            for region in regions
-        ],
+        return TableSpec(
+            region=region.id,
+            title=f"領域 {region.id}",
+            orientation="rows",
+            header_rows=[region.r1] if header_row else [],
+            label_cols=[region.c1],
+            data_rows=[min(region.r1 + 1, region.r2) if header_row else region.r1, region.r2],
+            data_cols=[region.c1, region.c2],
+        )
+
+    return SheetStructure(
+        summary=f"（自動判定: {'行' if orientation == 'rows' else '列'}方向）",
+        tables=[spec(region) for region in regions],
     )
 
 
-def structure_prompt(sheet: str, regions: Sequence[Region], grid: Grid, *, rows: int, cols: int, error: str | None, language: str) -> str:
-    blocks = "\n\n".join(f"### 領域 {r.id}（行{r.r1}-{r.r2}, 列{grid.letter(r.c1)}-{grid.letter(r.c2)}, {r.cell_count}セル）\n{r.preview(grid, rows=rows, cols=cols)}" for r in regions)
-    fix = f"\n\n前回の回答は却下されました: {error}\n修正して返してください。" if error else ""
-    return (
-        f"シート「{sheet}」の非空セルの塊です。各領域について、表ならtitle、orientation、header_rows、label_cols、"
-        f"data_rows=[最初,最後]、data_cols=[最初,最後]を決め、注記・凡例はignoreにしてください。\n\n{blocks}{fix}\n\n"
-        f"出力言語: {language}。JSON のみ。"
-    )
-
-
-async def decide_structure(sheet: str, grid: Grid, regions: Sequence[Region], *, model: Any, config: Any, attempts: int = 2) -> SheetStructure:
+async def decide_structure(sheet: str, grid: Grid, regions: Sequence[Region], *, model: Any, config: Any) -> SheetStructure:
     from langchain_core.messages import HumanMessage
 
-    error = None
-    for _ in range(attempts):
-        try:
-            structure = await model.structured(SheetStructure, [HumanMessage(content=structure_prompt(sheet, regions, grid, rows=config.tabular_preview_rows, cols=config.tabular_preview_cols, error=error, language=config.output_language))])
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            continue
-        error = validate_structure(structure, regions)
-        if error is None:
-            return structure
-    return heuristic_structure(regions, grid, header_row=getattr(config, "source_kind", "csv") != "xlsx")
+    row_structure = heuristic_structure(
+        regions,
+        grid,
+        header_row=getattr(config, "source_kind", "csv") != "xlsx",
+        orientation="rows",
+    )
+    column_structure = heuristic_structure(regions, grid, orientation="columns")
+    previews = "\n\n".join(
+        f"### 領域 {region.id}\n{region.preview(grid, rows=config.tabular_preview_rows, cols=config.tabular_preview_cols)}"
+        for region in regions
+    )
+    try:
+        answer = await model.text([HumanMessage(content=(
+            f"シート「{sheet}」の表は、1行を1件として読む表ですか、それとも1列を1件として読む表ですか。\n\n"
+            f"{previews}\n\n回答は「行」または「列」の一語だけにしてください。"
+        ))])
+    except Exception:
+        return row_structure
+    choice = answer.strip().splitlines()[-1].strip("。. `").casefold() if answer.strip() else ""
+    return column_structure if choice in {"列", "column", "columns"} else row_structure
 
 
 @dataclass
@@ -351,7 +383,7 @@ def specs_in_page(body: str) -> list[dict[str, Any]]:
 
 
 def grids_in_page(body: str) -> list[Grid]:
-    html = [grid_from_html(match.group(0)) for match in re.finditer(r"<table>.*?</table>", body, re.DOTALL)]
+    html = [grid_from_html(match.group(0), origin=_table_origin(body)) for match in re.finditer(r"<table>.*?</table>", body, re.DOTALL)]
     if html:
         return html
     tables: list[list[str]] = []
@@ -447,29 +479,124 @@ def check_citations(markdown: str, records: Sequence[Record]) -> list[str]:
     return [f"存在しないキーを引用しています: {', '.join(bad[:10])}"] if bad else []
 
 
-async def write_tables(*, sheets: list[tuple[str, str, tuple[int, int]]], run_dir, model, config, on_progress=None, stop_check=None) -> list[dict[str, Any]]:
+async def describe_vba(sheet: str, body: str, *, model: Any, language: str) -> VbaDescription:
+    from langchain_core.messages import HumanMessage
+
+    result = await model.structured(VbaDescription, [
+        HumanMessage(content=(
+            f"次のVBAコード「{sheet}」を、ワークブック内での役割が分かるように説明してください。"
+            "目的、起動元のボタンまたはセル、参照シート、更新シート、最終出力への影響を、"
+            "確認できる事実だけで簡潔にまとめてください。titleは処理内容を表す短い日本語名にし、"
+            "モジュール名やプロシージャ名をそのまま使わないでください。コードは再掲しないでください。\n\n"
+            f"{body}\n\n出力言語: {language}。"
+        ))
+    ])
+    result.title = re.sub(r"^マクロ[-：:\s]*", "", result.title.strip())
+    if not re.search(r"[ぁ-んァ-ヶ一-龯々]", result.title) or re.search(r"[A-Za-z]", result.title):
+        result.title = "宣言" if sheet.endswith("-宣言") else "処理"
+    return result
+
+
+async def write_tables(
+    *,
+    sheets: list[tuple[str, str, tuple[int, int]]],
+    run_dir,
+    model,
+    config,
+    on_progress=None,
+    stop_check=None,
+    generate_analyses: bool = True,
+) -> list[dict[str, Any]]:
     from langchain_core.messages import HumanMessage
     from graph.wiki.storage import write_json_atomic, write_text_atomic
 
     docs = Path(run_dir) / "docs"
     docs.mkdir(parents=True, exist_ok=True)
-    number = 0
     files: list[dict[str, Any]] = []
-    for sheet, table_text, source_range in sheets:
-        if stop_check and stop_check():
-            raise RuntimeError("tabular cancelled")
-        grid = grid_from_html(table_text) if table_text.lstrip().startswith("<table") else grid_from_gfm(table_text.splitlines())
-        regions = find_regions(grid)
-        structure = SheetStructure(summary="（大きすぎるため原本のみ）", tables=[]) if not regions or "_Sparse cell view" in table_text else await decide_structure(sheet, grid, regions, model=model, config=config)
-        tables = []
-        for spec in structure.tables:
-            columns, records = records_for(grid, spec)
-            if records:
-                tables.append((spec, columns, records, stats_for(columns, records)))
-        number += 1
-        name = f"{number:03d}-{_slug(sheet)}.md"
-        write_text_atomic(docs / name, render_table_page(sheet, structure, tables, table_text, grid))
-        files.append({"filename": name, "title": sheet, "kind": "table", "source_ranges": [list(source_range)], "summary": structure.summary})
+    prepared = []
+    link_renames: dict[str, str] = {}
+    progress_stage = "excel-source" if config.source_kind == "xlsx" else "tabular"
+    if on_progress:
+        on_progress({"stage": progress_stage, "step": "start", "total": len(sheets)})
+    semaphore = asyncio.Semaphore(
+        max(1, int(getattr(config, "rewrite_concurrency", app_concurrency())))
+    )
+    completed = 0
+
+    async def prepare(number: int, item: tuple[str, str, tuple[int, int]]):
+        nonlocal completed
+        sheet, table_text, source_range = item
+        async with semaphore:
+            if stop_check and stop_check():
+                raise RuntimeError("tabular cancelled")
+            grid = grid_from_html(table_text, origin=_table_origin(table_text)) if table_text.lstrip().startswith("<table") else grid_from_gfm(table_text.splitlines())
+            is_vba = "<!-- vba-id:" in table_text
+            if on_progress:
+                on_progress({
+                    "stage": progress_stage,
+                    "step": "describe",
+                    "current": number,
+                    "total": len(sheets),
+                    "kind": "vba" if is_vba else "sheet",
+                    "sheet": sheet,
+                })
+            regions = [] if is_vba else find_regions(grid)
+            description = await describe_vba(
+                sheet,
+                table_text,
+                model=model,
+                language=config.output_language,
+            ) if is_vba else None
+            structure = SheetStructure(
+                summary=description.summary,
+                tables=[],
+            ) if description else SheetStructure(summary="（大きすぎるため原本のみ）", tables=[]) if not regions or "_Sparse cell view" in table_text else await decide_structure(sheet, grid, regions, model=model, config=config)
+            tables = []
+            for spec in structure.tables:
+                columns, records = records_for(grid, spec)
+                if records:
+                    tables.append((spec, columns, records, stats_for(columns, records)))
+            page_title = f"マクロ-{description.title}" if description else source_page_title(sheet, is_vba=False) if config.source_kind == "xlsx" else sheet
+            name = f"{number:03d}-{_slug(page_title)}.md"
+            old_name = f"{number:03d}-{_slug(source_page_title(sheet, is_vba=True))}.md" if is_vba else name
+            write_text_atomic(docs / name, render_table_page(page_title if is_vba else sheet, structure, tables, table_text, grid))
+            completed += 1
+            if on_progress:
+                on_progress({
+                    "stage": progress_stage,
+                    "step": "done",
+                    "current": completed,
+                    "total": len(sheets),
+                    "kind": "vba" if is_vba else "sheet",
+                    "sheet": sheet,
+                    "filename": name,
+                })
+            return (
+                {"filename": name, "title": page_title if is_vba else sheet, "kind": "vba" if is_vba else "table", "source_ranges": [list(source_range)], "summary": structure.summary},
+                (sheet, source_range, name, tables),
+                (old_name, name) if old_name != name else None,
+            )
+
+    results = await asyncio.gather(*(prepare(number, item) for number, item in enumerate(sheets, 1)))
+    for file, prepared_item, rename in results:
+        files.append(file)
+        prepared.append(prepared_item)
+        if rename:
+            link_renames[rename[0]] = rename[1]
+
+    if link_renames:
+        for path in docs.glob("*.md"):
+            body = path.read_text(encoding="utf-8")
+            rewritten = body
+            for old_name, new_name in link_renames.items():
+                rewritten = rewritten.replace(f"({old_name})", f"({new_name})")
+            if rewritten != body:
+                write_text_atomic(path, rewritten)
+
+    number = len(prepared)
+    for sheet, source_range, name, tables in prepared:
+        if not generate_analyses:
+            continue
         for spec, columns, records, stats in tables:
             slices = [records] if config.tabular_slice_records <= 0 else [records[i:i + config.tabular_slice_records] for i in range(0, len(records), config.tabular_slice_records)]
             targets = [("分析", records if len(records) <= 60 else records[:30] + records[-10:])]
@@ -486,20 +613,30 @@ async def write_tables(*, sheets: list[tuple[str, str, tuple[int, int]]], run_di
                 if feedback:
                     text = "> 引用チェックに失敗したため、統計のみを掲載します。\n\n" + json.dumps(stats, ensure_ascii=False, indent=1)
                 number += 1
-                filename = f"{number:03d}-{_slug(sheet)}-{_slug(spec.title)}-{suffix}.md"
+                prefix = "解説" if config.source_kind == "xlsx" else "series"
+                filename = f"{number:03d}-{prefix}-{_slug(sheet)}-{_slug(spec.title)}-{suffix}.md"
                 write_text_atomic(docs / filename, f"# {spec.title} — {suffix}\n\n元の表: [{sheet}]({name})（{spec.title}）\n\n{text}\n")
                 files.append({"filename": filename, "title": f"{spec.title} — {suffix}", "kind": "analysis", "source_ranges": [list(source_range)], "summary": text.strip().splitlines()[0][:120] if text.strip() else ""})
         if on_progress:
             on_progress({"stage": "tabular", "sheet": sheet, "tables": len(tables)})
+    if on_progress:
+        on_progress({"stage": progress_stage, "step": "complete", "current": len(sheets), "total": len(sheets)})
     planning = Path(run_dir) / "_planning"
     planning.mkdir(exist_ok=True)
     write_json_atomic(planning / "manifest.json", {"planning": {"ingest_mode": "wiki", "strategy": "tabular"}, "files": files})
-    write_json_atomic(planning / "coverage.json", {"files": [{"title": item["title"], "filename": re.sub(r"^\d+-", "", item["filename"]), "summary": item["summary"], "header": "表", "source_start": item["source_ranges"][0][0], "source_end": item["source_ranges"][0][1]} for item in files]})
-    write_json_atomic(planning / "metadata.json", {"files": [{"name": re.sub(r"^\d+-", "", item["filename"]), "header": "表"} for item in files]})
+    write_json_atomic(planning / "coverage.json", {"files": [{"title": item["title"], "filename": re.sub(r"^\d+-", "", item["filename"]), "summary": item["summary"], "header": "VBA" if item["kind"] == "vba" else "表", "source_start": item["source_ranges"][0][0], "source_end": item["source_ranges"][0][1]} for item in files]})
+    write_json_atomic(planning / "metadata.json", {"files": [{"name": re.sub(r"^\d+-", "", item["filename"]), "header": "VBA" if item["kind"] == "vba" else "表"} for item in files]})
     return files
 
 
 def _slug(text: str) -> str:
     from graph.wiki.ids import slugify
 
-    return slugify(text, fallback="sheet")
+    return slugify(text, fallback="シート")
+
+
+def source_page_title(sheet: str, *, is_vba: bool) -> str:
+    title = re.sub(r"-part(\d+)$", r"-部分\1", sheet, flags=re.IGNORECASE)
+    if is_vba:
+        return re.sub(r"^vba-", "マクロ-", title, flags=re.IGNORECASE)
+    return f"シート-{title}"

@@ -16,6 +16,7 @@ import httpx
 from pydantic import BaseModel
 
 from graph.common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
+from graph.wiki.page import strip_reader_references
 
 
 class GrowiAPIError(RuntimeError):
@@ -222,26 +223,107 @@ class GrowiClient:
         return self._page_from_payload(response.json())
 
     async def delete_pages(self, page_ids_to_revisions: dict[str, str]) -> None:
-        if page_ids_to_revisions:
+        items = list(page_ids_to_revisions.items())
+        for start in range(0, len(items), 20):
             await self._request(
                 "POST",
                 "/pages/delete",
-                json_body={"pageIdToRevisionIdMap": page_ids_to_revisions},
+                json_body={"pageIdToRevisionIdMap": dict(items[start : start + 20])},
             )
 
 
 _GROWI_BAD = re.compile(r"[\^$*+#<>%?\\]")
 _LINES_RE = re.compile(r"^<!-- chunk: [^ ]+ lines (\d+)-(\d+)", re.MULTILINE)
+_MARKDOWN_LINK_RE = re.compile(
+    r"(?<!!)(?P<prefix>\[[^\]\n]*\]\()(?P<target>(?:(?!\]\().)*?\.md)(?P<fragment>#[^)\n]*)?\)"
+)
+_PERMALINK_RE = re.compile(
+    r"(?<!!)(?P<prefix>\[[^\]\n]*\]\()/(?P<page_id>[^/#)\n]+)(?P<fragment>#[^)\n]*)?\)"
+)
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 
 
 def growi_segment(name: str) -> str:
     cleaned = _GROWI_BAD.sub("-", name.strip()).strip("/")
+    if cleaned.lower().endswith(".md"):
+        cleaned = cleaned[:-3]
     return cleaned or "-"
 
 
 def growi_path(*parts: str) -> str:
     segments = [growi_segment(seg) for part in parts for seg in part.split("/") if seg.strip()]
     return "/" + "/".join(segments)
+
+
+def rewrite_page_links(body: str, source_rel: str, page_ids: dict[str, str]) -> str:
+    """Translate generated local Markdown links to stable GROWI permalinks."""
+    source_dir = posixpath.dirname(source_rel)
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group("target")
+        resolved = posixpath.normpath(posixpath.join(source_dir, target))
+        page_id = page_ids.get(resolved)
+        if not page_id:
+            return match.group(0)
+        return f'{match.group("prefix")}/{page_id}{match.group("fragment") or ""})'
+
+    return _rewrite_outside_fences(body, _MARKDOWN_LINK_RE, replace)
+
+
+def restore_page_links(body: str, source_rel: str, page_paths: dict[str, str]) -> str:
+    """Translate GROWI permalinks back to local relative Markdown paths."""
+    source_dir = posixpath.dirname(source_rel)
+
+    def replace(match: re.Match[str]) -> str:
+        target = page_paths.get(match.group("page_id"))
+        if not target:
+            return match.group(0)
+        relative = posixpath.relpath(target, source_dir or ".")
+        return f'{match.group("prefix")}{relative}{match.group("fragment") or ""})'
+
+    return _rewrite_outside_fences(body, _PERMALINK_RE, replace)
+
+
+def _rewrite_outside_fences(body: str, pattern: re.Pattern[str], replace: Any) -> str:
+    fence: str | None = None
+    output: list[str] = []
+    for line in body.splitlines(keepends=True):
+        marker = _FENCE_RE.match(line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = None
+            output.append(line)
+        else:
+            def outside_link(match: re.Match[str]) -> str:
+                prefix = line[:match.start()]
+                if prefix.rfind("](") > prefix.rfind(")"):
+                    return match.group(0)
+                return replace(match)
+
+            output.append(line if fence is not None else pattern.sub(outside_link, line))
+    return "".join(output)
+
+
+def managed_page_markdown(body: str, marker_id: str) -> str | None:
+    """Recover locally editable content while excluding unowned remote text."""
+    sections = _marked_sections(body)
+    if not sections:
+        return None
+    recovered: list[str] = []
+    for chunk_id, (start, end) in sorted(sections.items(), key=lambda item: item[1][0]):
+        section = body[start:end]
+        if chunk_id in {marker_id, marker_id + "-links"}:
+            lines = section.splitlines()
+            if lines and _CHUNK_MARKER_RE.fullmatch(lines[0]):
+                lines.pop(0)
+            if lines and _CHUNK_END_RE.fullmatch(lines[-1]):
+                lines.pop()
+            section = "\n".join(lines)
+        recovered.append(section.strip("\n"))
+    return "\n\n".join(part for part in recovered if part).rstrip() + "\n"
 
 
 def team_of_path(path: str, write_path: str) -> str | None:
@@ -344,6 +426,12 @@ def merge_marked_sections(existing: str, additions: str) -> str:
     return result
 
 
+def _complete_page(page: GrowiPage, path: str, body: str) -> GrowiPage:
+    if page.path and page.body:
+        return page
+    return page.model_copy(update={"path": page.path or path, "body": page.body or body})
+
+
 async def publish_pages(
     client: GrowiClient,
     pages: list[dict[str, str]],
@@ -351,31 +439,51 @@ async def publish_pages(
     mode: str,
     write_path: str,
     root_path: str = "/",
+    known_page_ids: dict[str, str] | None = None,
 ) -> list[GrowiPage]:
-    """Publish each page once, retrying one stale-revision conflict."""
-    results: list[GrowiPage] = []
+    """Resolve every page ID first, then publish stable permalink bodies."""
+    current: dict[str, GrowiPage] = {}
     for item in pages:
         path = item["path"]
         body = item["body"]
         assert_publish_path(path, mode=mode, write_path=write_path, root_path=root_path)
         existing = await client.get_page(path=path)
         if existing is None:
-            results.append(await client.create_page(path, body))
-            continue
+            existing = _complete_page(await client.create_page(path, body), path, body)
+        if not existing.page_id:
+            raise ValueError(f"GROWI returned no page ID for {path}")
+        current[path] = existing
+
+    page_ids = dict(known_page_ids or {})
+    page_ids.update({
+        item["local_path"]: current[item["path"]].page_id
+        for item in pages
+        if item.get("local_path") and current[item["path"]].page_id
+    })
+    results: list[GrowiPage] = []
+    for item in pages:
+        path = item["path"]
+        existing = current[path]
+        body = rewrite_page_links(item["body"], item.get("local_path", ""), page_ids)
         merged = merge_marked_sections(existing.body, body)
+        if merged == existing.body:
+            results.append(existing)
+            continue
         try:
-            results.append(await client.update_page(existing.page_id, existing.revision_id, merged))
+            results.append(_complete_page(
+                await client.update_page(existing.page_id, existing.revision_id, merged), path, merged
+            ))
         except GrowiAPIError as exc:
             if exc.status_code != 409:
                 raise
             refreshed = await client.get_page(path=path)
             if refreshed is None:
-                results.append(await client.create_page(path, body))
+                results.append(_complete_page(await client.create_page(path, body), path, body))
                 continue
             retry_body = merge_marked_sections(refreshed.body, body)
-            results.append(
-                await client.update_page(refreshed.page_id, refreshed.revision_id, retry_body)
-            )
+            results.append(_complete_page(
+                await client.update_page(refreshed.page_id, refreshed.revision_id, retry_body), path, retry_body
+            ))
     return results
 
 
@@ -414,32 +522,135 @@ class GrowiPublisher:
         folder = project.wiki_dir(rel).relative_to(project.wiki).as_posix()
         return growi_path(self.connection.write_path, folder)
 
-    def publish_document(self, project: Any, rel: str) -> list[GrowiPage]:
+    def _document_pages(self, project: Any, rel: str) -> list[dict[str, str]]:
         folder = project.wiki_dir(rel)
         doc_path = self.doc_path(project, rel)
         ranges = _coverage_ranges(folder)
         pages: list[dict[str, str]] = []
         for md in sorted(folder.glob("*.md")):
             name = growi_segment(md.name)
-            body = md.read_text(encoding="utf-8")
+            body = strip_reader_references(md.read_text(encoding="utf-8"))
             page_path = f"{doc_path}/{name}"
             main, footer = split_footer(body)
             page_id = "page" + page_path.replace(" ", "_")
             pages.append({
+                "local_path": md.relative_to(project.wiki).as_posix(),
                 "path": page_path,
                 "body": wrap_page(main, page_id=page_id, ranges=ranges.get(_canonical(md.name), []))
                 + "\n\n"
                 + wrap_links(footer, page_id=page_id),
             })
+        return pages
+
+    def publish_documents(
+        self,
+        project: Any,
+        rels: list[str],
+        known_pages: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, GrowiPage]:
+        pages: list[dict[str, str]] = []
+        document_paths: dict[str, set[str]] = {}
+        for rel in dict.fromkeys(rels):
+            document_pages = self._document_pages(project, rel)
+            pages.extend(document_pages)
+            document_paths[self.doc_path(project, rel)] = {page["path"] for page in document_pages}
+        if len({page["path"] for page in pages}) != len(pages):
+            raise ValueError("multiple local wiki pages resolve to the same GROWI path")
         results = asyncio.run(publish_pages(
             self.client,
             pages,
             mode=self.connection.mode,
             write_path=self.connection.write_path,
             root_path=self.connection.root_path,
+            known_page_ids={
+                path: str(row.get("page_id"))
+                for path, row in (known_pages or {}).items()
+                if row.get("page_id")
+            },
         ))
-        asyncio.run(self._trash_under(doc_path, keep={p["path"] for p in pages}))
-        return results
+        for doc_path, keep in document_paths.items():
+            asyncio.run(self._trash_under(doc_path, keep=keep))
+        return {item["local_path"]: page for item, page in zip(pages, results)}
+
+    def discover_documents(self, project: Any, rels: list[str]) -> dict[str, GrowiPage]:
+        pages = [page for rel in dict.fromkeys(rels) for page in self._document_pages(project, rel)]
+
+        async def fetch() -> list[GrowiPage | None]:
+            return [await self.client.get_page(path=page["path"]) for page in pages]
+
+        return {
+            item["local_path"]: page
+            for item, page in zip(pages, asyncio.run(fetch()))
+            if page is not None
+        }
+
+    def publish_document(self, project: Any, rel: str) -> list[GrowiPage]:
+        return list(self.publish_documents(project, [rel]).values())
+
+    def pull_changes(
+        self,
+        project: Any,
+        published_pages: dict[str, dict[str, Any]],
+        unchanged_documents: set[str],
+    ) -> tuple[list[str], list[str], set[str]]:
+        """Pull non-conflicting edits to publisher-owned page sections."""
+        async def fetch() -> dict[str, GrowiPage | None]:
+            return {
+                local_path: await self.client.get_page(page_id=str(row.get("page_id", "")))
+                for local_path, row in published_pages.items()
+                if row.get("page_id")
+            }
+
+        remote = asyncio.run(fetch())
+        page_paths = {
+            str(row.get("page_id")): local_path
+            for local_path, row in published_pages.items()
+            if row.get("page_id")
+        }
+        pulled: list[str] = []
+        conflicts: list[str] = []
+        blocked: set[str] = set()
+        from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
+
+        wiki_root = Path(project.wiki).resolve()
+        for local_path, page in remote.items():
+            row = published_pages[local_path]
+            if page is None or page.revision_id == row.get("revision_id"):
+                continue
+            document = posixpath.dirname(local_path)
+            if document not in unchanged_documents:
+                blocked.add(document)
+                conflicts.append(f"{local_path}: local and GROWI pages both changed")
+                continue
+            target = (wiki_root / local_path).resolve()
+            try:
+                target.relative_to(wiki_root)
+            except ValueError:
+                blocked.add(document)
+                conflicts.append(f"{local_path}: invalid local page path")
+                continue
+            marker_id = "page" + str(row.get("growi_path") or page.path).replace(" ", "_")
+            markdown = managed_page_markdown(page.body, marker_id)
+            if markdown is None:
+                blocked.add(document)
+                conflicts.append(f"{local_path}: GROWI ownership markers were removed")
+                continue
+            markdown = restore_page_links(markdown, local_path, page_paths)
+            write_text_atomic(target, markdown)
+            pristine = target.parent / "_planning" / "pages" / target.name
+            if pristine.exists():
+                main, _footer = split_footer(markdown)
+                write_text_atomic(pristine, main)
+            marker = target.parent / "_planning" / "linker.json"
+            state = read_json(marker, default={})
+            if state.get("status") == "complete":
+                state["status"] = "pending"
+                write_json_atomic(marker, state)
+            row["growi_path"] = page.path
+            row["page_id"] = page.page_id
+            row["revision_id"] = page.revision_id
+            pulled.append(local_path)
+        return pulled, conflicts, blocked
 
     def delete_document(self, project: Any, rel: str) -> int:
         return asyncio.run(self._trash_under(self.doc_path(project, rel), keep=set()))

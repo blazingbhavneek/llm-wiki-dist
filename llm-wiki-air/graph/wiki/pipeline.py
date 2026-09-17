@@ -40,6 +40,7 @@ from .page import (
     link_titles,
     normalize_draft,
     split_sections,
+    strip_reader_references,
     word_tokens,
 )
 from .prompts import (
@@ -356,29 +357,6 @@ def _reference_ranges_from_markdown(
     return _merge_ranges(found)
 
 
-def _link_reference_markers(
-    markdown: str, page: SeedPage, pages: Sequence[SeedPage]
-) -> str:
-    """Point each imported-fact marker at the page that owns the cited lines."""
-
-    def link(match) -> str:
-        start = int(match.group(1))
-        owner = next(
-            (
-                item for item in pages
-                if item.number != page.number
-                and any(s <= start <= e for s, e in item.owner_ranges)
-            ),
-            None,
-        )
-        if owner is None:
-            return match.group(0)
-        span = match.group(1) + (f"-{match.group(2)}" if match.group(2) else "")
-        return f"（参照元: [{owner.title}]({owner.filename}) 原文 {span}行）"
-
-    return REFERENCE_MARKER_RE.sub(link, markdown)
-
-
 def _write_reference_seeds(
     pages: Sequence[SeedPage],
     lines: Sequence[str],
@@ -487,8 +465,6 @@ def _render_reference_research(
     target: SeedPage,
     evidence: Sequence[_ReferenceEvidence],
     *,
-    lines: Sequence[str],
-    units: Sequence[ImageUnit],
     seed_root: Path,
 ) -> str:
     """Create the compact, auditable evidence pack consumed by plan and writer."""
@@ -520,17 +496,6 @@ def _render_reference_research(
             continue
         for fact in item.facts:
             useful_count += 1
-            fact_units = [
-                unit
-                for unit in units
-                if fact.source_start <= unit.source_start
-                and unit.source_end <= fact.source_end
-            ]
-            excerpt = _numbered_source(
-                lines,
-                [(fact.source_start, fact.source_end)],
-                fact_units,
-            ).rstrip()
             rendered.extend(
                 [
                     f"### useful fact {useful_count}",
@@ -538,10 +503,6 @@ def _render_reference_research(
                     f"- 必要な理由: {fact.reason.strip() or '対象記事を単独で理解しやすくするため。'}",
                     f"- 挿入場所: {fact.insertion_point.strip() or '関連する説明の直後'}",
                     f"- 出典: 原文 {fact.source_start}-{fact.source_end}行",
-                    "- 根拠抜粋:",
-                    "```text",
-                    excerpt,
-                    "```",
                     "",
                 ]
             )
@@ -588,15 +549,13 @@ def _select_references(
     picks = [item for score, _, item in scored[: max(0, limit)] if score > 0]
     family = [item for item in others if item.path and item.path[:-1] == page.path[:-1]]
     unique = {item.number: item for item in adjacent + family[:limit] + picks}
-    return sorted(unique.values(), key=lambda item: item.number)
+    return sorted(list(unique.values())[: max(0, limit)], key=lambda item: item.number)
 
 
 async def _research_references(
     page: SeedPage,
     *,
     pages: Sequence[SeedPage],
-    lines: Sequence[str],
-    units: Sequence[ImageUnit],
     tokens: dict[int, set[str]],
     model: ModelPort,
     config: WikiConfig,
@@ -612,8 +571,14 @@ async def _research_references(
         return [], "# 参照調査結果\n\n他のWikiページはない。\n"
 
     research_dir = clean_workdir(work_root / f"research-{page.number:03d}")
-    target_source = _numbered_source(
-        lines, page.owner_ranges, _page_units(page, units)
+    target_summary = page.summary.strip() or page.title
+    references = "\n\n".join(
+        (
+            f"--- 参照ページ {candidate.number:03d} {candidate.title}"
+            f"（原文 {_ranges_text(candidate.owner_ranges)}行） ---\n"
+            f"ページ要約: {candidate.summary}\n"
+        )
+        for candidate in selected
     )
     _emit(
         on_progress,
@@ -622,19 +587,14 @@ async def _research_references(
         page=page.title,
         candidates=len(selected),
         references=[item.number for item in selected],
-    )
-
-    references = "\n\n".join(
-        f"--- 参照ページ {candidate.number:03d} {candidate.title}"
-        f"（原文 {_ranges_text(candidate.owner_ranges)}行）の行番号付き原文（全文） ---\n"
-        + _numbered_source(lines, candidate.owner_ranges, _page_units(candidate, units))
-        for candidate in selected
+        context_characters=len(target_summary) + len(references),
+        context_bytes=len((target_summary + references).encode("utf-8")),
     )
     prompt = reference_research_prompt(
         target_number=page.number,
         target_title=page.title,
         target_ranges=_ranges_text(page.owner_ranges),
-        target_source=target_source,
+        target_summary=target_summary,
         references=references,
         output_language=config.output_language,
     )
@@ -675,9 +635,7 @@ async def _research_references(
             error=error,
         )
 
-    research = _render_reference_research(
-        page, evidence, lines=lines, units=units, seed_root=seed_root
-    )
+    research = _render_reference_research(page, evidence, seed_root=seed_root)
     write_text_atomic(research_dir / "reference-research.md", research)
     return evidence, research
 
@@ -832,29 +790,16 @@ def _resume_rewritten_page(
 
 def _facts_text(
     facts: Sequence[ReferenceFact],
-    lines: Sequence[str],
-    units: Sequence[ImageUnit],
 ) -> str:
     if not facts:
         return "なし"
     rendered: list[str] = []
     for number, fact in enumerate(facts, start=1):
-        fact_units = [
-            unit
-            for unit in units
-            if fact.source_start <= unit.source_start
-            and unit.source_end <= fact.source_end
-        ]
-        excerpt = _numbered_source(
-            lines, [(fact.source_start, fact.source_end)], fact_units
-        ).rstrip()
         rendered.append(
             f"## 追加事実 {number}\n"
             f"- 事実: {fact.description.strip()}\n"
             f"- 理由: {fact.reason.strip() or '単独で理解するために必要'}\n"
             f"- 出典: 原文 {fact.source_start}-{fact.source_end}行\n"
-            "- 根拠抜粋:\n```text\n"
-            f"{excerpt}\n```"
         )
     return "\n\n".join(rendered)
 
@@ -910,7 +855,7 @@ async def _write_section(
     placeholders = [unit.placeholder for unit in section_units]
     numbered = _numbered_source(lines, [(start, end)], section_units)
     source_text = _prompt_safe(slice_text(list(lines), start, end), section_units)
-    facts_text = _facts_text(facts, lines, units)
+    facts_text = _facts_text(facts)
     stem = f"section-{index:02d}"
     candidates: list[_SectionCandidate] = []
     feedback: list[str] = []
@@ -931,7 +876,11 @@ async def _write_section(
             output_language=config.output_language,
             feedback=feedback,
             context=context,
-            code_identifiers=sorted(code_tokens(source_text)),
+            code_identifiers=(
+                []
+                if config.source_kind in {"csv", "xlsx"}
+                else sorted(code_tokens(source_text))
+            ),
         )
         write_text_atomic(
             task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md", prompt.render()
@@ -964,6 +913,7 @@ async def _write_section(
             block_ranges=(),
             placeholders=placeholders,
             facts=facts,
+            check_identifiers=config.source_kind not in {"csv", "xlsx"},
         )
         if errors:
             candidates.append(_SectionCandidate(draft, attempt, errors=errors))
@@ -1103,7 +1053,7 @@ async def _rewrite_page(
     task_dir = clean_workdir(work_root / f"page-{page.number:03d}")
 
     evidence, _research = await _research_references(
-        page, pages=pages, lines=lines, units=units, tokens=tokens, model=model,
+        page, pages=pages, tokens=tokens, model=model,
         config=config, work_root=work_root, seed_root=seed_root,
         stop_check=stop_check, on_progress=on_progress,
     )
@@ -1149,10 +1099,12 @@ async def _rewrite_page(
     restored, unresolved = restore_images(markdown, page_units)
     if unresolved:
         raise PipelineError(f"page {page.number} has unresolved image placeholders: {unresolved}")
-    page.reference_ranges = _reference_ranges_from_markdown(
-        restored, page.owner_ranges, source_line_count
-    )
-    restored = _link_reference_markers(restored, page, pages)
+    page.reference_ranges = _merge_ranges([
+        (fact.source_start, fact.source_end) for fact in facts
+        if 1 <= fact.source_start <= fact.source_end <= source_line_count
+        and not any(start <= fact.source_start and fact.source_end <= end for start, end in page.owner_ranges)
+    ])
+    restored = strip_reader_references(restored)
     return RewriteResult(
         page=page,
         markdown=restored,
@@ -1257,8 +1209,7 @@ def _index_text(title: str, pages: Sequence[SeedPage]) -> str:
             seen.add(parent)
         lines.append(
             f"- [{page.title}]({page.filename}) — "
-            f"{page.summary or '要約なし'} "
-            f"（原文 {_ranges_text(page.owner_ranges)}行）"
+            f"{page.summary or '要約なし'}"
         )
     return "\n".join(lines) + "\n"
 
@@ -1523,10 +1474,10 @@ async def run_pipeline(
     flagged = [item for item in results if item.verbatim_sections]
     if flagged:
         review = [
-            "# Human review required",
+            "# 人手による確認が必要です",
             "",
-            "These sections were published as the exact source text because every "
-            "rewrite attempt lost content. Check them by hand:",
+            "書き換え時に情報が欠落したため、次の節は原文のまま公開されています。"
+            "内容を確認してください。",
             "",
         ]
         for item in flagged:

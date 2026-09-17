@@ -86,8 +86,9 @@ class ChatModelPort:
         kwargs: dict[str, Any] = {}
         if max_output_tokens is not None:
             kwargs["max_tokens"] = max_output_tokens
-        if not self.config.text_thinking:
-            kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+        kwargs["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": self.config.text_thinking}
+        }
         llm = self.llm.bind(**kwargs)
         reply = await asyncio.wait_for(
             llm.ainvoke(list(messages)), timeout=self.config.request_timeout

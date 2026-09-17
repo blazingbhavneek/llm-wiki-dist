@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 PROMPT_VERSION = "wiki-overlap-plan-ja-6"
 SEED_PLAN_VERSION = "wiki-seed-plan-ja-11"
-REWRITE_PROMPT_VERSION = "wiki-sections-ja-3"
+REWRITE_PROMPT_VERSION = "wiki-sections-ja-4"
 
 class WikiConfig(BaseModel):
     # Overlapping source observation

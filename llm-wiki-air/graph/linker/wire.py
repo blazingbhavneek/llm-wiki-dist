@@ -9,6 +9,7 @@ class ChunkEntity(BaseModel):
     name: str = ""
     kind: str = ""
     role: Literal["defines", "uses"] = "uses"
+    replaces: list[str] = Field(default_factory=list)
 
 
 class ChunkBehaviour(BaseModel):
@@ -53,7 +54,19 @@ class NeoEdgeSuggestions(BaseModel):
     edges: list[NeoEdgeSuggestion] = Field(default_factory=list)
 
 
+class PageReferenceChoice(BaseModel):
+    edge_id: str
+    placement: Literal["inline", "footer"] = "footer"
+    anchor: str = ""
+    summary: str = ""
+
+
+class PageReferencePlan(BaseModel):
+    references: list[PageReferenceChoice] = Field(default_factory=list)
+
+
 __all__ = [
     "ChunkBehaviour", "ChunkEntity", "ChunkMeta", "EdgeSuggestion", "EdgeSuggestions",
-    "NeoEdgeSuggestion", "NeoEdgeSuggestions", "NeoLabel",
+    "NeoEdgeSuggestion", "NeoEdgeSuggestions", "NeoLabel", "PageReferenceChoice",
+    "PageReferencePlan",
 ]

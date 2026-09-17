@@ -17,7 +17,7 @@ from graph.wiki.storage import read_json, write_json_atomic
 from . import chunks
 from .catalog import Catalog, LinkerModeMismatch
 from .legacy import Candidate
-from .prompts import EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
+from .prompts import CHUNK_META_VERSION, EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
 from .render import RenderEdge, render_page, write_if_changed
 
 Progress = Callable[[dict[str, Any]], None] | None
@@ -163,7 +163,9 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
         catalog = Catalog.open(project.linker_database, mode=mode)
         with catalog.lock(project):
             catalog.sync_from_planning(project, skip_document=document)
-            previous_cache = chunks.cache_by_hash(planning / "chunks.json")
+            chunk_cache_path = planning / "chunks.json"
+            refresh_metadata = model is not None and read_json(chunk_cache_path, default={}).get("meta_version") != CHUNK_META_VERSION
+            previous_cache = chunks.cache_by_hash(chunk_cache_path)
             original_hashes = chunks.snapshot_originals(project.wiki_dir(rel))
             all_chunks: list[chunks.Chunk] = []
             for page in sorted((planning / "pages").glob("*.md")):
@@ -172,18 +174,22 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
             for item in all_chunks:
                 if item.text_sha256 in previous_cache:
                     item.meta = previous_cache[item.text_sha256]
-                elif item.chunk_id in old_rows:
+                elif not refresh_metadata and item.chunk_id in old_rows:
                     item.meta = _row_meta(old_rows[item.chunk_id])
             diff = catalog.reconcile(document, all_chunks, team=team, raw_rel=rel, page_hashes=original_hashes)
             if on_progress:
                 on_progress({"stage": "linker", "step": "chunks", "document": rel, "current": len(all_chunks), "total": len(all_chunks)})
             stale_ids = set(diff["new"]) | set(diff["changed"])
-            to_describe = [item for item in all_chunks if not previously_complete or item.chunk_id in stale_ids]
+            to_describe = [item for item in all_chunks if refresh_metadata or not previously_complete or item.chunk_id in stale_ids]
             run_dir = Path(project.state_dir(rel)) / "work" / "linker" / run_id
             meta_calls, meta_fallbacks = (0, 0)
+            revised_ids: set[str] = set()
             output_language = str(getattr(settings, "wiki_output_language", "Japanese (日本語)"))
             if to_describe and model is not None:
-                meta_calls, meta_fallbacks = await chunks.describe_all(to_describe, model=model, output_language=output_language, concurrency=int(getattr(settings, "wiki_linker_concurrency", 0) or getattr(settings, "wiki_rewrite_concurrency", 4) or 4), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check)
+                before_meta = {item.chunk_id: item.meta.model_dump_json() for item in all_chunks}
+                meta_calls, meta_fallbacks = await chunks.describe_all(all_chunks, model=model, output_language=output_language, concurrency=int(getattr(settings, "wiki_linker_concurrency", 0) or getattr(settings, "wiki_rewrite_concurrency", 4) or 4), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check)
+                revised_ids = {item.chunk_id for item in all_chunks if item.meta.model_dump_json() != before_meta[item.chunk_id]}
+                to_describe = [item for item in all_chunks if item.chunk_id in stale_ids or item.chunk_id in revised_ids or not previously_complete]
             chunk_data = chunks.to_json(document, team, all_chunks)
             chunk_data["raw_rel"] = rel
             for page in chunk_data["pages"]:
@@ -193,6 +199,9 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
             # A rebuilt catalog has no edges for this document yet; links.json (kept
             # across republish) restores the ones whose endpoint text is unchanged.
             catalog.restore_edges(planning / "links.json")
+            revised_peers = {peer for chunk_id in revised_ids for peer in catalog.edge_peers(chunk_id)}
+            metadata_edges_removed = catalog.delete_edges_for(revised_ids)
+            diff["edges_removed"] = int(diff.get("edges_removed", 0)) + metadata_edges_removed
             catalog.embed_pending(embedder, team=team)
             candidates_for: list[tuple[chunks.Chunk, list[Candidate]]] = []
             for item in to_describe:
@@ -244,7 +253,7 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
             for edge in edge_rows:
                 inserted_edges += int(catalog.insert_edge(edge, commit=False))
             catalog.conn.commit()
-            touched_chunk_ids = set(diff["peers_before"])
+            touched_chunk_ids = set(diff["peers_before"]) | revised_peers
             for edge in edge_rows:
                 touched_chunk_ids.update((edge["chunk_a"], edge["chunk_b"]))
             pages: set[str] = {item.page_rel for item in all_chunks}
@@ -262,7 +271,7 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
                         touched_docs.add(_raw_rel(catalog, doc))
             all_docs = {document, *{page.rsplit("/", 1)[0] for page in pages}}
             catalog.write_links_json(project, all_docs)
-            complete = {"schema_version": 2, "status": "complete", "mode": mode, "meta_version": "wiki-chunk-meta-1", "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            complete = {"schema_version": 2, "status": "complete", "mode": mode, "meta_version": CHUNK_META_VERSION, "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             write_json_atomic(planning / "linker.json", complete)
             if on_progress:
                 on_progress({"stage": "linker", "step": "done", "document": rel, "edges": len(edge_rows)})

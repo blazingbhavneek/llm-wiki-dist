@@ -6,6 +6,7 @@ import io
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 
 def wiki_folder_name(raw_name: str) -> str:
@@ -17,7 +18,12 @@ def wiki_folder_name(raw_name: str) -> str:
 def raw_name_for(mount_name: str) -> str:
     path = PurePosixPath(mount_name)
     ext = path.suffix.lstrip(".").lower()
-    return f"{path.stem}_{ext}.md" if ext else f"{path.stem}.md"
+    if not ext:
+        return path.stem
+    base, sep, tail = path.stem.rpartition("_")
+    if ext == "md" and sep and base and tail.isalnum():
+        return path.name  # already raw-style `<stem>_<srcent>.md`: don't double-suffix
+    return f"{path.stem}_{ext}.md"
 
 
 RESERVED_TEAMS = {"all", "admin", "assets"}
@@ -31,10 +37,11 @@ def team_of(rel: str) -> str:
 @dataclass(frozen=True)
 class Project:
     root: Path
+    mount_root: Path | None = None
 
     @property
     def mount(self) -> Path:
-        return self.root / "mount"
+        return self.mount_root if self.mount_root is not None else self.root / "mount"
 
     @property
     def raw(self) -> Path:
@@ -59,6 +66,10 @@ class Project:
     @property
     def linker_database(self) -> Path:
         return self.metadata / "wiki-linker.sqlite"
+
+    @property
+    def queue_database(self) -> Path:
+        return self.metadata / "watch-queue.sqlite"
 
     @property
     def last_sha_path(self) -> Path:
@@ -104,6 +115,17 @@ class Project:
                 if path.is_dir() and not path.name.startswith(".") and path.name not in RESERVED_TEAMS:
                     names.add(path.name)
         return sorted(names)
+
+
+def open_project(settings: Any) -> Project:
+    name = str(getattr(settings, "target_name", "")).strip()
+    mount_value = str(getattr(settings, "mount_path", "")).strip()
+    if not name or not mount_value:
+        raise ValueError("project config did not provide target_name and source_mount")
+    mount = Path(mount_value)
+    if not mount.is_dir():
+        raise FileNotFoundError(f"mount directory not found: {mount}")
+    return Project(Path(settings.data_root) / name, mount).ensure()
 
 
 def zip_wiki(project: Project, team: str | None = None) -> bytes:

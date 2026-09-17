@@ -266,11 +266,11 @@ def reference_research_prompt(
     target_number: int,
     target_title: str,
     target_ranges: str,
-    target_source: str,
+    target_summary: str,
     references: str,
     output_language: str,
 ) -> Prompt:
-    """Compare every selected reference seed with one complete target seed."""
+    """Compare compact summaries of related seed pages."""
 
     from .wire import ReferenceResearchResult
 
@@ -278,9 +278,9 @@ def reference_research_prompt(
         kind="reference_research",
         version=REWRITE_PROMPT_VERSION,
         system=(
-            "あなたは技術Wikiの資料調査者である。対象原文と参照原文はプロンプト内に"
-            "全文が与えられているため、ファイル操作は不要である。記事や計画は書かず、"
-            "参照原文から対象記事へ本当に追加すべき事実だけを構造化JSONで返す。\n\n"
+            "あなたは技術Wikiの資料調査者である。対象ページと参照ページの要約は"
+            "プロンプト内に与えられている。記事や計画は書かず、参照ページから"
+            "対象記事へ本当に追加すべき事実だけを構造化JSONで返す。\n\n"
             "JSON形式:\n" + _schema_hint(ReferenceResearchResult)
         ),
         body=(
@@ -288,22 +288,23 @@ def reference_research_prompt(
             f"説明は{output_language}で書くこと。\n\n"
             "判定規則:\n"
             "- 目標は、この対象ページだけでエンティティを完全に理解・使用・実装・運用・"
-            "障害対応できる状態にすることである。参照原文に対象エンティティ関連の"
+            "障害対応できる状態にすることである。参照ページ要約に対象エンティティ関連の"
             "情報が残っている限り、網羅的に拾うこと。遠慮して漏らす方が誤り。\n"
-            "- 対象原文に既にある事実は追加候補にしない。\n"
+            "- 対象ページ要約に既にある事実は追加候補にしない。\n"
             "- 前提、用語定義、関連エンティティとの関係、使用条件、制約、引数や"
             "設定項目の意味、出力メッセージ、返回値、注意、障害事例など、"
             "対象ページを単独で理解、利用、実装、運用、障害対応するために有用な"
             "事実をすべて選ぶ。\n"
+            "- 提示された要約にない内容は推測せず、追加候補にしない。\n"
             "- 単なる関数一覧、章番号、同じ説明の言い換え、ナビゲーション用リンクは選ばない。\n"
-            "- 各事実のsource_start/source_endは、必ずいずれかの参照原文に表示された正確な行番号にする。\n"
+            "- 各事実のsource_start/source_endは、必ず該当する参照ページに表示された原文範囲内にする。\n"
             "- target_lineには、その事実を本文へ入れるべき対象原文の行番号"
             "（対象原文に表示された番号のうち、最も関係の深い行）を書く。\n"
             "- descriptionには追加する事実、reasonには必要な理由、insertion_pointには"
             "対象記事のどこへ入れるかを書く。\n"
             "- 有用な事実がなければuseful_factsを空にし、"
             "no_useful_information_reasonへ具体的な理由を書く。捏造して水増ししない。\n\n"
-            f"--- 対象ページの行番号付き原文（全文） ---\n{target_source}\n\n"
+            f"--- 対象ページ要約 ---\n{target_summary}\n\n"
             f"{references}"
         ),
     )
@@ -429,9 +430,7 @@ def section_write_prompt(
             + identifier_block
             + "# 他ページから追加する事実\n"
             f"{facts_text}\n"
-            "各事実は本文の該当箇所へ自然に組み込み、その段落の直後に"
-            "`（参照元: 原文 S-E行）`（SとEは各事実の出典行）と書く。"
-            f"原文 {source_start}-{source_end}行の情報にはこのマーカーを付けない。\n\n"
+            "各事実は本文の該当箇所へ自然に組み込む。出典ページ名や原文の行番号を本文へ書かない。\n\n"
             f"{feedback_block}"
             "--- 行番号付き原文（この節） ---\n"
             f"{numbered_section}"

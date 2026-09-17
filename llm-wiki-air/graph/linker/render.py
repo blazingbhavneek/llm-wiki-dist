@@ -9,12 +9,32 @@ from pathlib import Path
 from typing import Any
 
 from graph.common.markdown import LINKS_FOOTER_END as FOOTER_END, LINKS_FOOTER_START as FOOTER_START
-from graph.wiki.page import link_titles
+from graph.wiki.page import link_entity_mentions, link_titles, strip_reader_references
 from graph.wiki.storage import write_text_atomic
 
-FOOTER_TITLE = "## 関連リンク"
-MAX_FOOTER_ENTRIES = 30
+FOOTER_TITLE = "## 関連資料"
+MAX_FOOTER_ENTRIES = 15
+MAX_INLINE_ENTRIES = 8
+MAX_BIG_INLINE_ENTRIES = 12
+MAX_NEO_BEHAVIOUR_INLINE_ENTRIES = 3
+BIG_DOCUMENT_LINES = 150
 MAX_SIMILAR_ENTRIES = 5
+USEFUL_LABELS = {
+    "defines", "defined-by", "uses", "used-by", "requires", "required-by",
+    "prerequisite", "prerequisite-for", "implements", "implemented-by",
+    "configures", "configured-by", "triggers", "triggered-by", "consequence",
+    "consequence-of", "constraint", "constrains", "alternative", "alternative-to",
+    "contradicts", "example-of", "has-example",
+}
+INTERNAL_SUMMARY_TERMS = ("新ノード", "対象ノード", "候補ノード", "チャンク", "lchunk-")
+LABEL_PRIORITY = {
+    "defines": 0, "defined-by": 0, "implements": 1, "implemented-by": 1,
+    "configures": 2, "configured-by": 2, "requires": 3, "required-by": 3,
+    "prerequisite": 3, "prerequisite-for": 3, "constraint": 3, "constrains": 3,
+    "triggers": 4, "triggered-by": 4, "consequence": 4, "consequence-of": 4,
+    "uses": 5, "used-by": 5, "example-of": 6, "has-example": 6,
+    "alternative": 7, "alternative-to": 7, "contradicts": 7,
+}
 
 
 @dataclass
@@ -42,19 +62,28 @@ def relative_link(from_page_rel: str, to_page_rel: str) -> str:
     return posixpath.relpath(to_page_rel, posixpath.dirname(from_page_rel) or ".")
 
 
-def ordered(edges: list[RenderEdge]) -> list[RenderEdge]:
-    group = {"define": 0, "use": 0, "similar": 1}
-    return sorted(edges, key=lambda edge: (group.get(edge.source, 2), edge.label, edge.peer_title, edge.edge_id))
+def ordered(edges: list[RenderEdge], page_rel: str = "") -> list[RenderEdge]:
+    document = posixpath.dirname(page_rel)
+    return sorted(edges, key=lambda edge: (
+        0 if edge.source in {"define", "use"} else 1,
+        LABEL_PRIORITY.get(edge.label.lower(), 99),
+        0 if page_rel and posixpath.dirname(edge.peer_page_rel) != document else 1,
+        edge.peer_title,
+        edge.edge_id,
+    ))
 
 
-def footer_edges(edges: list[RenderEdge]) -> list[RenderEdge]:
+def footer_edges(edges: list[RenderEdge], *, page_rel: str = "", limit: int | None = MAX_FOOTER_ENTRIES) -> list[RenderEdge]:
     """Edges are per chunk; a page footer shows one line per peer page and reason."""
     seen: set[tuple[str, ...]] = set()
     kept: list[RenderEdge] = []
     similar = 0
-    for edge in ordered(edges):
-        _arrow, label, summary = display(edge)
-        key = (edge.peer_page_rel, label) if edge.source == "similar" else (edge.peer_page_rel, label, summary)
+    for edge in ordered(edges, page_rel):
+        if edge.source == "similar" or (edge.source not in {"use", "define"} and edge.label.strip().lower() not in USEFUL_LABELS):
+            continue
+        if any(term in edge.summary for term in INTERNAL_SUMMARY_TERMS):
+            continue
+        key = (edge.peer_page_rel,)
         if key in seen:
             continue
         if edge.source == "similar":
@@ -63,7 +92,7 @@ def footer_edges(edges: list[RenderEdge]) -> list[RenderEdge]:
             similar += 1
         seen.add(key)
         kept.append(edge)
-    return kept[:MAX_FOOTER_ENTRIES]
+    return kept if limit is None else kept[:limit]
 
 
 def peer_defines(edge: RenderEdge) -> bool:
@@ -81,24 +110,86 @@ def display(edge: RenderEdge) -> tuple[str, str, str]:
     return ("" if edge.forward else "← "), edge.label, edge.summary
 
 
-def render_page(original: str, *, page_rel: str, edges: list[RenderEdge], mode: str) -> str:
-    body = original.rstrip("\n") + "\n"
+def render_page(
+    original: str, *, page_rel: str, edges: list[RenderEdge], mode: str,
+    big_document: bool = False, choices: list[dict[str, Any]] | None = None,
+) -> str:
+    body = strip_reader_references(original).rstrip("\n") + "\n"
+    entity_paths: set[str] = set()
     if mode == "neo":
-        targets = [(edge.via[0], relative_link(page_rel, edge.peer_page_rel)) for edge in edges if peer_defines(edge)]
-        body = link_titles(body, targets)
-    if not edges:
+        seen_entities: set[str] = set()
+        entity_targets: list[tuple[str, str]] = []
+        for edge in ordered(edges, page_rel):
+            if not peer_defines(edge):
+                continue
+            entity = edge.via[0].strip()
+            key = entity.casefold()
+            if not entity or key in seen_entities:
+                continue
+            entity_targets.append((entity, relative_link(page_rel, edge.peer_page_rel)))
+            seen_entities.add(key)
+        for entity, path in sorted(entity_targets, key=lambda target: -len(target[0])):
+            linked = link_entity_mentions(body, entity, path)
+            if linked != body or f"[{entity}]({path})" in body:
+                body = linked
+                entity_paths.add(path)
+    inline_budget = MAX_NEO_BEHAVIOUR_INLINE_ENTRIES if mode == "neo" else MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES
+    curated_edges = edges if mode == "legacy" else [edge for edge in edges if edge.source not in {"use", "define"}]
+    by_id = {edge.edge_id: edge for edge in footer_edges(curated_edges, page_rel=page_rel, limit=None)}
+    if choices is None:
+        selected = [(edge, "footer" if mode == "neo" else "inline", "", edge.summary) for edge in by_id.values()]
+    else:
+        selected = []
+        for choice in choices:
+            edge = by_id.get(str(choice.get("edge_id", "")))
+            if edge is not None:
+                selected.append((edge, str(choice.get("placement", "footer")), str(choice.get("anchor", "")).strip(), str(choice.get("summary", "")).strip() or edge.summary))
+    inline_paths: set[str] = set()
+    inline_titles: set[str] = set()
+    failed_inline: list[tuple[RenderEdge, str]] = []
+    for edge, placement, anchor, summary in selected:
+        if placement != "inline":
+            continue
+        if len(inline_paths) >= inline_budget:
+            failed_inline.append((edge, summary))
+            continue
+        title = anchor or (edge.via[0] if mode == "neo" and peer_defines(edge) else edge.peer_title if mode == "legacy" else "")
+        path = relative_link(page_rel, edge.peer_page_rel)
+        if not title or title in inline_titles:
+            failed_inline.append((edge, summary))
+            continue
+        linked = link_titles(body, [(title, path)])
+        if linked != body or f"]({path})" in body:
+            body = linked
+            inline_paths.add(path)
+            inline_titles.add(title)
+        else:
+            failed_inline.append((edge, summary))
+    footer: list[tuple[RenderEdge, str]] = failed_inline
+    footer.extend((edge, summary) for edge, placement, _anchor, summary in selected if placement != "inline")
+    seen_paths: set[str] = set(inline_paths) | entity_paths
+    unique_footer: list[tuple[RenderEdge, str]] = []
+    for edge, summary in footer:
+        path = relative_link(page_rel, edge.peer_page_rel)
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        unique_footer.append((edge, summary))
+    footer = unique_footer[:MAX_FOOTER_ENTRIES]
+    if not footer:
         return body
     lines = [FOOTER_START, FOOTER_TITLE, ""]
-    for edge in footer_edges(edges):
+    for edge, summary in footer:
         heading = edge.peer_heading if edge.peer_heading and edge.peer_heading != edge.peer_title else ""
         peer = f"{edge.peer_title} › {heading}" if heading else edge.peer_title
-        arrow, label, summary = display(edge)
-        lines.append(f"- [{peer}]({relative_link(page_rel, edge.peer_page_rel)}) — {arrow}{label}: {summary}")
+        suffix = f" — {summary}" if summary else ""
+        lines.append(f"- [{peer}]({relative_link(page_rel, edge.peer_page_rel)}){suffix}")
     lines.append(FOOTER_END)
     return body + "\n" + "\n".join(lines) + "\n"
 
 
-_FOOTER_LINE_RE = re.compile(r"^- \[(?P<title>.*?)\]\((?P<path>[^)]+)\) — (?P<reverse>← )?(?P<label>[^:]+): (?P<summary>.*)$")
+_FOOTER_LINE_RE = re.compile(r"^- \[(?P<title>.*?)\]\((?P<path>[^)]+)\) — (?P<reverse>← )?(?P<label>[a-z][a-z0-9_-]*): (?P<summary>.*)$")
+_REFERENCE_LINE_RE = re.compile(r"^- \[(?P<title>.*?)\]\((?P<path>[^)]+)\)(?: — (?P<summary>.*))?$")
 
 
 def parse_footer(text: str) -> list[FooterLink]:
@@ -111,6 +202,10 @@ def parse_footer(text: str) -> list[FooterLink]:
         match = _FOOTER_LINE_RE.match(line.strip())
         if match:
             result.append(FooterLink(match["path"], match["label"].strip(), match["summary"].strip(), bool(match["reverse"])))
+            continue
+        match = _REFERENCE_LINE_RE.match(line.strip())
+        if match:
+            result.append(FooterLink(match["path"], "", (match["summary"] or "").strip()))
     return result
 
 
@@ -122,4 +217,4 @@ def write_if_changed(path: Path, text: str) -> bool:
     return True
 
 
-__all__ = ["FOOTER_END", "FOOTER_START", "FOOTER_TITLE", "FooterLink", "MAX_FOOTER_ENTRIES", "MAX_SIMILAR_ENTRIES", "display", "footer_edges", "peer_defines", "RenderEdge", "ordered", "parse_footer", "relative_link", "render_page", "write_if_changed"]
+__all__ = ["BIG_DOCUMENT_LINES", "FOOTER_END", "FOOTER_START", "FOOTER_TITLE", "FooterLink", "INTERNAL_SUMMARY_TERMS", "LABEL_PRIORITY", "MAX_BIG_INLINE_ENTRIES", "MAX_FOOTER_ENTRIES", "MAX_INLINE_ENTRIES", "MAX_NEO_BEHAVIOUR_INLINE_ENTRIES", "MAX_SIMILAR_ENTRIES", "USEFUL_LABELS", "display", "footer_edges", "peer_defines", "RenderEdge", "ordered", "parse_footer", "relative_link", "render_page", "write_if_changed"]

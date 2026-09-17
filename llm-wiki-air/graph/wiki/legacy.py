@@ -29,9 +29,6 @@ MAX_CHUNK_EXTRA = 50
 # Concurrency inside verification for one file.
 CONCURRENCY = 20
 
-# Number of input markdown files processed at the same time.
-FILE_CONCURRENCY = 4
-
 TEMPERATURE = 0.7
 TIMEOUT = 300
 

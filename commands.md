@@ -8,20 +8,23 @@ relative to `WIKI_DATA_ROOT`.
 
 | type: server | URL | env |
 |---|---|---|
-| chat — llama-server / vLLM, `gemma-4-12B` | `http://localhost:8000/v1` | `OPENAI_BASE_URL`, `WIKI_MODEL` |
-| embed — `cl-nagoya/ruri-v3-30m` | `http://localhost:8001/v1` | `WIKI_EMBED_BASE_URL` |
-| rerank — `ruri-v3-reranker-310m` (engine only) | `http://localhost:8002/v1` | `WIKI_RERANK_BASE_URL` |
-| parser — doc-parser (needed for non-`.md` sources) | `http://<host>:8888` | `WIKI_PARSER_BASE_URL` |
+| chat — vLLM, `gemma-4-31B` | `http://10.160.144.101:51029/v1` | `OPENAI_BASE_URL`, `WIKI_MODEL` |
+| embed — `cl-nagoya/ruri-v3-310m` (dim 768) | `http://10.160.144.101:51024/v1` | `WIKI_EMBED_BASE_URL` |
+| rerank — `cl-nagoya/ruri-v3-reranker-310m` (engine only) | `http://10.160.144.101:51025/v1` | `WIKI_RERANK_BASE_URL` |
+| parser — doc-parser (needed for non-`.md` sources) | `http://127.0.0.1:8888` | `WIKI_PARSER_BASE_URL` |
+
+All three model URLs/model names are also the defaults in `graph/config.py`, so
+an empty `.env` still works. Endpoints expose `/health` (parser), not `/queue`.
 
 ```bash
-cd /mnt/common/Code/llm-wiki-dist/parser && python3 -m uvicorn server:app --host 0.0.0.0 --port 8888
+cd /home/seigyo/c_repo/bhavneek/llm-wiki-neo/parser && .venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8888
 .venv/bin/python main.py check        # from either folder: pings chat/embed/rerank/parser(/GROWI)
 ```
 
-## 1. Full product — `llm-wiki-dist/llm-wiki-dist`
+## 1. Full product — `llm-wiki-dist/`
 
 ```bash
-cd /mnt/common/Code/llm-wiki-dist/llm-wiki-dist
+cd /home/seigyo/c_repo/bhavneek/llm-wiki-neo/llm-wiki-dist
 ```
 
 ### type: server — engine API + UI (FastAPI), MCP proxy
@@ -60,6 +63,8 @@ GROWI, republish documents the linker touched.
 
 ### type: pipeline, one file (the old `wiki_one.py`)
 
+`.md` sources live under `data/raw/rikiseisan/test/` (convert ones from the parser samples for other formats).
+
 ```bash
 .venv/bin/python main.py wiki 'rikiseisan/test/系統制御ミドルウェア（Ｍｏｏｖｅ）_構成制御ユーザーズマニュアル_pdf.md'
 .venv/bin/python main.py wiki 'rikiseisan/test/系統制御ミドルウェア（Ｍｏｏｖｅ）_システム運転情報管理ユーザーズマニュアル_pdf.md'
@@ -76,7 +81,7 @@ GROWI, republish documents the linker touched.
 | `--linker legacy` | RRF candidates + `EDGE_PROMPT` groups of 4 (default, `WIKI_LINKER_MODE`) |
 | `--linker neo` | entity define/use + behaviour hops, inline links at first mention |
 | `--linker off` | no linker, writes `{"status":"disabled"}` markers |
-| `--timeout N` | per-call model timeout (`WIKI_REQUEST_TIMEOUT`, default 300; gemma-4-12B planner needs ~900) |
+| `--timeout N` | per-call model timeout (`WIKI_REQUEST_TIMEOUT`, default 300; gemma-4-31B planner may need ~900) |
 
 ```bash
 .venv/bin/python main.py wiki test/docx/Input1_docx.md --mode chunks --linker off
@@ -115,8 +120,9 @@ Runtime files: `data/metadata/wiki-linker.sqlite`,
 ## 2. Minimal no-Git publisher — `llm-wiki-air` (same flags, mount-driven)
 
 ```bash
-cd /mnt/common/Code/llm-wiki-dist/llm-wiki-air
-cp .env.example .env                                  # WIKI_DATA_ROOT=./data, WIKI_CHAT_*, WIKI_EMBED_*, GROWI_*
+cd /home/seigyo/c_repo/bhavneek/llm-wiki-neo/llm-wiki-air
+uv venv --python 3.13 .venv && uv sync                # 3.13 required; system python3 is 3.6
+# .env: WIKI_DATA_ROOT=./data + chat/embed/rerank/parser URLs (see §0)
 ```
 
 ### type: server — none of its own (uses the same chat/embed/parser servers + GROWI)
@@ -125,26 +131,33 @@ cp .env.example .env                                  # WIKI_DATA_ROOT=./data, W
 python main.py check
 ```
 
-### type: pipeline, full — one pass over `data/mount`: parse → raw → wiki → links → GROWI sweep
+### type: pipeline, inspect first — `raw` → `wiki` → links, then publish
 
 ```bash
-python main.py sync
-python main.py watch --interval 60                    # loop
+python main.py build wiki                             # generate every raw Markdown; do not link
+python main.py link                                   # link pending wikis; do not regenerate
+python main.py build all                              # wiki batch, then link/render batch
+python main.py build --force all team/manual_pdf.md   # selected raw-relative file
+python main.py build --data-root /tmp/neo --linker neo all
+python main.py publish --data-root /tmp/neo
+```
+
+Bare `build` (and the old `wiki` alias) means `build all`. `--data-root` may go
+before or after the command, which makes separate legacy/neo and wiki/chunks
+test folders easy to keep.
+
+### type: pipeline, full — `mount` → parser → `raw` → `wiki` → links → GROWI
+
+```bash
+python main.py sync                                   # one testable pass
+python main.py watch --interval 60                    # same pass whenever content changes
 python main.py -v sync --linker neo --timeout 900
 ```
 
-### type: pipeline, list of files / one file (mount-relative paths; still ledger-tracked)
+### type: reset GROWI output
 
 ```bash
-python main.py wiki demo/Input1.md demo/Valid.md
-python main.py wiki team/manual.pdf --force           # regenerate even if the source is unchanged
-python main.py wiki --from-file files.txt
-```
-
-### type: publish only — GROWI sweep by content hash, no generation
-
-```bash
-python main.py publish
+python main.py reset                                  # only publisher-marked pages; local data stays
 ```
 
 ### type: linker only — identical to the full product

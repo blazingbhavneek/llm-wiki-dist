@@ -94,7 +94,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         "chat": f"{settings.chat_base_url.rstrip('/')}/models",
         "embed": f"{settings.embed_base_url.rstrip('/')}/models",
         "rerank": f"{settings.rerank_base_url.rstrip('/')}/models",
-        "parser": f"{settings.parser_base_url.rstrip('/')}/queue" if settings.parser_base_url else "",
+        "parser": f"{settings.parser_base_url.rstrip('/')}/health" if settings.parser_base_url else "",
     }
     bad = 0
     for name, url in targets.items():

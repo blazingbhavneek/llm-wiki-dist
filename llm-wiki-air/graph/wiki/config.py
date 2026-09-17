@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from graph.config import app_concurrency
 
 PROMPT_VERSION = "wiki-overlap-plan-ja-6"
 SEED_PLAN_VERSION = "wiki-seed-plan-ja-11"
-REWRITE_PROMPT_VERSION = "wiki-sections-ja-3"
+REWRITE_PROMPT_VERSION = "wiki-sections-ja-4"
 
 class WikiConfig(BaseModel):
     # Overlapping source observation
     window_target_lines: int = 250
     window_overlap_lines: int = 50
-    planner_concurrency: int = 4
+    planner_concurrency: int = Field(default_factory=app_concurrency)
     planner_attempts: int = 5
     regional_window_count: int = 10
     # Zero means retry the final range compiler until it succeeds or is cancelled.
@@ -23,7 +25,7 @@ class WikiConfig(BaseModel):
     page_target_lines: int = 100
 
     # Section-wise page writing
-    rewrite_concurrency: int = 4
+    rewrite_concurrency: int = Field(default_factory=app_concurrency)
     section_target_lines: int = 80
     section_min_lines: int = 8
     write_attempts: int = 3
@@ -43,7 +45,7 @@ class WikiConfig(BaseModel):
     request_timeout: int = 300
     # Reasoning on plain-text rewrite/intro calls (structured calls keep the
     # server default). Python's lossless checks gate the output either way.
-    text_thinking: bool = False
+    text_thinking: bool = True
     output_language: str = "Japanese (日本語)"
     prompt_version: str = PROMPT_VERSION
     resume: bool = True

@@ -8,6 +8,8 @@ from typing import Any
 
 import requests
 
+from .xlsm import apply_manifest, build_manifest
+
 
 class UnsupportedDocument(RuntimeError):
     pass
@@ -23,11 +25,13 @@ def parse_document(path: Path, *, base_url: str, settings: Any, timeout_s: float
         }.items()
         if value
     }
+    manifest = build_manifest(path)
     with Path(path).open("rb") as handle:
         response = requests.post(
             f"{base_url.rstrip('/')}/parse",
             params={"images": "true", "describe_images": "true"},
             headers=headers,
+            data={"manifest": json.dumps(manifest, ensure_ascii=False)} if manifest else None,
             files={"file": (Path(path).name, handle)},
             timeout=(30, timeout_s),
         )
@@ -40,7 +44,8 @@ def parse_document(path: Path, *, base_url: str, settings: Any, timeout_s: float
         raise RuntimeError("doc-parser returned invalid JSON") from exc
     if not isinstance(payload, dict) or "markdown" not in payload:
         raise RuntimeError(f"doc-parser: {payload.get('error', 'missing markdown') if isinstance(payload, dict) else 'invalid response'}")
-    return str(payload["markdown"])
+    markdown = str(payload["markdown"])
+    return apply_manifest(markdown, manifest) if manifest else markdown
 
 
 __all__ = ["UnsupportedDocument", "parse_document"]

@@ -429,9 +429,7 @@ def section_write_prompt(
             + identifier_block
             + "# 他ページから追加する事実\n"
             f"{facts_text}\n"
-            "各事実は本文の該当箇所へ自然に組み込み、その段落の直後に"
-            "`（参照元: 原文 S-E行）`（SとEは各事実の出典行）と書く。"
-            f"原文 {source_start}-{source_end}行の情報にはこのマーカーを付けない。\n\n"
+            "各事実は本文の該当箇所へ自然に組み込む。出典ページ名や原文の行番号を本文へ書かない。\n\n"
             f"{feedback_block}"
             "--- 行番号付き原文（この節） ---\n"
             f"{numbered_section}"

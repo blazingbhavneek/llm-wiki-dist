@@ -1,33 +1,94 @@
+# Mirrors upstream growilabs/growi-docker-compose (master).
+# GROWI v8 requires MongoDB as a (single-node) replica set for change streams.
+# Elasticsearch (AGPLv3 option, v9 per docs) provides GROWI native full-text search.
 services:
-  mongo:
-    image: mongo:6
-    restart: unless-stopped
-    volumes:
-      - mongo_data:/data/db
-    healthcheck:
-      test: echo 'db.runCommand("ping").ok' | mongosh --quiet
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  growi:
-    image: weseek/growi:latest
+  app:
+    image: growilabs/growi:8
     restart: unless-stopped
     depends_on:
       mongo:
         condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
     ports:
-      - "3000:3000"
+      - "0.0.0.0:3000:3000" # external access; upstream ships 127.0.0.1 only
     environment:
-      MONGO_URI: mongodb://mongo:27017/growi
+      MONGO_URI: mongodb://mongo:27017/growi?replicaSet=rs0
+      ELASTICSEARCH_URI: http://elasticsearch:9200/growi
+      BULK_EXPORT_PDF_CONVERTER_URI: http://pdf-converter:3010
       # First boot has no admin/token yet: create the admin user via the
-      # setup wizard at http://localhost:3000, then generate an API token
+      # setup wizard at http://<host>:3000, then generate an API token
       # from Admin > Users > (your user) > API token, or Admin > API.
       PASSWORD_SEED: changeme-seed
       FILE_UPLOAD: local
+      HTTP_PROXY: http://133.141.7.237:9515
+      HTTPS_PROXY: http://133.141.7.237:9515
+      NO_PROXY: localhost,127.0.0.1
+      http_proxy: http://133.141.7.237:9515
+      https_proxy: http://133.141.7.237:9515
+      no_proxy: localhost,127.0.0.1
+      # Node >=24: built-in fetch (used by the OpenAI SDK) only honors
+      # *_PROXY env vars when this flag is set; without it GROWI tries a
+      # direct connection and times out.
+      NODE_USE_ENV_PROXY: "1"
     volumes:
       - growi_data:/data
+      - page_bulk_export_tmp:/tmp/page-bulk-export
+
+  mongo:
+    image: mongo:8.2
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongo_configdb:/data/configdb
+      - mongo_db:/data/db
+    healthcheck:
+      # Initiates the replica set on first boot (no-op afterwards), then
+      # reports healthy only once this node is PRIMARY — otherwise app would
+      # start against a set that cannot accept writes yet.
+      test: >
+        mongosh --quiet --eval "
+          try { rs.status() } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }) }
+          db.hello().isWritablePrimary || quit(1)
+        "
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.3
+    # For Elasticsearch 8.x: docker.elastic.co/elasticsearch/elasticsearch:8.19.14
+    environment:
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms256m -Xmx256m" # increase if you have enough memory
+      - LOG4J_FORMAT_MSG_NO_LOOKUPS=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    restart: unless-stopped
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+      - ./elasticsearch/v9/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+      - ./elasticsearch/v9/config/elasticsearch-plugins.yml:/usr/share/elasticsearch/config/elasticsearch-plugins.yml
+      - ./elasticsearch/v9/plugins:/opt/plugins:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 180s # first boot downloads+installs kuromoji/ICU plugins
+
+  pdf-converter:
+    image: growilabs/pdf-converter:1
+    restart: unless-stopped
+    volumes:
+      - page_bulk_export_tmp:/tmp/page-bulk-export
 
 volumes:
-  mongo_data:
   growi_data:
+  mongo_db:
+  mongo_configdb:
+  es_data:
+  page_bulk_export_tmp:

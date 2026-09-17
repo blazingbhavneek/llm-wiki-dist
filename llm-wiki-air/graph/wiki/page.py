@@ -17,6 +17,11 @@ HEADING_RE = re.compile(r"^#{1,4} \S")
 CODE_TOKEN_RE = re.compile(r"0[xX][0-9A-Fa-f]+|[A-Za-z_][A-Za-z0-9_]{2,}")
 WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}|[ァ-ヶー]{3,}|[一-龯]{2,}")
 REFERENCE_MARKER_RE = re.compile(r"（参照元:\s*原文\s*(\d+)\s*(?:[-–—]\s*(\d+)\s*)?行）")
+READER_REFERENCE_RE = re.compile(
+    r"（(?:参照元:\s*(?:\[[^\]\n]*\]\([^\n]*?\)\s*)?)?原文\s*\d+\s*(?:[-–—]\s*\d+\s*)?行）"
+)
+MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]\n]*\]\([^\n]*?\)")
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 PLACEHOLDER_RE = re.compile(r"\[\[NEO-IMAGE:[A-Za-z0-9_-]+\]\]")
 # doc-parser output backslash-escapes CommonMark punctuation in prose (e.g.
@@ -186,6 +191,7 @@ def check_section(
     block_ranges: Sequence[tuple[str, int, int]],
     placeholders: Sequence[str],
     facts: Sequence[ReferenceFact],
+    check_identifiers: bool = True,
 ) -> list[str]:
     """Mechanical lossless checks. Every returned string is writer feedback."""
 
@@ -221,23 +227,17 @@ def check_section(
         if count != 1:
             errors.append(f"画像トークン {placeholder} は必ず1回だけ置くこと（現在{count}回）。")
 
-    missing_tokens = sorted(code_tokens(source_text) - code_tokens(draft))
+    missing_tokens = (
+        sorted(code_tokens(source_text) - code_tokens(draft))
+        if check_identifiers
+        else []
+    )
     if missing_tokens:
         errors.append(
             "次の識別子・定数が本文から消えている。省略や言い換えをせず必ず書くこと: "
             + ", ".join(missing_tokens[:40])
         )
 
-    marked = [
-        (int(match.group(1)), int(match.group(2) or match.group(1)))
-        for match in REFERENCE_MARKER_RE.finditer(draft)
-    ]
-    for fact in facts:
-        if not any(ms <= fact.source_start and fact.source_end <= me for ms, me in marked):
-            errors.append(
-                f"参照事実「{fact.description.strip()[:60]}」を本文へ組み込み、"
-                f"その直後に（参照元: 原文 {fact.source_start}-{fact.source_end}行）と書くこと。"
-            )
     return errors
 
 
@@ -289,4 +289,51 @@ def link_titles(markdown: str, targets: Sequence[tuple[str, str]]) -> str:
             if linked is not None:
                 lines[i] = linked
                 break
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def strip_reader_references(markdown: str) -> str:
+    """Remove obsolete reader-facing source-line annotations."""
+
+    return READER_REFERENCE_RE.sub("", markdown)
+
+
+def _ascii_word(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char == "_")
+
+
+def link_entity_mentions(markdown: str, title: str, filename: str, *, max_links: int = 3) -> str:
+    """Link 1–3 well-spaced plain mentions without adding any prose."""
+
+    title = title.strip()
+    if len(title) < 2 or max_links < 1:
+        return markdown
+    lines = markdown.splitlines()
+    flags = _fence_flags(lines)
+    existing = sum(line.count(f"[{title}]({filename})") for line in lines)
+    remaining = max(0, max_links - existing)
+    matches: list[tuple[int, int]] = []
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("<!-- wiki-links:start -->"):
+            break
+        if flags[i] or stripped.startswith(("#", "|", "<", "[[NEO-IMAGE", "![")) or "前のページ:" in line or "次のページ:" in line:
+            continue
+        blocked = [match.span() for regex in (MARKDOWN_LINK_RE, INLINE_CODE_RE) for match in regex.finditer(line)]
+        at = line.find(title)
+        while at >= 0:
+            end = at + len(title)
+            left_ok = not _ascii_word(title[0]) or at == 0 or not _ascii_word(line[at - 1])
+            right_ok = not _ascii_word(title[-1]) or end == len(line) or not _ascii_word(line[end])
+            if left_ok and right_ok and not any(start <= at < stop for start, stop in blocked):
+                matches.append((i, at))
+            at = line.find(title, at + len(title))
+    if not matches or not remaining:
+        return markdown
+    count = min(remaining, 3 if len(matches) >= 5 else 2 if len(matches) >= 2 else 1)
+    indexes = [0] if count == 1 else [0, len(matches) - 1] if count == 2 else [0, len(matches) // 2, len(matches) - 1]
+    selected = [matches[index] for index in dict.fromkeys(indexes)]
+    for line_index, at in reversed(selected):
+        line = lines[line_index]
+        lines[line_index] = line[:at] + f"[{title}]({filename})" + line[at + len(title):]
     return "\n".join(lines).rstrip() + "\n"

@@ -390,8 +390,14 @@ class Catalog:
         hash_b = str(edge.get("hash_b") or edge.get("b", {}).get("text_sha256", "") or "")
         if (hash_a or hash_b) and (hash_a, hash_b) != (row_a[0], row_b[0]):
             return False
-        edge_id = str(edge.get("edge_id") or "ledge-" + short_hash("\0".join(sorted((a, b))), 20))
-        cursor = self.conn.execute("INSERT OR IGNORE INTO edges(edge_id,chunk_a,chunk_b,label,summary,source,via_json,created_at) VALUES(?,?,?,?,?,?,?,?)", (edge_id, a, b, str(edge.get("label") or "related"), str(edge.get("summary") or ""), str(edge.get("source") or "legacy_rrf"), json.dumps(edge.get("via") or edge.get("via_json") or [], ensure_ascii=False) if not isinstance(edge.get("via_json"), str) else edge["via_json"], str(edge.get("created_at") or "")))
+        source = str(edge.get("source") or "legacy_rrf")
+        raw_via = edge.get("via") or edge.get("via_json") or []
+        via = json.loads(raw_via) if isinstance(raw_via, str) else list(raw_via)
+        identity = sorted((a, b))
+        if source in {"use", "define"} and via:
+            identity.append(normalize_name(str(via[0])))
+        edge_id = str(edge.get("edge_id") or "ledge-" + short_hash("\0".join(identity), 20))
+        cursor = self.conn.execute("INSERT OR IGNORE INTO edges(edge_id,chunk_a,chunk_b,label,summary,source,via_json,created_at) VALUES(?,?,?,?,?,?,?,?)", (edge_id, a, b, str(edge.get("label") or "related"), str(edge.get("summary") or ""), source, json.dumps(via, ensure_ascii=False), str(edge.get("created_at") or "")))
         if commit:
             self.conn.commit()
         return cursor.rowcount > 0

@@ -20,6 +20,9 @@ llm-wiki-dist/usage_log.jsonl
 test_wiki/
 inputs/
 /data/
-.env
 .github/
-data_backup/
+data_backups/
+llm-wiki-air/data-neo/
+growi-stack/elasticsearch/v9/plugins/
+llm-wiki-air/data-test/
+llm-wiki-air/data-excel/

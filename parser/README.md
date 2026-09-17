@@ -29,6 +29,14 @@ include both their formula and Excel's saved cached result, while raster and
 vector workbook images use the shared conversion and description pipeline.
 Workbook image labels include the worksheet cell or cell range covered by the
 image, including vector media recovered directly from the XLSX package.
+An optional multipart `manifest` JSON field can select final sheets and supply
+XLSM lineage/VBA metadata. In that mode, every sheet is emitted first (split at
+100 rows, 100 columns, or 100,000 rendered characters), followed by one page per
+VBA procedure; downstream generation adds Japanese-named, workbook-wide
+narrative pages last using the parser-created parts as indivisible planning
+units and worksheet-cell provenance.
+Manifested XLSM files skip LibreOffice recalculation so no macro-capable
+application opens them.
 CSV and TSV inputs use the same minimal HTML table representation, with their
 first row emitted as header cells.
 

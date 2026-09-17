@@ -93,14 +93,14 @@ class LosslessCheckTests(unittest.TestCase):
         self.assertIn("[[NEO-IMAGE:x]]", joined)
         self.assertIn("mpf_open", joined)
         self.assertIn("x_y", joined)
-        self.assertIn("300-301行", joined)
+        self.assertNotIn("参照元", joined)
 
     def test_check_section_passes_a_lossless_draft(self) -> None:
         lines = source()
         draft = (
             "## A\n\n```sh\n# comment\nx_y = 1\n```\n\n"
             "|a|b|\n|---|---|\n|1|mpf_open|\n\n[[NEO-IMAGE:x]]\n\n"
-            "設定が必要である。（参照元: 原文 300-301行）\n"
+            "設定が必要である。\n"
         )
         errors = page.check_section(
             draft,
@@ -111,6 +111,14 @@ class LosslessCheckTests(unittest.TestCase):
             facts=[ReferenceFact(description="設定が必要", source_start=300, source_end=301)],
         )
         self.assertEqual(errors, [])
+
+    def test_entity_mentions_are_spread_and_reader_references_are_removed(self) -> None:
+        markdown = "# X-Term\n\n" + "\n\n".join(f"段落{i} X-Term を使う。" for i in range(6))
+        linked = page.link_entity_mentions(markdown, "X-Term", "definition.md")
+        self.assertEqual(linked.count("[X-Term](definition.md)"), 3)
+        self.assertEqual(page.link_entity_mentions(linked, "X-Term", "definition.md"), linked)
+        cited = "説明。（参照元: [設定](002-settings.md) 原文 17-18行）\n"
+        self.assertEqual(page.strip_reader_references(cited), "説明。\n")
 
     def test_facts_land_in_the_section_owning_target_line(self) -> None:
         sections = [(1, 10), (11, 20)]

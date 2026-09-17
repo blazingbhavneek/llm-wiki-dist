@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import shutil
@@ -13,14 +12,11 @@ from typing import Any, Callable
 
 from graph.common.hashing import short_hash
 from graph.common.markdown import strip_big_tables, strip_image_media
-from graph.wiki.page import fence_flags
+from graph.wiki.page import fence_flags, strip_reader_references
 from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
 
 from .prompts import CHUNK_META_VERSION, chunk_meta_prompt
 from .wire import ChunkBehaviour, ChunkEntity, ChunkMeta
-
-META_MAX_OUTPUT_TOKENS = 4000
-
 
 def normalize_name(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value or "").casefold().split())
@@ -112,6 +108,7 @@ def chunk_id(document: str, filename: str, ordinal: int) -> str:
 
 
 def make_chunks(document: str, team: str, filename: str, text: str) -> list[Chunk]:
+    text = strip_reader_references(text)
     title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ") and line[2:].strip()), Path(filename).stem)
     page_rel = f"{document}/{filename}"
     return [
@@ -155,9 +152,15 @@ def validate_meta(meta: ChunkMeta, text: str) -> ChunkMeta:
         if key in seen_names:
             continue
         seen_names.add(key)
-        entities.append(item.model_copy(update={"name": name, "kind": item.kind.strip()}))
-        if len(entities) == 20:
-            break
+        replaces: list[str] = []
+        seen_replacements: set[str] = set()
+        for old_name in item.replaces:
+            old_name = (old_name or "").strip()
+            key = normalize_name(old_name)
+            if old_name and key != normalize_name(name) and key not in seen_replacements:
+                seen_replacements.add(key)
+                replaces.append(old_name)
+        entities.append(item.model_copy(update={"name": name, "kind": item.kind.strip(), "replaces": replaces}))
     entity_names = {normalize_name(item.name): item.name for item in entities}
     behaviours: list[ChunkBehaviour] = []
     seen_behaviours: set[tuple[str, str, str]] = set()
@@ -172,8 +175,6 @@ def validate_meta(meta: ChunkMeta, text: str) -> ChunkMeta:
             continue
         seen_behaviours.add(key)
         behaviours.append(ChunkBehaviour(subject=subject, action=action, object=obj))
-        if len(behaviours) == 20:
-            break
     return ChunkMeta(
         summary=collapse(meta.summary, 1000), keywords=keywords, entity=collapse(meta.entity, 1000),
         claims=claims, bridge_probe=collapse(meta.bridge_probe, 1000), entities=entities,
@@ -190,6 +191,8 @@ def _meta_from_json(value: dict[str, Any]) -> ChunkMeta:
 
 def cache_by_hash(path: Path) -> dict[str, ChunkMeta]:
     data = read_json(path, default={})
+    if data.get("meta_version") != CHUNK_META_VERSION:
+        return {}
     result: dict[str, ChunkMeta] = {}
     for page in data.get("pages", []):
         for item in page.get("chunks", []):
@@ -228,42 +231,71 @@ def snapshot_originals(doc_dir: Path) -> dict[str, str]:
     return result
 
 
+def _apply_entity_replacements(processed: list[Chunk], entities: list[ChunkEntity]) -> set[str]:
+    replacements: dict[str, list[ChunkEntity]] = {}
+    for entity in entities:
+        for old_name in entity.replaces:
+            replacements.setdefault(normalize_name(old_name), []).append(entity)
+    if not replacements:
+        return set()
+    changed: set[str] = set()
+    for chunk in processed:
+        revised: list[ChunkEntity] = []
+        touched = False
+        for entity in chunk.entities:
+            choices = replacements.get(normalize_name(entity.name))
+            if not choices:
+                revised.append(entity)
+                continue
+            touched = True
+            revised.extend(
+                choice.model_copy(update={"role": entity.role, "replaces": []})
+                for choice in choices if choice.name in chunk.text
+            )
+        if touched:
+            chunk.meta = validate_meta(chunk.meta.model_copy(update={"entities": revised}), chunk.text)
+            changed.add(chunk.chunk_id)
+    return changed
+
+
 async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str, concurrency: int, cache: dict[str, ChunkMeta] | None = None, artifact_dir: Path | None = None, stop_check: Callable[[], bool] | None = None) -> tuple[int, int]:
     cache = cache or {}
-    sem = asyncio.Semaphore(max(1, concurrency))
     calls = fallbacks = 0
+    registry: dict[str, ChunkEntity] = {}
+    processed: list[Chunk] = []
 
-    async def call(item: Chunk) -> tuple[Chunk, bool, bool]:
-        nonlocal calls
+    for item in chunks:
         if item.text_sha256 in cache:
             item.meta = validate_meta(cache[item.text_sha256], item.text)
-            return item, False, False
-        if stop_check and stop_check():
-            raise RuntimeError("linker cancelled")
-        prompt = chunk_meta_prompt(page_title=item.title, heading=item.heading, document=item.document, text=item.model_text, output_language=output_language)
-        if artifact_dir:
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.prompt.md", prompt.render())
-        async with sem:
+        else:
+            if stop_check and stop_check():
+                raise RuntimeError("linker cancelled")
+            prompt = chunk_meta_prompt(
+                page_title=item.title, heading=item.heading, document=item.document,
+                text=item.model_text, output_language=output_language,
+                known_entities=[{"name": entity.name, "kind": entity.kind} for entity in registry.values()],
+            )
+            if artifact_dir:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.prompt.md", prompt.render())
             calls += 1
             try:
-                try:
-                    result = await model.structured(ChunkMeta, prompt.messages(), max_output_tokens=META_MAX_OUTPUT_TOKENS)
-                except TypeError:
-                    result = await model.structured(ChunkMeta, prompt.messages())
+                result = await model.structured(ChunkMeta, prompt.messages())
                 item.meta = validate_meta(result if isinstance(result, ChunkMeta) else ChunkMeta.model_validate(result), item.text)
-                fallback = False
             except Exception as exc:
                 item.meta = ChunkMeta(summary=item.model_text[:300])
-                fallback = True
+                fallbacks += 1
                 if artifact_dir:
                     write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}-error.txt", f"{type(exc).__name__}: {exc}")
             if artifact_dir:
                 write_json_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.json", item.meta)
-            return item, True, fallback
-
-    results = await asyncio.gather(*(call(item) for item in chunks))
-    fallbacks = sum(1 for _, called, failed in results if called and failed)
+        replaced = {normalize_name(name) for entity in item.entities for name in entity.replaces}
+        _apply_entity_replacements(processed, item.entities)
+        for name in replaced:
+            registry.pop(name, None)
+        for entity in item.entities:
+            registry[normalize_name(entity.name)] = entity
+        processed.append(item)
     return calls, fallbacks
 
 

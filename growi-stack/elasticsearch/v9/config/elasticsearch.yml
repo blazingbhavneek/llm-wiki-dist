@@ -1,0 +1,13 @@
+http.host: 0.0.0.0
+
+# for elasticsearch-head
+http.cors.enabled: true
+http.cors.allow-origin: "*"
+
+xpack.security.enabled: false
+
+# This development host is over 90% full, but still has tens of GB available.
+# Absolute watermarks prevent percentage-based allocation from blocking GROWI.
+cluster.routing.allocation.disk.watermark.low: 40gb
+cluster.routing.allocation.disk.watermark.high: 30gb
+cluster.routing.allocation.disk.watermark.flood_stage: 20gb

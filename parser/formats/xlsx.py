@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import posixpath
@@ -13,9 +14,11 @@ from datetime import date, datetime, time
 from html import escape
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup, Tag
+from oletools.olevba import VBA_Parser
 from openpyxl import load_workbook
 from openpyxl.utils import coordinate_to_tuple, get_column_letter
 from openpyxl.utils.units import (
@@ -24,6 +27,7 @@ from openpyxl.utils.units import (
     EMU_to_pixels,
     points_to_pixels,
 )
+from openpyxl.worksheet.formula import ArrayFormula
 from xlsx2html.core import render_table, worksheet_to_data
 
 from client.llm import LLMClient
@@ -43,6 +47,14 @@ _EMBED_ID = (
     "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
 )
 _VECTOR_SUFFIXES = frozenset({".emf", ".wmf", ".svg"})
+_PART_MAX_ROWS = 100
+_PART_MAX_COLS = 100
+_PART_MAX_CHARS = 100_000
+_VBA_PROCEDURE_RE = re.compile(
+    r"^\s*(?:(?:Public|Private|Friend|Static)\s+)?"
+    r"(Sub|Function|Property\s+(?:Get|Let|Set))\s+([^\s(]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 class OpenpyxlError(RuntimeError):
@@ -97,7 +109,7 @@ def recalculate_with_libreoffice(
             f"LibreOffice recalculation timed out after {timeout_s:g} seconds"
         ) from exc
 
-    recalculated = destination / source.name
+    recalculated = destination / f"{source.stem}.xlsx"
     if completed.returncode or not recalculated.is_file():
         details = (completed.stderr or completed.stdout or "no output").strip()[-4000:]
         raise LibreOfficeError(
@@ -120,7 +132,9 @@ def _render_cell(cell, cached_value: Any) -> str:
     if cell.data_type != "f":
         return _html_text(cell.value)
 
-    formula = _html_text(cell.value)
+    formula = _html_text(
+        cell.value.text if isinstance(cell.value, ArrayFormula) else cell.value
+    )
     resolved = (
         _html_text(cached_value)
         if cached_value is not None
@@ -176,12 +190,21 @@ def _render_worksheet(worksheet, cached_worksheet) -> tuple[str, bool]:
 
     # Images are emitted separately as document image units. Prevent the
     # renderer from embedding duplicate data URLs inside cells.
+    array_formulas = [
+        (cell, cell.value)
+        for cell in cells.values()
+        if isinstance(cell.value, ArrayFormula)
+    ]
+    for cell, formula in array_formulas:
+        cell.value = formula.text
     images = cached_worksheet._images
     cached_worksheet._images = []
     try:
         data = worksheet_to_data(cached_worksheet, fs=worksheet)
     finally:
         cached_worksheet._images = images
+        for cell, formula in array_formulas:
+            cell.value = formula
 
     # xlsx2html supplies formatted cached values and handles merged-cell
     # geometry. Keep both the expression and the recalculated value for formula
@@ -211,6 +234,108 @@ def _render_worksheet(worksheet, cached_worksheet) -> tuple[str, bool]:
 
     markup = render_table(data, lambda *_: None, lambda *_: None)
     return _simplify_html_table(markup), has_formulas
+
+
+def _bands(values: list[int], maximum_span: int) -> list[tuple[int, int]]:
+    if not values:
+        return [(1, 1)]
+    output: list[tuple[int, int]] = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value - start >= maximum_span:
+            output.append((start, previous))
+            start = value
+        previous = value
+    output.append((start, previous))
+    return output
+
+
+def _render_worksheet_parts(
+    worksheet,
+    cached_worksheet,
+    extra_positions: list[tuple[int, int]],
+) -> tuple[list[tuple[str, tuple[int, int, int, int]]], bool]:
+    cells = _worksheet_cells(worksheet)
+    positions = [*cells, *extra_positions]
+    if not positions:
+        return [("_空のシート_", (1, 1, 1, 1))], False
+
+    rows = sorted({row for row, _ in positions})
+    cols = sorted({col for _, col in positions})
+    rendered = {
+        position: _render_cell(
+            cell,
+            cached_worksheet.cell(*position).value,
+        )
+        for position, cell in cells.items()
+    }
+    size = sum(len(value) + 40 for value in rendered.values())
+    bounds = (rows[0], rows[-1], cols[0], cols[-1])
+    has_formulas = any(cell.data_type == "f" for cell in cells.values())
+    if (
+        rows[-1] - rows[0] < _PART_MAX_ROWS
+        and cols[-1] - cols[0] < _PART_MAX_COLS
+        and size <= _PART_MAX_CHARS
+    ):
+        table, _ = _render_worksheet(worksheet, cached_worksheet)
+        if len(table) <= _PART_MAX_CHARS:
+            return [(table, bounds)], has_formulas
+
+    parts: list[tuple[str, tuple[int, int, int, int]]] = []
+    for row_start, row_end in _bands(rows, _PART_MAX_ROWS):
+        for col_start, col_end in _bands(cols, _PART_MAX_COLS):
+            selected = [
+                (position, value)
+                for position, value in rendered.items()
+                if row_start <= position[0] <= row_end
+                and col_start <= position[1] <= col_end
+            ]
+            related = [
+                position
+                for position in extra_positions
+                if row_start <= position[0] <= row_end
+                and col_start <= position[1] <= col_end
+            ]
+            if not selected and not related:
+                continue
+            chunk: list[tuple[tuple[int, int], str]] = []
+            chunk_size = 90
+
+            def flush() -> None:
+                nonlocal chunk, chunk_size
+                if not chunk:
+                    return
+                lines = [
+                    "<table>",
+                    "<tr><th>Row</th><th>Cell</th><th>Content</th></tr>",
+                ]
+                for number, ((row, col), value) in enumerate(chunk, 1):
+                    coordinate = f"{get_column_letter(col)}{row}"
+                    lines.append(
+                        f"<tr><td>{number}</td><td>{coordinate}</td><td>{value}</td></tr>"
+                    )
+                lines.append("</table>")
+                part_rows = [position[0] for position, _ in chunk] or [row_start]
+                part_cols = [position[1] for position, _ in chunk] or [col_start]
+                parts.append(
+                    (
+                        "\n".join(lines),
+                        (min(part_rows), max(part_rows), min(part_cols), max(part_cols)),
+                    )
+                )
+                chunk = []
+                chunk_size = 90
+
+            for position, value in sorted(selected):
+                row_size = len(value) + 70
+                if chunk and chunk_size + row_size > _PART_MAX_CHARS:
+                    flush()
+                chunk.append((position, value))
+                chunk_size += row_size
+            flush()
+            if not selected and related:
+                parts.append(("_セル値のないオブジェクト範囲_", (row_start, row_end, col_start, col_end)))
+    return parts, has_formulas
 
 
 def _simplify_html_table(markup: str) -> str:
@@ -414,6 +539,326 @@ def _relationship_targets(
     return targets
 
 
+def _extract_vba_modules(xlsx_path: Path) -> list[tuple[str, str]]:
+    with zipfile.ZipFile(xlsx_path) as archive:
+        if "xl/vbaProject.bin" not in archive.namelist():
+            return []
+
+    parser = VBA_Parser(str(xlsx_path))
+    try:
+        return [
+            (Path(module_name).name, str(code).replace("\r\n", "\n"))
+            for _, _, module_name, code in parser.extract_macros()
+        ]
+    except Exception as exc:
+        raise OpenpyxlError(f"could not extract VBA source: {exc}") from exc
+    finally:
+        parser.close()
+
+
+def _vba_pages(modules: list[tuple[str, str]]) -> list[dict[str, str]]:
+    pages: list[dict[str, str]] = []
+    for module_name, code in modules:
+        matches = list(_VBA_PROCEDURE_RE.finditer(code))
+        declarations = "\n".join(
+            line
+            for line in code[: matches[0].start() if matches else len(code)].splitlines()
+            if line.strip() and not line.lstrip().startswith("Attribute VB_")
+        )
+        module = Path(module_name).stem
+        if declarations:
+            pages.append(
+                {
+                    "id": f"{module.casefold()}::declarations",
+                    "title": f"マクロ-{module}-宣言",
+                    "module": module_name,
+                    "name": "宣言",
+                    "kind": "declarations",
+                    "code": declarations,
+                }
+            )
+        for index, match in enumerate(matches):
+            name = match.group(2)
+            pages.append(
+                {
+                    "id": f"{module.casefold()}::{name.casefold()}",
+                    "title": f"マクロ-{module}-{name}",
+                    "module": module_name,
+                    "name": name,
+                    "kind": match.group(1).casefold(),
+                    "code": code[
+                        match.start() : matches[index + 1].start()
+                        if index + 1 < len(matches)
+                        else len(code)
+                    ].rstrip(),
+                }
+            )
+    return pages
+
+
+def _vba_lookup(pages: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    output: dict[str, dict[str, str]] = {}
+    for page in pages:
+        if page["kind"] != "declarations":
+            output.setdefault(page["name"].casefold(), page)
+            output[f'{Path(page["module"]).stem.casefold()}.{page["name"].casefold()}'] = page
+    return output
+
+
+def _render_vba_page(
+    page: dict[str, str],
+    usages: list[str],
+    details: dict[str, Any] | None = None,
+) -> str:
+    output = [
+        f'<!-- vba-id: {quote(page["id"], safe="")} -->',
+        "> VBAソースコードは静的に抽出しており、マクロは実行していません。",
+        "",
+        f'- ソースモジュール: `{page["module"]}`',
+        f'- 種別: `{page["kind"]}`',
+    ]
+    if usages:
+        output.extend(["", "## ワークブック内の参照元", "", *usages])
+    if details:
+        manifest_buttons = [
+            f"- `{button.get('sheet', '不明')}!{button.get('cells', '不明')}` のボタン"
+            for button in details.get("buttons") or []
+        ]
+        output.extend(["", "## ボタン・セル", "", *(manifest_buttons or ["- 該当なし"])])
+        for heading, key in (
+            ("参照シート", "sheets_read"),
+            ("更新シート", "sheets_written"),
+            ("影響する最終出力", "final_outputs_affected"),
+        ):
+            values = details.get(key) or []
+            output.extend(["", f"## {heading}", "", *([f"- `{value}`" for value in values] or ["- 該当なし"])])
+        dynamic = details.get("unresolved_dynamic_references") or []
+        if dynamic:
+            output.extend(
+                [
+                    "",
+                    "## 静的に解決できない動的参照",
+                    "",
+                    "> 静的に参照先を確定できないため、参照元シートを推測で展開していません。",
+                    "",
+                    *[f"- `{line}`" for line in dynamic],
+                ]
+            )
+    output.extend(["", "## コード", "", "```vb", page["code"], "```"])
+    return "\n".join(output)
+
+
+def _chart_summary(worksheet) -> list[str]:
+    output: list[str] = []
+    for number, chart in enumerate(worksheet._charts, 1):
+        root = chart.to_tree()
+        formulas = list(dict.fromkeys(node.text for node in root.iter() if _local_name(node.tag) == "f" and node.text))
+        chart_type = type(chart).__name__.removesuffix("Chart") or "Chart"
+        source = ", ".join(f"`{value}`" for value in formulas) or "参照範囲不明"
+        output.append(f"- グラフ {number}（{chart_type}）: {source}")
+    return output
+
+
+def _selection(manifest_json: str | None, workbook) -> tuple[set[str] | None, dict[str, dict[str, Any]]]:
+    if not manifest_json:
+        return None, {}
+    try:
+        manifest = json.loads(manifest_json)
+        if manifest.get("mode") != "xlsm-vba-lineage":
+            return None, {}
+        sheets = {row["name"]: row for row in manifest.get("sheets", []) if isinstance(row, dict) and row.get("name")}
+        selected = {name for name, row in sheets.items() if row.get("emit") == "full"}
+        if not selected or not selected.issubset(set(workbook.sheetnames)):
+            raise OpenpyxlError("invalid XLSM sheet-selection manifest")
+        return selected, sheets
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise OpenpyxlError(f"invalid XLSM sheet-selection manifest: {exc}") from exc
+
+
+def _sheet_context(
+    name: str,
+    sheet_manifest: dict[str, dict[str, Any]],
+    charts: dict[str, list[str]],
+) -> list[str]:
+    row = sheet_manifest.get(name, {})
+    direct = row.get("depends_on") or []
+    lineage = row.get("lineage") or []
+    related = [source for source in lineage if source in sheet_manifest]
+    output = ["<!-- sheet-context:start -->"]
+    if related:
+        output.extend(
+            [
+                "### シートの系譜",
+                "",
+                f"- 最終出力: `{name}`",
+                f"- 直接入力: {', '.join(f'`{value}`' for value in direct)}",
+                f"- 上流シート: {', '.join(f'`{value}`' for value in related)}",
+            ]
+        )
+    attached_charts = [*charts.get(name, [])]
+    if attached_charts:
+        output.extend(["", "### グラフ", "", *attached_charts])
+    output.append("<!-- sheet-context:end -->")
+    return output if len(output) > 2 else []
+
+
+def _vba_control_locations(
+    archive: zipfile.ZipFile,
+    workbook,
+) -> dict[str, list[tuple[str, str]]]:
+    workbook_rels = _relationship_targets(archive, _WORKBOOK_XML)
+    workbook_xml = ElementTree.fromstring(archive.read(_WORKBOOK_XML))
+    worksheets = {worksheet.title: worksheet for worksheet in workbook.worksheets}
+    locations: dict[str, list[tuple[str, str]]] = {}
+
+    for sheet in workbook_xml.iter():
+        if _local_name(sheet.tag) != "sheet":
+            continue
+        sheet_name = sheet.attrib.get("name", "不明なシート")
+        worksheet = worksheets.get(sheet_name)
+        sheet_part = workbook_rels.get(sheet.attrib.get(_RELATIONSHIP_ID, ""))
+        if (
+            worksheet is None
+            or sheet_part is None
+            or sheet_part not in archive.namelist()
+        ):
+            continue
+        sheet_rels = _relationship_targets(archive, sheet_part)
+        sheet_xml = ElementTree.fromstring(archive.read(sheet_part))
+        for drawing in sheet_xml.iter():
+            if _local_name(drawing.tag) not in {"drawing", "legacyDrawing"}:
+                continue
+            drawing_part = sheet_rels.get(drawing.attrib.get(_RELATIONSHIP_ID, ""))
+            if drawing_part is None or drawing_part not in archive.namelist():
+                continue
+            drawing_xml = ElementTree.fromstring(archive.read(drawing_part))
+            if _local_name(drawing.tag) == "drawing":
+                for anchor in drawing_xml.iter():
+                    if _local_name(anchor.tag) not in {
+                        "oneCellAnchor",
+                        "twoCellAnchor",
+                        "absoluteAnchor",
+                    }:
+                        continue
+                    macro = next(
+                        (
+                            value
+                            for node in anchor.iter()
+                            for key, value in node.attrib.items()
+                            if _local_name(key) == "macro" and value
+                        ),
+                        "",
+                    )
+                    if macro:
+                        locations.setdefault(sheet_name, []).append(
+                            (
+                                _drawing_anchor_range(anchor, worksheet),
+                                macro.rsplit("!", 1)[-1],
+                            )
+                        )
+                continue
+
+            for client in drawing_xml.iter():
+                if _local_name(client.tag) != "ClientData":
+                    continue
+                values = {
+                    _local_name(child.tag): (child.text or "").strip()
+                    for child in client
+                }
+                macro = values.get("FmlaMacro", "").rsplit("!", 1)[-1]
+                try:
+                    anchor = [int(value.strip()) for value in values["Anchor"].split(",")]
+                    start = f"{get_column_letter(anchor[0] + 1)}{anchor[2] + 1}"
+                    end = f"{get_column_letter(anchor[4] + 1)}{anchor[6] + 1}"
+                except (KeyError, ValueError, IndexError):
+                    continue
+                if macro:
+                    locations.setdefault(sheet_name, []).append(
+                        (start if start == end else f"{start}:{end}", macro)
+                    )
+    return locations
+
+
+def _render_vba_references(
+    worksheet,
+    controls: list[tuple[str, str]],
+    procedures: dict[str, dict[str, str]],
+    usages: dict[str, list[str]],
+) -> list[tuple[tuple[int, int], str]]:
+    references: list[tuple[tuple[int, int], str]] = []
+    for cell_range, macro in controls:
+        procedure = procedures.get(macro.casefold()) or procedures.get(
+            macro.rsplit(".", 1)[-1].casefold()
+        )
+        if procedure:
+            position = coordinate_to_tuple(cell_range.split(":", 1)[0])
+            target = f'vba://{quote(procedure["id"], safe="")}'
+            references.append(
+                (
+                    position,
+                    f"- ボタン範囲 **{cell_range}**: [{procedure['name']}]({target})",
+                )
+            )
+            usages.setdefault(procedure["id"], []).append(
+                f"- Button on `{worksheet.title}!{cell_range}`"
+            )
+
+    functions = {
+        name: value
+        for name, value in procedures.items()
+        if "." not in name and value["kind"] == "function"
+    }
+    if functions:
+        pattern = re.compile(
+            r"(?<![\w.])(" + "|".join(map(re.escape, functions)) + r")\s*\(",
+            re.IGNORECASE,
+        )
+        for cell in worksheet._cells.values():
+            formula = getattr(cell.value, "text", cell.value)
+            if cell.data_type != "f" or not isinstance(formula, str):
+                continue
+            for match in pattern.finditer(formula):
+                procedure = functions[match.group(1).casefold()]
+                target = f'vba://{quote(procedure["id"], safe="")}'
+                references.append(
+                    (
+                        (cell.row, cell.column),
+                        f"- 数式セル **{cell.coordinate}**: "
+                        f"[{procedure['name']}]({target})",
+                    )
+                )
+                usages.setdefault(procedure["id"], []).append(
+                    f"- Formula in `{worksheet.title}!{cell.coordinate}`"
+                )
+    return list(dict.fromkeys(references))
+
+
+def _reference_position(text: str) -> tuple[int, int] | None:
+    match = re.search(r"(?:セル |\*\*)([A-Z]+\d+)", text)
+    return coordinate_to_tuple(match.group(1)) if match else None
+
+
+def _references_by_part(
+    parts: list[tuple[str, tuple[int, int, int, int]]],
+    references: list[tuple[tuple[int, int] | None, str]],
+) -> list[list[str]]:
+    output = [[] for _ in parts]
+    for position, text in references:
+        index = 0
+        if position is not None:
+            row, col = position
+            index = next(
+                (
+                    number
+                    for number, (_, (r1, r2, c1, c2)) in enumerate(parts)
+                    if r1 <= row <= r2 and c1 <= col <= c2
+                ),
+                0,
+            )
+        output[index].append(text)
+    return output
+
+
 def _marker_values(node) -> tuple[int, int, int, int] | None:
     values: dict[str, int] = {}
     for child in node:
@@ -570,9 +1015,12 @@ def run_openpyxl(
     xlsx_path: str,
     output_dir: str,
     document_title: str | None = None,
+    vba_path: str | None = None,
+    manifest_json: str | None = None,
 ) -> str:
     """Convert workbook cells to compact HTML tables and extract its images."""
     source = Path(xlsx_path).resolve()
+    macro_source = Path(vba_path).resolve() if vba_path else source
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     markdown_path = destination / "document.md"
@@ -585,35 +1033,109 @@ def run_openpyxl(
 
     try:
         images = _extract_images(formulas, destination)
-        vector_images = _extract_package_vector_images(
-            source,
-            destination,
-            formulas,
+        vba_modules = _extract_vba_modules(macro_source)
+        vba_pages = _vba_pages(vba_modules)
+        vba_procedures = _vba_lookup(vba_pages)
+        vba_usages: dict[str, list[str]] = {}
+        with zipfile.ZipFile(macro_source) as archive:
+            vba_controls = _vba_control_locations(archive, formulas)
+        vector_images = _extract_package_vector_images(source, destination, formulas)
+        selected, sheet_manifest = _selection(manifest_json, formulas)
+        chart_summaries = (
+            {sheet.title: _chart_summary(sheet) for sheet in formulas.worksheets}
+            if selected is not None
+            else {}
         )
         title = document_title or "Excel ワークブック"
         sections = [f"# {_html_text(title)}"]
         has_formulas = False
         for worksheet in formulas.worksheets:
+            if selected is not None and worksheet.title not in selected:
+                continue
             cached_worksheet = cached_values[worksheet.title]
-            table, sheet_has_formulas = _render_worksheet(
+            vba_references = _render_vba_references(
+                worksheet,
+                vba_controls.get(worksheet.title, []),
+                vba_procedures,
+                vba_usages,
+            )
+            image_references = [
+                (position, reference)
+                for reference in [
+                    *images.get(worksheet.title, []),
+                    *vector_images.get(worksheet.title, []),
+                ]
+                if (position := _reference_position(reference)) is not None
+            ]
+            parts, sheet_has_formulas = _render_worksheet_parts(
                 worksheet,
                 cached_worksheet,
+                [position for position, _ in [*image_references, *vba_references]],
             )
             has_formulas = has_formulas or sheet_has_formulas
-            sections.extend(
-                ["", f"## シート: {_html_text(worksheet.title)}", "", table]
-            )
-            references = [
-                *images.get(worksheet.title, []),
-                *vector_images.get(worksheet.title, []),
-            ]
-            if references:
-                sections.extend(["", "### 画像", "", *references])
+            part_images = _references_by_part(parts, image_references)
+            part_vba = _references_by_part(parts, vba_references)
+            for index, ((table, bounds), page_images, page_vba) in enumerate(
+                zip(parts, part_images, part_vba),
+                1,
+            ):
+                page_title = (
+                    worksheet.title
+                    if len(parts) == 1
+                    else f"{worksheet.title}-part{index}"
+                )
+                r1, r2, c1, c2 = bounds
+                sections.extend(
+                    [
+                        "",
+                        f"## シート: {_html_text(page_title)}",
+                        "",
+                        f"_元範囲: {get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}_",
+                        "",
+                        table,
+                    ]
+                )
+                if page_images:
+                    sections.extend(["", "### 画像", "", *page_images])
+                if page_vba:
+                    sections.extend(
+                        [
+                            "",
+                            "<!-- vba-references:start -->",
+                            "### VBA参照",
+                            "",
+                            *page_vba,
+                            "<!-- vba-references:end -->",
+                        ]
+                    )
+                if selected is not None and index == 1:
+                    context = _sheet_context(
+                        worksheet.title,
+                        sheet_manifest,
+                        chart_summaries,
+                    )
+                    if context:
+                        sections.extend(["", *context])
 
-        unplaced_vectors = vector_images.get("")
+        unplaced_vectors = vector_images.get("") if selected is None else None
         if unplaced_vectors:
             sections.extend(
-                ["", "## 位置不明のベクター画像", "", *unplaced_vectors]
+                ["", "## シート: 位置不明のベクター画像", "", *unplaced_vectors]
+            )
+
+        manifest_procedures = {
+            row.get("id"): row
+            for row in (json.loads(manifest_json).get("procedures", []) if manifest_json else [])
+            if isinstance(row, dict) and row.get("id")
+        }
+        for page in vba_pages:
+            sections.extend(
+                [
+                    "",
+                    f'## シート: {_html_text(page["title"])}',
+                    "",
+                    _render_vba_page(page, vba_usages.get(page["id"], []), manifest_procedures.get(page["id"])),
+                ]
             )
 
         if has_formulas:
@@ -659,7 +1181,7 @@ class XlsxParser(BaseParser):
     ) -> str:
         work_dir = Path(image_dir)
         upload_name = Path(options.filename or "").name or "document.xlsx"
-        if Path(upload_name).suffix.lower() != ".xlsx":
+        if Path(upload_name).suffix.lower() not in {".xlsx", ".xlsm"}:
             upload_name = f"{Path(upload_name).stem}.xlsx"
         xlsx_path = work_dir / upload_name
         output_dir = work_dir / "openpyxl-output"
@@ -672,7 +1194,8 @@ class XlsxParser(BaseParser):
 
         workbook_path = xlsx_path
         recalculate_mode = os.getenv("XLSX_RECALCULATE_FORMULAS", "auto").lower()
-        if recalculate_mode not in {"0", "false", "no", "off"}:
+        is_manifested_xlsm = bool(options.manifest and options.manifest.get("mode") == "xlsm-vba-lineage")
+        if not is_manifested_xlsm and recalculate_mode not in {"0", "false", "no", "off"}:
             command = find_libreoffice_command()
             if command is None:
                 if recalculate_mode in {"1", "true", "yes", "required"}:
@@ -704,6 +1227,8 @@ class XlsxParser(BaseParser):
                 str(workbook_path),
                 str(output_dir),
                 document_title,
+                str(xlsx_path),
+                json.dumps(options.manifest, ensure_ascii=False) if options.manifest else None,
             )
         )
         markdown = markdown_path.read_text(encoding="utf-8")

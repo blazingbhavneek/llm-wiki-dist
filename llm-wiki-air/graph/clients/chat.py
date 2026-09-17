@@ -36,12 +36,12 @@ async def structured_ainvoke(
     messages: list[Any],
     max_output_tokens: int | None = None,
     *,
-    thinking: bool = False,
+    thinking: bool = True,
 ) -> BaseModel:
     """One bounded structured call with the same fallback policy the chunk writer used.
 
-    Thinking is off by default: Python validates every structured result anyway,
-    and on gemma-4 the reasoning trace makes the same call three times slower.
+    Thinking is enabled by default so structured decisions retain the model's
+    full reasoning capability.
     """
 
     request_timeout = getattr(llm, "request_timeout", None)
@@ -59,8 +59,7 @@ async def structured_ainvoke(
     bind: dict[str, Any] = {}
     if max_output_tokens is not None:
         bind["max_tokens"] = max_output_tokens
-    if not thinking:
-        bind["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    bind["extra_body"] = {"chat_template_kwargs": {"enable_thinking": thinking}}
     call_llm = llm.bind(**bind) if bind else llm
 
     try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import shutil
 import subprocess
 import tempfile
@@ -14,7 +15,9 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
 from openpyxl.drawing.image import Image as SpreadsheetImage
+from openpyxl.worksheet.formula import ArrayFormula
 from PIL import Image
 
 from formats import detect
@@ -22,6 +25,11 @@ from formats.base import ParseOptions
 from formats.xlsx import (
     XlsxParser,
     _render_worksheet,
+    _render_worksheet_parts,
+    _render_vba_page,
+    _render_vba_references,
+    _vba_lookup,
+    _vba_pages,
     recalculate_with_libreoffice,
     run_openpyxl,
 )
@@ -120,6 +128,105 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
         formulas.close()
         cached.close()
 
+    def test_array_formula_is_rendered(self) -> None:
+        formulas = Workbook()
+        formulas.active["A1"] = ArrayFormula("A1:A2", "=SUM(B1:B2)")
+        cached = Workbook()
+        cached.active["A1"] = 5
+
+        html, has_formulas = _render_worksheet(formulas.active, cached.active)
+
+        self.assertTrue(has_formulas)
+        self.assertIn("数式: <code>=SUM(B1:B2)</code>", html)
+        self.assertIn("キャッシュ値: 5", html)
+        formulas.close()
+        cached.close()
+
+    def test_vba_source_and_formula_reference_link_to_vba_page(self) -> None:
+        modules = [
+            (
+                "Module1.bas",
+                "Function DoubleIt(value)\nDoubleIt = value * 2\nEnd Function\n"
+                "Sub SecondMacro()\nEnd Sub\n",
+            )
+        ]
+        workbook = Workbook()
+        workbook.active["B2"] = "=DoubleIt(A2)"
+        pages = _vba_pages(modules)
+        usages: dict[str, list[str]] = {}
+
+        self.assertEqual(len(pages), 2)
+        self.assertNotIn("SecondMacro", pages[0]["code"])
+        self.assertNotIn("DoubleIt", pages[1]["code"])
+
+        references = _render_vba_references(
+            workbook.active,
+            [("D4:F5", "DoubleIt")],
+            _vba_lookup(pages),
+            usages,
+        )
+        page = _render_vba_page(pages[0], usages[pages[0]["id"]])
+
+        self.assertIn("```vb\nFunction DoubleIt", page)
+        self.assertIn("Button on `Sheet!D4:F5`", page)
+        self.assertIn("Formula in `Sheet!B2`", page)
+        self.assertEqual(
+            references,
+            [
+                ((4, 4), "- ボタン範囲 **D4:F5**: [DoubleIt](vba://module1%3A%3Adoubleit)"),
+                ((2, 2), "- 数式セル **B2**: [DoubleIt](vba://module1%3A%3Adoubleit)"),
+            ],
+        )
+        workbook.close()
+
+    def test_manifest_emits_sheets_before_vba_with_lineage_charts_and_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.xlsx"
+            output = root / "output"
+            workbook = Workbook()
+            settings = workbook.active
+            settings.title = "設定"
+            data = workbook.create_sheet("グラフデータ")
+            data.sheet_state = "hidden"
+            for row in range(1, 244):
+                data.cell(row, 1, row)
+            image_stream = io.BytesIO()
+            Image.new("RGB", (2, 2), "blue").save(image_stream, format="PNG")
+            image_stream.seek(0)
+            data.add_image(SpreadsheetImage(image_stream), "B2")
+            graph = workbook.create_sheet("グラフ")
+            chart = BarChart()
+            chart.add_data(Reference(data, min_col=1, min_row=1, max_row=243))
+            graph.add_chart(chart, "A1")
+            workbook.save(source)
+            workbook.close()
+            manifest = {
+                "mode": "xlsm-vba-lineage",
+                "sheets": [
+                    {"name": "設定", "emit": "full", "lineage": []},
+                    {"name": "グラフデータ", "emit": "full", "lineage": ["設定"]},
+                    {"name": "グラフ", "emit": "full", "lineage": ["設定", "グラフデータ"]},
+                ],
+                "procedures": [],
+            }
+
+            markdown = Path(
+                run_openpyxl(
+                    str(source),
+                    str(output),
+                    manifest_json=json.dumps(manifest, ensure_ascii=False),
+                )
+            ).read_text(encoding="utf-8")
+
+        self.assertIn("## シート: グラフ", markdown)
+        self.assertIn("## シート: グラフデータ-part1", markdown)
+        self.assertIn("## シート: グラフデータ-part3", markdown)
+        self.assertIn("## シート: 設定", markdown)
+        self.assertIn("上流シート: `設定`, `グラフデータ`", markdown)
+        self.assertIn("グラフ 1", markdown)
+        self.assertIn("グラフデータ シートのセル B2", markdown)
+
     def test_worksheet_uses_minimal_html_and_preserves_merged_cells(self) -> None:
         formulas = Workbook()
         formulas.active.merge_cells("A1:C2")
@@ -156,6 +263,30 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("_矩形範囲が非常に大きいため", html)
         self.assertIn("<tr><td>Z100</td><td>far</td></tr>", html)
         self.assertNotIn("| Cell | Content |", html)
+        formulas.close()
+        cached.close()
+
+    def test_worksheet_is_split_at_100_rows_and_100k_characters(self) -> None:
+        formulas = Workbook()
+        cached = Workbook()
+        for row in range(1, 102):
+            formulas.active.cell(row, 1, f"row {row}")
+            cached.active.cell(row, 1, f"row {row}")
+
+        parts, _ = _render_worksheet_parts(formulas.active, cached.active, [])
+        self.assertEqual([bounds[:2] for _, bounds in parts], [(1, 100), (101, 101)])
+        formulas.close()
+        cached.close()
+
+        formulas = Workbook()
+        cached = Workbook()
+        for row in range(1, 5):
+            formulas.active.cell(row, 1, "x" * 30_000)
+            cached.active.cell(row, 1, "x" * 30_000)
+
+        parts, _ = _render_worksheet_parts(formulas.active, cached.active, [])
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(len(table) <= 100_000 for table, _ in parts))
         formulas.close()
         cached.close()
 
@@ -260,11 +391,11 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
     def test_libreoffice_recalculation_uses_isolated_profile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "source.xlsx"
+            source = root / "source.xlsm"
             output = root / "recalculated"
             source.write_bytes(make_xlsx())
             output.mkdir()
-            recalculated = output / source.name
+            recalculated = output / "source.xlsx"
             recalculated.write_bytes(source.read_bytes())
 
             completed = subprocess.CompletedProcess([], 0, "converted", "")
@@ -311,6 +442,18 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
             "Description of Summary シートのセル D4 を覆う画像",
             result.markdown,
         )
+
+    async def test_manifested_xlsm_never_opens_libreoffice(self) -> None:
+        workers = FakeWorkers()
+        options = ParseOptions(
+            filename="source.xlsm",
+            describe_images=False,
+            manifest={"mode": "xlsm-vba-lineage", "sheets": [{"name": "Summary", "emit": "full"}]},
+        )
+        with patch("formats.xlsx.find_libreoffice_command", return_value=["libreoffice"]):
+            await XlsxParser().parse(make_xlsx(), options, workers)
+
+        self.assertEqual(workers.external_functions, [run_openpyxl])
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ class ChunkEntity(BaseModel):
     name: str = ""
     kind: str = ""
     role: Literal["defines", "uses"] = "uses"
+    replaces: list[str] = Field(default_factory=list)
 
 
 class ChunkBehaviour(BaseModel):

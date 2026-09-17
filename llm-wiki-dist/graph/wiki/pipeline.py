@@ -40,6 +40,7 @@ from .page import (
     link_titles,
     normalize_draft,
     split_sections,
+    strip_reader_references,
     word_tokens,
 )
 from .prompts import (
@@ -354,29 +355,6 @@ def _reference_ranges_from_markdown(
             continue
         found.append((start, end))
     return _merge_ranges(found)
-
-
-def _link_reference_markers(
-    markdown: str, page: SeedPage, pages: Sequence[SeedPage]
-) -> str:
-    """Point each imported-fact marker at the page that owns the cited lines."""
-
-    def link(match) -> str:
-        start = int(match.group(1))
-        owner = next(
-            (
-                item for item in pages
-                if item.number != page.number
-                and any(s <= start <= e for s, e in item.owner_ranges)
-            ),
-            None,
-        )
-        if owner is None:
-            return match.group(0)
-        span = match.group(1) + (f"-{match.group(2)}" if match.group(2) else "")
-        return f"（参照元: [{owner.title}]({owner.filename}) 原文 {span}行）"
-
-    return REFERENCE_MARKER_RE.sub(link, markdown)
 
 
 def _write_reference_seeds(
@@ -1149,10 +1127,12 @@ async def _rewrite_page(
     restored, unresolved = restore_images(markdown, page_units)
     if unresolved:
         raise PipelineError(f"page {page.number} has unresolved image placeholders: {unresolved}")
-    page.reference_ranges = _reference_ranges_from_markdown(
-        restored, page.owner_ranges, source_line_count
-    )
-    restored = _link_reference_markers(restored, page, pages)
+    page.reference_ranges = _merge_ranges([
+        (fact.source_start, fact.source_end) for fact in facts
+        if 1 <= fact.source_start <= fact.source_end <= source_line_count
+        and not any(start <= fact.source_start and fact.source_end <= end for start, end in page.owner_ranges)
+    ])
+    restored = strip_reader_references(restored)
     return RewriteResult(
         page=page,
         markdown=restored,
@@ -1257,8 +1237,7 @@ def _index_text(title: str, pages: Sequence[SeedPage]) -> str:
             seen.add(parent)
         lines.append(
             f"- [{page.title}]({page.filename}) — "
-            f"{page.summary or '要約なし'} "
-            f"（原文 {_ranges_text(page.owner_ranges)}行）"
+            f"{page.summary or '要約なし'}"
         )
     return "\n".join(lines) + "\n"
 

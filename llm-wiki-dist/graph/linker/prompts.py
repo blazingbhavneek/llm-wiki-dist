@@ -10,9 +10,9 @@ from graph.wiki.prompts import COMMON_RULES, Prompt, _schema_hint, _language_rul
 
 from .wire import ChunkMeta, NeoEdgeSuggestions
 
-CHUNK_META_VERSION = "wiki-chunk-meta-1"
-EDGE_VERSION_LEGACY = "wiki-link-edge-legacy-1"
-EDGE_VERSION_NEO = "wiki-link-edge-neo-1"
+CHUNK_META_VERSION = "wiki-chunk-meta-2"
+EDGE_VERSION_LEGACY = "wiki-link-edge-legacy-2"
+EDGE_VERSION_NEO = "wiki-link-edge-neo-2"
 
 NEO_EDGE_PROMPT = (
     "あなたはWiki横断リンクの判定者である。対象チャンクと、エンティティの振る舞いグラフを"
@@ -28,18 +28,27 @@ NEO_EDGE_PROMPT = (
 )
 
 
-def chunk_meta_prompt(*, page_title: str, heading: str, document: str, text: str, output_language: str) -> Prompt:
+def chunk_meta_prompt(
+    *, page_title: str, heading: str, document: str, text: str,
+    output_language: str, known_entities: list[dict[str, str]] | None = None,
+) -> Prompt:
+    registry = json.dumps(known_entities or [], ensure_ascii=False)
     body = (
         f"# 対象\n- 文書: {document}\n- ページ: {page_title}\n"
         f"- 節: {heading or '(導入)'}\n- 出力は{output_language}で書く。\n\n"
         f"# summary\n{SUMMARY_PROMPT}\n\n# keywords\n{KEYWORD_PROMPT}\n\n"
         f"# entity / claims\n{CLAIM_PROMPT}\n\n# bridge_probe\n{BRIDGE_PROBE_PROMPT}\n\n"
         "# entities\nこの節に登場する固有のエンティティ（人物、組織、役割、製品、API、関数、"
-        "パラメータ、エラーコード、文書名、規則名、手順名、概念、場所）を最大20件。\n"
+        "パラメータ、エラーコード、文書名、規則名、手順名、概念、場所）を漏れなく列挙する。\n"
         "- name は本文に書かれている表記をそのまま写す。\n"
         "- role は、この節が定義・宣言・仕様説明・初出解説している場合は defines、単に使用・"
-        "言及している場合は uses。\n\n# behaviours\n"
-        "この節で「誰が／何が、何をしているか」を最大20件。subject と object は entities の"
+        "言及している場合は uses。\n"
+        "- 次の既知エンティティと同一なら、その name を再利用して表記揺れや重複を増やさない。\n"
+        "- 後の記述から既知エンティティが誤り・複合名だったと判明した場合、正しい各 entity の"
+        "replaces に置換前の name を入れる。例: A-B が別々の A と B だと判明したら、A と B の"
+        "両方に replaces=[\"A-B\"] を付ける。単なる再言及では replaces を空にする。\n"
+        f"- 文書先頭からここまでの既知エンティティ: {registry}\n\n# behaviours\n"
+        "この節で「誰が／何が、何をしているか」を漏れなく列挙する。subject と object は entities の"
         "name と一致させる。object が無い場合は空文字。action は短い動詞句。\n\n"
         f"--- 本文 ---\n{text}"
     )

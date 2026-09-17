@@ -12,16 +12,36 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from graph.common.hashing import short_hash
+from graph.config import app_concurrency
+from graph.wiki.page import strip_reader_references
 from graph.wiki.storage import read_json, write_json_atomic
 
 from . import chunks
 from .catalog import Catalog, LinkerModeMismatch
 from .legacy import Candidate
-from .prompts import EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
-from .render import RenderEdge, render_page, write_if_changed
+from .prompts import CHUNK_META_VERSION, EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
+from .render import (
+    BIG_DOCUMENT_LINES, INTERNAL_SUMMARY_TERMS, MAX_BIG_INLINE_ENTRIES,
+    MAX_FOOTER_ENTRIES, MAX_INLINE_ENTRIES, USEFUL_LABELS, RenderEdge,
+    MAX_NEO_BEHAVIOUR_INLINE_ENTRIES, footer_edges, render_page, write_if_changed,
+)
 
 Progress = Callable[[dict[str, Any]], None] | None
 StopCheck = Callable[[], bool] | None
+MAX_EDGE_CANDIDATES = 8
+MAX_EDGES_PER_TARGET = 2
+MAX_PAGE_CANDIDATES = 40
+
+
+def _concurrency(settings: Any) -> int:
+    return max(
+        1,
+        int(
+            getattr(settings, "wiki_linker_concurrency", 0)
+            or getattr(settings, "wiki_rewrite_concurrency", 0)
+            or getattr(settings, "concurrency", app_concurrency())
+        ),
+    )
 
 
 class LinkerCancelled(RuntimeError):
@@ -36,6 +56,7 @@ class LinkResult:
     meta_calls: int = 0
     edge_calls: int = 0
     meta_fallbacks: int = 0
+    affected_pages: list[str] | None = None
 
     @property
     def touched(self) -> list[str]:
@@ -80,6 +101,152 @@ def _raw_rel(catalog: Catalog, document: str) -> str:
     return str(row[0]) if row and row[0] else document
 
 
+def _big_document(project: Any, document: str) -> bool:
+    originals = Path(project.wiki) / document / "_planning" / "pages"
+    return sum(len(page.read_text(encoding="utf-8").splitlines()) for page in originals.glob("*.md")) >= BIG_DOCUMENT_LINES
+
+
+def _navigation_path(project: Any, document: str) -> Path:
+    return Path(project.wiki) / document / "_planning" / "navigation.json"
+
+
+def _navigation(project: Any, document: str) -> dict[str, Any]:
+    return read_json(_navigation_path(project, document), default={"schema_version": 1, "pages": {}})
+
+
+def _valid_choices(current: list[dict[str, Any]], edges: list[RenderEdge], *, inline_limit: int) -> list[dict[str, Any]]:
+    by_id = {edge.edge_id: edge for edge in edges}
+    seen_ids: set[str] = set()
+    seen_pages: set[str] = set()
+    inline = footer = 0
+    result: list[dict[str, Any]] = []
+    for raw in current:
+        edge_id = str(raw.get("edge_id", ""))
+        edge = by_id.get(edge_id)
+        if edge is None or edge_id in seen_ids or edge.peer_page_rel in seen_pages:
+            continue
+        placement = "inline" if raw.get("placement") == "inline" and inline < inline_limit else "footer"
+        if placement == "footer" and footer >= MAX_FOOTER_ENTRIES:
+            continue
+        inline += placement == "inline"
+        footer += placement == "footer"
+        summary = str(raw.get("summary", "")).strip() or edge.summary
+        if any(term in summary for term in INTERNAL_SUMMARY_TERMS):
+            summary = edge.summary
+        result.append({"edge_id": edge_id, "placement": placement, "anchor": str(raw.get("anchor", "")).strip(), "summary": summary})
+        seen_ids.add(edge_id)
+        seen_pages.add(edge.peer_page_rel)
+    return result
+
+
+async def _curate_page(
+    *, page_rel: str, original: str, edges: list[RenderEdge], current: list[dict[str, Any]],
+    previous_candidates: list[str], model: Any, settings: Any, big_document: bool, mode: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    from .prompts import reference_plan_messages
+    from .wire import PageReferencePlan
+
+    candidates = footer_edges(edges, page_rel=page_rel, limit=None)
+    inline_limit = MAX_NEO_BEHAVIOUR_INLINE_ENTRIES if mode == "neo" else MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES
+    current = _valid_choices(current, candidates, inline_limit=inline_limit)
+    current_ids = {choice["edge_id"] for choice in current}
+    # Always show the existing choices, then the strongest remaining candidates.
+    by_id = {edge.edge_id: edge for edge in candidates}
+    pool = [by_id[choice["edge_id"]] for choice in current if choice["edge_id"] in by_id]
+    pool.extend(edge for edge in candidates if edge.edge_id not in current_ids)
+    pool = pool[:MAX_PAGE_CANDIDATES]
+    candidate_ids = sorted(edge.edge_id for edge in pool)
+    if candidate_ids == previous_candidates:
+        return current, candidate_ids
+    if not pool:
+        return [], []
+    if model is None:
+        return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary} for edge in pool[:3]]), candidate_ids
+    current_payload = [{**choice, "target": by_id[choice["edge_id"]].peer_title} for choice in current if choice["edge_id"] in by_id]
+    candidate_payload = []
+    for edge in pool:
+        candidate_payload.append({
+            "edge_id": edge.edge_id,
+            "state": "current" if edge.edge_id in current_ids else "new",
+            "target_page": edge.peer_title,
+            "target_section": edge.peer_heading,
+            "evidence": edge.summary,
+            "relation_hint": edge.label,
+        })
+    messages = reference_plan_messages(
+        page={"path": page_rel, "content": original[:12000]}, current=current_payload,
+        candidates=candidate_payload, inline_limit=inline_limit, footer_limit=MAX_FOOTER_ENTRIES,
+        output_language=str(getattr(settings, "wiki_output_language", "Japanese (日本語)")),
+        behaviour_only=mode == "neo",
+    )
+    try:
+        try:
+            plan = await model.structured(PageReferencePlan, messages, max_output_tokens=4000)
+        except TypeError:
+            plan = await model.structured(PageReferencePlan, messages)
+        plan = plan if isinstance(plan, PageReferencePlan) else PageReferencePlan.model_validate(plan)
+        proposed = [item.model_dump(mode="json") for item in plan.references]
+        for item in proposed:
+            if item.get("placement") == "inline" and str(item.get("anchor", "")).strip() not in original:
+                item["placement"] = "footer"
+                item["anchor"] = ""
+        return _valid_choices(proposed, pool, inline_limit=inline_limit), candidate_ids
+    except Exception:
+        # A transient curator failure must not erase good links already visible to readers.
+        return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary} for edge in pool[:3]]), candidate_ids
+
+
+async def render_pages(
+    project: Any, catalog: Catalog, pages: set[str], *, model: Any, settings: Any, mode: str,
+    on_progress: Progress = None,
+) -> set[str]:
+    from .prompts import REFERENCE_PLAN_VERSION
+
+    concurrency = _concurrency(settings)
+    semaphore = asyncio.Semaphore(concurrency)
+    jobs: list[tuple[str, str, Path, str, list[RenderEdge], dict[str, Any], bool]] = []
+    navigation_by_doc: dict[str, dict[str, Any]] = {}
+    completed = 0
+    for page_rel in sorted(pages):
+        doc, filename = page_rel.rsplit("/", 1)
+        original_path = Path(project.wiki) / doc / "_planning" / "pages" / filename
+        if not original_path.exists():
+            continue
+        nav = navigation_by_doc.setdefault(doc, _navigation(project, doc))
+        page_state = nav.setdefault("pages", {}).get(filename, {})
+        edges = [_edge_from_row(row, page_rel) for row in catalog.edges_for_page(page_rel)]
+        jobs.append((page_rel, doc, original_path, strip_reader_references(original_path.read_text(encoding="utf-8")), edges, page_state, _big_document(project, doc)))
+
+    async def curate(job: tuple[str, str, Path, str, list[RenderEdge], dict[str, Any], bool]):
+        nonlocal completed
+        page_rel, _doc, _path, original, edges, state, big = job
+        curation_edges = edges if mode == "legacy" else [edge for edge in edges if edge.source not in {"use", "define"}]
+        async with semaphore:
+            choices, candidate_ids = await _curate_page(
+                page_rel=page_rel, original=original, edges=curation_edges,
+                current=list(state.get("references", [])),
+                previous_candidates=list(state.get("candidate_ids", [])) if state.get("version") == REFERENCE_PLAN_VERSION else [],
+                model=model, settings=settings, big_document=big, mode=mode,
+            )
+        completed += 1
+        if on_progress:
+            on_progress({"stage": "linker", "step": "page_curated", "page": page_rel, "current": completed, "total": len(jobs)})
+        return choices, candidate_ids
+
+    results = await asyncio.gather(*(curate(job) for job in jobs))
+    touched: set[str] = set()
+    for job, (choices, candidate_ids) in zip(jobs, results):
+        page_rel, doc, original_path, original, edges, _state, big = job
+        navigation_by_doc[doc].setdefault("pages", {})[original_path.name] = {"version": REFERENCE_PLAN_VERSION, "candidate_ids": candidate_ids, "references": choices}
+        rendered = render_page(original, page_rel=page_rel, edges=edges, mode=mode, big_document=big, choices=choices)
+        if write_if_changed(Path(project.wiki) / page_rel, rendered):
+            touched.add(doc)
+    for doc, navigation in navigation_by_doc.items():
+        navigation["schema_version"] = 1
+        write_json_atomic(_navigation_path(project, doc), navigation)
+    return touched
+
+
 async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_: list[Candidate], mode: str, version: str, artifact_dir: Path | None, stop_check: StopCheck, output_language: str = "") -> tuple[list[dict[str, Any]], int]:
     from .legacy import EDGE_GROUP_SIZE
     from .prompts import legacy_edge_messages, neo_edge_messages
@@ -87,10 +254,15 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
 
     accepted: list[dict[str, Any]] = []
     calls = 0
-    for offset in range(0, len(candidates_), EDGE_GROUP_SIZE):
+    selected = candidates_[:MAX_EDGE_CANDIDATES]
+    if mode == "neo":
+        entity_candidates = [candidate for candidate in candidates_ if candidate.source in {"use", "define"}]
+        behaviour_candidates = [candidate for candidate in candidates_ if candidate.source not in {"use", "define"}]
+        selected = entity_candidates + behaviour_candidates[:MAX_EDGE_CANDIDATES]
+    for offset in range(0, len(selected), EDGE_GROUP_SIZE):
         if stop_check and stop_check():
             raise LinkerCancelled("cancelled during edge filtering")
-        group = candidates_[offset : offset + EDGE_GROUP_SIZE]
+        group = selected[offset : offset + EDGE_GROUP_SIZE]
         pairs = [(item, catalog.chunk(item.chunk_id)) for item in group]
         pairs = [(item, row) for item, row in pairs if row is not None]
         rows = [row for _item, row in pairs]
@@ -101,6 +273,7 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
             "id": target.chunk_id, "title": f"{target.title} › {target.heading}".rstrip(" ›"),
             "summary": target.summary, "keywords": target.keywords, "header": target.document, "body": target.model_text[:4000],
         }
+        artifact_name = f"edge-{Path(target.filename).stem}-{target.ordinal}-{offset // EDGE_GROUP_SIZE}"
         if mode == "neo":
             target_view = {"chunk_id": target.chunk_id, "title": target.title, "heading": target.heading, "summary": target.summary, "entities": json.loads(target_row["entities_json"] or "[]"), "behaviours": json.loads(target_row["behaviours_json"] or "[]"), "body": target.model_text[:3000]}
             candidate_views = []
@@ -114,7 +287,7 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
             messages, schema = legacy_edge_messages(target_view, candidate_views, output_language=output_language), EdgeSuggestions
         if artifact_dir:
             from graph.wiki.storage import write_text_atomic
-            write_text_atomic(artifact_dir / f"edge-{target.filename}-{offset // EDGE_GROUP_SIZE}.prompt.md", "\n".join(str(getattr(message, "content", message)) for message in messages))
+            write_text_atomic(artifact_dir / f"{artifact_name}.prompt.md", "\n".join(str(getattr(message, "content", message)) for message in messages))
         calls += 1
         try:
             try:
@@ -125,7 +298,7 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
         except Exception as exc:
             if artifact_dir:
                 from graph.wiki.storage import write_text_atomic
-                write_text_atomic(artifact_dir / f"edge-{target.filename}-{offset // EDGE_GROUP_SIZE}-error.txt", f"{type(exc).__name__}: {exc}")
+                write_text_atomic(artifact_dir / f"{artifact_name}-error.txt", f"{type(exc).__name__}: {exc}")
             continue
         allowed = {item.chunk_id for item, _row in pairs}
         for suggestion in result.edges:
@@ -135,13 +308,20 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
             item = next(item for item, _row in pairs if item.chunk_id == target_id)
             label = str(suggestion.label).strip() or "related"
             summary = str(suggestion.summary).strip()
-            if mode == "neo" and not summary:
+            if label.lower() not in USEFUL_LABELS or not summary:
                 continue
             accepted.append({"chunk_a": target.chunk_id, "chunk_b": target_id, "label": label, "summary": summary, "source": item.source, "via": item.via})
-    return accepted, calls
+    if mode == "neo":
+        entity_edges = [edge for edge in accepted if edge["source"] in {"use", "define"}]
+        behaviour_edges = [edge for edge in accepted if edge["source"] not in {"use", "define"}]
+        return entity_edges + behaviour_edges[:MAX_EDGES_PER_TARGET], calls
+    return accepted[:MAX_EDGES_PER_TARGET], calls
 
 
-async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, settings: Any, on_progress: Progress = None, stop_check: StopCheck = None) -> LinkResult:
+async def link_document(
+    project: Any, rel: str, *, model: Any, embedder: Any, settings: Any,
+    on_progress: Progress = None, stop_check: StopCheck = None, render: bool = True,
+) -> LinkResult:
     started = time.monotonic()
     document = _document(project, rel)
     team = _team(document)
@@ -163,7 +343,9 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
         catalog = Catalog.open(project.linker_database, mode=mode)
         with catalog.lock(project):
             catalog.sync_from_planning(project, skip_document=document)
-            previous_cache = chunks.cache_by_hash(planning / "chunks.json")
+            chunk_cache_path = planning / "chunks.json"
+            refresh_metadata = model is not None and read_json(chunk_cache_path, default={}).get("meta_version") != CHUNK_META_VERSION
+            previous_cache = chunks.cache_by_hash(chunk_cache_path)
             original_hashes = chunks.snapshot_originals(project.wiki_dir(rel))
             all_chunks: list[chunks.Chunk] = []
             for page in sorted((planning / "pages").glob("*.md")):
@@ -172,18 +354,22 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
             for item in all_chunks:
                 if item.text_sha256 in previous_cache:
                     item.meta = previous_cache[item.text_sha256]
-                elif item.chunk_id in old_rows:
+                elif not refresh_metadata and item.chunk_id in old_rows:
                     item.meta = _row_meta(old_rows[item.chunk_id])
             diff = catalog.reconcile(document, all_chunks, team=team, raw_rel=rel, page_hashes=original_hashes)
             if on_progress:
                 on_progress({"stage": "linker", "step": "chunks", "document": rel, "current": len(all_chunks), "total": len(all_chunks)})
             stale_ids = set(diff["new"]) | set(diff["changed"])
-            to_describe = [item for item in all_chunks if not previously_complete or item.chunk_id in stale_ids]
+            to_describe = [item for item in all_chunks if refresh_metadata or not previously_complete or item.chunk_id in stale_ids]
             run_dir = Path(project.state_dir(rel)) / "work" / "linker" / run_id
             meta_calls, meta_fallbacks = (0, 0)
+            revised_ids: set[str] = set()
             output_language = str(getattr(settings, "wiki_output_language", "Japanese (日本語)"))
             if to_describe and model is not None:
-                meta_calls, meta_fallbacks = await chunks.describe_all(to_describe, model=model, output_language=output_language, concurrency=int(getattr(settings, "wiki_linker_concurrency", 0) or getattr(settings, "wiki_rewrite_concurrency", 4) or 4), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check)
+                before_meta = {item.chunk_id: item.meta.model_dump_json() for item in all_chunks}
+                meta_calls, meta_fallbacks = await chunks.describe_all(all_chunks, model=model, output_language=output_language, concurrency=_concurrency(settings), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check)
+                revised_ids = {item.chunk_id for item in all_chunks if item.meta.model_dump_json() != before_meta[item.chunk_id]}
+                to_describe = [item for item in all_chunks if item.chunk_id in stale_ids or item.chunk_id in revised_ids or not previously_complete]
             chunk_data = chunks.to_json(document, team, all_chunks)
             chunk_data["raw_rel"] = rel
             for page in chunk_data["pages"]:
@@ -193,6 +379,9 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
             # A rebuilt catalog has no edges for this document yet; links.json (kept
             # across republish) restores the ones whose endpoint text is unchanged.
             catalog.restore_edges(planning / "links.json")
+            revised_peers = {peer for chunk_id in revised_ids for peer in catalog.edge_peers(chunk_id)}
+            metadata_edges_removed = catalog.delete_edges_for(revised_ids)
+            diff["edges_removed"] = int(diff.get("edges_removed", 0)) + metadata_edges_removed
             catalog.embed_pending(embedder, team=team)
             candidates_for: list[tuple[chunks.Chunk, list[Candidate]]] = []
             for item in to_describe:
@@ -225,8 +414,21 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
                 if pending:
                     unresolved.append((item, pending))
             edge_calls = 0
-            for item, pending in unresolved:
-                accepted, calls = await _filter_groups(catalog, model, item, pending, mode, edge_version, run_dir, stop_check, output_language)
+            concurrency = _concurrency(settings)
+            semaphore = asyncio.Semaphore(concurrency)
+            completed = 0
+
+            async def filter_target(item: chunks.Chunk, pending: list[Candidate]) -> tuple[list[dict[str, Any]], int]:
+                nonlocal completed
+                async with semaphore:
+                    result = await _filter_groups(catalog, model, item, pending, mode, edge_version, run_dir, stop_check, output_language)
+                completed += 1
+                if on_progress:
+                    on_progress({"stage": "linker", "step": "edge_target_done", "document": rel, "current": completed, "total": len(unresolved)})
+                return result
+
+            filtered = await asyncio.gather(*(filter_target(item, pending) for item, pending in unresolved))
+            for (item, pending), (accepted, calls) in zip(unresolved, filtered):
                 edge_calls += calls
                 accepted_keys = {(edge["chunk_b"], edge["label"], edge["summary"]) for edge in accepted}
                 for candidate in pending:
@@ -244,29 +446,22 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
             for edge in edge_rows:
                 inserted_edges += int(catalog.insert_edge(edge, commit=False))
             catalog.conn.commit()
-            touched_chunk_ids = set(diff["peers_before"])
+            touched_chunk_ids = set(diff["peers_before"]) | revised_peers
             for edge in edge_rows:
                 touched_chunk_ids.update((edge["chunk_a"], edge["chunk_b"]))
             pages: set[str] = {item.page_rel for item in all_chunks}
             pages.update(filter(None, (catalog.page_of(cid) for cid in touched_chunk_ids)))
             touched_docs: set[str] = set()
-            for page_rel in sorted(pages):
-                original_path = Path(project.wiki) / page_rel.rsplit("/", 1)[0] / "_planning" / "pages" / page_rel.rsplit("/", 1)[1]
-                if not original_path.exists():
-                    continue
-                rendered = render_page(original_path.read_text(encoding="utf-8"), page_rel=page_rel, edges=[_edge_from_row(row, page_rel) for row in catalog.edges_for_page(page_rel)], mode=mode)
-                published = Path(project.wiki) / page_rel
-                if write_if_changed(published, rendered):
-                    doc = page_rel.rsplit("/", 1)[0]
-                    if doc != document:
-                        touched_docs.add(_raw_rel(catalog, doc))
+            if render:
+                rendered_docs = await render_pages(project, catalog, pages, model=model, settings=settings, mode=mode, on_progress=on_progress)
+                touched_docs.update(_raw_rel(catalog, doc) for doc in rendered_docs if doc != document)
             all_docs = {document, *{page.rsplit("/", 1)[0] for page in pages}}
             catalog.write_links_json(project, all_docs)
-            complete = {"schema_version": 2, "status": "complete", "mode": mode, "meta_version": "wiki-chunk-meta-1", "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            complete = {"schema_version": 2, "status": "complete" if render else "render_pending", "mode": mode, "meta_version": CHUNK_META_VERSION, "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             write_json_atomic(planning / "linker.json", complete)
             if on_progress:
                 on_progress({"stage": "linker", "step": "done", "document": rel, "edges": len(edge_rows)})
-            return LinkResult(sorted(touched_docs), inserted_edges, int(diff.get("edges_removed", 0)), meta_calls, edge_calls, meta_fallbacks)
+            return LinkResult(sorted(touched_docs), inserted_edges, int(diff.get("edges_removed", 0)), meta_calls, edge_calls, meta_fallbacks, sorted(pages))
     except Exception as exc:
         write_json_atomic(planning / "linker.json", {"schema_version": 2, "status": "failed", "mode": mode, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"[:500]})
         if on_progress:
@@ -275,6 +470,44 @@ async def link_document(project: Any, rel: str, *, model: Any, embedder: Any, se
     finally:
         if catalog is not None:
             catalog.close()
+
+
+async def link_documents(
+    project: Any, rels: list[str], *, model: Any, embedder: Any, settings: Any,
+    on_progress: Progress = None, stop_check: StopCheck = None,
+) -> LinkResult:
+    """Link a batch, then curate and write every affected page exactly once."""
+    aggregate = LinkResult([])
+    pages: set[str] = set()
+    for rel in rels:
+        result = await link_document(
+            project, rel, model=model, embedder=embedder, settings=settings,
+            on_progress=on_progress, stop_check=stop_check, render=False,
+        )
+        pages.update(result.affected_pages or [])
+        aggregate.edges_added += result.edges_added
+        aggregate.edges_removed += result.edges_removed
+        aggregate.meta_calls += result.meta_calls
+        aggregate.edge_calls += result.edge_calls
+        aggregate.meta_fallbacks += result.meta_fallbacks
+    mode = str(getattr(settings, "wiki_linker_mode", "legacy"))
+    if pages:
+        catalog = Catalog.open(project.linker_database, mode=mode)
+        try:
+            with catalog.lock(project):
+                touched_docs = await render_pages(project, catalog, pages, model=model, settings=settings, mode=mode, on_progress=on_progress)
+                aggregate.touched_documents = sorted(_raw_rel(catalog, doc) for doc in touched_docs)
+                catalog.write_links_json(project, {page.rsplit("/", 1)[0] for page in pages})
+        finally:
+            catalog.close()
+    for rel in rels:
+        marker = Path(project.wiki_dir(rel)) / "_planning" / "linker.json"
+        data = read_json(marker, default={})
+        if data.get("status") == "render_pending":
+            data["status"] = "complete"
+            write_json_atomic(marker, data)
+    aggregate.affected_pages = sorted(pages)
+    return aggregate
 
 
 def remove_document(project: Any, rel: str) -> list[str]:
@@ -290,15 +523,22 @@ def remove_document(project: Any, rel: str) -> list[str]:
             for peer in peers:
                 folder = Path(project.wiki) / peer
                 originals = folder / "_planning" / "pages"
+                big_document = _big_document(project, peer)
+                navigation = _navigation(project, peer)
                 for original in sorted(originals.glob("*.md")):
                     page_rel = f"{peer}/{original.name}"
-                    rendered = render_page(original.read_text(encoding="utf-8"), page_rel=page_rel, edges=[_edge_from_row(row, page_rel) for row in catalog.edges_for_page(page_rel)], mode=catalog.meta("mode") or "legacy")
+                    edges = [_edge_from_row(row, page_rel) for row in catalog.edges_for_page(page_rel)]
+                    page_state = navigation.setdefault("pages", {}).get(original.name, {})
+                    choices = _valid_choices(list(page_state.get("references", [])), footer_edges(edges, page_rel=page_rel, limit=None), inline_limit=MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES)
+                    navigation.setdefault("pages", {})[original.name] = {"candidate_ids": [], "references": choices}
+                    rendered = render_page(original.read_text(encoding="utf-8"), page_rel=page_rel, edges=edges, mode=catalog.meta("mode") or "legacy", big_document=big_document, choices=choices)
                     if write_if_changed(folder / original.name, rendered):
                         touched.add(_raw_rel(catalog, peer))
+                write_json_atomic(_navigation_path(project, peer), navigation)
                 catalog.write_links_json(project, [peer])
             return sorted(touched)
     finally:
         catalog.close()
 
 
-__all__ = ["LinkResult", "LinkerCancelled", "LinkerModeMismatch", "link_document", "remove_document"]
+__all__ = ["LinkResult", "LinkerCancelled", "LinkerModeMismatch", "link_document", "link_documents", "remove_document"]

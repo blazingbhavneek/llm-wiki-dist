@@ -5,10 +5,13 @@ from __future__ import annotations
 import shutil
 import hashlib
 import json
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
+
+from graph.config import app_concurrency
 
 StopCheck = Callable[[], bool] | None
 Progress = Callable[[dict[str, Any]], None] | None
@@ -23,6 +26,7 @@ class WriteResult:
 def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kind: str = "md"):
     from graph.wiki.config import WikiConfig
 
+    concurrency = max(1, int(getattr(settings, "concurrency", app_concurrency())))
     return WikiConfig(
         chat_base_url=settings.chat_base_url,
         chat_api_key=settings.chat_api_key,
@@ -31,7 +35,10 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
         output_language=getattr(settings, "wiki_output_language", "Japanese (日本語)"),
         section_target_lines=int(getattr(settings, "wiki_section_target_lines", 80)),
         write_attempts=int(getattr(settings, "wiki_write_attempts", 3)),
-        rewrite_concurrency=int(getattr(settings, "wiki_rewrite_concurrency", 4)),
+        planner_concurrency=concurrency,
+        rewrite_concurrency=int(
+            getattr(settings, "wiki_rewrite_concurrency", concurrency)
+        ),
         request_timeout=int(getattr(settings, "wiki_request_timeout", 300)),
         run_dir=str(run_dir),
         resume=resume,
@@ -88,6 +95,7 @@ def build_wiki_output(
     on_progress: Progress = None,
     stop_check: StopCheck = None,
     source_kind: str | None = None,
+    resume: bool = True,
 ) -> SimpleNamespace:
     source_path = Path(source_path)
     out_dir = Path(out_dir)
@@ -101,7 +109,7 @@ def build_wiki_output(
         from graph.formats import csv as csv_format, xlsx as xlsx_format
         from graph.wiki.model import ChatModelPort
 
-        config = wiki_config(settings, run_dir=state_dir or (out_dir / "wiki-state"), source_kind=kind)
+        config = wiki_config(settings, run_dir=state_dir or (out_dir / "wiki-state"), resume=resume, source_kind=kind)
         runner = xlsx_format.run if kind == "xlsx" else csv_format.run
         model = llm if hasattr(llm, "structured") and hasattr(llm, "text") else ChatModelPort(config, llm=llm)
         run_async_blocking(runner(source_path, run_dir=out_dir, model=model, config=config, on_progress=on_progress, stop_check=stop_check))
@@ -117,6 +125,7 @@ def build_wiki_output(
             on_progress=on_progress,
             stop_check=stop_check,
             source_kind=kind,
+            resume=resume,
         )
         export_ingest_layout(run_root, out_dir, document_name=document_name)
         return SimpleNamespace(
@@ -131,7 +140,16 @@ def build_wiki_output(
         document_name=document_name,
         out_dir=out_dir,
         llm=getattr(llm, "llm", llm),
-        concurrency=max(1, int(getattr(settings, "ingest_concurrency", 4))),
+        concurrency=max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "ingest_concurrency",
+                    getattr(settings, "concurrency", app_concurrency()),
+                )
+            ),
+        ),
         on_progress=on_progress,
         stop_check=stop_check,
     )
@@ -144,7 +162,7 @@ def publish_output(staged: Path, target: Path) -> int:
     target = Path(target)
     preserved: dict[str, bytes] = {}
     old_planning = target / "_planning"
-    for name in ("chunks.json", "links.json", "linker.json"):
+    for name in ("chunks.json", "links.json", "linker.json", "navigation.json"):
         path = old_planning / name
         if path.exists():
             preserved[name] = path.read_bytes()
@@ -164,7 +182,7 @@ def publish_output(staged: Path, target: Path) -> int:
     return count
 
 
-def write_wiki(
+def write_wiki_pages(
     project: Any,
     rel: str,
     *,
@@ -174,9 +192,25 @@ def write_wiki(
     embedder: Any,
     on_progress: Progress = None,
     stop_check: StopCheck = None,
+    resume: bool = True,
 ) -> WriteResult:
     from graph.formats import kind_of
 
+    if resume:
+        old_source = project.state_dir(rel) / "source" / "original.md"
+        if old_source.exists():
+            old_lines = old_source.read_text(encoding="utf-8").splitlines()
+            new_text = project.raw_file(rel).read_text(encoding="utf-8")
+            new_lines = new_text.splitlines()
+            # ponytail: stdlib line diff; replace only if multi-MB changed Markdown proves slow.
+            hunks = [
+                (old_start + 1, old_end - old_start, new_start + 1, new_end - new_start)
+                for tag, old_start, old_end, new_start, new_end in SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes()
+                if tag != "equal"
+            ]
+            if hunks:
+                from graph.wiki.incremental import invalidate_pages
+                invalidate_pages(project.state_dir(rel), hunks, new_text)
     work = project.work_dir(rel)
     if work.exists():
         shutil.rmtree(work)
@@ -194,14 +228,34 @@ def write_wiki(
             on_progress=on_progress,
             stop_check=stop_check,
             source_kind=kind_of(rel),
+            resume=resume,
         )
         target = project.wiki_dir(rel)
         publish_output(result.out_dir, target)
-        touched = run_linker(project, rel, settings=settings, llm=llm, embedder=embedder, on_progress=on_progress, stop_check=stop_check)
         write_source_stamp(target, project.raw_file(rel), rel)
-        return WriteResult(target=target, touched=touched)
+        marker = target / "_planning" / "linker.json"
+        status = "pending" if getattr(settings, "wiki_linker_enabled", True) else "disabled"
+        from graph.wiki.storage import write_json_atomic
+        write_json_atomic(marker, {"schema_version": 2, "status": status, "mode": str(getattr(settings, "wiki_linker_mode", "legacy"))})
+        return WriteResult(target=target, touched=[])
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def write_wiki(
+    project: Any, rel: str, *, mode: str, settings: Any, llm: Any, embedder: Any,
+    on_progress: Progress = None, stop_check: StopCheck = None,
+) -> WriteResult:
+    """Compatibility wrapper: generate one wiki and immediately link it."""
+    result = write_wiki_pages(
+        project, rel, mode=mode, settings=settings, llm=llm, embedder=embedder,
+        on_progress=on_progress, stop_check=stop_check,
+    )
+    touched = run_linkers(
+        project, [rel], settings=settings, llm=llm, embedder=embedder,
+        on_progress=on_progress, stop_check=stop_check,
+    )
+    return WriteResult(target=result.target, touched=touched)
 
 
 def run_linker(
@@ -249,6 +303,25 @@ def run_linker(
 run_wiki_linker = run_linker
 
 
+def run_linkers(
+    project: Any, rels: list[str], *, settings: Any, llm: Any, embedder: Any,
+    on_progress: Progress = None, stop_check: StopCheck = None,
+) -> list[str]:
+    """Link a completed wiki batch and render affected pages once."""
+    if not rels:
+        return []
+    from graph.wiki.storage import write_json_atomic
+    if not getattr(settings, "wiki_linker_enabled", True):
+        for rel in rels:
+            write_json_atomic(project.wiki_dir(rel) / "_planning" / "linker.json", {"schema_version": 2, "status": "disabled"})
+        return []
+    from graph.common.async_tools import run_async_blocking
+    from graph.linker import link_documents
+    from graph.wiki.model import ChatModelPort
+    model = llm if hasattr(llm, "structured") else ChatModelPort(wiki_config(settings, run_dir=project.metadata / "state" / "linker"), llm=llm) if llm is not None else None
+    return run_async_blocking(link_documents(project, rels, model=model, embedder=embedder, settings=settings, on_progress=on_progress, stop_check=stop_check)).touched_documents
+
+
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -261,7 +334,7 @@ def write_source_stamp(target: Path, raw_file: Path, rel: str) -> None:
     tmp.replace(planning / "source.json")
 
 
-def up_to_date(project: Any, rel: str) -> bool:
+def wiki_up_to_date(project: Any, rel: str) -> bool:
     planning = project.wiki_dir(rel) / "_planning"
     raw = project.raw_file(rel)
     current = _sha256_file(raw) if raw.exists() else ""
@@ -274,17 +347,23 @@ def up_to_date(project: Any, rel: str) -> bool:
                 return False
         except (OSError, ValueError):
             return False
-        # A present pending/failed linker marker means the cross-document
-        # phase never finished; legacy output without any marker stays valid.
-        marker = planning / "linker.json"
-        if marker.exists():
-            try:
-                status = json.loads(marker.read_text(encoding="utf-8")).get("status")
-            except (OSError, ValueError):
-                return False
-            return status in ("complete", "disabled")
         return True
     return False
+
+
+def links_up_to_date(project: Any, rel: str, *, mode: str | None = None) -> bool:
+    marker = project.wiki_dir(rel) / "_planning" / "linker.json"
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if data.get("status") not in ("complete", "disabled"):
+        return False
+    return mode is None or (data.get("status") == "complete" and data.get("mode") == mode)
+
+
+def up_to_date(project: Any, rel: str) -> bool:
+    return wiki_up_to_date(project, rel) and links_up_to_date(project, rel)
 
 
 def write_index(project: Any) -> None:

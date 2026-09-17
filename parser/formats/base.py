@@ -29,6 +29,7 @@ class ParseOptions:
     llm_api_key: str | None = None
     llm_model: str | None = None
     filename: str | None = None  # original upload name, used for document titles
+    manifest: dict | None = None  # optional caller-supplied format manifest
 
 
 @dataclass

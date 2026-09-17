@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import copy
 import hashlib
 import os
@@ -19,6 +20,52 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+
+def app_concurrency() -> int:
+    return max(1, int(os.environ.get("WIKI_CONCURRENCY", "4")))
+
+
+def _normalize_growi_token(value: str) -> str:
+    return value.strip().removeprefix("API Token:").strip()
+
+
+def _project_paths(selector: str) -> tuple[str, str, str, str, str, dict[str, str]]:
+    value = selector.strip()
+    if not value:
+        raise ValueError("--project is required (config name from configs/ or absolute INI path)")
+    selected = Path(value).expanduser()
+    if selected.is_absolute():
+        if selected.suffix != ".ini":
+            raise ValueError("absolute project config path must end in .ini")
+        config_path = selected.resolve()
+    else:
+        if selected.name != value or selected.suffix not in ("", ".ini"):
+            raise ValueError("project must be a name from configs/ or an absolute INI path")
+        config_path = Path(__file__).resolve().parents[1] / "configs" / f"{selected.stem}.ini"
+    parser = configparser.ConfigParser(interpolation=None)
+    if not parser.read(config_path, encoding="utf-8"):
+        raise FileNotFoundError(f"project config not found: {config_path}")
+    target_name = parser.get("project", "target_name").strip()
+    if target_name in {"", ".", ".."} or Path(target_name).name != target_name:
+        raise ValueError(f"target_name must be one folder name: {target_name!r}")
+    data_root = Path(parser.get("project", "data_root")).expanduser()
+    if not data_root.is_absolute():
+        data_root = config_path.parent / data_root
+    mount = Path(parser.get("project", "source_mount")).expanduser()
+    if not mount.is_absolute():
+        raise ValueError(f"source_mount must be absolute: {mount}")
+    overrides = dict(parser.items("project"))
+    if parser.has_section("settings"):
+        overrides.update(parser.items("settings"))
+    return (
+        str(data_root.resolve()),
+        target_name,
+        str(mount.resolve()),
+        parser.get("project", "growi_url", fallback="").strip(),
+        parser.get("project", "growi_token", fallback="").strip(),
+        overrides,
+    )
 
 
 def now_iso() -> str:
@@ -89,24 +136,34 @@ class Settings(BaseModel):
     entity_dedup: bool = True
 
     # --- page assembly -----------------------------------------------------
+    # Shared default for all bounded parallel work. More specific settings
+    # remain available as backwards-compatible overrides.
+    concurrency: int = app_concurrency()
     # Both ingest modes remain available; chunks is the historical default.
     ingest_mode: Literal["chunks", "wiki"] = "wiki"
     # wiki mode: lossless section-wise rewrite, see graph/wiki
     wiki_section_target_lines: int = 80
     wiki_write_attempts: int = 3
-    wiki_rewrite_concurrency: int = 4
+    wiki_rewrite_concurrency: int = app_concurrency()
     # per-request timeout for wiki/linker model calls; slow local models may need more
     wiki_request_timeout: int = 300
     wiki_output_language: str = "Japanese (日本語)"
     # cross-document linker (graph/linker), runs inside the wiki writer
     wiki_linker_enabled: bool = True
-    wiki_linker_mode: Literal["legacy", "neo"] = "legacy"
+    wiki_linker_mode: Literal["legacy", "neo"] = "neo"
     wiki_linker_concurrency: int = 0
     # Kept as an explicit fail-fast compatibility flag for old engine callers.
     engine_semantic_edges: bool = False
-    # project data folder (WP-S2); empty = legacy single-sqlite layout
+    # One project selected from configs/<name>.ini or an absolute INI path.
     data_root: str = ""
+    target_name: str = ""
+    mount_path: str = ""
     parser_base_url: str = ""
+    parser_timeout: float = 7200.0
+    growi_url: str = ""
+    growi_token: str = ""
+    growi_mode: Literal["attach", "own"] = "attach"
+    growi_timeout: float = 30.0
 
     # Legacy read-only config fields. Runtime vector selection is deliberately
     # sqlite-vec-only; keep these for callers that still deserialize Settings.
@@ -131,7 +188,7 @@ class Settings(BaseModel):
     tabular_preview_cols: int = 12
 
     # bounded parallelism for the additive benchmark ingest path
-    ingest_concurrency: int = 4
+    ingest_concurrency: int = app_concurrency()
     # 0 disables automatic reclustering; the caller runs one explicit refresh
     # after a batch has completed.
     recluster_every: int = 10
@@ -174,7 +231,7 @@ class Settings(BaseModel):
 
     # API service concurrency (semaphores in ReadGraphService)
     service_max_reads: int = 16
-    service_max_agents: int = 4
+    service_max_agents: int = app_concurrency()
 
     # TODO: Reactivate it when serving with docker container and pre installed chrome headless etc
     enable_mermaid: bool = True
@@ -184,12 +241,25 @@ class Settings(BaseModel):
     mermaid_render_timeout: int = 30
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls, project: str = "") -> "Settings":
         env = os.environ.get
-        return cls(
-            chat_base_url=env("OPENAI_BASE_URL", cls.chat_base_url),
-            chat_api_key=env("OPENAI_API_KEY", cls.chat_api_key),
-            chat_model=env("WIKI_MODEL", cls.chat_model),
+        (
+            data_root,
+            project_name,
+            mount_path,
+            project_growi_url,
+            project_growi_token,
+            project_overrides,
+        ) = _project_paths(project or env("WIKI_PROJECT", ""))
+        concurrency = app_concurrency()
+        settings = cls(
+            chat_base_url=env(
+                "WIKI_CHAT_BASE_URL", env("OPENAI_BASE_URL", cls.chat_base_url)
+            ),
+            chat_api_key=env(
+                "WIKI_CHAT_API_KEY", env("OPENAI_API_KEY", cls.chat_api_key)
+            ),
+            chat_model=env("WIKI_CHAT_MODEL", env("WIKI_MODEL", cls.chat_model)),
             chat_temperature=float(env("WIKI_TEMPERATURE", cls.chat_temperature)),
             embed_backend=env("WIKI_EMBED_BACKEND", cls.embed_backend),
             embed_base_url=env(
@@ -231,6 +301,7 @@ class Settings(BaseModel):
             search_rrf_k=int(env("WIKI_SEARCH_RRF_K", cls.search_rrf_k)),
             entity_dedup=env("WIKI_ENTITY_DEDUP", "1" if cls.entity_dedup else "0")
             not in {"0", "false", "False", ""},
+            concurrency=concurrency,
             ingest_mode=env("WIKI_INGEST_MODE", cls.ingest_mode),
             wiki_section_target_lines=int(
                 env("WIKI_SECTION_TARGET_LINES", cls.wiki_section_target_lines)
@@ -238,7 +309,7 @@ class Settings(BaseModel):
             wiki_write_attempts=int(env("WIKI_WRITE_ATTEMPTS", cls.wiki_write_attempts)),
             wiki_request_timeout=int(env("WIKI_REQUEST_TIMEOUT", cls.wiki_request_timeout)),
             wiki_rewrite_concurrency=int(
-                env("WIKI_REWRITE_CONCURRENCY", cls.wiki_rewrite_concurrency)
+                env("WIKI_REWRITE_CONCURRENCY", concurrency)
             ),
             wiki_output_language=env("WIKI_OUTPUT_LANGUAGE", cls.wiki_output_language),
             wiki_linker_enabled=env(
@@ -246,11 +317,18 @@ class Settings(BaseModel):
             ).lower() in ("1", "true", "yes", "on"),
             wiki_linker_mode=env("WIKI_LINKER_MODE", cls.wiki_linker_mode),
             wiki_linker_concurrency=int(
-                env("WIKI_LINKER_CONCURRENCY", cls.wiki_linker_concurrency)
+                env("WIKI_LINKER_CONCURRENCY", concurrency)
             ),
             engine_semantic_edges=env("WIKI_ENGINE_SEMANTIC_EDGES", "0") == "1",
-            data_root=env("WIKI_DATA_ROOT", cls.data_root),
+            data_root=data_root,
+            target_name=project_name,
+            mount_path=mount_path,
             parser_base_url=env("WIKI_PARSER_BASE_URL", cls.parser_base_url),
+            parser_timeout=float(env("WIKI_PARSER_TIMEOUT", cls.parser_timeout)),
+            growi_url=project_growi_url or env("GROWI_URL", cls.growi_url),
+            growi_token=_normalize_growi_token(project_growi_token or env("GROWI_TOKEN", cls.growi_token)),
+            growi_mode=env("GROWI_MODE", cls.growi_mode),
+            growi_timeout=float(env("GROWI_TIMEOUT", cls.growi_timeout)),
             vector_backend=env("WIKI_VECTOR_BACKEND", cls.vector_backend),
             qdrant_url=env("QDRANT_URL", cls.qdrant_url),
             qdrant_collection=env("WIKI_QDRANT_COLLECTION", cls.qdrant_collection),
@@ -268,7 +346,7 @@ class Settings(BaseModel):
             tabular_preview_rows=int(env("WIKI_TABULAR_PREVIEW_ROWS", cls.tabular_preview_rows)),
             tabular_preview_cols=int(env("WIKI_TABULAR_PREVIEW_COLS", cls.tabular_preview_cols)),
             ingest_concurrency=max(
-                1, int(env("WIKI_INGEST_CONCURRENCY", cls.ingest_concurrency))
+                1, int(env("WIKI_INGEST_CONCURRENCY", concurrency))
             ),
             recluster_every=int(env("WIKI_RECLUSTER_EVERY", cls.recluster_every)),
             search_candidate_pool=int(
@@ -335,7 +413,7 @@ class Settings(BaseModel):
             ),
             service_max_reads=int(env("WIKI_SERVICE_MAX_READS", cls.service_max_reads)),
             service_max_agents=int(
-                env("WIKI_SERVICE_MAX_AGENTS", cls.service_max_agents)
+                env("WIKI_SERVICE_MAX_AGENTS", concurrency)
             ),
             enable_mermaid=env(
                 "WIKI_ENABLE_MERMAID", "1" if cls.enable_mermaid else "0"
@@ -352,6 +430,28 @@ class Settings(BaseModel):
                 env("WIKI_MERMAID_RENDER_TIMEOUT", cls.mermaid_render_timeout)
             ),
         )
+        reserved = {"source_mount", "mount_path", "data_root", "target_name"}
+        unknown = sorted(set(project_overrides) - set(cls.model_fields) - {"source_mount"})
+        if unknown:
+            raise ValueError(f"unknown project setting(s): {', '.join(unknown)}")
+        overrides = {
+            key: value
+            for key, value in project_overrides.items()
+            if key not in reserved and value.strip()
+        }
+        if "concurrency" in overrides:
+            shared = max(1, int(overrides["concurrency"]))
+            overrides["concurrency"] = shared
+            for field_name in (
+                "wiki_rewrite_concurrency",
+                "wiki_linker_concurrency",
+                "ingest_concurrency",
+                "service_max_agents",
+            ):
+                overrides.setdefault(field_name, shared)
+        if "growi_token" in overrides:
+            overrides["growi_token"] = _normalize_growi_token(overrides["growi_token"])
+        return cls.model_validate({**settings.model_dump(), **overrides})
 
 
 # from_env() reads Settings.<field> as a plain default value; pydantic v2 stores

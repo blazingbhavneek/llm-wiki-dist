@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from graph.common.markdown import LINKS_FOOTER_END as FOOTER_END, LINKS_FOOTER_START as FOOTER_START
-from graph.wiki.page import link_titles
+from graph.wiki.page import link_entity_mentions, strip_reader_references
 from graph.wiki.storage import write_text_atomic
 
 FOOTER_TITLE = "## 関連リンク"
-MAX_FOOTER_ENTRIES = 30
+MAX_FOOTER_ENTRIES = 15
 MAX_SIMILAR_ENTRIES = 5
 
 
@@ -82,14 +82,33 @@ def display(edge: RenderEdge) -> tuple[str, str, str]:
 
 
 def render_page(original: str, *, page_rel: str, edges: list[RenderEdge], mode: str) -> str:
-    body = original.rstrip("\n") + "\n"
+    body = strip_reader_references(original).rstrip("\n") + "\n"
+    entity_paths: set[str] = set()
     if mode == "neo":
-        targets = [(edge.via[0], relative_link(page_rel, edge.peer_page_rel)) for edge in edges if peer_defines(edge)]
-        body = link_titles(body, targets)
-    if not edges:
+        seen_entities: set[str] = set()
+        entity_targets: list[tuple[str, str]] = []
+        for edge in ordered(edges):
+            if not peer_defines(edge):
+                continue
+            entity = edge.via[0].strip()
+            key = entity.casefold()
+            if not entity or key in seen_entities:
+                continue
+            entity_targets.append((entity, relative_link(page_rel, edge.peer_page_rel)))
+            seen_entities.add(key)
+        for entity, path in sorted(entity_targets, key=lambda target: -len(target[0])):
+            linked = link_entity_mentions(body, entity, path)
+            if linked != body or f"[{entity}]({path})" in body:
+                body = linked
+                entity_paths.add(path)
+    footer = [
+        edge for edge in footer_edges([edge for edge in edges if edge.source not in {"use", "define"}])
+        if relative_link(page_rel, edge.peer_page_rel) not in entity_paths
+    ]
+    if not footer:
         return body
     lines = [FOOTER_START, FOOTER_TITLE, ""]
-    for edge in footer_edges(edges):
+    for edge in footer:
         heading = edge.peer_heading if edge.peer_heading and edge.peer_heading != edge.peer_title else ""
         peer = f"{edge.peer_title} › {heading}" if heading else edge.peer_title
         arrow, label, summary = display(edge)
