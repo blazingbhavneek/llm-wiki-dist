@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 
-from formats.base import ParseOptions
+from formats.base import ParseOptions, ParseProfile
 from formats.pdf import PdfParser, run_mineru
 
 _PNG_BYTES = base64.b64decode(
@@ -36,16 +36,42 @@ class FakeWorkers:
         self.network_calls = 0
 
     async def run_gpu(self, fn, pdf_path: str, output_dir: str) -> str:
+        import json
+
         self.asserted_pdf = Path(pdf_path).read_bytes()
         markdown_dir = Path(output_dir) / "document" / "auto"
         image_dir = markdown_dir / "images"
         image_dir.mkdir(parents=True)
         (image_dir / "chart.png").write_bytes(_PNG_BYTES)
         markdown_path = markdown_dir / "document.md"
+        # Two-page document with content-list artifact and page-boundary
+        # markers so both generic (content_list) and llm-wiki (marker) paths
+        # receive deterministic, backend-honest page boundaries.
         markdown_path.write_text(
-            "# Report\n\n![Chart](images/chart.png)\n\n"
-            "Repeated: ![Chart again](images/chart.png)\n",
+            "# Report\n\n"
+            "## PDF ページ 1\n\n"
+            "![Chart](images/chart.png)\n\n"
+            "## PDF ページ 2\n\n"
+            "![Chart](images/chart.png)\n",
             encoding="utf-8",
+        )
+        content = [
+            {"type": "text", "text": "Report", "text_level": 1, "page_idx": 0},
+            {
+                "type": "image",
+                "img_path": "images/chart.png",
+                "img_caption": ["Chart"],
+                "page_idx": 0,
+            },
+            {
+                "type": "image",
+                "img_path": "images/chart.png",
+                "img_caption": ["Chart"],
+                "page_idx": 1,
+            },
+        ]
+        (markdown_dir / "document_content_list.json").write_text(
+            json.dumps(content, ensure_ascii=False), encoding="utf-8"
         )
         return str(markdown_path)
 
@@ -107,6 +133,8 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--gpu-memory-utilization", args[0])
         self.assertEqual(call_options["env"]["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(call_options["env"]["MINERU_PROCESSING_WINDOW_SIZE"], "4")
+        self.assertEqual(call_options["env"]["MINERU_DISABLE_CUDNN_SDPA"], "true")
+        self.assertIn("workers/mineru_bootstrap", call_options["env"]["PYTHONPATH"])
 
     async def test_gpu_extract_then_describes_unique_images_in_parallel_stage(self) -> None:
         workers = FakeWorkers()
@@ -117,6 +145,7 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
             llm_base_url="http://override/v1",
             llm_api_key="override-key",
             llm_model="override-model",
+            profile=ParseProfile.LLM_WIKI,
         )
         FakeLLMClient.configurations.clear()
 
@@ -129,6 +158,11 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.markdown.count("<image-unit>"), 2)
         self.assertEqual(result.markdown.count("data:image/png;base64,"), 2)
         self.assertEqual(result.markdown.count("Detailed description for Chart."), 2)
+        self.assertEqual(len(result.pages), 2)
+        self.assertTrue(all("<image-unit>" in page for page in result.pages))
+        self.assertTrue(
+            all("Detailed description for Chart." in page for page in result.pages)
+        )
         self.assertEqual(
             FakeLLMClient.configurations,
             [
@@ -147,7 +181,11 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
         with patch("formats.pdf.LLMClient", FakeLLMClient):
             result = await parser.parse(
                 b"%PDF-1.7 fake",
-                ParseOptions(images=False, describe_images=True),
+                ParseOptions(
+                    images=False,
+                    describe_images=True,
+                    profile=ParseProfile.LLM_WIKI,
+                ),
                 workers,
             )
 

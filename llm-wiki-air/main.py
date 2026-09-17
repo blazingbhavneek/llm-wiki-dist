@@ -27,8 +27,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from graph.config import Settings
+from graph import config
+from graph.config import Settings, resolve_project_path
 from graph.workspace.project import open_project
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+config.PROJECT_ROOT = PROJECT_ROOT
 
 
 def _settings(args: argparse.Namespace) -> Settings:
@@ -43,7 +47,7 @@ def _settings(args: argparse.Namespace) -> Settings:
         if value:
             setattr(settings, key, value)
     if getattr(args, "data_root", None):
-        settings.data_root = args.data_root
+        settings.data_root = str(resolve_project_path(args.data_root).resolve())
     if getattr(args, "mode", None) and args.command != "link":
         settings.ingest_mode = args.mode
     linker = getattr(args, "linker", None)

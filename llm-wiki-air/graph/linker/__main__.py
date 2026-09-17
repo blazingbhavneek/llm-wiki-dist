@@ -4,8 +4,9 @@ import argparse
 import sqlite3
 from pathlib import Path
 
+import main
 from graph.common.async_tools import run_async_blocking
-from graph.config import Settings
+from graph.config import Settings, resolve_project_path
 from graph.workspace.project import Project, open_project
 from graph.workspace.writer import wiki_config
 from graph.wiki.model import ChatModelPort
@@ -81,7 +82,7 @@ def main() -> None:
     args = parser.parse_args()
     settings = Settings.from_env(args.project)
     if args.data_root:
-        settings.data_root = args.data_root
+        settings.data_root = str(resolve_project_path(args.data_root).resolve())
     project = open_project(settings)
     if args.command == "status":
         if not project.linker_database.exists():

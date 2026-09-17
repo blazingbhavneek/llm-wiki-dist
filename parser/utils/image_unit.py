@@ -150,6 +150,34 @@ def strip_image_media(text: str) -> str:
     return _IMAGE_UNIT_RE.sub(replace_image_unit, text).strip()
 
 
+def deduplicate_image_descriptions(text: str) -> str:
+    """Keep a description only on the first image unit with identical media."""
+    if not isinstance(text, str) or not text:
+        return text
+
+    described_sources: set[str] = set()
+
+    def replace_image_unit(match: re.Match[str]) -> str:
+        unit = match.group(0)
+        source = _IMAGE_SRC_RE.search(unit)
+        description = _IMAGE_DESCRIPTION_RE.search(unit)
+        if source is None or description is None:
+            return unit
+
+        data_url = source.group("src")
+        value = description.group("description").strip()
+        if not value:
+            return unit
+        if data_url not in described_sources:
+            described_sources.add(data_url)
+            return unit
+
+        start, end = description.span("description")
+        return unit[:start] + "" + unit[end:]
+
+    return _IMAGE_UNIT_RE.sub(replace_image_unit, text)
+
+
 def extract_image_descriptions(text: str) -> list[str]:
     """Return non-empty image-description values from image-unit blocks."""
     if not isinstance(text, str) or not text:

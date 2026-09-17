@@ -72,14 +72,22 @@ MINERU_COMMAND=mineru
 MINERU_BACKEND=pipeline
 MINERU_CUDA_VISIBLE_DEVICES=1
 MINERU_GPU_MEMORY_UTILIZATION=0.5
+# Avoid UniMERNet cuDNN attention-plan failures; other SDPA backends stay enabled.
+MINERU_DISABLE_CUDNN_SDPA=true
 MINERU_TIMEOUT_SECONDS=1800
 # Warm mineru-api logs (10 MiB active file plus 3 rotated backups)
 MINERU_API_LOG_PATH=logs/mineru-api.log
 MINERU_API_LOG_MAX_BYTES=10485760
 MINERU_API_LOG_BACKUP_COUNT=3
 
+# URL deployment prefix only (never selects behavior). Both routes are served
+# under it: /parse (generic Markdown) and /parse/llm-wiki (image-unit + LLM).
+URL_PREFIX=/agent/doc-parser/
+
 # Behaviour switches
 PPTX_RENDER_SLIDES=auto            # slide PNG fallback via LibreOffice
+PPTX_SLIDE_DESCRIPTION_ATTEMPTS=4  # iterative judged drafts (maximum 5)
+PPTX_INDIVIDUAL_IMAGE_MIN_AREA_PERCENT=1.0  # skip tiny standalone descriptions
 XLSX_RECALCULATE_FORMULAS=auto     # LibreOffice recalculation pass
 VECTOR_IMAGE_CONVERSION=auto       # EMF/WMF -> PNG
 CSV_MAX_ROWS=5000

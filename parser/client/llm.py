@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass, replace
 from typing import Any, Self
 
@@ -24,12 +26,32 @@ IMAGE_DESCRIPTION_PROMPT = (
 SLIDE_SYNTHESIS_PROMPT = (
     "この画像はプレゼンテーションのスライド全体です。以下には、このスライドから"
     "既に抽出したテキスト、表、各画像の位置と個別説明があります。既存テキストの"
-    "文字起こし・言い換え・要約や、個々の画像の再説明はしないでください。"
-    "スライド全体を見なければ分からない情報だけを補足してください。具体的には、"
+    "機械的な全文転載や、個々の画像の独立した再説明はしないでください。ただし、"
+    "関係を正確に説明するために必要な主要エンティティの名称とラベルは必ず明記して"
+    "ください。スライド全体を見なければ分からない情報を中心に補足してください。"
+    "具体的には、"
     "要素の空間的な配置、グループ化、視覚的な階層、矢印や近接関係、テキストと画像の"
     "対応、各要素の役割、そして組み合わせによって伝えようとしている主張・流れ・"
-    "結論を説明してください。抽出内容と矛盾する推測は避け、簡潔な日本語の説明文のみ"
-    "を返してください。"
+    "結論を漏れなく説明してください。単に「スライドである」「画像とテキストがある」"
+    "などの自明な記述は禁止します。抽出内容と矛盾する推測は避けてください。通常は"
+    "2〜4個の十分に具体的な段落で、スライドを見ていない読者でも構成と要素間の相互作用"
+    "を再現できる説明文のみを返してください。"
+)
+
+SLIDE_JUDGE_PROMPT = (
+    "あなたはプレゼンテーションのアクセシビリティ説明を厳格に評価する審査員です。"
+    "まずスライド画像と抽出済みコンテキストから、主要エンティティを漏れなく確認して"
+    "ください。主要エンティティには、名前付きの人物・組織・システム・データ・成果物・"
+    "工程・施策・図表・グループ・目標が含まれます。装飾だけのアイコンは除外します。"
+    "次に、それらの間の主要な関係を確認してください。関係には、矢印や線の方向、"
+    "入力と出力、包含とグループ化、順序と時間軸、対応付け、比較、因果、依存関係、"
+    "強調、および最終的な主張への収束が含まれます。その完全な確認結果と候補説明を"
+    "照合し、エンティティ網羅性45点、関係網羅性45点、明瞭性10点で0〜100点を付けて"
+    "ください。長いだけでは加点せず、重要なエンティティまたは関係が1つでも抜けて"
+    "いれば具体的に列挙してください。JSON以外は出力せず、必ず次の形式にしてください: "
+    '{"score": 0, "missing_entities": ["..."], '
+    '"missing_relationships": ["..."], '
+    '"feedback": "次稿で行う具体的な修正"}'
 )
 
 
@@ -39,6 +61,16 @@ class LLMResponseError(RuntimeError):
 
 class LLMRequestError(RuntimeError):
     """The LLM rejected a request and returned a useful diagnostic."""
+
+
+@dataclass(frozen=True, slots=True)
+class SlideDescriptionReview:
+    """A judge score and actionable feedback for one slide description."""
+
+    score: float
+    missing: str
+    missing_entities: tuple[str, ...] = ()
+    missing_relationships: tuple[str, ...] = ()
 
 
 def _first_env(*names: str, default: str) -> str:
@@ -162,8 +194,13 @@ class LLMClient:
 
         return await self._describe_with_prompt(data_url, prompt)
 
-    async def describe_slide(self, data_url: str, context: str) -> str:
-        """Explain slide-level relationships without repeating extracted content."""
+    async def describe_slide(
+        self,
+        data_url: str,
+        context: str,
+        revision_history: list[tuple[str, str]] | None = None,
+    ) -> str:
+        """Explain a slide, continuing prior draft/critique turns when supplied."""
         max_context = max(1, int(os.getenv("PPTX_SLIDE_CONTEXT_MAX_CHARS", "20000")))
         trimmed_context = context.strip()[:max_context]
         prompt = (
@@ -172,10 +209,73 @@ class LLMClient:
             f"{trimmed_context}\n"
             "--- コンテキスト終了 ---"
         )
-        return await self._describe_with_prompt(data_url, prompt)
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url, "detail": "high"},
+                    },
+                ],
+            }
+        ]
+        for previous_draft, feedback in revision_history or []:
+            messages.append({"role": "assistant", "content": previous_draft})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "前稿に対する審査結果は以下です。これは新規作成ではなく改稿です。"
+                        "前稿の正確で有用な内容をすべて保持し、不足している主要エンティティ"
+                        "と関係を追加して、完成した説明全文だけを返してください。\n"
+                        f"{feedback.strip()}"
+                    ),
+                }
+            )
+        return await self._complete_messages(messages)
+
+    async def judge_slide_description(
+        self,
+        data_url: str,
+        context: str,
+        candidate: str,
+    ) -> SlideDescriptionReview:
+        """Score whether a candidate captures the slide's visual relationships."""
+        max_context = max(1, int(os.getenv("PPTX_SLIDE_CONTEXT_MAX_CHARS", "20000")))
+        trimmed_context = context.strip()[:max_context]
+        prompt = (
+            f"{SLIDE_JUDGE_PROMPT}\n\n"
+            "--- 抽出済みコンテキスト ---\n"
+            f"{trimmed_context}\n"
+            "--- 候補説明 ---\n"
+            f"{candidate.strip()}\n"
+            "--- 評価対象終了 ---"
+        )
+        response = await self._describe_with_prompt(data_url, prompt)
+        return _parse_slide_review(response)
 
     async def _describe_with_prompt(self, data_url: str, prompt: str) -> str:
         """Send one image and its task-specific prompt to the vision endpoint."""
+
+        return await self._complete_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": "high"},
+                        },
+                    ],
+                }
+            ]
+        )
+
+    async def _complete_messages(self, messages: list[dict[str, Any]]) -> str:
+        """Send a complete conversation to the configured chat endpoint."""
 
         headers = {"Accept": "application/json"}
         if self.config.api_key:
@@ -186,18 +286,7 @@ class LLMClient:
             headers=headers,
             json={
                 "model": self.config.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": data_url, "detail": "high"},
-                            },
-                        ],
-                    }
-                ],
+                "messages": messages,
                 "max_tokens": self.config.max_tokens,
                 "temperature": self.config.temperature,
                 "stream": False,
@@ -212,3 +301,44 @@ class LLMClient:
         if not text:
             raise LLMResponseError("LLM response did not contain a description")
         return text
+
+
+def _parse_slide_review(value: str) -> SlideDescriptionReview:
+    """Parse a judge response while tolerating fenced JSON from local models."""
+    match = re.search(r"\{.*\}", value, re.DOTALL)
+    if match is None:
+        return SlideDescriptionReview(score=0.0, missing=value.strip())
+    try:
+        payload = json.loads(match.group(0))
+        if not isinstance(payload, dict):
+            raise ValueError("judge response was not an object")
+        score = max(0.0, min(100.0, float(payload.get("score", 0))))
+        missing_entities = _string_tuple(payload.get("missing_entities"))
+        missing_relationships = _string_tuple(payload.get("missing_relationships"))
+        feedback = str(payload.get("feedback", payload.get("missing", ""))).strip()
+        feedback_parts = []
+        if missing_entities:
+            feedback_parts.append(
+                "不足している主要エンティティ: " + "、".join(missing_entities)
+            )
+        if missing_relationships:
+            feedback_parts.append(
+                "不足している主要な関係: " + "、".join(missing_relationships)
+            )
+        if feedback:
+            feedback_parts.append("修正指示: " + feedback)
+        missing = "\n".join(feedback_parts)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return SlideDescriptionReview(score=0.0, missing=value.strip())
+    return SlideDescriptionReview(
+        score=score,
+        missing=missing,
+        missing_entities=missing_entities,
+        missing_relationships=missing_relationships,
+    )
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(item).strip() for item in value if str(item).strip())

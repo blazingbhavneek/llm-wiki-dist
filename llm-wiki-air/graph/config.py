@@ -21,6 +21,16 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+PROJECT_ROOT: Path | None = None
+
+
+def resolve_project_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    assert PROJECT_ROOT is not None, "project root is not configured"
+    return PROJECT_ROOT / path
+
 
 def app_concurrency() -> int:
     return max(1, int(os.environ.get("WIKI_CONCURRENCY", "4")))
@@ -42,16 +52,14 @@ def _project_paths(selector: str) -> tuple[str, str, str, str, str, dict[str, st
     else:
         if selected.name != value or selected.suffix not in ("", ".ini"):
             raise ValueError("project must be a name from configs/ or an absolute INI path")
-        config_path = Path(__file__).resolve().parents[1] / "configs" / f"{selected.stem}.ini"
+        config_path = resolve_project_path(f"configs/{selected.stem}.ini")
     parser = configparser.ConfigParser(interpolation=None)
     if not parser.read(config_path, encoding="utf-8"):
         raise FileNotFoundError(f"project config not found: {config_path}")
     target_name = parser.get("project", "target_name").strip()
     if target_name in {"", ".", ".."} or Path(target_name).name != target_name:
         raise ValueError(f"target_name must be one folder name: {target_name!r}")
-    data_root = Path(parser.get("project", "data_root")).expanduser()
-    if not data_root.is_absolute():
-        data_root = config_path.parent / data_root
+    data_root = resolve_project_path(parser.get("project", "data_root"))
     mount = Path(parser.get("project", "source_mount")).expanduser()
     if not mount.is_absolute():
         raise ValueError(f"source_mount must be absolute: {mount}")

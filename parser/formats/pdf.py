@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ctypes
+import json
+import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -12,11 +15,24 @@ import sys
 from pathlib import Path
 
 from client.llm import LLMClient
-from formats.base import BaseParser, ParseOptions
+from formats.base import BaseParser, ExtractedDocument, ParseOptions, ParseProfile
 from utils.markdown_images import embed_markdown_images
 from workers import Workers
 
+logger = logging.getLogger("doc-parser.pdf")
+
 _PDF_HEADER = b"%PDF-"
+
+# Explicit page-boundary markers that a MinerU backend may emit into the
+# Markdown when no content-list JSON is available. Match the ``N`` as either
+# a plain page number or a page number prefixed by a leading ``page``; the
+# marker can appear on any line and its span does not depend on Markdown
+# structure so a backend can produce it from any source-of-truth.
+_PAGE_MARKER_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"<!--\s*page[-_ ]?(?:break|index)?\s*[:=]\s*(\d+)\s*-->", re.IGNORECASE),
+    re.compile(r"^<!--\s*page\s+(\d+)\s*-->\s*$", re.IGNORECASE | re.MULTILINE),
+)
+_PDF_PAGE_HEADING_RE = re.compile(r"^##\s*PDF ページ\s+(\d+)\s*$", re.MULTILINE)
 
 try:
     _LIBC = ctypes.CDLL(None)
@@ -47,6 +63,136 @@ def _find_markdown(output_dir: Path, input_stem: str) -> Path:
 
     relative = ", ".join(str(path.relative_to(output_dir)) for path in candidates[:8])
     raise MineruError(f"MinerU produced multiple Markdown files: {relative}")
+
+
+def _render_content_list(blocks: list[dict]) -> list[str]:
+    """Render each ``page_idx`` group as one raw Markdown string.
+
+    Blocks keep their emitted order; block fields (``text``, ``img_path``,
+    ``table_body``, captions) are the same fields already used by MinerU's
+    own document Markdown, so a page's raw references match the raw references
+    in the full document.
+    """
+    pages: dict[int, list[str]] = {}
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        raw_index = block.get("page_idx", block.get("page"))
+        try:
+            page_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        rendered: list[str] = []
+        block_type = block.get("type")
+        if block_type == "image":
+            img_path = block.get("img_path") or ""
+            caption_lines = [str(c) for c in (block.get("img_caption") or []) if str(c).strip()]
+            alt = " / ".join(caption_lines) or "PDF ページ画像"
+            if img_path:
+                rendered.append(f"![{alt}]({img_path})")
+            if caption_lines:
+                rendered.append("\n".join(caption_lines))
+            image_footnote = block.get("img_footnote") or []
+            if image_footnote:
+                rendered.append("\n".join(str(line) for line in image_footnote if str(line).strip()))
+        elif block_type == "table":
+            body = str(block.get("table_body") or "").strip()
+            caption_lines = [str(c) for c in (block.get("table_caption") or []) if str(c).strip()]
+            if caption_lines:
+                rendered.append("\n".join(caption_lines))
+            if body:
+                rendered.append(body)
+        else:
+            text = str(block.get("text") or "").strip()
+            level = block.get("text_level") or 0
+            if text:
+                if isinstance(level, int) and 1 <= level <= 6:
+                    rendered.append(f"{'#' * level} {text}")
+                else:
+                    rendered.append(text)
+        if rendered:
+            pages.setdefault(page_index, []).append("\n\n".join(rendered))
+    return ["\n\n".join(pages[index]) for index in sorted(pages)]
+
+
+def _split_by_markers(markdown: str) -> list[str]:
+    """Split Markdown into pages using an installed backend's explicit markers.
+
+    Supports both HTML comment page boundaries and ``## PDF ページ N`` style
+    headings. If no marker appears, returns an empty list so the caller can
+    report a clear ``MineruError`` rather than produce false pages.
+    """
+    for pattern in _PAGE_MARKER_RES:
+        splits = pattern.split(markdown)
+        # ``re.split`` with a capture emits [pre, num, section, num, ...].
+        if len(splits) > 2 and any(int(splits[i]) >= 1 for i in range(1, len(splits), 2)):
+            sections: list[str] = []
+            for index in range(2, len(splits), 2):
+                section = splits[index].strip()
+                if section:
+                    sections.append(section)
+            if sections:
+                return sections
+    splits = _PDF_PAGE_HEADING_RE.split(markdown)
+    if len(splits) > 1 and any(splits[i] for i in range(1, len(splits), 2)):
+        sections = []
+        for pair_index in range(1, len(splits), 2):
+            page_number = int(splits[pair_index])
+            body = splits[pair_index + 1] if pair_index + 1 < len(splits) else ""
+            section = f"## PDF ページ {page_number}\n\n{body.strip()}".strip()
+            if section:
+                sections.append(section)
+        return sections
+    return []
+
+
+def split_mineru_pages(markdown_path: Path, output_dir: Path) -> list[str]:
+    """Return MinerU's per-page Markdown strings for a parsed PDF.
+
+    Prefers the ``content_list.json`` that the ``pipeline``/``vlm``/
+    ``hybrid`` backends emit alongside the Markdown. Each block carries a
+    ``page_idx`` and either a ``text``/``img_path``/``table_body`` field, so
+    grouping by page reproduces the raw relative image references that appear
+    in the document Markdown. When no content-list is available, explicit
+    page-boundary markers within the Markdown are used instead. Never infers
+    boundaries from headings or blank lines alone.
+    """
+    preferred: list[Path] = []
+    fallback: list[Path] = []
+    for candidate in output_dir.rglob("*.json"):
+        name = candidate.name.casefold()
+        if name.endswith("content_list.json") or name == "content_list.json":
+            preferred.append(candidate)
+        elif "content_list" in name:
+            fallback.append(candidate)
+    for content_path in [*sorted(preferred), *sorted(fallback)]:
+        try:
+            payload = json.loads(content_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            payload = payload.get("pdf_info") or payload.get("content_list") or []
+        if not isinstance(payload, list):
+            continue
+        pages = _render_content_list(payload)
+        if pages:
+            return pages
+
+    try:
+        markdown_text = markdown_path.read_text(encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - markdown path is created earlier
+        raise MineruError(f"MinerU Markdown is unreadable at {markdown_path}: {exc}") from exc
+
+    marker_pages = _split_by_markers(markdown_text)
+    if marker_pages:
+        return marker_pages
+
+    raise MineruError(
+        "MinerU produced no per-page artifact: neither a content-list JSON "
+        f"(looked under {output_dir} for content_list.json) nor explicit page "
+        f"markers were found in {markdown_path.name}. "
+        "Enable MinerU's content_list output or add backend page markers."
+    )
 
 
 def discover_mineru_bin(command: list[str]) -> str | None:
@@ -139,6 +285,16 @@ def run_mineru(pdf_path: str, output_dir: str) -> str:
         "MINERU_PROCESSING_WINDOW_SIZE",
         "4",
     )
+    environment["MINERU_DISABLE_CUDNN_SDPA"] = os.getenv(
+        "MINERU_DISABLE_CUDNN_SDPA",
+        "true",
+    )
+    bootstrap_dir = (
+        Path(__file__).resolve().parent.parent / "workers" / "mineru_bootstrap"
+    )
+    environment["PYTHONPATH"] = (
+        f"{bootstrap_dir}{os.pathsep}{environment.get('PYTHONPATH', '')}"
+    )
     mineru_bin = discover_mineru_bin(command)
     if mineru_bin:
         environment["PATH"] = (
@@ -210,7 +366,7 @@ class PdfParser(BaseParser):
         image_dir: str,
         options: ParseOptions,
         workers: Workers,
-    ) -> str:
+    ) -> ExtractedDocument:
         work_dir = Path(image_dir)
         pdf_path = work_dir / "document.pdf"
         output_dir = work_dir / "mineru-output"
@@ -224,6 +380,20 @@ class PdfParser(BaseParser):
             )
         )
         markdown = markdown_path.read_text(encoding="utf-8")
+
+        if options.profile == ParseProfile.GENERIC:
+            # Return raw references plus resolved paths; BaseParser.parse embeds
+            # Markdown data URLs into the full document and every page. Page
+            # extraction is generic-only: llm-wiki keeps its historical
+            # behavior and must not newly depend on a page artifact existing.
+            raw_pages = split_mineru_pages(markdown_path, output_dir)
+            return ExtractedDocument(
+                markdown=markdown,
+                pages=raw_pages,
+                markdown_path=markdown_path,
+                asset_root=output_dir,
+            )
+
         client = (
             LLMClient(
                 base_url=options.llm_base_url,
@@ -234,12 +404,31 @@ class PdfParser(BaseParser):
             else None
         )
         try:
-            return await embed_markdown_images(
-                markdown,
-                markdown_path,
-                output_dir,
-                workers,
-                client.describe_image if client is not None else None,
+            # Embed the full document and its page views in one pass. This
+            # keeps descriptions identical while scheduling only one LLM call
+            # per unique image asset.
+            try:
+                raw_pages = split_mineru_pages(markdown_path, output_dir)
+            except MineruError as exc:
+                logger.warning("llm-wiki PDF pages unavailable: %s", exc)
+                raw_pages = []
+            boundary = "\n<!-- doc-parser-pdf-page-boundary -->\n"
+            parts = [markdown, *raw_pages]
+            if any(boundary in part for part in parts):
+                raise MineruError("reserved PDF page boundary appeared in MinerU output")
+            embedded_parts = (
+                await embed_markdown_images(
+                    boundary.join(parts),
+                    markdown_path,
+                    output_dir,
+                    workers,
+                    client.describe_image if client is not None else None,
+                )
+            ).split(boundary)
+            embedded, *embedded_pages = embedded_parts
+            return ExtractedDocument(
+                markdown=embedded,
+                pages=embedded_pages or [embedded],
             )
         finally:
             if client is not None:

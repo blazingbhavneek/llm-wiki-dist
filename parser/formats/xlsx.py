@@ -10,6 +10,7 @@ import posixpath
 import re
 import subprocess
 import zipfile
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from html import escape
 from pathlib import Path
@@ -31,7 +32,13 @@ from openpyxl.worksheet.formula import ArrayFormula
 from xlsx2html.core import render_table, worksheet_to_data
 
 from client.llm import LLMClient
-from formats.base import BaseParser, ParseOptions
+from formats.base import BaseParser, ExtractedDocument, ParseOptions, ParseProfile
+from formats.xlsm_lineage import (
+    build_manifest,
+    has_vba,
+    render_consolidated_vba_code,
+    render_consolidated_vba_final_outputs,
+)
 from utils.markdown_images import embed_markdown_images
 from utils.vector_images import convert_document_vector_images, find_libreoffice_command
 from workers import Workers
@@ -59,6 +66,24 @@ _VBA_PROCEDURE_RE = re.compile(
 
 class OpenpyxlError(RuntimeError):
     """The XLSX renderer could not produce a usable document."""
+
+
+_SHEET_BLOCK_RE = re.compile(r"(?=^## (?:Sheet|シート): )", re.MULTILINE)
+
+
+def _split_sheet_blocks(markdown: str) -> list[str]:
+    """Split fully-rendered workbook Markdown into per-unit page strings.
+
+    Used only on the llm-wiki path, where the final page content must match the
+    image-unit-embedded document. The document title and any preamble before the
+    first ``## シート:`` heading remain only in ``markdown``.
+    """
+    blocks = [
+        block.strip()
+        for block in _SHEET_BLOCK_RE.split(markdown)
+        if block.lstrip().startswith(("## シート: ", "## Sheet: "))
+    ]
+    return blocks
 
 
 class LibreOfficeError(RuntimeError):
@@ -1011,14 +1036,96 @@ def _extract_package_vector_images(
     return references
 
 
+@dataclass(slots=True)
+class RenderedWorkbook:
+    """Picklable result of rendering a workbook into worksheet Markdown units.
+
+    ``pages`` holds raw, un-embedded unit strings in assembly order. In the
+    generic profile each page is one whole worksheet (plus consolidated VBA
+    pages for XLSM); llm-wiki leaves ``pages`` empty because its final page
+    form must be derived after the image-unit LLM pipeline runs.
+    """
+
+    markdown: str
+    pages: list[str] = field(default_factory=list)
+    markdown_path: Path | None = None
+    asset_root: Path | None = None
+
+
+def _generic_render(
+    formulas,
+    cached_values,
+    images: dict[str, list[str]],
+    vector_images: dict[str, list[str]],
+    macro_source: Path,
+    is_macro: bool,
+    title: str,
+    has_formulas: bool,
+) -> tuple[str, list[str]]:
+    """Render one whole unit per worksheet (+ consolidated VBA pages) generically.
+
+    No worksheet splitting, no lineage/chart context, and no ``vba://`` links.
+    Static VBA analysis runs on the original upload and produces exactly two
+    synthetic pages: one consolidated code page and one final-output page.
+    """
+    preamble = [f"# {_html_text(title)}"]
+    if has_formulas:
+        preamble.append(
+            "> 数式セルには数式とワークブックのキャッシュ値の両方を記載しています。"
+            "利用可能な環境では LibreOffice により抽出前に再計算されます。"
+        )
+    units: list[str] = []
+    for worksheet in formulas.worksheets:
+        cached_worksheet = cached_values[worksheet.title]
+        table, _ = _render_worksheet(worksheet, cached_worksheet)
+        block = [
+            f"## シート: {_html_text(worksheet.title)}",
+            "",
+            table,
+        ]
+        sheet_images = [*images.get(worksheet.title, []), *vector_images.get(worksheet.title, [])]
+        if sheet_images:
+            block.extend(["", "### 画像", "", *sheet_images])
+        units.append("\n".join(block))
+
+    unplaced = vector_images.get("")
+    if unplaced:
+        # ``pages`` is one item per worksheet. Keep package media whose sheet
+        # anchor could not be resolved inside the first sheet instead of
+        # inventing a synthetic worksheet page.
+        section = "\n".join(["### 位置不明のベクター画像", "", *unplaced])
+        if units:
+            units[0] = f"{units[0]}\n\n{section}"
+
+    manifest = build_manifest(macro_source) if is_macro else None
+    code_page = render_consolidated_vba_code(manifest)
+    final_page = render_consolidated_vba_final_outputs(manifest)
+    if code_page:
+        units.append(code_page.rstrip("\n"))
+    if final_page:
+        units.append(final_page.rstrip("\n"))
+
+    markdown = "\n\n".join(["\n".join(preamble), *units])
+    return markdown, units
+
+
 def run_openpyxl(
     xlsx_path: str,
     output_dir: str,
     document_title: str | None = None,
     vba_path: str | None = None,
     manifest_json: str | None = None,
-) -> str:
-    """Convert workbook cells to compact HTML tables and extract its images."""
+    profile: ParseProfile = ParseProfile.LLM_WIKI,
+    is_macro: bool = False,
+) -> RenderedWorkbook:
+    """Convert workbook cells to compact HTML tables and extract its images.
+
+    ``profile=GENERIC`` renders every worksheet whole (never split), attaches
+    each sheet's images to that same unit, and emits two consolidated static
+    VBA pages for macro workbooks. ``profile=LLM_WIKI`` preserves the existing
+    manifest-driven selection, splitting, lineage, and per-procedure output and
+    defers page construction to the parser.
+    """
     source = Path(xlsx_path).resolve()
     macro_source = Path(vba_path).resolve() if vba_path else source
     destination = Path(output_dir).resolve()
@@ -1033,20 +1140,47 @@ def run_openpyxl(
 
     try:
         images = _extract_images(formulas, destination)
+        vector_images = _extract_package_vector_images(source, destination, formulas)
+        title = document_title or "Excel ワークブック"
+
+        # The generic profile never consults the manifest or splits worksheets,
+        # and it never renders vba:// links or per-procedure pages.
+        if profile == ParseProfile.GENERIC:
+            sheet_formulas = any(
+                cell.data_type == "f"
+                for sheet in formulas.worksheets
+                for cell in sheet._cells.values()
+            )
+            markdown, pages = _generic_render(
+                formulas,
+                cached_values,
+                images,
+                vector_images,
+                macro_source,
+                is_macro,
+                title,
+                sheet_formulas,
+            )
+            markdown_path.write_text(markdown + "\n", encoding="utf-8")
+            return RenderedWorkbook(
+                markdown=markdown,
+                pages=pages,
+                markdown_path=markdown_path,
+                asset_root=destination,
+            )
+
         vba_modules = _extract_vba_modules(macro_source)
         vba_pages = _vba_pages(vba_modules)
         vba_procedures = _vba_lookup(vba_pages)
         vba_usages: dict[str, list[str]] = {}
         with zipfile.ZipFile(macro_source) as archive:
             vba_controls = _vba_control_locations(archive, formulas)
-        vector_images = _extract_package_vector_images(source, destination, formulas)
         selected, sheet_manifest = _selection(manifest_json, formulas)
         chart_summaries = (
             {sheet.title: _chart_summary(sheet) for sheet in formulas.worksheets}
             if selected is not None
             else {}
         )
-        title = document_title or "Excel ワークブック"
         sections = [f"# {_html_text(title)}"]
         has_formulas = False
         for worksheet in formulas.worksheets:
@@ -1146,7 +1280,8 @@ def run_openpyxl(
                     "利用可能な環境では LibreOffice により抽出前に再計算されます。"
                 ),
             ]
-        markdown_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+        markdown = "\n".join(sections) + "\n"
+        markdown_path.write_text(markdown, encoding="utf-8")
     except OpenpyxlError:
         raise
     except Exception as exc:
@@ -1155,7 +1290,7 @@ def run_openpyxl(
         formulas.close()
         cached_values.close()
 
-    return str(markdown_path)
+    return RenderedWorkbook(markdown=markdown, pages=[], markdown_path=markdown_path, asset_root=destination)
 
 
 class XlsxParser(BaseParser):
@@ -1178,7 +1313,7 @@ class XlsxParser(BaseParser):
         image_dir: str,
         options: ParseOptions,
         workers: Workers,
-    ) -> str:
+    ) -> ExtractedDocument:
         work_dir = Path(image_dir)
         upload_name = Path(options.filename or "").name or "document.xlsx"
         if Path(upload_name).suffix.lower() not in {".xlsx", ".xlsm"}:
@@ -1191,11 +1326,22 @@ class XlsxParser(BaseParser):
             if Path(upload_name).stem not in {"document", ""}
             else "Excel ワークブック"
         )
+        is_macro = has_vba(xlsx_path)
+        generic = options.profile == ParseProfile.GENERIC
+
+        # Static lineage for llm-wiki when a manifest is missing must originate
+        # from the original upload; the caller-supplied manifest is preserved
+        # verbatim so any downstream ordering/translation stays intact.
+        manifest = options.manifest
+        if not generic and is_macro and manifest is None:
+            manifest = build_manifest(xlsx_path)
 
         workbook_path = xlsx_path
         recalculate_mode = os.getenv("XLSX_RECALCULATE_FORMULAS", "auto").lower()
-        is_manifested_xlsm = bool(options.manifest and options.manifest.get("mode") == "xlsm-vba-lineage")
-        if not is_manifested_xlsm and recalculate_mode not in {"0", "false", "no", "off"}:
+        skip_recalculation = is_macro or bool(
+            manifest and manifest.get("mode") == "xlsm-vba-lineage"
+        )
+        if not skip_recalculation and recalculate_mode not in {"0", "false", "no", "off"}:
             command = find_libreoffice_command()
             if command is None:
                 if recalculate_mode in {"1", "true", "yes", "required"}:
@@ -1221,17 +1367,40 @@ class XlsxParser(BaseParser):
                         exc,
                     )
 
-        markdown_path = Path(
-            await workers.run_external(
-                run_openpyxl,
-                str(workbook_path),
-                str(output_dir),
-                document_title,
-                str(xlsx_path),
-                json.dumps(options.manifest, ensure_ascii=False) if options.manifest else None,
-            )
+        rendered: RenderedWorkbook = await workers.run_external(
+            run_openpyxl,
+            str(workbook_path),
+            str(output_dir),
+            document_title,
+            str(xlsx_path),
+            json.dumps(manifest, ensure_ascii=False) if manifest else None,
+            options.profile,
+            is_macro,
         )
-        markdown = markdown_path.read_text(encoding="utf-8")
+
+        if generic:
+            # Convert once across the full document and its duplicated page
+            # views. Re-running LibreOffice per page creates different PNG
+            # names and can make ``markdown`` disagree with ``pages``.
+            boundary = "\n<!-- doc-parser-page-boundary -->\n"
+            parts = [rendered.markdown, *rendered.pages]
+            if any(boundary in part for part in parts):
+                raise OpenpyxlError("reserved page boundary appeared in workbook output")
+            converted = await convert_document_vector_images(
+                boundary.join(parts), output_dir / "media", workers
+            )
+            markdown, *pages = converted.split(boundary)
+            return ExtractedDocument(
+                markdown=markdown,
+                pages=pages,
+                markdown_path=rendered.markdown_path,
+                asset_root=rendered.asset_root,
+            )
+
+        # llm-wiki path: preserve the existing image-unit LLM pipeline exactly.
+        markdown = rendered.markdown
+        markdown_path = rendered.markdown_path
+        assert markdown_path is not None
         markdown = await convert_document_vector_images(
             markdown, output_dir / "media", workers
         )
@@ -1246,7 +1415,7 @@ class XlsxParser(BaseParser):
             else None
         )
         try:
-            return await embed_markdown_images(
+            embedded = await embed_markdown_images(
                 markdown,
                 markdown_path,
                 output_dir,
@@ -1256,3 +1425,7 @@ class XlsxParser(BaseParser):
         finally:
             if client is not None:
                 await client.close()
+        # Derive pages from the fully-embedded final llm-wiki output so their
+        # shape matches markdown. The document title stays only in markdown.
+        pages = _split_sheet_blocks(embedded)
+        return ExtractedDocument(markdown=embedded, pages=pages)

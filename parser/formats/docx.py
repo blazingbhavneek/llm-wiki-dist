@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 from client.llm import LLMClient
-from formats.base import BaseParser, ParseOptions
+from formats.base import BaseParser, ExtractedDocument, ParseOptions, ParseProfile
 from utils.markdown_images import embed_markdown_images
 from utils.vector_images import convert_document_vector_images
 from workers import Workers
@@ -93,7 +93,7 @@ class DocxParser(BaseParser):
         image_dir: str,
         options: ParseOptions,
         workers: Workers,
-    ) -> str:
+    ) -> ExtractedDocument:
         work_dir = Path(image_dir)
         docx_path = work_dir / "document.docx"
         output_dir = work_dir / "pandoc-output"
@@ -113,6 +113,17 @@ class DocxParser(BaseParser):
             markdown, output_dir / "media", workers
         )
 
+        # The generic profile returns raw Markdown with relative references and
+        # never creates an LLM client; BaseParser.parse embeds data URLs. DOCX
+        # has no page structure, so pages stays empty for both profiles.
+        if options.profile == ParseProfile.GENERIC:
+            return ExtractedDocument(
+                markdown=markdown,
+                pages=[],
+                markdown_path=markdown_path,
+                asset_root=output_dir,
+            )
+
         client = (
             LLMClient(
                 base_url=options.llm_base_url,
@@ -123,7 +134,7 @@ class DocxParser(BaseParser):
             else None
         )
         try:
-            return await embed_markdown_images(
+            embedded = await embed_markdown_images(
                 markdown,
                 markdown_path,
                 output_dir,
@@ -133,3 +144,4 @@ class DocxParser(BaseParser):
         finally:
             if client is not None:
                 await client.close()
+        return ExtractedDocument(markdown=embedded, pages=[])

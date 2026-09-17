@@ -10,6 +10,11 @@ import requests
 
 from .xlsm import apply_manifest, build_manifest
 
+# The graph pipeline always requests the llm-wiki profile so its historical
+# image-unit, description, and XLSM lineage behavior is preserved. The generic
+# /parse route produces ordinary Markdown and must never be used here.
+LLM_WIKI_PARSE_PATH = "/parse/llm-wiki"
+
 
 class UnsupportedDocument(RuntimeError):
     pass
@@ -28,7 +33,7 @@ def parse_document(path: Path, *, base_url: str, settings: Any, timeout_s: float
     manifest = build_manifest(path)
     with Path(path).open("rb") as handle:
         response = requests.post(
-            f"{base_url.rstrip('/')}/parse",
+            f"{base_url.rstrip('/')}{LLM_WIKI_PARSE_PATH}",
             params={"images": "true", "describe_images": "true"},
             headers=headers,
             data={"manifest": json.dumps(manifest, ensure_ascii=False)} if manifest else None,
@@ -45,7 +50,15 @@ def parse_document(path: Path, *, base_url: str, settings: Any, timeout_s: float
     if not isinstance(payload, dict) or "markdown" not in payload:
         raise RuntimeError(f"doc-parser: {payload.get('error', 'missing markdown') if isinstance(payload, dict) else 'invalid response'}")
     markdown = str(payload["markdown"])
+    # ``pages`` is validated when present so a parser regression is caught
+    # early, but the graph pipeline is not required to consume it yet. When a
+    # manifest reorders markdown, pages would have to be reordered identically;
+    # until a downstream consumer needs pages, the pipeline keeps returning the
+    # manifest-applied markdown only, exactly as before.
+    pages = payload.get("pages")
+    if pages is not None and (not isinstance(pages, list) or not all(isinstance(page, str) for page in pages)):
+        raise RuntimeError("doc-parser: pages must be a list of strings")
     return apply_manifest(markdown, manifest) if manifest else markdown
 
 
-__all__ = ["UnsupportedDocument", "parse_document"]
+__all__ = ["UnsupportedDocument", "parse_document", "LLM_WIKI_PARSE_PATH"]

@@ -16,7 +16,7 @@ from collections import Counter
 from html import escape
 from pathlib import Path
 
-from formats.base import BaseParser, ParseOptions
+from formats.base import BaseParser, ExtractedDocument, ParseOptions
 from workers import Workers
 
 logger = logging.getLogger("doc-parser.csv")
@@ -169,7 +169,7 @@ class CsvParser(BaseParser):
         image_dir: str,
         options: ParseOptions,
         workers: Workers,
-    ) -> str:
+    ) -> ExtractedDocument:
         work_dir = Path(image_dir)
         upload_name = Path(options.filename or "").name or "document.csv"
         if Path(upload_name).suffix.lower() != ".csv":
@@ -181,4 +181,11 @@ class CsvParser(BaseParser):
         markdown_path = Path(
             await workers.run_external(run_csv, str(csv_path), str(output_dir))
         )
-        return markdown_path.read_text(encoding="utf-8")
+        # CSV is profile-agnostic: it has no images, no LLM work, and always
+        # returns an empty page list. The whole table is one Markdown document.
+        return ExtractedDocument(
+            markdown=markdown_path.read_text(encoding="utf-8"),
+            pages=[],
+            markdown_path=markdown_path,
+            asset_root=output_dir,
+        )

@@ -1,49 +1,136 @@
 # llm-wiki-air
 
-No-Git document pipeline:
+A self-contained document pipeline that turns a directory of source documents
+(PDF, DOCX, PPTX, XLSX/XLSM, CSV, Markdown) into a cross-linked, LLM-rewritten
+Markdown wiki and publishes it to [GROWI](https://growi.org) — with **no Git
+repository anywhere in the loop**. Local state lives in plain files and SQLite
+under `data/`, and GROWI itself is the collaborative editing surface.
 
-```text
-external mount -> raw Markdown -> wiki -> neo linker -> GROWI
+The name "air" is the no-Git edition: `graph/` is copied from the upstream
+factory allowlist, and `publisher/` plus `main.py` are the downstream pipeline.
+
+## What it does
+
+```mermaid
+flowchart LR
+    M["external mount<br/>(NFS / bind / local dir)"] -->|convert| R["raw/<br/>Markdown"]
+    R -->|wiki generation| W["wiki/<br/>numbered pages"]
+    W -->|neo linker| L["cross-document<br/>links + catalog"]
+    L -->|publish| G[("GROWI")]
+    G -.->|revision pull<br/>inside markers| W
 ```
 
-Run every command below from `llm-wiki-air/`. The default build mode is `wiki`
-with the `neo` linker.
+| Stage | Input | Output | Notes |
+| --- | --- | --- | --- |
+| **convert** | mounted source tree (`source_mount`) | `data/<target>/raw/*.md` | `.md` is copied as-is; other formats go through the external doc-parser service, `.xlsm` gets a static lineage pass first |
+| **wiki** | one raw Markdown file | a folder of numbered pages + `_planning/` state | overlapping-window observation, seed-page planning, section-wise lossless rewriting; the model never decides what survives, Python does |
+| **link** (neo/legacy) | the whole wiki batch | `<!-- llm-wiki-links -->` footers + SQLite catalog | chunks, metadata, embedding candidates, then per-page link decisions |
+| **publish** | wiki tree | GROWI pages | only inside `<!-- chunk: ... -->` markers; links are rewritten to GROWI `/{pageId}` permalinks |
+
+Everything runs through a single entry point, `main.py`. Each invocation
+operates on exactly **one project** selected with `--project`, and every
+project keeps its own data folder, linker catalog, and queue database, so
+projects never touch each other's state.
+
+## Read-only search service
+
+[`growi-search/`](growi-search/README.md) is a separate, self-contained
+**read-only** service: live GROWI keyword search, a reranker-augmented
+retrieval pipeline, and a lead-agent + bounded subagent researcher with
+streaming answers and citations. It has no local index, no graph, and no write
+endpoints. See [`growi-search/README.md`](growi-search/README.md).
+
+## Requirements and setup
+
+- Python **3.13+** (see `pyproject.toml`; `uv.lock` is committed, `uv sync`
+  creates `.venv/`)
+- Reachable services on the company network: an OpenAI-compatible **chat**
+  endpoint, an **embedding** endpoint, a **doc-parser** service (only needed
+  for non-Markdown sources), and a **GROWI** instance with an API token
+
+`.env` is committed in this repo and already points at those company endpoints,
+so a fresh clone needs no setup beyond the virtualenv. `.env.example` exists
+only as a list of variable names — edit `.env` itself when an endpoint moves.
+
+```bash
+uv sync            # creates .venv/
+.venv/bin/python main.py check --project projectA   # ping every endpoint
+```
+
+Run every command in this file from `llm-wiki-air/`, using `.venv/bin/python`.
+The defaults are `wiki` ingest mode with the `neo` linker.
+
+### The doc-parser service runs somewhere else
+
+This pipeline does **not** parse PDF/DOCX/PPTX/XLSX itself. The `doc-parser/`
+directory in this repo holds that server's source — MinerU GPU conversion,
+pandoc, headless LibreOffice media/vector conversion, and vision-model image
+description — but in practice it is deployed on a **GPU host**, not here. The
+only coupling is one URL: `WIKI_PARSER_BASE_URL`, which POSTs each original file
+to `{base}/parse/llm-wiki` and reads back Markdown (`{base}/health` is what `check`
+pings). Nothing is written to disk on the parser box, and nothing on the GPU
+box knows about GROWI, the wiki, or the queue.
+
+Consequences worth knowing:
+
+- Set `WIKI_PARSER_BASE_URL` to the **remote** host; a Markdown-only project can
+  leave it unset and never touches the parser.
+- Parse calls are slow and long-lived, hence the 7200 s `parser_timeout`.
+  `convert` prints a `waiting` heartbeat every 10 s under `-v`.
+- The chat credentials from `.env`/INI are forwarded per request as
+  `X-LLM-Base-URL` / `X-LLM-API-Key` / `X-LLM-Model` headers, so image
+  description uses the same model this project is configured for.
+- To run or modify the parser itself, see `doc-parser/README.md` and
+  `doc-parser/SETUP.md`; it is an independent service with its own tests.
 
 ## Configuration
 
-Copy the environment template and set the parser, model, embedding, and GROWI
-endpoints:
+Two layers: a shared `.env` at the repo root, and one INI per project under
+`configs/`. Later layers win:
 
-```bash
-cp .env.example .env
+```text
+Settings defaults (graph/config.py)  ->  .env  ->  configs/<name>.ini  ->  CLI flags
 ```
 
 Set `WIKI_CONCURRENCY` in `.env` to control planner, wiki/Excel generation,
 ingestion, linker, and API-agent parallelism from one place.
 
-Each source project has one file under `configs/`. The filename selects the
-configuration; `target_name` controls both the data subfolder and GROWI path:
+## Structuring a project INI
+
+Each source project is exactly one file under `configs/`, and the filename is
+what `--project` selects — `configs/projectA.ini` is `--project projectA` (or
+an absolute path to any `.ini`). A project file has two sections:
+
+| Section | Required | Purpose |
+| --- | --- | --- |
+| `[project]` | yes | **structure**: where the sources are, where local state lives, where it publishes. These three keys are structural and must live here. |
+| `[settings]` | no | **runtime overrides**: any `Settings` field name; beats `.env` for this project only. |
 
 ```ini
-# configs/projectA.ini
+# configs/projectA.ini — the minimal complete project file
 [project]
-source_mount = /home/seigyo/mnt/projectA
-target_name = Moove
-data_root = ../data
+source_mount = /home/seigyo/mnt/projectA   # absolute; the mounted document tree
+target_name  = Moove                       # one folder name: data/Moove/ + /Moove in GROWI
+data_root    = data                        # absolute, or relative to the project root
+growi_url    = http://10.160.152.235:3000/ # optional: beats GROWI_URL from .env
+growi_token  = API Token:<token>           # optional: beats GROWI_TOKEN (prefix optional)
 ```
 
-`data_root` may be absolute or relative to the INI file. `source_mount` must be
-absolute. This example reads from projectA, writes local state under
-`data/Moove/`, and publishes below `/Moove` in GROWI. Optional `growi_url` and
-`growi_token` values override `GROWI_URL` and `GROWI_TOKEN` from `.env` for that
-project only.
+Rules enforced at load time (`graph/config.py::_project_paths`):
 
-```ini
-growi_url = http://10.160.152.235:3000/
-growi_token = API Token:<token>
-```
+- `source_mount` must be **absolute** (the mount point itself, e.g. an NFS or
+  `--bind` mount — see command 1). Sources stay there; nothing is copied into
+  `data/`.
+- `data_root` may be absolute or **relative to the project root** (the
+  directory containing `main.py`, `README.md`, and `pyproject.toml`). It can
+  still be overridden per invocation with `--data-root`.
+- `target_name` must be a single folder name (no `/`, no `.`/`..`). It chooses
+  **both** `data/<target_name>/` and the GROWI path prefix, so local tree and
+  remote tree keep the same name.
+- `growi_url` / `growi_token` here override `.env` for this project; omit them
+  to use the global values. `API Token:` prefix is stripped automatically.
 
-Project-specific runtime overrides go in an optional `[settings]` section.
+Then an optional `[settings]` section for per-project runtime overrides.
 Values here take precedence over `.env`; omitted values continue to use `.env`:
 
 ```ini
@@ -89,7 +176,52 @@ absolute INI path. One command invocation always operates on one project.
 `--data-root /another/path` can be added before or after a command when an
 isolated output tree is needed.
 
+Service endpoints and tuning come from `.env` (`WIKI_CHAT_*`, `WIKI_EMBED_*`,
+`WIKI_PARSER_BASE_URL`, `GROWI_URL`, `GROWI_TOKEN`, `WIKI_CONCURRENCY`, and
+friends); `graph/config.py::Settings.from_env` is the authoritative list, and
+the optional `[settings]` INI section overrides any of those fields per project.
+
+## Project data layout
+
+```
+data/<target_name>/                 # e.g. data/Moove/
+  raw/                              # converted Markdown, mirroring the mount tree
+    <dir>/<stem>_<ext>.md           #   マニュアル/kdmパッケージ取扱説明書B改訂_pdf.md
+  wiki/                             # generated pages, one folder per source
+    <dir>/<stem>.<ext>/
+      001-<slug>.md ...             #   numbered wiki pages
+      _planning/                    #   manifest, coverage, links, linker state
+  metadata/
+    pipeline.json                   # publish ledger: source sha256 + per-doc/page
+                                    #   publish state (the only record of what was pushed)
+    convert.json                    # mount -> raw conversion log (size + mtime_ns)
+    state/                          # per-document generation state (resume / repair)
+    work/                           # scratch area for in-flight generations
+    wiki-linker.sqlite              # linker catalog: chunks, metadata, edges
+    watch-queue.sqlite              # watcher source tree + fast/slow job queue
+    *.lock                          # flock files for pipeline / linker / worker
+```
+
+Source files always live in `source_mount`; nothing below `data/` mirrors them.
+Deleting `data/<target_name>/` clears local generation and publish state without
+touching GROWI (only `reset` removes GROWI pages).
+
 ## Commands
+
+Quick map — the numbered sections below explain each command in detail:
+
+| I want to … | Command |
+| --- | --- |
+| verify config and every service | `check` |
+| redo only `mount -> raw` | `convert` |
+| run the whole pipeline once | `sync` |
+| rebuild wiki / re-link / both locally, publish nothing | `build wiki\|link\|all` |
+| smoke-test one source end to end | `sync … "path/in/mount"` |
+| keep a project continuously fresh | `watch` (or cron + `watch`) |
+| inspect or drive the queue by hand | `queue scan\|work\|status\|retry` |
+| push the current wiki tree as it is | `publish` |
+| fix one document's links | `link relink <doc>` |
+| remove this publisher's GROWI pages | `reset` |
 
 ### 1. Mount a source directory manually
 
@@ -283,6 +415,108 @@ slow are intentionally not assigned yet. A failed fast delete blocks slow work
 until `queue retry` succeeds, preventing newer publication from passing an
 unreconciled deletion.
 
+## How each phase works
+
+**Convert** (`graph/workspace/convert.py`). Cheap `size + mtime_ns` diff against
+`metadata/convert.json`; supported extensions are `.md .docx .pdf .pptx .xlsx
+.xlsm .csv` (`publisher/scanner.py`). Markdown files are copied; everything
+else is POSTed to the doc-parser service unchanged. Removed sources delete
+their raw file.
+
+**Wiki generation** (`graph/wiki/`). Deterministic partition plus section-wise
+lossless rewriting: overlapping 250-line windows are described without
+assigning ownership, planners compile one exact sequential seed partition, then
+Python cuts each page into sections and the model rewrites one section at a
+time — fences, tables and images are placeholder tokens the model must place,
+and Python verifies identifiers and imported facts survived before a judge
+call looks for semantic omissions. Every intermediate artifact is written
+under the page's `_planning/` folder so a crashed run resumes instead of
+restarting. `graph/formats/` adapts this per source kind (pdf, docx, pptx,
+csv, xlsx/xlsm); XLSM gets the static lineage treatment described in step 2.
+
+**Linker** (`graph/linker/`). One batch phase after the whole wiki is built.
+Pages are chunked on H2 headings with one metadata call per chunk; candidates
+are discovered by `legacy` (RRF over embeddings) or `neo` (deterministic
+entity/behaviour discovery) and vetted by a per-page model call. Results are
+stored in `metadata/wiki-linker.sqlite` and rendered into a managed
+`llm-wiki-links` footer (plus inline see-also links) — pure footer rendering
+and parsing lives in `render.py`, so relinking is idempotent.
+
+**Publish** (`graph/growi/` + `publisher/`). Each generated page is wrapped in
+`<!-- chunk: ... -->` markers before it is pushed. On write, only marked
+sections owned by this publisher are replaced (`merge_marked_sections`), so
+human text outside the markers on a GROWI page is never touched; `attach` mode
+additionally refuses any write outside the project's GROWI path. Local links
+are resolved before writing so published links are stable `/{pageId}`
+permalinks, while the local tree keeps portable relative paths. The reverse
+direction (GROWI revision check during `watch`) pulls edits made *inside* the
+markers back into local wiki state.
+
+## Code map (for agents)
+
+Single entry point; every command is a thin `cmd_*` in `main.py` that imports
+the real work lazily. `graph/` is the upstream factory copy and `doc-parser/`
+is the source of the remote parse service — prefer changing `publisher/`,
+`main.py`, configs, or prompts over editing either.
+
+```text
+main.py                      CLI: argument parsing + one cmd_* per subcommand;
+                             also maps WIKI_CHAT_* env names onto Settings
+
+doc-parser/                  separate service (FastAPI + MinerU/GPU, pandoc,
+                             LibreOffice): its source lives here but it RUNS on
+                             another host; reached only through
+                             WIKI_PARSER_BASE_URL -> POST /parse/llm-wiki; it has its own
+                             tests and is never imported by this pipeline
+
+publisher/                   downstream no-Git pipeline (edit freely)
+  pipeline.py                sync_once/build_raw/build_wiki_only/link_raw/
+                             publish_only/reset_growi: one reconciliation pass,
+                             per-source state machine (convert->wiki->link->publish)
+  scanner.py                 content-addressed mount scan; SUPPORTED extensions
+  queue.py                   persistent SQLite queue in metadata/watch-queue.sqlite:
+                             scan / work_once / retry_failed / serve / worker_lock,
+                             fast(delete) + slow(add/update) lanes, coalescing
+  ledger.py                  metadata/pipeline.json: sources + published docs/pages
+
+graph/                       upstream factory allowlist (avoid edits)
+  config.py                  Settings: .env + configs/*.ini loading, validation;
+                             app_concurrency(); field names = [settings] keys
+  clients/                   OpenAI-compatible chat (`make_llm`, structured
+                             JSON calls) and embedding client
+  common/                    hashing, markdown sanitizers, async bridge, prompts
+  formats/                   per-format page planning: pdf, docx, pptx, csv,
+                             xlsx (+ workbook story), tabular tables, heading trees
+  wiki/                      generation engine: pipeline.py (driver),
+                             windows.py (overlapping observation), document_map.py
+                             (seed plan), page.py (section split/check),
+                             images.py, markdown_blocks.py, incremental.py (what a
+                             source edit invalidates), storage.py (atomic IO),
+                             prompts.py/schemas.py (versioned model contracts)
+  linker/                    cross-doc linking: service.py (orchestration),
+                             catalog.py (SQLite), chunks.py (H2 + metadata call),
+                             legacy.py / neo.py (candidate discovery),
+                             render.py (managed footer), prompts.py
+  growi/                     client.py (REST v3, markers, attach/own path guard,
+                             pull-side merge), publisher.py, paths.py
+  workspace/                 project.py (Project paths: raw/wiki/metadata/state/
+                             work, sqlite locations), convert.py (mount->raw),
+                             parser_client.py (doc-parser HTTP), writer.py
+                             (build/publish glue, wiki_up_to_date), xlsm.py
+                             (static VBA/sheet lineage, macros never executed)
+
+tests/                       stdlib unittest, no network: `python -m unittest
+                             discover -s tests` (see Tests below)
+data/<target>/               runtime state; git-ignored, safe to delete
+configs/<name>.ini           one project per file
+```
+
+Good places to start for common changes: a new source type →
+`publisher/scanner.py` (SUPPORTED) + `graph/formats/`; a behavior change to
+published output → `graph/growi/publisher.py` (markers/link wrapping) and
+`graph/linker/render.py` (footers); queue scheduling →
+`publisher/queue.py`; CLI flags → `main.py::build_parser`.
+
 ## Other operations
 
 ```bash
@@ -297,6 +531,20 @@ unreconciled deletion.
 
 `reset` deletes only GROWI pages carrying this publisher's markers. Unmanaged
 GROWI content is preserved.
+
+## Tests
+
+The suite is stdlib `unittest`, offline, and fast (~1 s):
+
+```bash
+.venv/bin/python -m unittest discover -s tests -q
+```
+
+- `test_pipeline_scope.py` — project selection, sync/build/queue scoping, ledger
+- `test_xlsm_preprocessing.py` — static XLSM lineage and page ordering
+- `test_wiki_reference_context.py` — wiki reference-selection prompts/contexts
+- `test_growi_images.py`, `test_model_thinking.py` — GROWI image handling,
+  chat-model thinking options
 
 ## Notes
 

@@ -30,6 +30,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from formats import ParseOptions, ParseResult, UnsupportedFormatError, detect
+from formats.base import ParseProfile
 from workers import Workers
 from workers.mineru_api import MinerUApiService
 
@@ -103,7 +104,38 @@ async def workers(request: Request) -> dict:
 
 
 @app.post("/parse")
-async def parse(
+async def parse_generic(
+    request: Request,
+    file: Annotated[UploadFile, File()],
+    manifest: Annotated[str | None, Form()] = None,
+    images: Annotated[bool, Query()] = True,
+    describe_images: Annotated[bool, Query()] = True,
+    llm_base_url: Annotated[str | None, Header(alias="X-LLM-Base-URL")] = None,
+    llm_api_key: Annotated[str | None, Header(alias="X-LLM-API-Key")] = None,
+    llm_model: Annotated[str | None, Header(alias="X-LLM-Model")] = None,
+):
+    """Generic Markdown route: ordinary data-URL images, never an LLM."""
+    if manifest:
+        raise HTTPException(
+            status_code=400, detail="manifest is only supported by /parse/llm-wiki"
+        )
+    # describe_images and LLM headers are accepted for compatibility but
+    # ignored; the generic profile never constructs an LLM client.
+    return await _run_parse(
+        request,
+        file,
+        None,
+        images=images,
+        describe_images=False,
+        llm_base_url=None,
+        llm_api_key=None,
+        llm_model=None,
+        profile=ParseProfile.GENERIC,
+    )
+
+
+@app.post("/parse/llm-wiki")
+async def parse_llm_wiki(
     request: Request,
     file: Annotated[UploadFile, File()],
     manifest: Annotated[str | None, Form()] = None,
@@ -119,16 +151,42 @@ async def parse(
     llm_api_key: Annotated[str | None, Header(alias="X-LLM-API-Key")] = None,
     llm_model: Annotated[str | None, Header(alias="X-LLM-Model")] = None,
 ):
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-
+    """llm-wiki route: full image-unit, description, and manifest behavior."""
     try:
         parsed_manifest = json.loads(manifest) if manifest else None
         if parsed_manifest is not None and not isinstance(parsed_manifest, dict):
             raise ValueError("manifest must be an object")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid manifest: {exc}") from exc
+
+    return await _run_parse(
+        request,
+        file,
+        parsed_manifest,
+        images=images,
+        describe_images=describe_images,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        profile=ParseProfile.LLM_WIKI,
+    )
+
+
+async def _run_parse(
+    request: Request,
+    file: UploadFile,
+    parsed_manifest: dict | None,
+    *,
+    images: bool,
+    describe_images: bool,
+    llm_base_url: str | None,
+    llm_api_key: str | None,
+    llm_model: str | None,
+    profile: ParseProfile,
+):  # returns a JSON-serialisable dict or an SSE-style streaming Response
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
 
     options = ParseOptions(
         images=images,
@@ -138,6 +196,7 @@ async def parse(
         llm_model=llm_model,
         filename=file.filename,
         manifest=parsed_manifest,
+        profile=profile,
     )
 
     try:

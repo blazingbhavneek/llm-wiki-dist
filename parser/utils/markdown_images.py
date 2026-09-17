@@ -17,6 +17,14 @@ from workers import Workers
 
 logger = logging.getLogger("doc-parser.images")
 
+# Ordinary Markdown image references (the generic-profile shape). The
+# data-URL target may itself contain a closing parenthesis in theory, but
+# base64 never does and a title is uncommon, so a non-greedy target is safe.
+_MD_IMAGE_RE = re.compile(
+    r"!\[(?P<alt>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\s*\)"
+)
+
+
 # Pandoc's ``gfm`` writer emits any image that carries size/position attributes
 # as a raw ``<img>`` tag rather than ``![alt](path)`` (``gfm-raw_html`` would fix
 # that but also drops complex HTML tables), so both spellings are recognised.
@@ -30,6 +38,7 @@ _HTML_SRC_RE = re.compile(r"""\bsrc\s*=\s*["']?(?P<src>[^"'>\s]+)""", re.IGNOREC
 _HTML_ALT_RE = re.compile(r"""\balt\s*=\s*["'](?P<alt>[^"']*)["']""", re.IGNORECASE)
 
 ImageDescriber = Callable[[str, str], Awaitable[str]]
+ImageDescriptionFilter = Callable[[str], bool]
 
 
 def _ref_alt_target(match: re.Match[str]) -> tuple[str, str] | None:
@@ -89,13 +98,27 @@ async def embed_markdown_images(
     allowed_root: Path,
     workers: Workers,
     describe_image: ImageDescriber | None = None,
+    *,
+    should_describe: ImageDescriptionFilter | None = None,
+    repeat_descriptions: bool = True,
+    style: str = "image-unit",
 ) -> str:
     """Replace local Markdown images with canonical ``<image-unit>`` blocks.
 
     Each unique file is read and encoded once. When a describer is supplied,
     its request starts immediately and is limited by the shared network pool.
+    ``should_describe`` can exclude decorative images before an LLM call is
+    scheduled. If ``repeat_descriptions`` is false, repeated references still
+    retain their media but only their first occurrence includes the description.
     A failed description does not prevent the image itself from being returned.
+
+    ``style="markdown"`` selects the generic profile: inline ``![alt](data:...)``
+    URLs with no LLM description and no image-unit markup. The default
+    ``"image-unit"`` preserves the historical behavior for existing callers.
     """
+    if style == "markdown":
+        return embed_markdown_data_urls(markdown, markdown_path, allowed_root)
+
     matches = [m for m in _IMAGE_REF_RE.finditer(markdown) if _ref_alt_target(m)]
     if not matches:
         return markdown
@@ -105,7 +128,37 @@ async def embed_markdown_images(
         for match in matches:
             alt, target = _ref_alt_target(match)  # type: ignore[misc]
             path = resolve_local_image(markdown_path, allowed_root, target)
-            if path is None or path in assets:
+            if path is None:
+                continue
+
+            asset = assets.get(path)
+            if asset is not None:
+                # A later occurrence can be the first one eligible for a
+                # description (for example, the same icon used at two sizes).
+                if (
+                    describe_image is not None
+                    and asset.task is None
+                    and (should_describe is None or should_describe(alt))
+                ):
+                    try:
+                        image_bytes = path.read_bytes()
+                        llm_data_url = llm_image_data_url(
+                            image_bytes,
+                            max_pixels=int(
+                                os.getenv("LLM_IMAGE_MAX_PIXELS", "16000000")
+                            ),
+                        )
+                    except (OSError, ValueError) as exc:
+                        logger.warning(
+                            "image description skipped for %s: %s",
+                            path,
+                            exc,
+                        )
+                    else:
+                        asset.task = asyncio.create_task(
+                            workers.run_network(describe_image, llm_data_url, alt)
+                        )
+                        await asyncio.sleep(0)
                 continue
 
             try:
@@ -118,7 +171,9 @@ async def embed_markdown_images(
 
             asset = _ImageAsset(data_url=encoded)
             assets[path] = asset
-            if describe_image is not None:
+            if describe_image is not None and (
+                should_describe is None or should_describe(alt)
+            ):
                 try:
                     llm_data_url = llm_image_data_url(
                         image_bytes,
@@ -161,6 +216,8 @@ async def embed_markdown_images(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+    descriptions_emitted: set[Path] = set()
+
     def replace_image(match: re.Match[str]) -> str:
         alt_target = _ref_alt_target(match)
         if alt_target is None:
@@ -170,10 +227,91 @@ async def embed_markdown_images(
         asset = assets.get(path) if path is not None else None
         if asset is None:
             return match.group(0)
+        description = asset.description
+        if should_describe is not None and not should_describe(alt):
+            description = ""
+        if description and not repeat_descriptions:
+            if path in descriptions_emitted:
+                description = ""
+            else:
+                descriptions_emitted.add(path)
         return embed_data_url(
             asset.data_url,
-            description=asset.description,
+            description=description,
             alt=alt,
         )
 
     return _IMAGE_REF_RE.sub(replace_image, markdown)
+
+
+def embed_markdown_data_urls(
+    markdown: str,
+    markdown_path: Path,
+    allowed_root: Path,
+) -> str:
+    """Replace local Markdown images with inline ``![alt](data:...)`` URLs.
+
+    This is the generic-profile image policy: ordinary Markdown that renders
+    natively and never requires the custom ``<image-unit>`` markup or a vision
+    model. Alt text is preserved verbatim. Each unique file is read and encoded
+    once. Dangling or out-of-root references are left untouched.
+    """
+    matches = [m for m in _IMAGE_REF_RE.finditer(markdown) if _ref_alt_target(m)]
+    if not matches:
+        return markdown
+
+    encoded: dict[Path, str] = {}
+    for match in matches:
+        _alt, target = _ref_alt_target(match)  # type: ignore[misc]
+        path = resolve_local_image(
+            markdown_path, allowed_root, target
+        )
+        if path is None or path in encoded:
+            continue
+        try:
+            mime = mimetypes.guess_type(path.name)[0] or "image/png"
+            encoded[path] = image_data_url(path.read_bytes(), mime)
+        except OSError as exc:
+            logger.warning("could not read extracted image %s: %s", path, exc)
+
+    if not encoded:
+        return markdown
+
+    def replace(match: re.Match[str]) -> str:
+        alt_target = _ref_alt_target(match)
+        if alt_target is None:
+            return match.group(0)
+        alt, target = alt_target
+        path = resolve_local_image(
+            markdown_path, allowed_root, target
+        )
+        data_url = encoded.get(path) if path is not None else None
+        if data_url is None:
+            return match.group(0)
+        return f"![{alt}]({data_url})"
+
+    return _IMAGE_REF_RE.sub(replace, markdown)
+
+
+def strip_markdown_image_media(markdown: str) -> str:
+    """Remove Markdown image media, keeping only readable alt/location text.
+
+    The generic ``images=false`` counterpart to :func:`embed_markdown_data_urls`
+    and the image-unit ``strip_image_media``. A Markdown image becomes its alt
+    text so worksheet-cell and slide-position context survives as plain text.
+    """
+    if not isinstance(markdown, str) or not markdown:
+        return markdown
+
+    def replace(match: re.Match[str]) -> str:
+        alt = match.group("alt").strip()
+        return alt if alt else ""
+
+    return _MD_IMAGE_RE.sub(replace, markdown)
+
+
+def count_markdown_images(markdown: str) -> int:
+    """Return the number of Markdown image references in a document."""
+    if not isinstance(markdown, str) or not markdown:
+        return 0
+    return len(_MD_IMAGE_RE.findall(markdown))

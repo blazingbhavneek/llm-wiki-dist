@@ -2,34 +2,66 @@
 
 from __future__ import annotations
 
-import mimetypes
-import re
 import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from utils.image_unit import count_image_units, embed_image, strip_image_media
+from utils.image_unit import count_image_units, strip_image_media
+from utils.markdown_images import (
+    count_markdown_images,
+    embed_markdown_data_urls,
+    strip_markdown_image_media,
+)
 
 if TYPE_CHECKING:
     from workers import Workers
 
-_MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)\s]+)\)")
+
+class ParseProfile(StrEnum):
+    """How a parse request processes images and pages.
+
+    ``GENERIC`` produces ordinary Markdown with data-URL images and never calls
+    an LLM. ``LLM_WIKI`` preserves the historical ``<image-unit>`` pipeline.
+    The profile is always selected explicitly by the caller (server route);
+    it is never inferred from a URL, filename, header, or manifest.
+    """
+
+    GENERIC = "generic"
+    LLM_WIKI = "llm-wiki"
 
 
 @dataclass
 class ParseOptions:
     """Client-level overrides for one request (kept picklable for workers)."""
 
-    images: bool = True  # on: base64 <image-unit> blocks, off: description text only
+    images: bool = True  # on: base64 image blocks, off: description text only
     describe_images: bool = True
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
     filename: str | None = None  # original upload name, used for document titles
     manifest: dict | None = None  # optional caller-supplied format manifest
+    profile: ParseProfile = ParseProfile.GENERIC
+
+
+@dataclass(slots=True)
+class ExtractedDocument:
+    """Raw, format-specific extraction before any profile image policy.
+
+    ``markdown`` and every ``pages`` entry share the same relative image
+    references. ``BaseParser.parse`` embeds them either as Markdown data URLs
+    (generic) or leaves them pre-embedded as image-unit blocks (llm-wiki).
+    The internal structure is never exposed directly in the HTTP API.
+    """
+
+    markdown: str
+    pages: list[str] = field(default_factory=list)
+    markdown_path: Path | None = None
+    asset_root: Path | None = None
 
 
 @dataclass
@@ -41,6 +73,7 @@ class ParseResult:
     image_count: int = 0
     duration_s: float = 0.0
     meta: dict = field(default_factory=dict)
+    pages: list[str] = field(default_factory=list)
 
 
 class BaseParser(ABC):
@@ -77,23 +110,42 @@ class BaseParser(ABC):
         options: ParseOptions | None,
         workers: Workers,
     ) -> ParseResult:
-        """Template method: staged extract -> inline assembly and image policy."""
+        """Template method: staged extract -> inline assembly and image policy.
+
+        ``GENERIC`` embeds ordinary Markdown data-URL images into both the
+        full document and every page and never touches an LLM. ``LLM_WIKI``
+        trusts the extractor's already-embedded image-unit output and applies
+        the historical stripping/counting policy. ``image_count`` always
+        describes the returned ``markdown``, never the sum across pages.
+        """
         options = options or ParseOptions()
         start = time.perf_counter()
 
         with tempfile.TemporaryDirectory(prefix="doc-parser-") as image_dir:
-            text = await self._extract(data, image_dir, options, workers)
-            markdown = self._embed_images(text, image_dir)
-            image_count = count_image_units(markdown)
+            document = await self._extract(data, image_dir, options, workers)
 
-        if not options.images:
-            markdown = strip_image_media(markdown)
+            if options.profile == ParseProfile.GENERIC:
+                markdown, pages = self._embed_generic(document)
+                if not options.images:
+                    markdown = strip_markdown_image_media(markdown)
+                    pages = [strip_markdown_image_media(page) for page in pages]
+                # Count after the images=false strip so the returned count
+                # always describes the returned markdown.
+                image_count = count_markdown_images(markdown)
+            else:
+                markdown = document.markdown
+                pages = list(document.pages)
+                image_count = count_image_units(markdown)
+                if not options.images:
+                    markdown = strip_image_media(markdown)
+                    pages = [strip_image_media(page) for page in pages]
 
         return ParseResult(
             markdown=markdown,
             parser=self.name,
             image_count=image_count,
             duration_s=time.perf_counter() - start,
+            pages=pages,
         )
 
     # ------------------------------------------------------------------
@@ -106,28 +158,34 @@ class BaseParser(ABC):
         image_dir: str,
         options: ParseOptions,
         workers: Workers,
-    ) -> str:
+    ) -> ExtractedDocument:
         """Format-specific step.
 
         Keep genuinely small work inline. Use ``workers.run_external`` for
         blocking converters, ``workers.run_gpu`` for GPU functions, and
         ``workers.run_network`` for async image-description/LLM calls.
 
-        Return the document as markdown. Any images must be written as
-        files inside ``image_dir`` and referenced relatively, e.g.
-        ``![alt](img_1.png)``. ``_embed_images`` converts those references
-        into base64 ``<image-unit>`` blocks afterwards.
+        In ``GENERIC`` return raw Markdown with relative image references
+        (``![alt](media/img_1.png)``) plus the resolved ``markdown_path`` and
+        ``asset_root`` so :meth:`parse` can embed data URLs. In ``LLM_WIKI``
+        return the historical fully-embedded ``<image-unit>`` Markdown and
+        pages; ``markdown_path``/``asset_root`` are unused on that path.
         """
 
-    def _embed_images(self, markdown: str, image_dir: str) -> str:
-        """Replace relative image references with base64 <image-unit> blocks."""
-
-        def replace(match: re.Match[str]) -> str:
-            root = Path(image_dir).resolve()
-            path = (root / match.group("path")).resolve()
-            if not path.is_relative_to(root) or not path.is_file():
-                return match.group(0)  # leave dangling refs untouched
-            mime = mimetypes.guess_type(path.name)[0] or "image/png"
-            return embed_image(path.read_bytes(), mime=mime)
-
-        return _MD_IMAGE_RE.sub(replace, markdown)
+    def _embed_generic(self, document: ExtractedDocument) -> tuple[str, list[str]]:
+        """Replace relative references with Markdown data URLs everywhere."""
+        markdown = document.markdown
+        pages = list(document.pages)
+        if document.markdown_path is not None and document.asset_root is not None:
+            markdown = embed_markdown_data_urls(
+                markdown,
+                document.markdown_path,
+                document.asset_root,
+            )
+            pages = [
+                embed_markdown_data_urls(
+                    page, document.markdown_path, document.asset_root
+                )
+                for page in pages
+            ]
+        return markdown, pages

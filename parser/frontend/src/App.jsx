@@ -42,7 +42,6 @@ export default function App() {
   const { t, i18n } = useTranslation()
   const [file, setFile] = useState(null)
   const [includeImages, setIncludeImages] = useState(true)
-  const [describeImages, setDescribeImages] = useState(true)
   const [dragging, setDragging] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -98,10 +97,8 @@ export default function App() {
     try {
       const form = new FormData()
       form.append('file', f)
-      const qs = new URLSearchParams({
-        images: String(includeImages),
-        describe_images: String(describeImages),
-      })
+      // Generic route: ordinary Markdown data-URL images, never an LLM call.
+      const qs = new URLSearchParams({ images: String(includeImages) })
       const res = await fetch(`${URL_PREFIX}/parse?${qs.toString()}`, {
         method: 'POST',
         body: form,
@@ -217,15 +214,6 @@ export default function App() {
               className="h-4 w-4 accent-neutral-900"
             />
             {t('includeImages')}
-          </label>
-          <label className="flex cursor-pointer select-none items-center gap-2">
-            <input
-              type="checkbox"
-              checked={describeImages}
-              onChange={(e) => setDescribeImages(e.target.checked)}
-              className="h-4 w-4 accent-neutral-900"
-            />
-            {t('describeImages')}
           </label>
 
           <div className="ml-auto flex gap-2">

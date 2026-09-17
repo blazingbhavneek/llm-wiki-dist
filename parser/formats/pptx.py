@@ -3,11 +3,16 @@
 Each slide becomes a section containing its text, tables, spatially annotated
 pictures, speaker notes, and a rendered overview image. Extracted pictures and
 slide overviews flow through the shared image-description pipeline.
+
+Under the generic profile, individual pictures and the LLM pipeline are
+skipped entirely; each slide contains its text followed by exactly one
+complete-slide screenshot rendered by LibreOffice and PDFium.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
 import os
@@ -15,6 +20,7 @@ import re
 import subprocess
 import tempfile
 import zipfile
+from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
@@ -24,8 +30,8 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.exc import PackageNotFoundError
 
 from client.llm import LLMClient
-from formats.base import BaseParser, ParseOptions
-from utils.image_unit import strip_image_media
+from formats.base import BaseParser, ExtractedDocument, ParseOptions, ParseProfile
+from utils.image_unit import deduplicate_image_descriptions, strip_image_media
 from utils.markdown_images import embed_markdown_images
 from utils.vector_images import convert_document_vector_images, find_libreoffice_command
 from workers import Workers
@@ -36,6 +42,10 @@ _CONTENT_TYPES = "[Content_Types].xml"
 _PRESENTATION_XML = "ppt/presentation.xml"
 _SLIDE_OVERVIEW_RE = re.compile(
     r"!\[(?P<alt>[^\]]*)\]\((?P<target>media/slide-(?P<slide>\d+)\.png)\)"
+)
+_SLIDE_BOUNDARY_RE = re.compile(r"(?=^## スライド \d+\s*$)", re.MULTILINE)
+_PICTURE_SIZE_RE = re.compile(
+    r"幅 (?P<width>[\d.]+)%、高さ (?P<height>[\d.]+)%"
 )
 
 
@@ -118,6 +128,100 @@ def _shape_placement(shape, slide_width: int, slide_height: int) -> str:
         f"左 {left:.1f}%、上 {top:.1f}%、"
         f"幅 {width:.1f}%、高さ {height:.1f}%"
     )
+
+
+def _should_describe_picture(alt_text: str) -> bool:
+    """Skip tiny icons and fragments that only matter in the full-slide view."""
+    match = _PICTURE_SIZE_RE.search(alt_text)
+    if match is None:
+        return True
+    try:
+        minimum_area = max(
+            0.0,
+            float(os.getenv("PPTX_INDIVIDUAL_IMAGE_MIN_AREA_PERCENT", "1.0")),
+        )
+    except ValueError:
+        minimum_area = 1.0
+    area_percent = float(match.group("width")) * float(match.group("height")) / 100
+    return area_percent >= minimum_area
+
+
+def _slide_needs_review(context: str) -> bool:
+    """Use the expensive multi-draft judge loop only for composition-rich slides."""
+    lines = [line.strip() for line in context.splitlines() if line.strip()]
+    picture_count = context.count("**画像位置:**")
+    has_table = any(line.startswith("|") and line.endswith("|") for line in lines)
+    content_lines = [
+        line
+        for line in lines
+        if not line.startswith(("## スライド ", "### ", "**画像位置:**", ">"))
+    ]
+    return (
+        (picture_count > 0 and bool(content_lines))
+        or has_table
+        or picture_count > 1
+        or len(content_lines) >= 4
+    )
+
+
+async def _describe_slide_with_review(
+    client: LLMClient,
+    data_url: str,
+    context: str,
+) -> str:
+    """Generate, critique, and select the best description for a complex slide."""
+    try:
+        configured_attempts = int(os.getenv("PPTX_SLIDE_DESCRIPTION_ATTEMPTS", "4"))
+    except ValueError:
+        configured_attempts = 4
+    attempts = (
+        max(1, min(5, configured_attempts))
+        if _slide_needs_review(context)
+        else 1
+    )
+
+    best_description = ""
+    best_score = -1.0
+    revision_history: list[tuple[str, str]] = []
+    for _ in range(attempts):
+        try:
+            candidate = await client.describe_slide(
+                data_url,
+                context,
+                revision_history,
+            )
+        except Exception:  # noqa: BLE001 - preserve a successfully generated draft
+            if best_description:
+                logger.exception("could not generate another slide-description draft")
+                break
+            raise
+
+        if attempts == 1:
+            return candidate
+
+        try:
+            review = await client.judge_slide_description(
+                data_url,
+                context,
+                candidate,
+            )
+            score = review.score
+            feedback = review.missing
+        except Exception:  # noqa: BLE001 - a judge outage must not discard the draft
+            logger.exception("slide-description judge failed")
+            score = min(99.0, len(candidate.strip()) / 10)
+            feedback = "前稿をより具体的かつ網羅的にし、要素間の関係を追加してください。"
+
+        revision_history.append((candidate, feedback))
+        logger.debug("slide-description draft scored %.1f: %s", score, feedback)
+
+        # Prefer the later revision when scores tie because it incorporates
+        # more of the judge conversation without sacrificing measured quality.
+        if score >= best_score:
+            best_description = candidate
+            best_score = score
+
+    return best_description
 
 
 def render_slides_with_libreoffice(
@@ -215,12 +319,31 @@ def render_slides_with_libreoffice(
     return filenames
 
 
+@dataclass(slots=True)
+class RenderedPresentation:
+    """Picklable result of converting a PPTX into slide Markdown strings."""
+
+    markdown: str
+    pages: list[str] = field(default_factory=list)
+    markdown_path: Path | None = None
+    asset_root: Path | None = None
+
+
 def run_pptx(
     pptx_path: str,
     output_dir: str,
     slide_images: list[str] | None = None,
-) -> str:
-    """Convert a PPTX to Markdown and extract pictures into ``output_dir``."""
+    profile: ParseProfile = ParseProfile.LLM_WIKI,
+) -> RenderedPresentation:
+    """Convert a PPTX to Markdown and extract pictures into ``output_dir``.
+
+    In generic mode the ``PICTURE`` branch is skipped entirely, no picture
+    blobs are written, and each slide section carries exactly one rendered
+    slide-image reference. In llm-wiki mode the historical behavior is
+    preserved byte-for-byte. The returned ``pages`` are the raw per-slide
+    strings before any image-embedding pass; the parser embeds them as data
+    URLs for generic, or drives them through the LLM pipeline for llm-wiki.
+    """
     source = Path(pptx_path).resolve()
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -237,15 +360,22 @@ def run_pptx(
         if source.stem not in {"document", ""}
         else "プレゼンテーション"
     )
-    sections = [f"# {_cell_text(title)}"]
+    preamble = [f"# {_cell_text(title)}"]
+    slide_bodies: list[list[str]] = []
     image_number = 0
+    images_by_digest: dict[str, str] = {}
 
     for index, slide in enumerate(presentation.slides, start=1):
-        sections.extend(["", f"## スライド {index}"])
+        slide_lines: list[str] = [f"## スライド {index}"]
         title_shape = slide.shapes.title
 
         for shape in _iter_shapes(slide.shapes):
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                if profile == ParseProfile.GENERIC:
+                    # A generic slide carries only the complete-slide
+                    # screenshot; individual pictures, position labels, size
+                    # filters, and dedup caches are all skipped.
+                    continue
                 try:
                     image = shape.image
                     payload = image.blob
@@ -257,10 +387,6 @@ def run_pptx(
                         exc,
                     )
                     continue
-                image_number += 1
-                media_dir.mkdir(parents=True, exist_ok=True)
-                filename = f"image-{image_number}.{extension}"
-                (media_dir / filename).write_bytes(payload)
                 alt = (shape.name or f"スライド {index} の画像").strip()
                 placement = _shape_placement(
                     shape,
@@ -268,7 +394,21 @@ def run_pptx(
                     presentation.slide_height,
                 )
                 contextual_alt = f"{alt}（{placement}）"
-                sections.extend(
+                if not _should_describe_picture(contextual_alt):
+                    # Small icons, arrows, and decorative fragments are more
+                    # useful as part of the rendered slide than as standalone
+                    # image units with generic descriptions.
+                    continue
+
+                digest = hashlib.sha256(payload).hexdigest()
+                filename = images_by_digest.get(digest, "")
+                if not filename:
+                    image_number += 1
+                    media_dir.mkdir(parents=True, exist_ok=True)
+                    filename = f"image-{image_number}.{extension}"
+                    (media_dir / filename).write_bytes(payload)
+                    images_by_digest[digest] = filename
+                slide_lines.extend(
                     [
                         "",
                         f"**画像位置:** {placement}",
@@ -281,7 +421,7 @@ def run_pptx(
             if shape.has_table:
                 table_lines = _render_table(shape.table)
                 if table_lines:
-                    sections.extend(["", *table_lines])
+                    slide_lines.extend(["", *table_lines])
                 continue
 
             if shape.has_text_frame:
@@ -289,18 +429,18 @@ def run_pptx(
                 if not lines:
                     continue
                 if title_shape is not None and shape == title_shape:
-                    sections.extend(["", f"### {' '.join(lines)}"])
+                    slide_lines.extend(["", f"### {' '.join(lines)}"])
                 else:
-                    sections.extend(["", *lines])
+                    slide_lines.extend(["", *lines])
 
         if slide.has_notes_slide:
             note = slide.notes_slide.notes_text_frame.text.strip()
             if note:
                 quoted = "\n".join(f"> {line}" for line in note.splitlines())
-                sections.extend(["", "> **スピーカーノート:**", ">", quoted])
+                slide_lines.extend(["", "> **スピーカーノート:**", ">", quoted])
 
         if slide_images and index <= len(slide_images):
-            sections.extend(
+            slide_lines.extend(
                 [
                     "",
                     "### スライド全体",
@@ -309,10 +449,20 @@ def run_pptx(
                     f"(media/{slide_images[index - 1]})",
                 ]
             )
-        sections.extend(["", "---"])
+        slide_lines.extend(["", "---"])
+        slide_bodies.append(slide_lines)
 
-    markdown_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
-    return str(markdown_path)
+    joined = "\n".join(
+        [*preamble, *(line for body in slide_bodies for line in ["", *body])]
+    )
+    markdown_path.write_text(joined + "\n", encoding="utf-8")
+
+    return RenderedPresentation(
+        markdown=joined,
+        pages=["\n".join(body) for body in slide_bodies],
+        markdown_path=markdown_path,
+        asset_root=destination,
+    )
 
 
 class PptxParser(BaseParser):
@@ -335,7 +485,7 @@ class PptxParser(BaseParser):
         image_dir: str,
         options: ParseOptions,
         workers: Workers,
-    ) -> str:
+    ) -> ExtractedDocument:
         work_dir = Path(image_dir)
         upload_name = Path(options.filename or "").name or "document.pptx"
         if Path(upload_name).suffix.lower() != ".pptx":
@@ -344,12 +494,17 @@ class PptxParser(BaseParser):
         output_dir = work_dir / "pptx-output"
         pptx_path.write_bytes(data)
 
+        # Generic PPTX requires exactly one complete-slide screenshot per
+        # slide, so PPTX_RENDER_SLIDES=false is a hard error there.
+        generic = options.profile == ParseProfile.GENERIC
         slide_images: list[str] = []
         render_mode = os.getenv("PPTX_RENDER_SLIDES", "auto").lower()
-        if render_mode not in {"0", "false", "no", "off"}:
+        required = generic or render_mode in {"1", "true", "yes", "required"}
+        disabled = not generic and render_mode in {"0", "false", "no", "off"}
+        if not disabled:
             command = find_libreoffice_command()
             if command is None:
-                if render_mode in {"1", "true", "yes", "required"}:
+                if required:
                     raise SlideRenderError(
                         "slide rendering was required, but LibreOffice was not found"
                     )
@@ -365,22 +520,50 @@ class PptxParser(BaseParser):
                         command,
                     )
                 except SlideRenderError as exc:
-                    if render_mode in {"1", "true", "yes", "required"}:
+                    if required:
                         raise
                     logger.warning(
                         "slide rendering failed; overview images were skipped: %s",
                         exc,
                     )
 
-        markdown_path = Path(
-            await workers.run_external(
-                run_pptx,
-                str(pptx_path),
-                str(output_dir),
-                slide_images,
-            )
+        rendered: RenderedPresentation = await workers.run_external(
+            run_pptx,
+            str(pptx_path),
+            str(output_dir),
+            slide_images,
+            options.profile,
         )
-        markdown = markdown_path.read_text(encoding="utf-8")
+
+        if generic:
+            slide_count = len(rendered.pages)
+            if not slide_images or len(slide_images) < slide_count:
+                raise SlideRenderError(
+                    "generic PPTX parsing requires one rendered screenshot "
+                    f"per slide; expected {slide_count}, got {len(slide_images)}"
+                )
+            # Vector-image conversion is applied to the document string and to
+            # every slide page so raw references inside pages match media/,
+            # and BaseParser.parse embeds the data URLs identically.
+            markdown = await convert_document_vector_images(
+                rendered.markdown, output_dir / "media", workers
+            )
+            pages = [
+                await convert_document_vector_images(page, output_dir / "media", workers)
+                for page in rendered.pages
+            ]
+            return ExtractedDocument(
+                markdown=markdown,
+                pages=pages,
+                markdown_path=rendered.markdown_path,
+                asset_root=rendered.asset_root,
+            )
+
+        # llm-wiki path: preserve the historical full-document description,
+        # deduplication, and slide-synthesis pipeline byte-for-byte.
+        markdown = rendered.markdown
+        markdown_path = rendered.markdown_path
+        assert markdown_path is not None
         markdown = await convert_document_vector_images(
             markdown, output_dir / "media", workers
         )
@@ -413,17 +596,26 @@ class PptxParser(BaseParser):
                 workers,
                 client.describe_image if client is not None else None,
             )
+            # Keep repeated descriptions in the private synthesis context so
+            # every slide judge sees the text for all of its images. Suppress
+            # those repetitions only in the document returned to the caller.
+            synthesis_context_markdown = markdown
+            markdown = deduplicate_image_descriptions(markdown)
 
             async def embed_overview(
                 token: str,
                 slide_number: int,
                 reference: str,
             ) -> tuple[str, str]:
-                context = _slide_context(markdown, slide_number, token)
+                context = _slide_context(
+                    synthesis_context_markdown,
+                    slide_number,
+                    token,
+                )
 
                 async def describe(data_url: str, _alt_text: str) -> str:
                     assert client is not None
-                    return await client.describe_slide(data_url, context)
+                    return await _describe_slide_with_review(client, data_url, context)
 
                 embedded = await embed_markdown_images(
                     reference,
@@ -440,7 +632,17 @@ class PptxParser(BaseParser):
                 )
                 for token, overview in overviews:
                     markdown = markdown.replace(token, overview, 1)
-            return markdown
+
+            # Derive per-slide llm-wiki pages from the final fully-embedded
+            # markdown. The document-level title stays only in the full output,
+            # matching the PDF preamble rule.
+            sections = _SLIDE_BOUNDARY_RE.split(markdown)
+            pages = [
+                section.strip()
+                for section in sections
+                if section.lstrip().startswith("## スライド ")
+            ]
+            return ExtractedDocument(markdown=markdown, pages=pages)
         finally:
             if client is not None:
                 await client.close()

@@ -46,7 +46,14 @@ complete slide to a PNG placed at the end of that slide section; those overview
 images receive a second-stage synthesis prompt containing the extracted slide
 text and completed individual-image descriptions. The synthesis focuses on
 layout, relationships, visual roles, and the overall message without repeating
-already-extracted content. Set
+already-extracted content. Composition-rich slides produce four iterative drafts; a
+vision judge scores missing interactions and feeds its criticism into later
+drafts before the best-scoring description is selected. Byte-identical pictures
+are described once; tiny icons or visual fragments are omitted as standalone
+images and left to the complete-slide description. Set
+`PPTX_SLIDE_DESCRIPTION_ATTEMPTS` from 1 to 5 to set the
+draft count, and use `PPTX_INDIVIDUAL_IMAGE_MIN_AREA_PERCENT` to adjust the
+default 1% slide-area cutoff for individual descriptions. Set
 `PPTX_RENDER_SLIDES=false` to disable this or `required` to fail when rendering
 is unavailable. `PPTX_SLIDE_RENDER_WIDTH` controls the default 1600-pixel width.
 
@@ -69,6 +76,10 @@ MinerU must be able to find its models and run through the `mineru` command.
 `MINERU_VENV_BIN` is auto-discovered (PATH, then the project's `.venv`/`venv`,
 then common venv roots); set it only to force a specific install. Also set
 `MINERU_COMMAND` when the executable has a different name.
+MinerU subprocesses disable PyTorch's cuDNN SDPA backend by default because
+UniMERNet formula recognition can otherwise fail with `No valid execution plans
+built`; Flash, memory-efficient, and math SDPA remain available. Set
+`MINERU_DISABLE_CUDNN_SDPA=false` to restore PyTorch's default selection.
 The included defaults select physical CUDA device 1, reserve a `0.1` GPU-memory
 fraction, and process pages in windows of 4; all are configurable in `.env`.
 Pandoc must also be installed and available as `pandoc`, or configured through
@@ -80,6 +91,59 @@ Start the server:
 uv run uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
+## Routes and profiles
+
+`URL_PREFIX` (for example `/agent/doc-parser`) is a deployment mount point only.
+It never selects behavior; two explicit routes do:
+
+- `POST /agent/doc-parser/parse` — generic Markdown. Ordinary Markdown images
+  as `![alt](data:...)` URLs, never calls an LLM, never emits image-unit or
+  image-description blocks, and ignores `describe_images` and the `X-LLM-*`
+  headers. A non-empty `manifest` is rejected with HTTP 400.
+- `POST /agent/doc-parser/parse/llm-wiki` — the historical pipeline: image-unit
+  blocks, LLM descriptions, PPTX judge/revision loop, XLSM manifests, splitting,
+  lineage, and `vba://` links.
+
+Both routes return the same JSON contract:
+
+```json
+{
+  "markdown": "full-document Markdown",
+  "pages": ["ordered page/sheet/unit Markdown strings"],
+  "parser": "pptx",
+  "image_count": 2,
+  "duration_s": 1.23,
+  "meta": {}
+}
+```
+
+`pages` is always present and always a list. DOCX and CSV return `[]`. PDF
+yields one item per PDF page, PPTX one per slide, XLSX one per worksheet, and
+XLSM every worksheet followed by one consolidated VBA-code page and one
+VBA-final-output page. Generic `pages` contain the same data-URL image form as
+`markdown`; llm-wiki `pages` contain the same image-unit form. `image_count`
+always describes `markdown`, never the sum across `pages`.
+
+Generic request (no LLM):
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/parse' \
+  -F 'file=@document.pptx'
+```
+
+llm-wiki request:
+
+```bash
+curl -X POST \
+  'http://127.0.0.1:8000/parse/llm-wiki?images=true&describe_images=true' \
+  -H 'X-LLM-Base-URL: http://llm.example/v1' \
+  -H 'X-LLM-Model: model-name' \
+  -F 'file=@document.pptx'
+```
+
+The graph pipeline migrates to `/parse/llm-wiki` so its downstream lineage,
+splitting, and description behavior remains unchanged.
+
 ## Parse a PDF
 
 PDF responses stream invisible JSON-whitespace heartbeats while MinerU runs.
@@ -88,18 +152,18 @@ The completed response body is standard JSON, so normal clients can call
 
 ```bash
 curl -N -X POST \
-  'http://127.0.0.1:8000/parse?images=true&describe_images=true' \
+  'http://127.0.0.1:8000/parse/llm-wiki?images=true&describe_images=true' \
   -H 'X-LLM-Base-URL: http://10.160.144.101:51029/v1' \
   -H 'X-LLM-Model: gemma-4-31B' \
   -H 'X-LLM-API-Key: local' \
   -F 'file=@document.pdf'
 ```
 
-DOCX uses the same endpoint and returns a normal JSON response:
+DOCX uses the llm-wiki route too and returns a normal JSON response:
 
 ```bash
 curl -X POST \
-  'http://127.0.0.1:8000/parse?images=true&describe_images=true' \
+  'http://127.0.0.1:8000/parse/llm-wiki?images=true&describe_images=true' \
   -F 'file=@document.docx'
 ```
 

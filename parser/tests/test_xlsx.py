@@ -11,7 +11,7 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 from openpyxl import Workbook
@@ -21,8 +21,9 @@ from openpyxl.worksheet.formula import ArrayFormula
 from PIL import Image
 
 from formats import detect
-from formats.base import ParseOptions
+from formats.base import ParseOptions, ParseProfile
 from formats.xlsx import (
+    RenderedWorkbook,
     XlsxParser,
     _render_worksheet,
     _render_worksheet_parts,
@@ -58,7 +59,7 @@ class FakeWorkers:
         self.external_functions = []
         self.network_calls = 0
 
-    async def run_external(self, fn, source: str, output_dir: str, *args) -> str:
+    async def run_external(self, fn, source: str, output_dir: str, *args) -> Any:
         self.external_functions.append(fn)
         destination = Path(output_dir)
         destination.mkdir(parents=True, exist_ok=True)
@@ -68,20 +69,33 @@ class FakeWorkers:
             shutil.copyfile(source, recalculated)
             return str(recalculated)
 
-        media = destination / "media"
-        media.mkdir()
-        (media / "image-1.png").write_bytes(_PNG_BYTES)
-        markdown_path = destination / "document.md"
-        markdown_path.write_text(
-            "# Excel workbook\n\n"
-            "<table>\n"
-            "<tr><td>Revenue</td><td>10</td></tr>\n"
-            "</table>\n\n"
-            "**画像位置:** Summary シート、セル D4\n\n"
-            "![Summary シートのセル D4 を覆う画像](media/image-1.png)\n",
-            encoding="utf-8",
-        )
-        return str(markdown_path)
+        if fn is run_openpyxl:
+            media = destination / "media"
+            media.mkdir(exist_ok=True)
+            (media / "image-1.png").write_bytes(_PNG_BYTES)
+            markdown_path = destination / "document.md"
+            markdown = (
+                "# Excel workbook\n\n"
+                "<table>\n"
+                "<tr><td>Revenue</td><td>10</td></tr>\n"
+                "</table>\n\n"
+                "## シート: Summary\n\n"
+                "**画像位置:** Summary シート、セル D4\n\n"
+                "![Summary シートのセル D4 を覆う画像](media/image-1.png)\n"
+            )
+            markdown_path.write_text(markdown, encoding="utf-8")
+            return RenderedWorkbook(
+                markdown=markdown,
+                pages=[
+                    "## シート: Summary\n\n"
+                    "**画像位置:** Summary シート、セル D4\n\n"
+                    "![Summary シートのセル D4 を覆う画像](media/image-1.png)\n"
+                ],
+                markdown_path=markdown_path,
+                asset_root=destination,
+            )
+
+        return fn(source, output_dir, *args)
 
     async def run_network(self, fn, *args, **kwargs):
         self.network_calls += 1
@@ -211,13 +225,11 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
                 "procedures": [],
             }
 
-            markdown = Path(
-                run_openpyxl(
-                    str(source),
-                    str(output),
-                    manifest_json=json.dumps(manifest, ensure_ascii=False),
-                )
-            ).read_text(encoding="utf-8")
+            markdown = run_openpyxl(
+                str(source),
+                str(output),
+                manifest_json=json.dumps(manifest, ensure_ascii=False),
+            ).markdown
 
         self.assertIn("## シート: グラフ", markdown)
         self.assertIn("## シート: グラフデータ-part1", markdown)
@@ -306,8 +318,7 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
             workbook.save(source)
             workbook.close()
 
-            markdown_path = Path(run_openpyxl(str(source), str(output)))
-            markdown = markdown_path.read_text(encoding="utf-8")
+            markdown = run_openpyxl(str(source), str(output)).markdown
 
             self.assertIn("<table>", markdown)
             self.assertNotIn("style=", markdown)
@@ -336,9 +347,7 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
             workbook.save(source)
             workbook.close()
 
-            markdown = Path(run_openpyxl(str(source), str(output))).read_text(
-                encoding="utf-8"
-            )
+            markdown = run_openpyxl(str(source), str(output)).markdown
 
             self.assertIn("Sheet シートのセル C3:E10 を覆う画像", markdown)
             self.assertIn("**画像位置:** Sheet シート、セル C3:E10", markdown)
@@ -374,8 +383,7 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                markdown_path = Path(run_openpyxl(str(source), str(output)))
-            markdown = markdown_path.read_text(encoding="utf-8")
+                markdown = run_openpyxl(str(source), str(output)).markdown
 
             self.assertIn(
                 "![Sheet シートのセル B2 を覆うベクター画像]"
@@ -421,6 +429,7 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
             llm_base_url="http://override/v1",
             llm_api_key="override-key",
             llm_model="override-model",
+            profile=ParseProfile.LLM_WIKI,
         )
         FakeLLMClient.configurations.clear()
 
@@ -449,8 +458,24 @@ class XlsxParserTests(unittest.IsolatedAsyncioTestCase):
             filename="source.xlsm",
             describe_images=False,
             manifest={"mode": "xlsm-vba-lineage", "sheets": [{"name": "Summary", "emit": "full"}]},
+            profile=ParseProfile.LLM_WIKI,
         )
         with patch("formats.xlsx.find_libreoffice_command", return_value=["libreoffice"]):
+            await XlsxParser().parse(make_xlsx(), options, workers)
+
+        self.assertEqual(workers.external_functions, [run_openpyxl])
+
+    async def test_generic_xlsm_never_opens_libreoffice(self) -> None:
+        workers = FakeWorkers()
+        options = ParseOptions(
+            filename="source.xlsm",
+            describe_images=False,
+            profile=ParseProfile.GENERIC,
+        )
+        with (
+            patch("formats.xlsx.has_vba", return_value=True),
+            patch("formats.xlsx.find_libreoffice_command", return_value=["libreoffice"]),
+        ):
             await XlsxParser().parse(make_xlsx(), options, workers)
 
         self.assertEqual(workers.external_functions, [run_openpyxl])

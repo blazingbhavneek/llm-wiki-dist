@@ -13,7 +13,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from formats import detect
-from formats.base import ParseOptions
+from formats.base import ParseOptions, ParseProfile
 from formats.docx import DocxParser, run_pandoc
 
 _PNG_BYTES = base64.b64decode(
@@ -117,6 +117,7 @@ class DocxParserTests(unittest.IsolatedAsyncioTestCase):
             llm_base_url="http://override/v1",
             llm_api_key="override-key",
             llm_model="override-model",
+            profile=ParseProfile.LLM_WIKI,
         )
         FakeLLMClient.configurations.clear()
 
@@ -149,7 +150,11 @@ class DocxParserTests(unittest.IsolatedAsyncioTestCase):
         with patch("formats.docx.LLMClient", side_effect=AssertionError):
             result = await DocxParser().parse(
                 document,
-                ParseOptions(images=True, describe_images=False),
+                ParseOptions(
+                    images=True,
+                    describe_images=False,
+                    profile=ParseProfile.LLM_WIKI,
+                ),
                 workers,
             )
 
