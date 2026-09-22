@@ -94,6 +94,7 @@ export function useWorkspace({ t, fireToast, setFocusIds, rememberNodes }) {
     centerView,
     setCenterView,
     centerHistory,
+    pushCenterHistory,
     closeWorkspace,
     openWorkspace,
     goBackFromWorkspace,

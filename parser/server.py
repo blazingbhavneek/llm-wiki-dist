@@ -32,11 +32,12 @@ from fastapi.staticfiles import StaticFiles
 from formats import ParseOptions, ParseResult, UnsupportedFormatError, detect
 from formats.base import ParseProfile
 from workers import Workers
-from workers.mineru_api import MinerUApiService
 
 logger = logging.getLogger("doc-parser")
 
-load_dotenv()
+# Keep explicit process/container environment variables authoritative while
+# using a local .env file as the fallback configuration source.
+load_dotenv(override=False)
 
 # Optional URL prefix, e.g. URL_PREFIX=/aaa/bbb serves every route under
 # http://host:port/aaa/bbb/... main.py writes the same value into
@@ -46,6 +47,9 @@ if URL_PREFIX and not URL_PREFIX.startswith("/"):
     URL_PREFIX = f"/{URL_PREFIX}"
 
 HEARTBEAT_INTERVAL_S = 15.0
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 
 # Vite builds the React app here (frontend/vite.config.js -> build.outDir).
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -60,17 +64,15 @@ ROOT_RELATIVE_ASSET_RE = re.compile(
 # ----------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.ready = False
     app.state.workers = Workers()
-    # Warm MinerU FastAPI service with the VLM preloaded, so PDF parsing
-    # through vlm/hybrid backends skips the multi-minute vLLM cold start.
-    # Runs in its own process group; killed when this server shuts down.
-    mineru_api = MinerUApiService()
-    app.state.mineru_api = mineru_api
-    mineru_api.start()
+    app.state.ready = True
     logger.info("workers started: external executor + GPU executor + network limiter")
-    yield
-    app.state.workers.shutdown()
-    mineru_api.stop()
+    try:
+        yield
+    finally:
+        app.state.ready = False
+        app.state.workers.shutdown()
 
 
 app = FastAPI(title="doc-parser", version="0.1.0", lifespan=lifespan)
@@ -85,16 +87,52 @@ async def strip_url_prefix(request: Request, call_next):
             remaining = path[len(URL_PREFIX) :]
             request.scope["path"] = remaining or "/"
             request.scope["raw_path"] = remaining.encode("utf-8")
-        elif path == "/health":
+        elif path in {"/health", "/health/live", "/health/ready"}:
             pass  # Keep an unprefixed health check available to monitors.
         else:
             return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+    # Reject obviously oversized multipart bodies before Starlette spools them
+    # into the container's temporary filesystem. The chunked check in
+    # ``_run_parse`` remains authoritative for clients using chunked transfer.
+    if request.method == "POST" and request.scope.get("path") in {
+        "/parse",
+        "/parse/llm-wiki",
+    }:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = 0
+            if declared_length > MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD_BYTES:
+                return JSONResponse(
+                    {"detail": f"Upload exceeds the {MAX_UPLOAD_BYTES} byte limit"},
+                    status_code=413,
+                )
     return await call_next(request)
 
 
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/health/live")
+async def health_live() -> dict:
+    """Cheap process liveness probe; it does not inspect dependencies."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def health_ready(request: Request) -> Response:
+    """Readiness probe used by container/orchestrator health checks."""
+    workers: Workers | None = getattr(request.app.state, "workers", None)
+    if not getattr(request.app.state, "ready", False) or workers is None:
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+    if not workers.ready():
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+    return JSONResponse({"status": "ready"})
 
 
 @app.get("/workers")
@@ -109,27 +147,27 @@ async def parse_generic(
     file: Annotated[UploadFile, File()],
     manifest: Annotated[str | None, Form()] = None,
     images: Annotated[bool, Query()] = True,
-    describe_images: Annotated[bool, Query()] = True,
+    describe_images: Annotated[bool, Query()] = False,
     llm_base_url: Annotated[str | None, Header(alias="X-LLM-Base-URL")] = None,
     llm_api_key: Annotated[str | None, Header(alias="X-LLM-API-Key")] = None,
     llm_model: Annotated[str | None, Header(alias="X-LLM-Model")] = None,
 ):
-    """Generic Markdown route: ordinary data-URL images, never an LLM."""
+    """Generic Markdown route with optional descriptions for every image."""
     if manifest:
         raise HTTPException(
             status_code=400, detail="manifest is only supported by /parse/llm-wiki"
         )
-    # describe_images and LLM headers are accepted for compatibility but
-    # ignored; the generic profile never constructs an LLM client.
+    # Generic mode describes every extracted Markdown image when requested;
+    # it does not apply llm-wiki's image-selection logic.
     return await _run_parse(
         request,
         file,
         None,
         images=images,
-        describe_images=False,
-        llm_base_url=None,
-        llm_api_key=None,
-        llm_model=None,
+        describe_images=describe_images,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
         profile=ParseProfile.GENERIC,
     )
 
@@ -184,7 +222,18 @@ async def _run_parse(
     llm_model: str | None,
     profile: ParseProfile,
 ):  # returns a JSON-serialisable dict or an SSE-style streaming Response
-    data = await file.read()
+    data_buffer = bytearray()
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        data_buffer.extend(chunk)
+        if len(data_buffer) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upload exceeds the {MAX_UPLOAD_BYTES} byte limit",
+            )
+    data = bytes(data_buffer)
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
 

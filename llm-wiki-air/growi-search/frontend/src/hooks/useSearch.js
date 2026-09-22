@@ -54,13 +54,5 @@ export function useSearch({ t, fireToast, setCenterView }) {
     }
   }
 
-  /** Show externally produced results (TopBar already ran the query). */
-  const showResults = ({ query, results }) => {
-    setSearchQuery(query)
-    setSearchResults(Array.isArray(results) ? results : [])
-    setSearchLoading(false)
-    setCenterView('search')
-  }
-
-  return { searchQuery, searchResults, searchLoading, onSearch, showResults }
+  return { searchQuery, searchResults, searchLoading, onSearch }
 }

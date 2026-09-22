@@ -24,9 +24,9 @@ export function getPreviewInteractionProps() {
 export function normalizeImageSrc(src) {
   if (typeof src !== 'string') return ''
 
-  const trimmed = src.trim()
+  const trimmed = unescapeHtml(src.trim())
 
-  if (/^data:image\//i.test(trimmed)) {
+  if (/^data:image\//i.test(trimmed) && /;\s*base64\s*,/i.test(trimmed)) {
     return trimmed.replace(/\s+/g, '')
   }
 
@@ -41,7 +41,7 @@ export function isSafeImageSrc(src) {
     value.startsWith('./') ||
     value.startsWith('../') ||
     /^https?:\/\//i.test(value) ||
-    /^data:image\/(png|jpe?g|gif|webp|bmp);base64,/i.test(value)
+    /^data:image\/[a-z0-9.+-]+(?:;[^,]*)?,/i.test(value)
   )
 }
 
@@ -95,14 +95,11 @@ function unescapeHtml(value = '') {
 }
 
 function parseImageUnitHtml(html = '') {
-  const imgMatch = html.match(/<img\b[^>]*>/i)
-  const imgTag = imgMatch?.[0] || ''
-
   return {
     type: 'image',
-    src: normalizeImageSrc(extractAttribute(imgTag, 'src')),
-    alt: extractAttribute(imgTag, 'alt'),
-    title: extractAttribute(imgTag, 'title'),
+    src: normalizeImageSrc(extractAttribute(html, 'src')),
+    alt: unescapeHtml(extractAttribute(html, 'alt')),
+    title: unescapeHtml(extractAttribute(html, 'title')),
     description: extractTagContent(html, 'image-description').trim(),
   }
 }

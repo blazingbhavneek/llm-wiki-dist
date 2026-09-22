@@ -65,23 +65,18 @@ functions, macros, or unavailable external links.
 
 ## Setup
 
-Install the server and optional PDF dependencies:
+Install the server dependencies:
 
 ```bash
-uv sync --extra pdf
+uv sync
 cp .env.example .env
 ```
 
-MinerU must be able to find its models and run through the `mineru` command.
-`MINERU_VENV_BIN` is auto-discovered (PATH, then the project's `.venv`/`venv`,
-then common venv roots); set it only to force a specific install. Also set
-`MINERU_COMMAND` when the executable has a different name.
-MinerU subprocesses disable PyTorch's cuDNN SDPA backend by default because
-UniMERNet formula recognition can otherwise fail with `No valid execution plans
-built`; Flash, memory-efficient, and math SDPA remain available. Set
-`MINERU_DISABLE_CUDNN_SDPA=false` to restore PyTorch's default selection.
-The included defaults select physical CUDA device 1, reserve a `0.1` GPU-memory
-fraction, and process pages in windows of 4; all are configurable in `.env`.
+Configure `MINERU_API_URL` to point at your running MinerU v4 API service. PDF
+jobs are uploaded directly to that endpoint; this application does not start a
+MinerU service or local CLI. `MINERU_API_TIER=advanced` is the accuracy-first
+default; `basic` is the closest v4 equivalent to hybrid-basic. A failed API
+request is retried once after 10 seconds.
 Pandoc must also be installed and available as `pandoc`, or configured through
 `PANDOC_COMMAND`.
 
@@ -97,9 +92,10 @@ uv run uvicorn server:app --host 0.0.0.0 --port 8000
 It never selects behavior; two explicit routes do:
 
 - `POST /agent/doc-parser/parse` — generic Markdown. Ordinary Markdown images
-  as `![alt](data:...)` URLs, never calls an LLM, never emits image-unit or
-  image-description blocks, and ignores `describe_images` and the `X-LLM-*`
-  headers. A non-empty `manifest` is rejected with HTTP 400.
+  as `![alt](data:...)` URLs, with optional LLM-generated detailed alt text
+  when `describe_images=true`; it never emits image-unit or image-description
+  blocks and does not apply llm-wiki image-selection logic. The option is
+  disabled by default. A non-empty `manifest` is rejected with HTTP 400.
 - `POST /agent/doc-parser/parse/llm-wiki` — the historical pipeline: image-unit
   blocks, LLM descriptions, PPTX judge/revision loop, XLSM manifests, splitting,
   lineage, and `vba://` links.
@@ -116,6 +112,10 @@ Both routes return the same JSON contract:
   "meta": {}
 }
 ```
+
+PDF extraction uses the same MinerU v4 tier for both profiles. The
+returned Markdown embeds extracted images as data URLs. Requests using
+`describe_images=false` perform no LLM image-description work.
 
 `pages` is always present and always a list. DOCX and CSV return `[]`. PDF
 yields one item per PDF page, PPTX one per slide, XLSX one per worksheet, and
@@ -169,8 +169,9 @@ curl -X POST \
 
 The three `X-LLM-*` headers override `.env` for that request. Omit them to
 use `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY`. Set
-`describe_images=false` to embed images without calling the LLM. Set
-`images=false` to return descriptions without base64 media.
+`describe_images=false` to embed images without calling the LLM. This option is
+available on both routes and defaults to false for the generic route. Set
+`images=false` to return descriptions/alt text without base64 media.
 
 Before an image is sent to the vision endpoint it is validated, normalized to
 PNG, and bounded by `LLM_IMAGE_MAX_PIXELS`. The original extracted image remains

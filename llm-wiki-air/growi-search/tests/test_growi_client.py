@@ -153,5 +153,25 @@ class Children(unittest.TestCase):
         self.assertIn("/_api/v3/page-listing/children", calls[0])
 
 
+class Attachment(unittest.TestCase):
+    def test_uses_separate_attachment_token(self):
+        seen = {}
+
+        def handler(request):
+            seen["auth"] = request.headers.get("authorization")
+            seen["token"] = request.url.params.get("access_token")
+            return httpx.Response(200, content=b"PNG", headers={"content-type": "image/png"})
+
+        client = GrowiSearchClient(
+            "http://growi.test",
+            "page-token",
+            attachment_token="attachment-token",
+            transport=httpx.MockTransport(handler),
+        )
+        self.assertEqual(client.fetch_attachment(ID), (b"PNG", "image/png"))
+        self.assertEqual(seen["auth"], "Bearer attachment-token")
+        self.assertEqual(seen["token"], "attachment-token")
+
+
 if __name__ == "__main__":
     unittest.main()

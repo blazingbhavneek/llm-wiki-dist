@@ -1,6 +1,8 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { api } from '../api'
+
+const CHAT_HISTORY_KEY = 'llm-wiki-chat-history'
 
 function activityLine(ev, t) {
   const who = ev.agent ? t.explorer(ev.agent) : null
@@ -57,9 +59,29 @@ function activityLine(ev, t) {
  */
 export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) {
   const [messages, setMessages] = useState([])
+  const [chatId, setChatId] = useState(newChatId)
+  const [savedChats, setSavedChats] = useState(loadSavedChats)
   const [agentRunning, setAgentRunning] = useState(false)
   const [agentRunId, setAgentRunId] = useState(null)
   const [agentStopping, setAgentStopping] = useState(false)
+
+  useEffect(() => {
+    const firstQuestion = messages.find((message) => message.role === 'user')?.text?.trim()
+    if (!firstQuestion) return
+
+    setSavedChats((prev) => {
+      const next = [
+        {
+          id: chatId,
+          title: firstQuestion.slice(0, 80),
+          messages,
+        },
+        ...prev.filter((chat) => chat.id !== chatId),
+      ]
+      saveChats(next)
+      return next
+    })
+  }, [chatId, messages])
 
   const patchLast = (fn) => {
     setMessages((prev) => {
@@ -94,7 +116,9 @@ export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) 
     let sawCancelled = false
 
     try {
-      await api.askStream(clean, overrides, (ev) => {
+      const { context, citedNodeIds } = buildConversationContext(messages)
+
+      await api.askStream(clean, overrides, context, citedNodeIds, (ev) => {
         if (ev.type === 'run') {
           setAgentRunId(ev.run_id || null)
           return
@@ -194,17 +218,38 @@ export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) 
     }
 
     setMessages([])
+    setChatId(newChatId())
     setAgentRunning(false)
     setAgentRunId(null)
     setAgentStopping(false)
   }
 
-  const recentQuestions = useMemo(() => {
-    return messages
-      .filter((m) => m.role === 'user')
-      .slice(-5)
-      .reverse()
-  }, [messages])
+  const openChat = (id) => {
+    const saved = savedChats.find((chat) => chat.id === id)
+    if (!saved) return
+    if (agentRunId) api.stopAgentRun(agentRunId).catch(() => {})
+
+    setChatId(saved.id)
+    setMessages(saved.messages.map((message) => ({ ...message, streaming: false })))
+    setAgentRunning(false)
+    setAgentRunId(null)
+    setAgentStopping(false)
+  }
+
+  const deleteChat = (id) => {
+    setSavedChats((prev) => {
+      const next = prev.filter((chat) => chat.id !== id)
+      saveChats(next)
+      return next
+    })
+    if (id === chatId) resetChat()
+  }
+
+  const clearChats = () => {
+    saveChats([])
+    setSavedChats([])
+    resetChat()
+  }
 
   return {
     messages,
@@ -212,9 +257,62 @@ export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) 
     ask,
     stopAgent,
     resetChat,
+    openChat,
+    deleteChat,
+    clearChats,
+    savedChats,
+    chatId,
     agentRunning,
     agentRunId,
     agentStopping,
-    recentQuestions,
+  }
+}
+
+function newChatId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
+}
+
+function loadSavedChats() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(CHAT_HISTORY_KEY) || '[]')
+    return Array.isArray(value)
+      ? value.filter((chat) => chat?.id && Array.isArray(chat.messages))
+      : []
+  } catch {
+    return []
+  }
+}
+
+function saveChats(chats) {
+  try {
+    window.localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(chats))
+  } catch {
+    // Keep the current chat usable if browser storage is unavailable or full.
+  }
+}
+
+function buildConversationContext(messages) {
+  const citedNodeIds = new Set()
+  const turns = []
+
+  for (const message of messages) {
+    if (message.role === 'user' && message.text) {
+      turns.push(`User: ${message.text}`)
+      continue
+    }
+    if (message.role !== 'assistant' || message.streaming) continue
+
+    const answer = message.answer?.markdown || message.text || ''
+    if (answer) turns.push(`Assistant: ${answer}`)
+
+    for (const id of message.answer?.citedIds || []) citedNodeIds.add(id)
+    for (const ref of message.answer?.refs || message.refs || []) {
+      if (ref?.id) citedNodeIds.add(ref.id)
+    }
+  }
+
+  return {
+    context: turns.join('\n\n').slice(-30000),
+    citedNodeIds: [...citedNodeIds],
   }
 }

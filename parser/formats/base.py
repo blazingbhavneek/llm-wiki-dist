@@ -5,14 +5,16 @@ from __future__ import annotations
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+from client.llm import LLMClient
 from utils.image_unit import count_image_units, strip_image_media
 from utils.markdown_images import (
     count_markdown_images,
+    describe_markdown_images,
     embed_markdown_data_urls,
     strip_markdown_image_media,
 )
@@ -39,7 +41,9 @@ class ParseOptions:
     """Client-level overrides for one request (kept picklable for workers)."""
 
     images: bool = True  # on: base64 image blocks, off: description text only
-    describe_images: bool = True
+    # ``None`` keeps the historical llm-wiki default while leaving generic
+    # parsing opt-in; HTTP routes pass an explicit value.
+    describe_images: bool | None = None
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
@@ -113,12 +117,18 @@ class BaseParser(ABC):
         """Template method: staged extract -> inline assembly and image policy.
 
         ``GENERIC`` embeds ordinary Markdown data-URL images into both the
-        full document and every page and never touches an LLM. ``LLM_WIKI``
-        trusts the extractor's already-embedded image-unit output and applies
-        the historical stripping/counting policy. ``image_count`` always
-        describes the returned ``markdown``, never the sum across pages.
+        full document and every page, optionally replacing their alt text with
+        LLM descriptions. ``LLM_WIKI`` trusts the extractor's already-embedded
+        image-unit output and applies the historical stripping/counting policy.
+        ``image_count`` always describes the returned ``markdown``, never the
+        sum across pages.
         """
         options = options or ParseOptions()
+        if options.describe_images is None:
+            options = replace(
+                options,
+                describe_images=options.profile == ParseProfile.LLM_WIKI,
+            )
         start = time.perf_counter()
 
         with tempfile.TemporaryDirectory(prefix="doc-parser-") as image_dir:
@@ -126,6 +136,24 @@ class BaseParser(ABC):
 
             if options.profile == ParseProfile.GENERIC:
                 markdown, pages = self._embed_generic(document)
+                if options.describe_images:
+                    client = LLMClient(
+                        base_url=options.llm_base_url,
+                        api_key=options.llm_api_key,
+                        model=options.llm_model,
+                    )
+                    try:
+                        markdown = await describe_markdown_images(
+                            markdown, workers, client.describe_image
+                        )
+                        pages = [
+                            await describe_markdown_images(
+                                page, workers, client.describe_image
+                            )
+                            for page in pages
+                        ]
+                    finally:
+                        await client.close()
                 if not options.images:
                     markdown = strip_markdown_image_media(markdown)
                     pages = [strip_markdown_image_media(page) for page in pages]

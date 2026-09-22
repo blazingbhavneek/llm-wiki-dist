@@ -53,6 +53,8 @@ export const STR = {
       terms: '利用規約',
       privacy: 'プライバシーポリシー',
       footerCopyright: (year) => `${year} MESW LLM Wiki`,
+      disclaimer:
+        'AI生成の回答です。重要な内容は確認してください。Ctrl/Cmd + Enter で送信できます。',
     },
 
     topbar: {
@@ -84,6 +86,12 @@ export const STR = {
       topicsTitle: 'トピック',
       topicsSubtitle: 'トピック別に整理',
       explorerTab: 'エクスプローラー',
+      chatsTab: 'チャット',
+      savedChats: 'チャット履歴',
+      noChats: '保存されたチャットはありません。',
+      clearChats: 'すべて削除',
+      clearChatsConfirm: '保存されたチャットをすべて削除しますか？',
+      deleteChat: 'チャットを削除',
       sourcesTab: 'ソース',
       sourcesTitle: '回答のソース',
       sourcesSubtitle: (n) => `${n} 件のソースノード`,
@@ -255,6 +263,8 @@ export const STR = {
       terms: 'Terms',
       privacy: 'Privacy Policy',
       footerCopyright: (year) => `${year} MESW LLM Wiki`,
+      disclaimer:
+        'AI-generated answer. Please verify critical information. Press Ctrl/Cmd + Enter to send.',
     },
 
     topbar: {
@@ -286,6 +296,12 @@ export const STR = {
       topicsTitle: 'Topics',
       topicsSubtitle: 'Arranged by topic',
       explorerTab: 'Explorer',
+      chatsTab: 'Chats',
+      savedChats: 'Chat history',
+      noChats: 'No saved chats.',
+      clearChats: 'Clear all',
+      clearChatsConfirm: 'Delete all saved chats?',
+      deleteChat: 'Delete chat',
       sourcesTab: 'Sources',
       sourcesTitle: 'Answer sources',
       sourcesSubtitle: (n) => `${n} source node${n === 1 ? '' : 's'}`,

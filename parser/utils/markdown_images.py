@@ -41,6 +41,52 @@ ImageDescriber = Callable[[str, str], Awaitable[str]]
 ImageDescriptionFilter = Callable[[str], bool]
 
 
+async def describe_markdown_images(
+    markdown: str,
+    workers: Workers,
+    describe_image: ImageDescriber,
+) -> str:
+    """Replace generic Markdown image alt text with LLM descriptions.
+
+    This operates only on the images already present in generic Markdown. It
+    deliberately has no image-selection or document-specific logic.
+    """
+    matches = [
+        m
+        for m in _MD_IMAGE_RE.finditer(markdown)
+        if m.group("target").startswith("data:image/")
+    ]
+    if not matches:
+        return markdown
+
+    descriptions: dict[str, asyncio.Task[str]] = {}
+    for match in matches:
+        target = match.group("target")
+        if target not in descriptions:
+            descriptions[target] = asyncio.create_task(
+                workers.run_network(describe_image, target, match.group("alt"))
+            )
+
+    outcomes = await asyncio.gather(*descriptions.values(), return_exceptions=True)
+    resolved = {
+        target: outcome.strip()
+        for target, outcome in zip(descriptions, outcomes, strict=True)
+        if isinstance(outcome, str) and outcome.strip()
+    }
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group("target")
+        description = resolved.get(target)
+        if not description:
+            return match.group(0)
+        # Keep the result valid Markdown even if the model emits line breaks
+        # or a closing bracket in its prose.
+        alt = description.replace("\n", " ").replace("]", "）")
+        return f"![{alt}]({target})"
+
+    return _MD_IMAGE_RE.sub(replace, markdown)
+
+
 def _ref_alt_target(match: re.Match[str]) -> tuple[str, str] | None:
     """Return ``(alt, target)`` for a Markdown or HTML image match, or None."""
     if match.group("md_target") is not None:

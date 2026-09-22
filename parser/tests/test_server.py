@@ -42,6 +42,27 @@ class StreamJsonTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class HealthAndUploadTests(unittest.TestCase):
+    def test_liveness_and_readiness_probes(self) -> None:
+        with TestClient(server.app) as client:
+            self.assertEqual(client.get("/health/live").status_code, 200)
+            response = client.get("/health/ready")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"status": "ready"})
+
+    def test_upload_limit_is_enforced_before_parsing(self) -> None:
+        with (
+            patch.object(server, "URL_PREFIX", ""),
+            patch.object(server, "MAX_UPLOAD_BYTES", 4),
+            TestClient(server.app) as client,
+        ):
+            response = client.post(
+                "/parse",
+                files={"file": ("too-big.txt", b"12345", "text/plain")},
+            )
+        self.assertEqual(response.status_code, 413)
+
+
 class UrlPrefixTests(unittest.TestCase):
     def setUp(self) -> None:
         self.prefix_patch = patch("server.URL_PREFIX", "/agent/doc-parser")

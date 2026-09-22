@@ -17,7 +17,8 @@ PREFIX_JS = FRONTEND / "src" / "url-prefix.js"
 
 
 def sync_frontend_prefix() -> None:
-    load_dotenv(ROOT / ".env")
+    # Keep explicit process/container environment variables authoritative.
+    load_dotenv(ROOT / ".env", override=False)
     prefix = os.environ.get("URL_PREFIX", "").strip().rstrip("/")
     if prefix and not prefix.startswith("/"):
         prefix = f"/{prefix}"

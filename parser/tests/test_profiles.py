@@ -282,7 +282,6 @@ class ProfileRoutesTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         server.app.state.workers = _FakeWorkers()
-        server.app.state.mineru_api = None
         self.client = TestClient(server.app)
 
     def test_generic_route_rejects_manifest(self) -> None:
@@ -313,9 +312,9 @@ class ProfileRoutesTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 415)
 
-    def test_generic_route_ignores_describe_images(self) -> None:
-        # A generic parse with describe_images=true must not attempt an LLM call
-        # and must not error out. Reuse CSV since there is no image path.
+    def test_generic_route_accepts_describe_images_without_images(self) -> None:
+        # Reuse CSV: there are no images to send to the LLM, but the generic
+        # route must accept the opt-in flag.
         response = self.client.post(
             "/parse?describe_images=true",
             files={"file": ("x.csv", _csv_body(), "text/csv")},

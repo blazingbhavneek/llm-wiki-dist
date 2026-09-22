@@ -1,4 +1,4 @@
-import { FileText, Loader2, Search } from 'lucide-react'
+import { ArrowLeft, FileText, Loader2, Search } from 'lucide-react'
 
 import { useT } from '../../i18n.jsx'
 import { growiPageUrl } from '../../data/growi.js'
@@ -10,13 +10,15 @@ export function SearchResultsCenter({
   results = [],
   loading = false,
   onOpenNode,
+  onBack,
   connection,
 }) {
   const t = useT(STR)
 
   if (loading) {
     return (
-      <div className="grid h-full place-items-center bg-white px-6">
+      <div className="relative grid h-full place-items-center bg-white px-6">
+        <BackButton onClick={onBack} label={t.markdownFrame.back} />
         <div className="flex items-center gap-2 rounded-2xl border border-neutral-200 bg-white px-5 py-4 text-[14px] font-bold text-neutral-600 shadow-sm">
           <Loader2 size={18} className="animate-spin text-blue-600" />
           <span>{t.topbar.searching}</span>
@@ -27,27 +29,42 @@ export function SearchResultsCenter({
 
   if (!query) {
     return (
-      <PlaceholderPage
-        icon={Search}
-        title={t.pages.searchIdleTitle}
-        text={t.pages.searchIdleText}
-      />
+      <div className="relative h-full">
+        <BackButton onClick={onBack} label={t.markdownFrame.back} />
+        <PlaceholderPage
+          icon={Search}
+          title={t.pages.searchIdleTitle}
+          text={t.pages.searchIdleText}
+        />
+      </div>
     )
   }
 
   if (!results.length) {
     return (
-      <PlaceholderPage
-        icon={Search}
-        title={t.pages.searchEmptyTitle}
-        text={t.pages.searchEmptyText(query)}
-      />
+      <div className="relative h-full">
+        <BackButton onClick={onBack} label={t.markdownFrame.back} />
+        <PlaceholderPage
+          icon={Search}
+          title={t.pages.searchEmptyTitle}
+          text={t.pages.searchEmptyText(query)}
+        />
+      </div>
     )
   }
 
   return (
     <div className="h-full overflow-y-auto bg-white">
       <div className="mx-auto max-w-[960px] px-6 py-6">
+        <button
+          type="button"
+          onClick={onBack}
+          className="mb-3 inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12px] font-semibold text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900"
+        >
+          <ArrowLeft size={15} />
+          {t.markdownFrame.back}
+        </button>
+
         <PageHeader
           icon={Search}
           title={t.pages.searchTitle}
@@ -67,6 +84,19 @@ export function SearchResultsCenter({
         </div>
       </div>
     </div>
+  )
+}
+
+function BackButton({ onClick, label }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="absolute left-6 top-6 z-10 inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12px] font-semibold text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900"
+    >
+      <ArrowLeft size={15} />
+      {label}
+    </button>
   )
 }
 

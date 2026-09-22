@@ -75,7 +75,6 @@ async def main() -> int:
 
     if args.llm_timeout:
         os.environ["LLM_TIMEOUT_SECONDS"] = args.llm_timeout
-    os.environ.setdefault("MINERU_VENV_BIN", str(ROOT / ".venv" / "bin"))
     # no-sudo boost-1.91->1.92 shim so headless LibreOffice can start
     if LO_SHIM.is_dir():
         os.environ["LD_LIBRARY_PATH"] = (

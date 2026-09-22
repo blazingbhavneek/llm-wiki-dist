@@ -1,19 +1,11 @@
 import { useState } from 'react'
-import {
-  ChevronLeft,
-  ChevronRight,
-  Loader2,
-  Search,
-} from 'lucide-react'
+import { Loader2, Search } from 'lucide-react'
 
 import { useT, LangToggle } from '../../i18n.jsx'
 import { STR } from './strings.js'
 
 export function TopBar({
   onSearch,
-  onSearchResults,
-  rightOpen,
-  onToggleRight,
   rootPath,
 }) {
   const t = useT(STR)
@@ -26,14 +18,7 @@ export function TopBar({
     setSearching(true)
 
     try {
-      const results = await onSearch?.(clean)
-
-      if (onSearchResults) {
-        onSearchResults({
-          query: clean,
-          results: Array.isArray(results) ? results : [],
-        })
-      }
+      await onSearch?.(clean)
     } finally {
       setSearching(false)
     }
@@ -75,20 +60,6 @@ export function TopBar({
         </span>
 
         <LangToggle />
-
-        <button
-          onClick={onToggleRight}
-          className={`grid h-9 w-9 place-items-center rounded-xl border transition ${
-            rightOpen
-              ? 'border-blue-200 bg-blue-50 text-blue-700'
-              : 'border-neutral-200 bg-white text-neutral-500 hover:bg-neutral-50'
-          }`}
-          title={rightOpen ? t.shell.collapseDocuments : t.shell.showDocuments}
-          aria-label={rightOpen ? t.shell.collapseDocuments : t.shell.showDocuments}
-        >
-          {rightOpen ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
-        </button>
-
       </div>
     </header>
   )

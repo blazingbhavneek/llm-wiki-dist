@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import MermaidDiagram from './MermaidDiagram'
+import { SafeImage } from './markdown/MarkdownRenderer.jsx'
 import {
   Check,
   ChevronDown,
@@ -47,8 +48,6 @@ const STR = {
     diagramFailed: '図のレンダリングに失敗しました。',
     suggestWiki: 'Wikiに追記を提案',
     relatedConcepts: '関連概念',
-    disclaimer:
-      'AI生成の回答です。重要な内容は確認してください。Ctrl/Cmd + Enter で送信できます。',
     emptyTitle: 'LLM Wiki に質問する',
     emptyText: '上部の検索バーまたは下部の入力欄から、ナレッジグラフに質問できます。',
     researchMap: '調査マップ',
@@ -87,8 +86,6 @@ const STR = {
     diagramFailed: 'Diagram rendering failed.',
     suggestWiki: 'Suggest adding to Wiki',
     relatedConcepts: 'Related concepts',
-    disclaimer:
-      'AI-generated answer. Please verify critical information. Press Ctrl/Cmd + Enter to send.',
     emptyTitle: 'Ask LLM Wiki',
     emptyText: 'Use the top search bar or the input below to ask the knowledge graph.',
     researchMap: 'Research map',
@@ -113,6 +110,7 @@ export default function ChatPanel({
   // Optional but strongly recommended.
   // Expected shape: Map<nodeId, node> or plain object keyed by nodeId.
   rawById,
+  growiUrl,
 
   // Tells App / right document rail which chunks were explicitly mentioned
   // in the final answer text by raw node ID.
@@ -157,6 +155,7 @@ export default function ChatPanel({
                 onViewAnswer={onViewAnswer}
                 activeAnswerId={activeAnswerId}
                 rawById={rawById}
+                growiUrl={growiUrl}
                 onAnswerMentionedIds={onAnswerMentionedIds}
               />
             ),
@@ -167,7 +166,10 @@ export default function ChatPanel({
         <div ref={endRef} />
       </div>
 
-      <div className="shrink-0 border-t border-neutral-200 bg-transparent px-6 pb-3 pt-3">
+      <div
+        style={{ height: 'var(--bottom-controls-height)' }}
+        className="shrink-0 border-t border-neutral-200 bg-transparent px-6 pb-3 pt-3"
+      >
         <div className="flex min-h-[58px] items-end gap-3 rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 shadow-none transition focus-within:border-blue-400 focus-within:bg-blue-50/40 focus-within:ring-4 focus-within:ring-blue-50">
           <textarea
             ref={inputRef}
@@ -211,9 +213,6 @@ export default function ChatPanel({
           )}
         </div>
 
-        <p className="mt-2 text-center text-[11px] font-medium text-neutral-400">
-          {t.disclaimer}
-        </p>
       </div>
     </section>
   )
@@ -263,6 +262,7 @@ function AssistantMessage({
   onViewAnswer,
   activeAnswerId,
   rawById,
+  growiUrl,
   onAnswerMentionedIds,
 }) {
   const t = useT(STR)
@@ -386,6 +386,7 @@ function AssistantMessage({
                 refs={refs}
                 onOpenNode={onOpenNode}
                 rawById={rawById}
+                growiUrl={growiUrl}
               >
                 {answerMarkdown}
               </MarkdownMessage>
@@ -579,6 +580,7 @@ function MarkdownMessage({
   refs,
   onOpenNode,
   rawById,
+  growiUrl,
 }) {
   const t = useT(STR)
   const isMermaid = (cls) => (cls || '').includes('language-mermaid')
@@ -596,6 +598,10 @@ function MarkdownMessage({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          img: ({ src = '', alt = '', title, width, height }) => (
+            <SafeImage src={src} alt={alt} title={title} width={width} height={height} growiUrl={growiUrl} />
+          ),
+
           pre: ({ children, ...props }) => {
             const child = Array.isArray(children) ? children[0] : children
 
@@ -940,7 +946,7 @@ function protectMarkdownSpecialRegions(markdown, replacer) {
 
 function replaceNodeIdTextWithChunkLinks(text, catalog, rawById) {
   const NODE_ID_CANDIDATE_RE =
-    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
+    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?(?:[0-9a-fA-F]{24}|[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+))(?=$|[^A-Za-z0-9_:\\-])/g
 
   let syntheticIndex = 1
 
@@ -1032,7 +1038,7 @@ function findMentionedNodeIds(markdown, refs, rawById) {
   const found = new Set()
 
   const NODE_ID_CANDIDATE_RE =
-    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
+    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?(?:[0-9a-fA-F]{24}|[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+))(?=$|[^A-Za-z0-9_:\\-])/g
 
   let match
 
@@ -1066,7 +1072,7 @@ function extractExplicitNodeIdsFromMarkdown(markdown) {
   const found = new Set()
 
   const NODE_ID_CANDIDATE_RE =
-    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+)(?=$|[^A-Za-z0-9_:\\-])/g
+    /(^|[^A-Za-z0-9_:\\-])?((?:node:)?(?:[0-9a-fA-F]{24}|[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?(?::[A-Za-z0-9](?:[A-Za-z0-9_.\\-]*[A-Za-z0-9])?)+))(?=$|[^A-Za-z0-9_:\\-])/g
 
   let match
 

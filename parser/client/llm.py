@@ -11,16 +11,19 @@ from typing import Any, Self
 import httpx
 from dotenv import load_dotenv
 
-load_dotenv()
+# Environment variables supplied by the process/container override .env.
+load_dotenv(override=False)
 
 DEFAULT_BASE_URL = "http://10.160.144.101:51029/v1"
 DEFAULT_API_KEY = "local"
 DEFAULT_MODEL = "gemma-4-31B"
 
 IMAGE_DESCRIPTION_PROMPT = (
-    "このドキュメント内の画像を、詳細かつ事実的に日本語で説明してください。"
-    "図、グラフ、表、スクリーンショットなどの意味のある視覚的な関係を解説し、"
-    "判読可能なテキストは文字起こししてください。説明文のみを返してください。"
+    "このドキュメント内の画像に実際に写っている内容を、詳細かつ事実的に日本語で"
+    "説明してください。図、グラフ、表、スクリーンショットでは、見えている主要な"
+    "要素・人物・組織・数値を挙げ、それらの配置、接続、比較、流れなどの関係を"
+    "具体的に説明してください。判読可能なテキストは省略せずすべて文字起こしして"
+    "ください。画像から確認できないことは推測せず、説明文のみを返してください。"
 )
 
 SLIDE_SYNTHESIS_PROMPT = (

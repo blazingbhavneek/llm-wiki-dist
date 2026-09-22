@@ -32,6 +32,7 @@ from gateway import Embedder, LlmClient, Reranker, cosine, normalize_scores
 from growi_client import GrowiAPIError, GrowiSearchClient
 from models import AgentAnswer, Evidence, WikiLink, WikiPage, make_link_id
 from prompts import (
+    FOLLOWUP_ANSWER_PROMPT,
     MAIN_AGENT_SYSTEM_PROMPT,
     ROUTER_PROMPT,
     SHALLOW_ANSWER_PROMPT,
@@ -943,12 +944,34 @@ class ResearchSession:
         question: str,
         on_event: Callable | None,
         stop_event: Event | None,
+        context: str = "",
+        cited_node_ids: list[str] | None = None,
     ) -> AgentAnswer:
         emit = on_event or (lambda _e: None)
         question = sanitize_text(question or "").strip()[:2000]
+        context = sanitize_text(context or "").strip()[-30000:]
         emit({"type": "start", "question": question})
 
-        answer = self._try_route(question, emit, stop_event, question)
+        answer = None
+        if context:
+            try:
+                text = self.llm.complete(
+                    FOLLOWUP_ANSWER_PROMPT,
+                    json.dumps({"question": question, "prior_context": context}, ensure_ascii=False),
+                ).strip()
+                self._record_usage()
+                if text and text != "NEEDS_RESEARCH":
+                    emit({"type": "route", "mode": "reuse", "reason": "prior conversation was sufficient"})
+                    answer = AgentAnswer(
+                        question=question,
+                        answer=sanitize_text(text),
+                        cited_node_ids=_clean_ids(cited_node_ids),
+                        steps=1,
+                    )
+            except Exception as exc:  # noqa: BLE001 - fall back to normal research
+                log.info("conversation reuse failed; full research: %s", exc)
+        if answer is None:
+            answer = self._try_route(question, emit, stop_event, question)
         if answer is None:
             answer = self._run_lead(question, emit, stop_event)
         answer.cited_nodes = [self._cite(node_id) for node_id in answer.cited_node_ids]
@@ -1485,10 +1508,10 @@ class Researcher:
 
         return await self._read(work)
 
-    async def ask(self, question, on_event=None, overrides=None, stop_event=None) -> AgentAnswer:
+    async def ask(self, question, on_event=None, overrides=None, stop_event=None, context="", cited_node_ids=None) -> AgentAnswer:
         def work():
             session = self.session(overrides)
-            return session.ask(question, on_event, stop_event)
+            return session.ask(question, on_event, stop_event, context, cited_node_ids)
 
         if on_event and self.agent_sem.locked():
             on_event({"type": "queued_for_agent"})

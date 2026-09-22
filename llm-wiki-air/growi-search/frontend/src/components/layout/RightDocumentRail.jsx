@@ -1,6 +1,16 @@
-import { useEffect, useState } from 'react'
-import { FileText, FolderTree, X } from 'lucide-react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import {
+  ChevronsLeftRight,
+  FileText,
+  FolderTree,
+  MessagesSquare,
+  PlusCircle,
+  Settings,
+  Trash2,
+  X,
+} from 'lucide-react'
 
+import { faviconUrl } from '../../data/utils'
 import { useT } from '../../i18n.jsx'
 import DocSidebar from '../DocSidebar'
 import { STR } from './strings.js'
@@ -28,9 +38,9 @@ const RIGHT_RAIL_STR = {
   },
 }
 
-const DEFAULT_RAIL_WIDTH = 380
-const MIN_RAIL_WIDTH = 300
-const MAX_RAIL_WIDTH = 640
+const DEFAULT_RAIL_WIDTH = 440
+const MIN_RAIL_WIDTH = 76
+const COLLAPSE_RAIL_WIDTH = 180
 
 export function RightDocumentRail({
   wiki,
@@ -44,20 +54,51 @@ export function RightDocumentRail({
   onOpenDocument,
   rawById,
   onViewAnswer,
-
+  onNewChat,
+  onOpenSettings,
+  settingsActive,
+  chats,
+  activeChatId,
+  onOpenChat,
+  onDeleteChat,
+  onClearChats,
   // Map(answer.id -> Array<string>)
   mentionedNodeIdsByAnswerId,
 }) {
   const t = useT(RIGHT_RAIL_STR)
-  const [railWidth, setRailWidth] = useState(DEFAULT_RAIL_WIDTH)
+  const railRef = useRef(null)
+  const actionsRef = useRef(null)
+  const [railWidth, setRailWidth] = useState(() => clampRailWidth(DEFAULT_RAIL_WIDTH))
   const [resizing, setResizing] = useState(false)
+  const collapsed = railWidth < COLLAPSE_RAIL_WIDTH
+
+  useLayoutEffect(() => {
+    const actions = actionsRef.current
+    const shell = railRef.current?.parentElement
+    if (!actions || !shell) return undefined
+
+    const syncHeight = () => {
+      shell.style.setProperty(
+        '--bottom-controls-height',
+        `${actions.getBoundingClientRect().height}px`,
+      )
+    }
+    const observer = new ResizeObserver(syncHeight)
+    syncHeight()
+    observer.observe(actions)
+
+    return () => {
+      observer.disconnect()
+      shell.style.removeProperty('--bottom-controls-height')
+    }
+  }, [collapsed])
 
   useEffect(() => {
     if (!resizing) return undefined
 
     const stop = () => setResizing(false)
     const move = (event) => {
-      setRailWidth(clampRailWidth(window.innerWidth - event.clientX))
+      setRailWidth(clampRailWidth(event.clientX))
     }
 
     const previousCursor = document.body.style.cursor
@@ -90,18 +131,23 @@ export function RightDocumentRail({
   }
 
   const resizeWithKeyboard = (event) => {
-    const delta = event.key === 'ArrowLeft' ? 24 : event.key === 'ArrowRight' ? -24 : 0
+    const delta = event.key === 'ArrowRight' ? 24 : event.key === 'ArrowLeft' ? -24 : 0
     if (!delta && event.key !== 'Home' && event.key !== 'End') return
 
     event.preventDefault()
     setRailWidth((width) => {
-      if (event.key === 'Home') return clampRailWidth(MAX_RAIL_WIDTH)
-      if (event.key === 'End') return clampRailWidth(MIN_RAIL_WIDTH)
+      if (event.key === 'Home') return clampRailWidth(MIN_RAIL_WIDTH)
+      if (event.key === 'End') return maxRailWidth()
       return clampRailWidth(width + delta)
     })
   }
 
   const allTabs = [
+    {
+      id: 'chats',
+      kind: 'chats',
+      title: t.rightRail.chatsTab,
+    },
     {
       id: 'explorer',
       kind: 'explorer',
@@ -121,29 +167,46 @@ export function RightDocumentRail({
 
   return (
     <aside
+      ref={railRef}
       style={{ width: railWidth }}
-      className="relative flex h-full min-h-0 shrink-0 flex-col border-l border-line bg-white"
+      className="relative flex h-full min-h-0 shrink-0 flex-col border-r border-line bg-white"
     >
+      <div className="border-b border-neutral-100 px-3 py-4">
+        <div className={`flex items-center gap-3 ${collapsed ? 'justify-center' : ''}`}>
+          <div className="flex w-full justify-center">
+            <img
+              src={faviconUrl()}
+              alt="Logo"
+              className="block h-[100px] w-[100px] max-w-full object-contain"
+            />
+          </div>
+        </div>
+      </div>
+
       <div
         role="separator"
         tabIndex={0}
         aria-label={t.rightRail.resizeSidebar}
         aria-orientation="vertical"
         aria-valuemin={MIN_RAIL_WIDTH}
-        aria-valuemax={MAX_RAIL_WIDTH}
+        aria-valuemax={maxRailWidth()}
         aria-valuenow={Math.round(railWidth)}
         onPointerDown={startResize}
         onKeyDown={resizeWithKeyboard}
-        className={resizing ? 'absolute -left-[4px] top-0 z-30 flex h-full w-[8px] cursor-ew-resize items-center justify-center bg-neutral-200/80' : 'absolute -left-[4px] top-0 z-30 flex h-full w-[8px] cursor-ew-resize items-center justify-center hover:bg-neutral-50'}
+        className={`group absolute -right-[5px] top-0 z-30 flex h-full w-[10px] cursor-ew-resize items-center justify-center ${resizing ? 'bg-blue-50/70' : 'hover:bg-neutral-50'}`}
         title={t.rightRail.dragToResize}
       >
-        <span className="h-10 w-[2px] rounded-full bg-neutral-300" />
+        <span className="h-10 w-px bg-neutral-300" />
+        <ChevronsLeftRight
+          size={16}
+          className="absolute rounded bg-white text-neutral-500 opacity-0 shadow-sm transition-opacity group-hover:opacity-100 group-focus:opacity-100"
+        />
       </div>
 
-      <div className="flex h-[46px] shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-white px-2">
+      {!collapsed && <div className="flex h-[46px] shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-white px-2">
         {allTabs.map((tab) => {
           const active = tab.id === activeTab.id
-          const closable = tab.kind !== 'explorer'
+          const closable = tab.kind === 'sources'
 
           return (
             <div
@@ -160,14 +223,16 @@ export function RightDocumentRail({
                 className="flex h-full min-w-0 items-center gap-1.5 px-2"
                 title={tab.title}
               >
-                {tab.kind === 'explorer' ? (
+                {tab.kind === 'chats' ? (
+                  <MessagesSquare size={14} />
+                ) : tab.kind === 'explorer' ? (
                   <FolderTree size={14} />
                 ) : (
                   <FileText size={14} />
                 )}
 
                 <span className="max-w-[120px] truncate">
-                  {tab.kind === 'explorer' ? tab.title : tab.title || t.rightRail.sourcesTab}
+                  {tab.kind === 'sources' ? tab.title || t.rightRail.sourcesTab : tab.title}
                 </span>
               </button>
 
@@ -188,10 +253,18 @@ export function RightDocumentRail({
             </div>
           )
         })}
-      </div>
+      </div>}
 
-      <div className="min-h-0 flex-1">
-        {activeTab.kind === 'sources' ? (
+      {!collapsed && <div className="min-h-0 flex-1">
+        {activeTab.kind === 'chats' ? (
+          <ChatHistory
+            chats={chats}
+            activeChatId={activeChatId}
+            onOpenChat={onOpenChat}
+            onDeleteChat={onDeleteChat}
+            onClearChats={onClearChats}
+          />
+        ) : activeTab.kind === 'sources' ? (
           <AnswerSourcesSidebar
             answer={activeTab.answer}
             rawById={rawById}
@@ -209,19 +282,98 @@ export function RightDocumentRail({
             onOpenDocument={onOpenDocument}
           />
         )}
-      </div>
+      </div>}
+
+      {!collapsed && <div ref={actionsRef} className="border-t border-line p-3">
+        <button
+          type="button"
+          onClick={onNewChat}
+          className="flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 text-[13px] font-bold text-blue-700 transition hover:bg-blue-100"
+        >
+          <PlusCircle size={17} />
+          <span>{t.shell.newChat}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          className={`mt-2 flex h-10 w-full items-center justify-center gap-2 rounded-xl text-[13px] font-semibold text-neutral-500 transition hover:bg-neutral-100 hover:text-neutral-900 ${settingsActive ? 'bg-blue-50 text-blue-700' : ''}`}
+        >
+          <Settings size={17} />
+          <span>{t.shell.settings}</span>
+        </button>
+      </div>}
     </aside>
   )
 }
 
 function clampRailWidth(width) {
-  const viewportMax =
-    typeof window === 'undefined'
-      ? MAX_RAIL_WIDTH
-      : Math.max(MIN_RAIL_WIDTH, window.innerWidth - 320)
-  return Math.max(
+  const value = Number(width)
+  const clamped = Math.max(
     MIN_RAIL_WIDTH,
-    Math.min(MAX_RAIL_WIDTH, viewportMax, Number(width) || DEFAULT_RAIL_WIDTH),
+    Math.min(maxRailWidth(), Number.isFinite(value) ? value : DEFAULT_RAIL_WIDTH),
+  )
+  return clamped < COLLAPSE_RAIL_WIDTH ? MIN_RAIL_WIDTH : clamped
+}
+
+function maxRailWidth() {
+  return typeof window === 'undefined'
+    ? DEFAULT_RAIL_WIDTH
+    : Math.max(MIN_RAIL_WIDTH, window.innerWidth)
+}
+
+function ChatHistory({ chats = [], activeChatId, onOpenChat, onDeleteChat, onClearChats }) {
+  const t = useT(RIGHT_RAIL_STR)
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-white p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <span className="text-[12px] font-semibold text-neutral-500">
+          {t.rightRail.savedChats}
+        </span>
+        {chats.length > 0 && (
+          <button
+            type="button"
+            onClick={() => window.confirm(t.rightRail.clearChatsConfirm) && onClearChats?.()}
+            className="text-[11px] font-semibold text-neutral-400 hover:text-red-600"
+          >
+            {t.rightRail.clearChats}
+          </button>
+        )}
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
+        {chats.length === 0 && (
+          <p className="px-2 py-6 text-center text-[12px] text-neutral-400">
+            {t.rightRail.noChats}
+          </p>
+        )}
+        {chats.map((chat) => (
+          <div
+            key={chat.id}
+            className={`group flex w-full items-center rounded-lg text-[12px] font-semibold ${chat.id === activeChatId ? 'bg-blue-50 text-blue-700' : 'text-neutral-600 hover:bg-neutral-50'}`}
+          >
+            <button
+              type="button"
+              onClick={() => onOpenChat?.(chat.id)}
+              className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left"
+            >
+              <MessagesSquare size={14} className="shrink-0" />
+              <span className="min-w-0 flex-1 truncate">{chat.title}</span>
+            </button>
+            <button
+              type="button"
+              aria-label={t.rightRail.deleteChat}
+              title={t.rightRail.deleteChat}
+              onClick={() => onDeleteChat?.(chat.id)}
+              className="mr-2 grid h-6 w-6 shrink-0 place-items-center rounded text-neutral-400 opacity-0 hover:bg-red-50 hover:text-red-600 group-hover:opacity-100 focus:opacity-100"
+            >
+              <Trash2 size={13} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }
 

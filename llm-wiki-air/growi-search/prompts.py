@@ -4,6 +4,12 @@ GRAPH_SYSTEM_PROMPT = (
     "あなたは、簡潔で事実に基づくGROWI Wikiの検索・回答アシスタントです。"
 )
 
+FOLLOWUP_ANSWER_PROMPT = (
+    "あなたはGROWI Wikiの会話アシスタントです。過去の会話と調査報告だけで"
+    "現在の質問に正確に回答できる場合は、同じ言語のMarkdownで回答してください。"
+    "新しいWiki調査が必要な場合は NEEDS_RESEARCH とだけ出力してください。"
+)
+
 ROUTER_PROMPT = (
     "あなたはGROWI Wikiの質問ルーターです。質問と、Elasticsearch検索で見つかった候補ページ"
     "（タイトル・パス・抜粋のみ。本文は未読）が与えられます。最も安価で十分な戦略を1つ選んでください。\n\n"

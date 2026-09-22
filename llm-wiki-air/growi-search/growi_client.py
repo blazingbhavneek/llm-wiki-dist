@@ -48,6 +48,7 @@ class GrowiSearchClient:
         url: str,
         api_token: str,
         *,
+        attachment_token: str | None = None,
         root_path: str = "/",
         timeout: float = 30.0,
         max_concurrency: int = 6,
@@ -57,6 +58,9 @@ class GrowiSearchClient:
         self.api_token = (api_token or "").strip()
         if self.api_token.lower().startswith("api token:"):
             self.api_token = self.api_token.split(":", 1)[1].strip()
+        self.attachment_token = (attachment_token or self.api_token).strip()
+        if self.attachment_token.lower().startswith("api token:"):
+            self.attachment_token = self.attachment_token.split(":", 1)[1].strip()
         self.root_path = root_path or "/"
         self.timeout = timeout
         self._request_slots = BoundedSemaphore(max(1, max_concurrency))
@@ -157,28 +161,54 @@ class GrowiSearchClient:
 
     def fetch_attachment(self, attachment_id: str) -> tuple[bytes, str] | None:
         """Bytes + content-type of one GROWI attachment, or None when missing."""
-        headers = {**self._headers(), "Accept": "*/*"}
+        headers = {"Accept": "*/*"}
+        if self.attachment_token:
+            headers["Authorization"] = f"Bearer {self.attachment_token}"
         try:
             with self._request_slots:
                 response = self._client.get(
                     f"/attachment/{attachment_id}",
                     headers=headers,
-                    params={"access_token": self.api_token},
+                    params={"access_token": self.attachment_token},
                     follow_redirects=True,
                 )
         except httpx.HTTPError as exc:
             raise GrowiAPIError(0, "GET", "/attachment", str(exc)) from exc
+        content_type = response.headers.get("content-type", "application/octet-stream")
         if response.status_code == 404:
             return None
-        content_type = response.headers.get("content-type", "application/octet-stream")
-        if response.is_error or content_type.startswith("text/html"):
+        if not response.is_error and not content_type.startswith("text/html"):
+            return response.content, content_type
+
+        # Legacy API tokens can read metadata but GROWI's binary route only
+        # accepts a scoped access token. A cached signed URL is the only
+        # token-authenticated fallback on installations using object storage.
+        try:
+            payload = self._request("GET", f"/_api/v3/attachment/{attachment_id}")
+        except GrowiAPIError:
             raise GrowiAPIError(
                 response.status_code if response.is_error else 401,
                 "GET",
                 "/attachment",
-                "not an attachment response",
+                "attachment access token is invalid or lacks read permission",
             )
-        return response.content, content_type
+        metadata = payload.get("attachment", payload) if isinstance(payload, dict) else {}
+        temporary_url = metadata.get("temporaryUrlCached") if isinstance(metadata, dict) else None
+        if temporary_url:
+            try:
+                with self._request_slots:
+                    signed = self._client.get(temporary_url, headers={"Accept": "*/*"}, follow_redirects=True)
+            except httpx.HTTPError as exc:
+                raise GrowiAPIError(0, "GET", "/attachment", str(exc)) from exc
+            if signed.is_success and not signed.headers.get("content-type", "").startswith("text/html"):
+                return signed.content, signed.headers.get("content-type") or metadata.get("fileFormat", "application/octet-stream")
+
+        raise GrowiAPIError(
+            response.status_code if response.is_error else 401,
+            "GET",
+            "/attachment",
+            "GROWI requires a scoped attachment access token",
+        )
 
     def search_pages(
         self,

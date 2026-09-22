@@ -46,6 +46,7 @@ class Settings(BaseModel):
     # GROWI
     growi_url: str = ""
     growi_token: str = ""
+    growi_attachment_token: str = ""
     growi_root_path: str = "/"
     growi_timeout: float = 30.0
 
@@ -113,11 +114,8 @@ class Settings(BaseModel):
         if token.lower().startswith("api token:"):
             token = token.split(":", 1)[1].strip()
 
-        root = (
-            f"/{project['target_name']}"
-            if project.get("target_name")
-            else (env("GROWI_ROOT_PATH") or "/")
-        ).strip() or "/"
+        # ponytail: whole-instance access; set GROWI_ROOT_PATH to scope manually.
+        root = (env("GROWI_ROOT_PATH") or "/").strip() or "/"
         if not root.startswith("/"):
             root = "/" + root
         if len(root) > 1:
@@ -126,6 +124,7 @@ class Settings(BaseModel):
         return cls(
             growi_url=(project.get("growi_url") or env("GROWI_URL") or "").rstrip("/"),
             growi_token=token,
+            growi_attachment_token=(env("GROWI_ATTACHMENT_TOKEN") or token).strip(),
             growi_root_path=root,
             growi_timeout=float(env("GROWI_TIMEOUT") or 30),
             chat_base_url=(
@@ -206,4 +205,4 @@ class Settings(BaseModel):
         return hosts
 
     def public_dict(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"growi_token", "chat_api_key", "rerank_api_key", "embed_api_key", "usage_log_path"})
+        return self.model_dump(exclude={"growi_token", "growi_attachment_token", "chat_api_key", "rerank_api_key", "embed_api_key", "usage_log_path"})

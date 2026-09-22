@@ -22,7 +22,6 @@ import { useT } from '../i18n.jsx'
 const STR = {
   ja: {
     app: { documentPages: (n) => `${n} ページ` },
-    documents: '参照した知識',
     filter: 'ドキュメントを絞り込み…',
     openFull: '文書のページ一覧',
     untitledSection: '無題のページ',
@@ -33,7 +32,6 @@ const STR = {
   },
   en: {
     app: { documentPages: (n) => `${n} pages` },
-    documents: 'Referenced Knowledge',
     filter: 'Filter documents…',
     openFull: 'Document pages',
     untitledSection: 'Untitled page',
@@ -50,7 +48,6 @@ export default function DocSidebar({ wiki, rootPath, onOpenNode, onOpenDocument,
   const q = filter.trim().toLowerCase()
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-white px-[12px] py-[14px]">
-      <div className="mb-[14px] text-[13px] font-semibold text-neutral-800">{t.documents}</div>
       <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={t.filter}
              className="mb-[12px] w-full rounded-md border border-line bg-white px-[10px] py-[8px] text-[12.5px] outline-none focus:border-blue/45" />
       <div className="min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-auto pr-[2px] pb-[20px]">

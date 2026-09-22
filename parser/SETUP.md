@@ -5,13 +5,11 @@
 Requires Python **3.13+** and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync              # base install (DOCX, PPTX, XLSX, CSV)
-uv sync --extra pdf  # also install MinerU for PDF parsing (large: pulls torch/vLLM)
+uv sync              # base install (all parsers; PDFs use the external API)
 ```
 
-MinerU occasionally lags on the newest Python. If `--extra pdf` fails to
-resolve, create a separate Python 3.12 virtualenv for MinerU and point this
-project at its binary instead (see `MINERU_VENV_BIN` below).
+PDF parsing requires a reachable MinerU v4 API endpoint; no local MinerU
+installation or GPU model is needed by this process.
 
 ## 2. External command-line tools
 
@@ -21,7 +19,6 @@ The parsers shell out to these; pip cannot install them.
 |---|---|---|
 | `pandoc` | DOCX → Markdown | yes, for `.docx` |
 | `libreoffice` (`soffice`) | EMF/WMF vector images → PNG, PPTX slide rendering, XLSX formula recalculation | recommended — features degrade gracefully without it |
-| `mineru` | PDF → Markdown (GPU) | only for `.pdf`; installed by `uv sync --extra pdf` into the venv |
 
 ### Fedora / RHEL / CentOS (dnf)
 
@@ -48,12 +45,13 @@ Fonts matter for slide/PDF rendering — for Japanese documents install
 ```bash
 pandoc --version
 soffice --version
-uv run mineru --version   # or: uv run python -c "import mineru"
 ```
 
-## 3. Environment variables (all optional)
+## 3. Environment variables
 
 Create a `.env` in the project root (`python-dotenv` loads it automatically).
+Values already supplied in the process environment take precedence over `.env`
+(`.env` is a fallback, never an override).
 
 ```bash
 # Image-description LLM (OpenAI-compatible endpoint)
@@ -61,24 +59,13 @@ LLM_BASE_URL=http://10.160.144.101:51029/v1
 LLM_API_KEY=local
 LLM_MODEL=gemma-4-31B
 
-# Override binary locations if they are not on PATH
+# External command locations
 PANDOC_COMMAND=pandoc
 LIBREOFFICE_COMMAND=soffice
-MINERU_COMMAND=mineru
-# MINERU_VENV_BIN=/path/to/mineru-venv/bin   # optional override; auto-discovered
-# from PATH, the project's .venv/venv, or this venv when unset
-
-# PDF (MinerU) tuning
-MINERU_BACKEND=pipeline
-MINERU_CUDA_VISIBLE_DEVICES=1
-MINERU_GPU_MEMORY_UTILIZATION=0.5
-# Avoid UniMERNet cuDNN attention-plan failures; other SDPA backends stay enabled.
-MINERU_DISABLE_CUDNN_SDPA=true
+MINERU_API_URL=http://10.160.144.101:51020/v1
+MINERU_API_TIER=advanced       # basic=hybrid-basic; standard/advanced=higher accuracy
+# A failed MinerU request is retried once after 10 seconds.
 MINERU_TIMEOUT_SECONDS=1800
-# Warm mineru-api logs (10 MiB active file plus 3 rotated backups)
-MINERU_API_LOG_PATH=logs/mineru-api.log
-MINERU_API_LOG_MAX_BYTES=10485760
-MINERU_API_LOG_BACKUP_COUNT=3
 
 # URL deployment prefix only (never selects behavior). Both routes are served
 # under it: /parse (generic Markdown) and /parse/llm-wiki (image-unit + LLM).
@@ -107,3 +94,38 @@ npm run build     # outputs to ../static, served by the FastAPI app
 uv run python -m uvicorn server:app --host 0.0.0.0 --port 8000
 # open http://localhost:8000
 ```
+
+## 6. Docker
+
+The production image builds the frontend once, installs the locked Python
+dependencies, includes the repository `.env` as its default configuration, and
+includes Pandoc, LibreOffice (Writer/Calc/Impress/Draw), and CJK fonts. It runs
+one Uvicorn worker as a non-root user; PDF parsing still uses the external
+`MINERU_API_URL` service.
+
+```bash
+docker build \
+  --build-arg URL_PREFIX="${URL_PREFIX:-}" \
+  --build-arg HTTP_PROXY="${HTTP_PROXY:-http://133.141.7.237:9515}" \
+  --build-arg HTTPS_PROXY="${HTTPS_PROXY:-http://133.141.7.237:9515}" \
+  --build-arg NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}" \
+  -t doc-parser-pj_10002-mg37274 .
+docker run -p 8000:8000 \
+  -e HTTP_PROXY="${HTTP_PROXY:-http://133.141.7.237:9515}" \
+  -e HTTPS_PROXY="${HTTPS_PROXY:-http://133.141.7.237:9515}" \
+  -e NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}" \
+  doc-parser-pj_10002-mg37274
+# Optional: --env-file .env or explicit `-e NAME=value` options override image defaults.
+```
+
+The image defaults to the company proxy for build-time package downloads and
+runtime outbound requests. The build arguments and runtime `-e` values can be
+overridden for another environment.
+
+Pass `URL_PREFIX` as a build argument when the service is mounted below a
+known path; if omitted, the frontend derives its prefix from the serving URL.
+The image healthcheck calls `/health/ready`; `/health/live` is a cheap process
+liveness probe. A failed Docker healthcheck marks the container unhealthy;
+automatic restart on health failure is managed by the external orchestrator.
+
+`MAX_UPLOAD_BYTES` defaults to 100 MiB and can be lowered in `.env`.

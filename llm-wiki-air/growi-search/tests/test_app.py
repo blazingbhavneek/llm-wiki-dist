@@ -71,7 +71,7 @@ class FakeResearcher:
             "pages": [{**WikiPage(id=ID1, path=f"{path}/child", title="child").public_dict(), "summary": "card summary", "keywords": ["one"]}],
         }
 
-    async def ask(self, question, on_event=None, overrides=None, stop_event=None):
+    async def ask(self, question, on_event=None, overrides=None, stop_event=None, context="", cited_node_ids=None):
         self.calls.append(("ask", question))
         self.overrides_passed = overrides
         if self.error:

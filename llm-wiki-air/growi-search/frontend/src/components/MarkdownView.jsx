@@ -50,16 +50,16 @@ export default function MarkdownView({ doc, mode = 'node', rawById, prevNodeId, 
       </div>
 
       <div className="min-h-0 overflow-auto bg-white">
-        <PreviewModeContent markdown={doc.markdown} sourcePath={doc.source_path} links={doc.links} onOpenNode={onOpenNode} rawById={rawById} />
+        <PreviewModeContent markdown={doc.markdown} sourcePath={doc.source_path} links={doc.links} onOpenNode={onOpenNode} rawById={rawById} growiUrl={growiConnection?.url} />
       </div>
     </div>
   )
 }
 
-function PreviewModeContent({ markdown, sourcePath, links, onOpenNode, rawById }) {
+function PreviewModeContent({ markdown, sourcePath, links, onOpenNode, rawById, growiUrl }) {
   return (
     <article className="md w-full max-w-none px-[36px] pb-[90px] pt-[36px]">
-      <MarkdownRenderer markdown={markdown} sourcePath={sourcePath} links={links} onOpenNode={onOpenNode} rawById={rawById} />
+      <MarkdownRenderer markdown={markdown} sourcePath={sourcePath} links={links} onOpenNode={onOpenNode} rawById={rawById} growiUrl={growiUrl} />
     </article>
   )
 }

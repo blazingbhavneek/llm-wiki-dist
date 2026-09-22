@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,24 +10,11 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from formats.base import ParseOptions, ParseProfile
-from formats.pdf import PdfParser, run_mineru
+from formats.pdf import MineruError, PdfParser, run_mineru
 
 _PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
-
-
-class FakePopen:
-    """Minimal stand-in for subprocess.Popen used by run_mineru."""
-
-    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
-        self.returncode = returncode
-        self._stdout = stdout
-        self._stderr = stderr
-        self.pid = 4242
-
-    def communicate(self, timeout=None):
-        return self._stdout, self._stderr
 
 
 class FakeWorkers:
@@ -100,7 +86,7 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(PdfParser.detect(b"prefix\n%PDF-1.7\n"))
         self.assertFalse(PdfParser.detect(b"not a pdf"))
 
-    def test_mineru_uses_pipeline_backend_and_configured_gpu(self) -> None:
+    def test_mineru_uses_configured_v4_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "document.pdf"
@@ -111,30 +97,57 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
             markdown_path.write_text("result", encoding="utf-8")
 
             environment = {
-                "MINERU_COMMAND": "mineru",
-                "MINERU_BACKEND": "pipeline",
-                "MINERU_CUDA_VISIBLE_DEVICES": "1",
-                "MINERU_GPU_MEMORY_UTILIZATION": "0.1",
-                "MINERU_PROCESSING_WINDOW_SIZE": "4",
-                "MINERU_API_URL": "",
+                "MINERU_API_URL": "http://mineru.example:8000",
+                "MINERU_API_TIER": "flash",
             }
-            popen = FakePopen(returncode=0, stdout="result", stderr="")
             with (
                 patch.dict(os.environ, environment, clear=False),
-                patch("formats.pdf.subprocess.Popen", return_value=popen) as invoke,
+                patch(
+                    "formats.pdf._run_mineru_api_once",
+                    return_value=str(markdown_path),
+                ) as invoke,
             ):
                 result = run_mineru(str(pdf_path), str(output_dir))
 
         self.assertEqual(result, str(markdown_path))
-        args, call_options = invoke.call_args
-        self.assertIn("-b", args[0])
-        self.assertIn("pipeline", args[0])
-        # vLLM-only knob must not be passed to the pipeline backend
-        self.assertNotIn("--gpu-memory-utilization", args[0])
-        self.assertEqual(call_options["env"]["CUDA_VISIBLE_DEVICES"], "1")
-        self.assertEqual(call_options["env"]["MINERU_PROCESSING_WINDOW_SIZE"], "4")
-        self.assertEqual(call_options["env"]["MINERU_DISABLE_CUDNN_SDPA"], "true")
-        self.assertIn("workers/mineru_bootstrap", call_options["env"]["PYTHONPATH"])
+        invoke.assert_called_once_with(str(pdf_path), str(output_dir))
+
+    def test_mineru_retries_once_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "document.pdf"
+            output_dir = root / "output"
+            markdown_path = output_dir / "document" / "auto" / "document.md"
+            markdown_path.parent.mkdir(parents=True)
+            pdf_path.write_bytes(b"%PDF-1.7 fake")
+            markdown_path.write_text("result", encoding="utf-8")
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"MINERU_API_URL": "http://mineru.example:8000"},
+                    clear=False,
+                ),
+                patch(
+                    "formats.pdf._run_mineru_api_once",
+                    side_effect=[
+                        MineruError("temporary failure"),
+                        str(markdown_path),
+                    ],
+                ) as invoke,
+                patch("formats.pdf.time.sleep") as sleep,
+            ):
+                result = run_mineru(str(pdf_path), str(output_dir))
+
+        self.assertEqual(result, str(markdown_path))
+        self.assertEqual(invoke.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    def test_mineru_requires_external_api_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"MINERU_API_URL": ""}, clear=False):
+                with self.assertRaisesRegex(MineruError, "MINERU_API_URL"):
+                    run_mineru(str(Path(directory) / "document.pdf"), directory)
 
     async def test_gpu_extract_then_describes_unique_images_in_parallel_stage(self) -> None:
         workers = FakeWorkers()

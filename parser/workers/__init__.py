@@ -121,6 +121,10 @@ class Workers:
             },
         }
 
+    def ready(self) -> bool:
+        """Return whether all local execution resources are usable."""
+        return self.external.ready() and self.gpu.ready()
+
     def shutdown(self) -> None:
         self.external.shutdown()
         self.gpu.shutdown()

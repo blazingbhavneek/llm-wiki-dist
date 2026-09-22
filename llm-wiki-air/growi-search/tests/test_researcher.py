@@ -386,6 +386,13 @@ class AskRouting(unittest.TestCase):
         self.assertFalse(any("route" == e.get("type") and e["mode"] == "deep" and client.page_calls for e in events[:3]))
         self.assertEqual(client.page_calls, [])  # router phase reads zero bodies
 
+    def test_followup_reuses_conversation(self):
+        session = make_session(llm=FakeLLM(answer="follow-up"))
+        events, emit = self._events(session)
+        answer = session.ask("question", emit, None, "User: earlier", [ID1])
+        self.assertEqual((answer.answer, answer.cited_node_ids), ("follow-up", [ID1]))
+        self.assertTrue(any(event.get("mode") == "reuse" for event in events))
+
     def test_shallow_answer_citations(self):
         client = FakeClient()
         llm = FakeLLM(route_mode="shallow", answer="shallow回答\n\n引用:\n" + ID1)
@@ -470,6 +477,7 @@ class Overrides(unittest.TestCase):
         session = make_session(settings=settings)
         session.apply_overrides({"chat_model": "other", "subagent_count": 99})
         self.assertEqual(session.settings.chat_model, "other")
+        self.assertEqual(session.llm.model, "other")
         self.assertEqual(session.settings.subagent_count, 6)
         self.assertEqual(settings.chat_model, "base-model")
         other = make_session(settings=settings)

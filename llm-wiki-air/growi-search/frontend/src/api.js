@@ -35,6 +35,11 @@ async function req(path, opts) {
   return res.status === 204 ? null : res.json()
 }
 
+function attachmentId(src) {
+  const match = String(src ?? '').match(/(?:^|\/)attachment\/([0-9a-f]{24})(?:[/?#]|$)/i)
+  return match?.[1] || ''
+}
+
 export const api = {
   ready: () => req('/api/ready'),
   growi: () => req('/api/growi'),
@@ -53,11 +58,11 @@ export const api = {
   // Stream step-level agent progress via SSE. Calls onEvent(ev) per event;
   // resolves when the stream ends. Falls back to throwing on a non-OK response.
   // `overrides` is an optional per-request tunable map (subagents/depth/etc).
-  askStream: async (question, overrides, onEvent) => {
+  askStream: async (question, overrides, context, citedNodeIds, onEvent) => {
     const res = await fetch(`${BASE}/api/ask/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, overrides }),
+      body: JSON.stringify({ question, overrides, context, cited_node_ids: citedNodeIds }),
     })
     if (!res.ok || !res.body) {
       throw new ApiError(res.status, await parseError(res), res.statusText)
@@ -95,4 +100,13 @@ export const api = {
   settings: () => req('/api/settings'),
   document: (path) => req(`/api/document?path=${encodeURIComponent(path)}`),
   attachmentUrl: (src) => `${BASE}/api${src}`,
+  imageUrls: (src, growiUrl = '') => {
+    const value = String(src ?? '')
+    const id = attachmentId(value)
+    if (!id) return [value]
+
+    const proxy = `${BASE}/api/attachment/${id}`
+    const directBase = String(growiUrl || '').replace(/\/+$/, '')
+    return directBase ? [proxy, `${directBase}/attachment/${id}`] : [proxy]
+  },
 }

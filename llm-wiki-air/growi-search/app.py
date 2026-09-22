@@ -55,6 +55,8 @@ def growi_http_error(exc: GrowiAPIError) -> JSONResponse:
 class AskRequest(BaseModel):
     question: str
     overrides: dict[str, Any] | None = None
+    context: str | None = None
+    cited_node_ids: list[str] | None = None
 
 
 class PrefixMiddleware:
@@ -92,6 +94,7 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         client = GrowiSearchClient(
             settings.growi_url,
             settings.growi_token,
+            attachment_token=settings.growi_attachment_token,
             root_path=settings.growi_root_path,
             timeout=settings.growi_timeout,
             max_concurrency=settings.growi_concurrency,
@@ -255,7 +258,9 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         except ValueError as exc:
             return JSONResponse(status_code=400, content=api_error(str(exc), False, "bad_request"))
         try:
-            answer = await researcher.ask(question, None, body.overrides)
+            answer = await researcher.ask(
+                question, None, body.overrides, None, body.context or "", body.cited_node_ids
+            )
         except GrowiAPIError as exc:
             return growi_http_error(exc)
         except RuntimeError:
@@ -285,7 +290,9 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
 
         async def runner() -> None:
             try:
-                answer = await researcher.ask(question, emit, body.overrides, stop_event)
+                answer = await researcher.ask(
+                    question, emit, body.overrides, stop_event, body.context or "", body.cited_node_ids
+                )
                 emit({"type": "answer", **answer.model_dump()})
             except AgentStopped:
                 emit({"type": "cancelled"})

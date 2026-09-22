@@ -60,6 +60,7 @@ settings still control all other search-service behavior.
 | --- | --- | --- |
 | `GROWI_URL` | yes | Base URL of the live GROWI instance. |
 | `GROWI_TOKEN` | yes | Service-account API token (an `API Token:` prefix is stripped). |
+| `GROWI_ATTACHMENT_TOKEN` | no | Scoped GROWI access token with attachment-read permission; required for cookie-free image downloads. Falls back to `GROWI_TOKEN`. |
 | `GROWI_ROOT_PATH` | no | Restrict all results/browsing to this path; default `/`. |
 | `WIKI_CHAT_BASE_URL` | ask | Chat endpoint (falls back to `OPENAI_BASE_URL`). |
 | `WIKI_CHAT_MODEL` | ask | Chat model (falls back to `WIKI_MODEL`). |

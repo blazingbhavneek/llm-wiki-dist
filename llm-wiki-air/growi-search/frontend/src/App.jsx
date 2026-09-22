@@ -6,7 +6,6 @@ import MarkdownView from './components/MarkdownView'
 import ErrorBoundary from './components/ErrorBoundary'
 import SettingsView from './components/SettingsView'
 import { AppFooter } from './components/layout/AppFooter'
-import { LeftSidebar } from './components/layout/LeftSidebar'
 import { MarkdownWorkspaceFrame } from './components/layout/MarkdownWorkspaceFrame'
 import { RightDocumentRail } from './components/layout/RightDocumentRail'
 import { SearchResultsCenter } from './components/layout/SearchResults'
@@ -31,8 +30,6 @@ export default function App() {
    * centerView (inside useWorkspace) controls the main center area.
    * No tab bar anymore.
    */
-  const [leftCollapsed, setLeftCollapsed] = useState(false)
-  const [rightOpen, setRightOpen] = useState(true)
   const [rightTabs, setRightTabs] = useState([])
   const [activeRightTabId, setActiveRightTabId] = useState('explorer')
 
@@ -67,6 +64,7 @@ export default function App() {
     centerView,
     setCenterView,
     centerHistory,
+    pushCenterHistory,
     closeWorkspace,
     openWorkspace,
     goBackFromWorkspace,
@@ -75,7 +73,14 @@ export default function App() {
     openDocument,
   } = ws
 
-  const search = useSearch({ t, fireToast, setCenterView })
+  const search = useSearch({
+    t,
+    fireToast,
+    setCenterView: (view) => {
+      if (view === 'search' && centerView !== 'search') pushCenterHistory()
+      setCenterView(view)
+    },
+  })
 
   useEffect(() => {
     const path = workspace?.kind === 'doc' ? workspace.node?.path : null
@@ -171,7 +176,6 @@ export default function App() {
     })
 
     setActiveRightTabId(id)
-    setRightOpen(true)
     setActiveAnswerId(answer.id)
     setFocusIds(new Set(citedIds))
 
@@ -269,16 +273,6 @@ export default function App() {
   // Navigation
   // ---------------------------------------------------------------------------
 
-  const handleNav = (view) => {
-    if (view === 'explorer') {
-      setActiveRightTabId('explorer')
-      setRightOpen(true)
-      return
-    }
-
-    setCenterView(view)
-  }
-
   const handleNewChat = () => {
     chat.resetChat()
     setWorkspace(null)
@@ -286,6 +280,15 @@ export default function App() {
     setRightTabs([])
     setAnswerMentionedIdsByAnswerId(new Map())
     setActiveRightTabId('explorer')
+    setCenterView('chat')
+  }
+
+  const handleOpenChat = (id) => {
+    chat.openChat(id)
+    setWorkspace(null)
+    setActiveAnswerId(null)
+    setRightTabs([])
+    setAnswerMentionedIdsByAnswerId(new Map())
     setCenterView('chat')
   }
 
@@ -342,6 +345,7 @@ export default function App() {
           loading={search.searchLoading}
           connection={growiConnection}
           onOpenNode={openSearchResult}
+          onBack={goBackFromWorkspace}
         />
       )
     }
@@ -398,6 +402,7 @@ export default function App() {
               agentStopping={chat.agentStopping}
               onStopAgent={chat.stopAgent}
               rawById={rawById}
+              growiUrl={growiConnection?.url}
               onAnswerMentionedIds={handleAnswerMentionedIds}
             />
           </div>
@@ -407,64 +412,57 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-white text-neutral-900">
-      <LeftSidebar
-        collapsed={leftCollapsed}
-        activeView={centerView}
-        activeRightTabId={activeRightTabId}
-        rightOpen={rightOpen}
-        recentQuestions={chat.recentQuestions}
-        onToggle={() => setLeftCollapsed((v) => !v)}
-        onNavigate={handleNav}
-        onNewChat={handleNewChat}
-      />
-
-      <div className="flex min-w-0 flex-1 flex-col">
-        <TopBar
-          onSearch={search.onSearch}
-          onSearchResults={search.showResults}
-          rightOpen={rightOpen}
-          onToggleRight={() => setRightOpen((v) => !v)}
-          rootPath={growiConnection?.root_path}
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-white text-neutral-900">
+      <div className="flex min-h-0 flex-1">
+        <RightDocumentRail
+          wiki={wiki}
+          rootPath={growiConnection?.root_path || '/'}
+          workspace={workspace}
+          tabs={rightTabs}
+          activeTabId={activeRightTabId}
+          onActivateTab={setActiveRightTabId}
+          onCloseTab={closeRightTab}
+          onOpenNode={(n) => openNodeById(n.id)}
+          onOpenDocument={openDocument}
+          rawById={rawById}
+          onViewAnswer={(answer) => openAnswerTab(answer, true)}
+          mentionedNodeIdsByAnswerId={answerMentionedIdsByAnswerId}
+          onNewChat={handleNewChat}
+          onOpenSettings={() => setCenterView('settings')}
+          settingsActive={centerView === 'settings'}
+          chats={chat.savedChats}
+          activeChatId={chat.chatId}
+          onOpenChat={handleOpenChat}
+          onDeleteChat={chat.deleteChat}
+          onClearChats={chat.clearChats}
         />
 
-        <div className="relative flex min-h-0 flex-1 overflow-hidden">
-          <main className="relative min-w-0 flex-1 overflow-hidden bg-white">
-            <ErrorBoundary
-              resetKey={`${centerView}:${workspace?.id || 'none'}:${search.searchQuery}`}
-            >
-              {renderCenter()}
-            </ErrorBoundary>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <TopBar
+            onSearch={search.onSearch}
+            rootPath={growiConnection?.root_path}
+          />
 
-            {toast && (
-              <div className="absolute bottom-[22px] right-[22px] z-30 max-w-[390px] rounded-xl border border-blue-200 bg-blue-50 px-[14px] py-[13px] text-[13px] leading-[1.45] text-blue-800 shadow-xl">
-                {toast}
-              </div>
-            )}
+          <div className="relative flex min-h-0 flex-1 overflow-hidden">
+            <main className="relative min-w-0 flex-1 overflow-hidden bg-white">
+              <ErrorBoundary
+                resetKey={`${centerView}:${workspace?.id || 'none'}:${search.searchQuery}`}
+              >
+                {renderCenter()}
+              </ErrorBoundary>
 
-          </main>
+              {toast && (
+                <div className="absolute bottom-[22px] right-[22px] z-30 max-w-[390px] rounded-xl border border-blue-200 bg-blue-50 px-[14px] py-[13px] text-[13px] leading-[1.45] text-blue-800 shadow-xl">
+                  {toast}
+                </div>
+              )}
 
-          {rightOpen && (
-            <RightDocumentRail
-              wiki={wiki}
-              rootPath={growiConnection?.root_path || '/'}
-              workspace={workspace}
-              tabs={rightTabs}
-              activeTabId={activeRightTabId}
-              onActivateTab={setActiveRightTabId}
-              onCloseTab={closeRightTab}
-              onOpenNode={(n) => openNodeById(n.id)}
-              onOpenDocument={openDocument}
-              rawById={rawById}
-              onViewAnswer={(answer) => openAnswerTab(answer, true)}
-              mentionedNodeIdsByAnswerId={answerMentionedIdsByAnswerId}
-              onClose={() => setRightOpen(false)}
-            />
-          )}
+            </main>
+          </div>
         </div>
-
-        <AppFooter />
       </div>
+
+      <AppFooter />
     </div>
   )
 }

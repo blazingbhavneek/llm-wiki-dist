@@ -5,9 +5,12 @@ description = "No-Git Markdown wiki publisher"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+  "fastapi",
   "httpx==0.28.1",
   "langchain-core==1.6.3",
   "langchain-openai==1.6.2",
+  "langgraph",
+  "uvicorn[standard]",
   "openpyxl==3.1.5",
   "oletools==0.60.2",
   "pathspec==1.1.1",

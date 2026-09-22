@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import ctypes
+import hashlib
+import io
 import json
 import logging
 import os
 import re
-import shlex
-import shutil
-import signal
-import subprocess
-import sys
+import time
+import zipfile
 from pathlib import Path
+from pathlib import PurePosixPath
+
+import httpx
 
 from client.llm import LLMClient
 from formats.base import BaseParser, ExtractedDocument, ParseOptions, ParseProfile
@@ -33,17 +34,6 @@ _PAGE_MARKER_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"^<!--\s*page\s+(\d+)\s*-->\s*$", re.IGNORECASE | re.MULTILINE),
 )
 _PDF_PAGE_HEADING_RE = re.compile(r"^##\s*PDF ページ\s+(\d+)\s*$", re.MULTILINE)
-
-try:
-    _LIBC = ctypes.CDLL(None)
-except Exception:  # noqa: BLE001 - non-Linux or exotic libc
-    _LIBC = None
-
-
-def _parent_death_signal() -> None:
-    """Terminate the MinerU child if its GPU worker is forcefully killed."""
-    if _LIBC is not None:
-        _LIBC.prctl(1, signal.SIGTERM, 0, 0, 0)
 
 
 class MineruError(RuntimeError):
@@ -195,161 +185,262 @@ def split_mineru_pages(markdown_path: Path, output_dir: Path) -> list[str]:
     )
 
 
-def discover_mineru_bin(command: list[str]) -> str | None:
-    """Return a ``bin`` directory to prepend to PATH so ``command[0]`` resolves.
-
-    Order: explicit MINERU_VENV_BIN, the current PATH, venvs in the project
-    root (``.venv``, ``venv``, ...), this interpreter's own bin, then common
-    venv/conda roots under the user's home and /opt. Returns None when nothing
-    is found, which leaves PATH untouched so the original error message still
-    applies.
-    """
-    explicit = os.getenv("MINERU_VENV_BIN", "").strip()
-    if explicit:
-        return explicit
-
-    executable = shutil.which(command[0])
-    if executable:
-        return str(Path(executable).parent)
-
-    exe_name = command[0] + (".exe" if os.name == "nt" else "")
-    # This package lives in <project root>/formats, so parent.parent is the root.
-    project_root = Path(__file__).resolve().parent.parent
-    candidates = [
-        *(project_root / name / "bin"
-          for name in (".venv", "venv", "env", ".env")),
-        Path(sys.executable).parent,
-    ]
-    home = Path.home()
-    candidates.extend(
-        bin_dir
-        for bin_dir in (
-            *sorted(home.glob("*venv*/bin")),
-            *sorted(home.glob("*/.venv/bin")),
-            *sorted(home.glob(".venvs/*/bin")),
-            *sorted(home.glob("*conda*/envs/*/bin")),
-            *sorted(Path("/opt").glob("*venv*/bin")),
-        )
-    )
-    for bin_dir in candidates:
-        if (bin_dir / exe_name).is_file():
-            return str(bin_dir)
-    return None
+def _mineru_api_base_url() -> str:
+    url = os.getenv("MINERU_API_URL", "").strip().rstrip("/")
+    if not url:
+        raise MineruError("MINERU_API_URL must be configured")
+    return url if url.endswith("/v1") else f"{url}/v1"
 
 
-def run_mineru(pdf_path: str, output_dir: str) -> str:
-    """Run MinerU in a GPU worker and return its generated Markdown path.
+def _safe_extract_zip(payload: bytes, destination: Path) -> None:
+    """Extract a MinerU result ZIP without allowing path traversal."""
+    root = destination.resolve()
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        for member in archive.infolist():
+            relative = PurePosixPath(member.filename)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise MineruError(f"MinerU returned an unsafe ZIP entry: {member.filename}")
+            target = (root / Path(*relative.parts)).resolve()
+            if target != root and root not in target.parents:
+                raise MineruError(f"MinerU returned an unsafe ZIP entry: {member.filename}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read(member))
 
-    This function is module-level because spawned process workers require a
-    picklable callable. MinerU itself is invoked without a shell.
-    """
+
+def _v4_middle_json_to_content_list(payload: dict, output_dir: Path) -> list[dict]:
+    """Translate MinerU v4 page blocks to the artifact shape used by this parser."""
+    image_files = {
+        path.name: path.relative_to(output_dir).as_posix()
+        for path in output_dir.glob("images/*")
+        if path.is_file()
+    }
+    blocks: list[dict] = []
+    for page in payload.get("pages", []):
+        page_idx = page.get("page_idx")
+        for block in page.get("blocks", []):
+            block_type = block.get("type")
+            content = block.get("content") or []
+            if block_type == "table":
+                captions = [
+                    str(item.get("content", ""))
+                    for item in content
+                    if item.get("type") == "table_caption"
+                ]
+                bodies = [
+                    str(item.get("content", ""))
+                    for item in content
+                    if item.get("type") == "table_body"
+                ]
+                blocks.append(
+                    {
+                        "page_idx": page_idx,
+                        "type": "table",
+                        "table_caption": captions,
+                        "table_body": "\n".join(bodies),
+                    }
+                )
+                continue
+            if block_type == "image":
+                body = next(
+                    (item for item in content if item.get("type") == "image_body"),
+                    None,
+                )
+                body_index = body.get("index") if body else None
+                prefix = f"page_{page_idx}_image_body_{body_index}."
+                image_name = next(
+                    (name for name in image_files if name.startswith(prefix)),
+                    None,
+                )
+                captions = [
+                    str(item.get("content", ""))
+                    for item in content
+                    if item.get("type") == "image_caption"
+                ]
+                if image_name:
+                    blocks.append(
+                        {
+                            "page_idx": page_idx,
+                            "type": "image",
+                            "img_path": image_files[image_name],
+                            "img_caption": captions,
+                        }
+                    )
+                elif captions:
+                    blocks.append(
+                        {
+                            "page_idx": page_idx,
+                            "type": "text",
+                            "text": "\n".join(captions),
+                        }
+                    )
+                continue
+            text = "\n".join(
+                str(item.get("content", ""))
+                for item in content
+                if item.get("type") == "text"
+            ).strip()
+            if text:
+                blocks.append(
+                    {
+                        "page_idx": page_idx,
+                        "type": "text",
+                        "text": text,
+                        "text_level": block.get("level", 0),
+                    }
+                )
+    return blocks
+
+
+def _run_mineru_api_once(pdf_path: str, output_dir: str) -> str:
     source = Path(pdf_path)
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-
-    command = shlex.split(os.getenv("MINERU_COMMAND", "mineru"))
-    if not command:
-        raise MineruError("MINERU_COMMAND is empty")
-
-    args = [*command, "-p", str(source), "-o", str(destination)]
-
-    # ``pipeline`` is the general-purpose backend; it cold-loads in ~1 minute and
-    # ignores --gpu-memory-utilization. The vlm/hybrid backends default otherwise
-    # and pull in vLLM, whose init on a shared GPU takes several minutes.
-    backend = os.getenv("MINERU_BACKEND", "pipeline").strip()
-    if backend:
-        args.extend(["-b", backend])
-
-    # A warm mineru-api service (started by the server lifespan with the VLM
-    # preloaded) avoids the per-request vLLM cold start. When it is not up,
-    # MINERU_API_URL is absent and the CLI cold-starts locally as before.
-    api_url = os.getenv("MINERU_API_URL", "").strip()
-    if api_url:
-        args.extend(["--api-url", api_url])
-
-    # --gpu-memory-utilization is a vLLM knob: only meaningful for vlm/hybrid.
-    gpu_memory = os.getenv("MINERU_GPU_MEMORY_UTILIZATION", "").strip()
-    if gpu_memory and backend not in {"", "pipeline"}:
-        args.extend(["--gpu-memory-utilization", gpu_memory])
-
-    extra_args = os.getenv("MINERU_EXTRA_ARGS", "").strip()
-    if extra_args:
-        args.extend(shlex.split(extra_args))
-
-    environment = os.environ.copy()
-    environment["CUDA_VISIBLE_DEVICES"] = os.getenv(
-        "MINERU_CUDA_VISIBLE_DEVICES",
-        "1",
-    )
-    environment["MINERU_PROCESSING_WINDOW_SIZE"] = os.getenv(
-        "MINERU_PROCESSING_WINDOW_SIZE",
-        "4",
-    )
-    environment["MINERU_DISABLE_CUDNN_SDPA"] = os.getenv(
-        "MINERU_DISABLE_CUDNN_SDPA",
-        "true",
-    )
-    bootstrap_dir = (
-        Path(__file__).resolve().parent.parent / "workers" / "mineru_bootstrap"
-    )
-    environment["PYTHONPATH"] = (
-        f"{bootstrap_dir}{os.pathsep}{environment.get('PYTHONPATH', '')}"
-    )
-    mineru_bin = discover_mineru_bin(command)
-    if mineru_bin:
-        environment["PATH"] = (
-            f"{mineru_bin}{os.pathsep}{environment.get('PATH', '')}"
-        )
-
+    base_url = _mineru_api_base_url()
+    payload = source.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
     timeout_s = float(os.getenv("MINERU_TIMEOUT_SECONDS", "1800"))
-    try:
-        # Own session so a kill on timeout takes the whole process group:
-        # without an API URL the CLI starts a temporary local mineru-api
-        # whose vLLM children would otherwise survive and hold GPU memory.
-        process = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=environment,
-            start_new_session=True,
-            preexec_fn=_parent_death_signal if _LIBC else None,
+    tier = os.getenv("MINERU_API_TIER", "advanced").strip() or "advanced"
+    timeout = httpx.Timeout(connect=10, read=60, write=300, pool=30)
+
+    with httpx.Client(
+        base_url=base_url,
+        timeout=timeout,
+        trust_env=False,
+    ) as client:
+        health = client.get("/health")
+        if health.status_code != 200:
+            raise MineruError(
+                f"MinerU API health failed: {health.status_code} {health.text[:500]}"
+            )
+        health_payload = health.json()
+        if health_payload.get("status") not in {"ok", "healthy"}:
+            raise MineruError(f"MinerU API is not healthy: {health.text[:1000]}")
+
+        upload = client.post(
+            "/uploads",
+            json={
+                "filename": source.name,
+                "bytes": len(payload),
+                "mime_type": "application/pdf",
+                "purpose": "parse",
+                "sha256sum": digest,
+            },
         )
-    except FileNotFoundError as exc:
-        raise MineruError(f"MinerU executable was not found: {command[0]}") from exc
+        upload.raise_for_status()
+        upload_payload = upload.json()
+        upload_id = upload_payload["id"]
+        if upload_payload.get("status") == "completed" and upload_payload.get("file"):
+            file_id = upload_payload["file"]["id"]
+        else:
+            upload_url = upload_payload.get("upload_url") or f"/uploads/{upload_id}/content"
+            content = client.put(
+                upload_url,
+                content=payload,
+                headers=upload_payload.get("upload_headers") or {
+                    "Content-Type": "application/octet-stream"
+                },
+            )
+            content.raise_for_status()
+            complete = client.post(
+                f"/uploads/{upload_id}/complete",
+                json={"sha256sum": digest},
+            )
+            complete.raise_for_status()
+            file_id = complete.json()["file"]["id"]
 
-    try:
-        stdout, stderr = process.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired as exc:
-        _kill_process_group(process)
-        process.communicate()
-        raise MineruError(f"MinerU timed out after {timeout_s:g} seconds") from exc
-
-    if process.returncode:
-        details = ((stderr or "") or (stdout or "")).strip()[-4000:]
-        raise MineruError(
-            f"MinerU exited with status {process.returncode}: {details}"
+        job = client.post(
+            "/parse/jobs",
+            json={
+                "files": [
+                    {
+                        "source": {"type": "file_id", "file_id": file_id},
+                        "page_range": "all",
+                    }
+                ],
+                # MinerU v4 selects accuracy through tiers rather than the old
+                # CLI backend names (pipeline/hybrid).
+                "tier": tier,
+                "ocr_mode": "auto",
+                "output_formats": ["markdown", "middle_json", "zip"],
+            },
         )
+        job.raise_for_status()
+        job_id = job.json()["job_id"]
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            status = client.get(f"/parse/jobs/{job_id}")
+            status.raise_for_status()
+            status_payload = status.json()
+            state = status_payload.get("status")
+            if state in {"completed", "partial", "failed", "canceled"}:
+                break
+            time.sleep(1)
+        else:
+            raise MineruError(f"MinerU API timed out after {timeout_s:g} seconds")
 
-    return str(_find_markdown(destination, source.stem))
+        if state not in {"completed", "partial"}:
+            raise MineruError(json.dumps(status_payload, ensure_ascii=False)[:4000])
+        file_result = status_payload.get("files", [{}])[0]
+        outputs = file_result.get("output_files") or {}
+        zip_reference = outputs.get("zip")
+        if zip_reference:
+            result_zip = client.get(f"/files/{zip_reference['file_id']}/content")
+            result_zip.raise_for_status()
+            _safe_extract_zip(result_zip.content, destination)
+        else:
+            for kind, filename in (("markdown", f"{source.stem}.md"), ("middle_json", "middle_json.json")):
+                reference = outputs.get(kind)
+                if not reference:
+                    raise MineruError(f"MinerU API response omitted {kind}")
+                result = client.get(f"/files/{reference['file_id']}/content")
+                result.raise_for_status()
+                (destination / filename).write_bytes(result.content)
 
-
-def _kill_process_group(process: subprocess.Popen) -> None:
-    """SIGTERM then SIGKILL the CLI's whole process group."""
-    try:
-        group = os.getpgid(process.pid)
-    except ProcessLookupError:
-        return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    markdown_candidates = sorted(destination.glob("*.md"))
+    if not markdown_candidates:
+        raise MineruError("MinerU API returned no Markdown file")
+    markdown_path = next(
+        (path for path in markdown_candidates if path.name == "markdown.md"),
+        markdown_candidates[0],
+    )
+    middle_path = destination / "middle_json.json"
+    if middle_path.exists():
         try:
-            os.killpg(group, sig)
-        except ProcessLookupError:
-            return
+            middle_payload = json.loads(middle_path.read_text(encoding="utf-8"))
+            content_list = _v4_middle_json_to_content_list(middle_payload, destination)
+            (destination / "content_list.json").write_text(
+                json.dumps(content_list, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError) as exc:
+            raise MineruError(f"MinerU API returned invalid middle JSON: {exc}") from exc
+    return str(markdown_path)
+
+
+def run_mineru(pdf_path: str, output_dir: str) -> str:
+    """Submit a PDF to the configured MinerU v4 API and return Markdown."""
+    _mineru_api_base_url()
+    for attempt in range(2):
         try:
-            process.wait(timeout=10)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            return _run_mineru_api_once(pdf_path, output_dir)
+        except (
+            MineruError,
+            httpx.HTTPError,
+            ValueError,
+            KeyError,
+            AttributeError,
+        ) as exc:
+            if attempt == 0:
+                logger.warning("MinerU API failed; retrying once in 10 seconds: %s", exc)
+                time.sleep(10)
+                continue
+            if isinstance(exc, MineruError):
+                raise
+            raise MineruError(f"MinerU API request failed: {exc}") from exc
+    raise AssertionError("unreachable")
 
 
 class PdfParser(BaseParser):

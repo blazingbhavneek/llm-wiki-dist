@@ -47,5 +47,9 @@ class ExternalExecutor:
             **self._limiter.stats(),
         }
 
+    def ready(self) -> bool:
+        """Return whether this executor can accept new work."""
+        return not bool(getattr(self._pool, "_shutdown", False))
+
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)

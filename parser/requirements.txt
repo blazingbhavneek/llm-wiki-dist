@@ -32,8 +32,6 @@ mammoth
 markdown-it-py
 markupsafe
 mdurl
-mineru
-mineru-vl-utils
 modelscope
 modelscope-hub
 mpmath

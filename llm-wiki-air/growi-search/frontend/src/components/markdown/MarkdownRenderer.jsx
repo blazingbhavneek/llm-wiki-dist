@@ -138,15 +138,17 @@ const markdownSchema = {
   },
 }
 
-export function SafeImage({ src, alt = '', title, className = '', width, height }) {
+export function SafeImage({ src, alt = '', title, className = '', width, height, growiUrl = '' }) {
   const t = useT(STR)
   const [failed, setFailed] = useState(false)
-
-  const normalizedSrc = normalizeImageSrc(src)
+  const [sourceIndex, setSourceIndex] = useState(0)
+  const sources = api.imageUrls(src, growiUrl)
+  const normalizedSrc = normalizeImageSrc(sources[sourceIndex] || '')
 
   useEffect(() => {
+    setSourceIndex(0)
     setFailed(false)
-  }, [normalizedSrc])
+  }, [src, growiUrl])
 
   if (!normalizedSrc) {
     return null
@@ -177,16 +179,19 @@ export function SafeImage({ src, alt = '', title, className = '', width, height 
       height={height}
       loading="lazy"
       decoding="async"
-      onError={() => setFailed(true)}
+      onError={() => {
+        if (sourceIndex < sources.length - 1) setSourceIndex((index) => index + 1)
+        else setFailed(true)
+      }}
       className={`my-4 block max-h-[620px] max-w-full object-contain ${className}`}
     />
   )
 }
 
-function PreviewImageUnit({ src, alt, title }) {
+function PreviewImageUnit({ src, alt, title, growiUrl }) {
   return (
     <div className="my-4 flex justify-center overflow-auto">
-      <SafeImage src={src} alt={alt} title={title} />
+      <SafeImage src={src} alt={alt} title={title} growiUrl={growiUrl} />
     </div>
   )
 }
@@ -198,10 +203,10 @@ const CITED_NODE_IDS_BLOCK_RE =
 const REFERENCE_NODES_LINE_RE =
   /(^|\n)\s*(?:参照ノード|引用ノード|reference\s*nodes?|cited\s*nodes?)\s*[:：]\s*([^\n]*)/gi
 
-function buildMarkdownComponents(onOpenNode, rawById, sourcePath, links) {
+function buildMarkdownComponents(onOpenNode, rawById, sourcePath, links, growiUrl) {
   return {
     img: ({ node, src = '', alt = '', title, width, height }) => (
-      <SafeImage src={String(src).startsWith('/attachment/') ? api.attachmentUrl(src) : src} alt={alt} title={title} width={width} height={height} />
+      <SafeImage src={src} alt={alt} title={title} width={width} height={height} growiUrl={growiUrl} />
     ),
 
     a: ({ node, href = '', children, ...props }) => {
@@ -353,15 +358,15 @@ function buildMarkdownComponents(onOpenNode, rawById, sourcePath, links) {
   }
 }
 
-function MarkdownChunk({ markdown, sourcePath, links, onOpenNode, rawById }) {
+function MarkdownChunk({ markdown, sourcePath, links, onOpenNode, rawById, growiUrl }) {
   const safeMarkdown = String(markdown || '')
   const linkedMarkdown = useMemo(
     () => linkifyNodeIdsInMarkdown(safeMarkdown, rawById),
     [safeMarkdown, rawById],
   )
   const markdownComponents = useMemo(
-    () => buildMarkdownComponents(onOpenNode, rawById, sourcePath, links),
-    [onOpenNode, rawById, sourcePath, links],
+    () => buildMarkdownComponents(onOpenNode, rawById, sourcePath, links, growiUrl),
+    [onOpenNode, rawById, sourcePath, links, growiUrl],
   )
   if (!safeMarkdown) return null
 
@@ -394,6 +399,7 @@ export function MarkdownRenderer({
   onOpenNode,
   rawById,
   referenceLabel = 'Reference',
+  growiUrl = '',
 }) {
   const normalizedMarkdown = useMemo(
     () => rewriteCitedNodeIdsBlock(markdown || '', rawById, referenceLabel),
@@ -414,6 +420,7 @@ export function MarkdownRenderer({
               src={part.src}
               alt={part.alt}
               title={part.title}
+              growiUrl={growiUrl}
             />
           )
         }
@@ -426,6 +433,7 @@ export function MarkdownRenderer({
             links={links}
             onOpenNode={onOpenNode}
             rawById={rawById}
+            growiUrl={growiUrl}
           />
         )
       })}

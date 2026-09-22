@@ -10,7 +10,7 @@ The server owns only three constrained resources:
 | Resource | API | Intended work |
 | --- | --- | --- |
 | External | `await workers.run_external(...)` | Blocking Pandoc, LibreOffice, or synchronous library calls |
-| GPU | `await workers.run_gpu(...)` | MinerU, local OCR, and local vision models |
+| GPU | `await workers.run_gpu(...)` | MinerU API client and other local GPU work |
 | Network | `await workers.run_network(...)` | Async LLM and image-description requests |
 
 Detection, markdown assembly, metadata, and other small bounded operations
@@ -118,18 +118,12 @@ GPU functions must be importable top-level functions. Arguments and results
 must be picklable because the executor uses spawned child processes:
 
 ```python
-_model = None
-
-
-def run_mineru(path: str) -> str:
-    global _model
-    if _model is None:
-        _model = load_mineru_model()  # once in the GPU process
-    return _model.parse(path)
+def run_mineru_api(path: str) -> str:
+    return submit_to_mineru_api(path, api_url=os.environ["MINERU_API_URL"])
 
 
 # Inside _extract:
-markdown = await workers.run_gpu(run_mineru, document_path)
+markdown = await workers.run_gpu(run_mineru_api, document_path)
 ```
 
 Do not submit lambdas, closures, open file objects, HTTP clients, or parser

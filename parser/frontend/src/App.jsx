@@ -10,6 +10,8 @@ const IMAGE_UNIT_RE = /<image-unit\b[^>]*>([\s\S]*?)<\/image-unit>/gi
 const IMAGE_SRC_RE = /<img\b[^>]*\bsrc=["']([^"']+)["']/i
 const IMAGE_DESC_RE =
   /<image-description\b[^>]*>([\s\S]*?)<\/image-description>/i
+const MARKDOWN_DATA_IMAGE_RE =
+  /!\[([^\]]*)\]\(\s*(<?data:image\/[^)\s>]+>?)\s*\)/gi
 
 /** Shorten base64 payloads so the raw view stays scrollable. */
 function truncateBase64(markdown) {
@@ -22,9 +24,12 @@ function truncateBase64(markdown) {
 const escapeHtml = (s) =>
   s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c])
 
+const escapeAttribute = (s) =>
+  escapeHtml(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+
 /** Turn custom <image-unit> blocks into styled HTML the renderer can show. */
 function preprocess(markdown) {
-  return markdown.replace(IMAGE_UNIT_RE, (_m, body) => {
+  const withUnits = markdown.replace(IMAGE_UNIT_RE, (_m, body) => {
     const src = body.match(IMAGE_SRC_RE)?.[1] ?? ''
     const desc = (body.match(IMAGE_DESC_RE)?.[1] ?? '').trim()
     return [
@@ -36,12 +41,21 @@ function preprocess(markdown) {
       '</figure>',
     ].join('\n')
   })
+
+  // marked leaves raw HTML tables untouched, so Markdown image syntax inside
+  // a <td> would otherwise render as literal base64 text. Convert data-image
+  // references to normal <img> elements before marked parses the document.
+  return withUnits.replace(MARKDOWN_DATA_IMAGE_RE, (_m, alt, rawSrc) => {
+    const src = rawSrc.replace(/^<|>$/g, '')
+    return `<img src="${escapeAttribute(src)}" alt="${escapeAttribute(alt)}" loading="lazy" />`
+  })
 }
 
 export default function App() {
   const { t, i18n } = useTranslation()
   const [file, setFile] = useState(null)
   const [includeImages, setIncludeImages] = useState(true)
+  const [describeImages, setDescribeImages] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -97,8 +111,11 @@ export default function App() {
     try {
       const form = new FormData()
       form.append('file', f)
-      // Generic route: ordinary Markdown data-URL images, never an LLM call.
-      const qs = new URLSearchParams({ images: String(includeImages) })
+      // Generic route: ordinary Markdown data-URL images, with optional descriptions.
+      const qs = new URLSearchParams({
+        images: String(includeImages),
+        describe_images: String(describeImages),
+      })
       const res = await fetch(`${URL_PREFIX}/parse?${qs.toString()}`, {
         method: 'POST',
         body: form,
@@ -214,6 +231,16 @@ export default function App() {
               className="h-4 w-4 accent-neutral-900"
             />
             {t('includeImages')}
+          </label>
+
+          <label className="flex cursor-pointer select-none items-center gap-2">
+            <input
+              type="checkbox"
+              checked={describeImages}
+              onChange={(e) => setDescribeImages(e.target.checked)}
+              className="h-4 w-4 accent-neutral-900"
+            />
+            {t('describeImages')}
           </label>
 
           <div className="ml-auto flex gap-2">

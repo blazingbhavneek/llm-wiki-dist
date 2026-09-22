@@ -5,8 +5,8 @@ Real-world (and one synthetic) documents for exercising the full
 
 | File | Format | Source | What it exercises |
 | --- | --- | --- | --- |
-| `pdf_transformer_paper.pdf` | PDF | arXiv 1706.03762 ("Attention Is All You Need"), 15 pp | Multi-column text, 4 tables, 5 figures, inline math — MinerU pipeline backend |
-| `pdf_medical_report_scanned.pdf` | PDF | microsoft/markitdown test files, 3 pp | Image-only scan — MinerU OCR path |
+| `pdf_transformer_paper.pdf` | PDF | arXiv 1706.03762 ("Attention Is All You Need"), 15 pp | Multi-column text, 4 tables, 5 figures, inline math — MinerU API pipeline backend |
+| `pdf_medical_report_scanned.pdf` | PDF | microsoft/markitdown test files, 3 pp | Image-only scan — MinerU API OCR path |
 | `pdf_repair_invoice_multipage.pdf` | PDF | microsoft/markitdown test files, 3 pp | Multi-page invoice, line-item tables, 2 logo images |
 | `docx_handbook_872p.docx` | DOCX | Unstructured-IO/unstructured example-docs (US DoJ Ch.13 Handbook), 872 pp | Huge document (5 MB `document.xml`), deep heading tree, HTML tables, TOC, 2 images |
 | `docx_contains_pictures.docx` | DOCX | Unstructured-IO/unstructured example-docs | Inline + floating `<img>` images with sizing attributes |
