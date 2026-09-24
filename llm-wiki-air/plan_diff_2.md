@@ -2805,7 +2805,8 @@ what you did.)
 
 | Date | Item | Notes |
 |---|---|---|
-| | Baseline test results (Phase 0) | |
-| | Manual `handoff.md` edit run (Phase 10.3) | tier / patched / escalated / curated / published / time |
-| | PDF determinism (Phase 10.4) | |
-| | Final fast suite summary (Phase 11.5) | |
+| 2026-09-24 | Baseline tests (Phase 0) | Initial run lacked `data/diff_test/mount/test.docx` and the parser virtualenv. Added a tracked Japanese DOCX fixture and prepared parser dependencies with `uv sync --locked` (no dependency changes). |
+| 2026-09-24 | Real document mutations | Digital Agency DOCX and NIES/A-PLAT PPTX update markers appeared in local parser output. The modified Japanese Constitution PDF contains its marker (`pdftotext`), but parser PDF extraction timed out at MinerU. Source copies and edits are in `/tmp/llm-wiki-test-docs`. |
+| 2026-09-24 | Manual `handoff.md` edit run (Phase 10.3) | Not run. The real live `test_19` stalled in initial window planning for over 23 minutes on local Gemma 4 12B and was stopped before publication; live tests 19–22 remain unverified. |
+| 2026-09-24 | PDF determinism (Phase 10.4) | Not measured: the local parser's MinerU API timed out on the 12-page Japanese PDF. |
+| 2026-09-24 | Fast suites (Phase 11.5) | Air discovery: 85 tests, 27 opt-in live skips; parser discovery: all 89 tests passed, including real LibreOffice `.xls` conversion. |

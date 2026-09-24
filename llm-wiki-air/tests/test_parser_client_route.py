@@ -113,6 +113,25 @@ class ParserClientTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "false")
 
+    def test_reuse_keeps_only_first_description_when_parser_deduplicates(self) -> None:
+        previous = _image("YWJj", "first") + "\n" + _image("YWJj")
+        current = _image("YWJj") + "\n" + _image("YWJj")
+        calls: list[str] = []
+        result = reuse_image_descriptions(
+            previous,
+            current,
+            lambda data_url, alt: calls.append(data_url) or "unexpected",
+            repeat_descriptions=False,
+        )
+        self.assertEqual(result, previous)
+        self.assertEqual(calls, [])
+
+    def test_reuse_repeats_descriptions_by_default(self) -> None:
+        previous = _image("YWJj", "first") + "\n" + _image("YWJj")
+        current = _image("YWJj") + "\n" + _image("YWJj")
+        result = reuse_image_descriptions(previous, current, lambda _data_url, _alt: "unexpected")
+        self.assertEqual(result, _image("YWJj", "first") + "\n" + _image("YWJj", "first"))
+
     def test_update_describes_only_new_image_bytes(self) -> None:
         previous = _image("YWJj", "keep me")
         current = previous.replace("keep me", "") + "\n" + _image("ZGVm")

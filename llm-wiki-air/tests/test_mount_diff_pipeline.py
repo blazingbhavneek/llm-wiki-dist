@@ -38,7 +38,6 @@ from docx import Document
 from graph import config
 from graph.config import Settings
 from graph.growi.client import GrowiPage, GrowiPublisher
-from graph.wiki.incremental import invalidate_pages
 from graph.workspace.project import Project, open_project, raw_name_for
 from publisher import pipeline, queue
 from publisher.history import candidate, ensure_repository, last_good, read_blob, stage_blob
@@ -46,8 +45,8 @@ from publisher.ledger import Ledger, load_ledger, save_ledger
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / "configs" / "diff_test.ini"
-FIXTURE = ROOT / "data" / "diff_test" / "mount" / "test.docx"
+CONFIG = ROOT / "configs" / "diff_test_local.ini"
+FIXTURE = ROOT / "tests" / "samples" / "digital-agency-pdl.docx"
 RUN_LIVE = os.environ.get("RUN_DIFF_INTEGRATION") == "1"
 LAST_GOOD_REF = "refs/llm-wiki/last-good"
 
@@ -87,9 +86,10 @@ class DiffDocxFixtureTest(unittest.TestCase):
         self.assertGreater(FIXTURE.stat().st_size, 0)
         config.PROJECT_ROOT = ROOT
         settings = Settings.from_env(str(CONFIG))
-        self.assertEqual(Path(settings.mount_path), FIXTURE.parent)
-        self.assertEqual(settings.target_name, "diff_test")
-        self.assertEqual(settings.chat_base_url, "http://10.160.144.101:51029/v1")
+        self.assertEqual(settings.mount_path, "/tmp/llm-wiki-diff-test/mount")
+        self.assertEqual(settings.target_name, "diff_test_local")
+        self.assertEqual(settings.chat_base_url, "http://127.0.0.1:8080/v1")
+        self.assertEqual(settings.parser_base_url, "http://127.0.0.1:8000/agent/doc-parser/")
 
     def test_docx_mutators_create_small_and_large_different_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,7 +124,7 @@ class DiffPipelineSafetyTest(unittest.TestCase):
         for index in range(0, 2000, 20):
             new[index] += " updated"
 
-        with patch.object(queue, "_docx_text", side_effect=[(old, ["Heading"]), (new, ["Heading"])]):
+        with patch.object(queue, "_docx_text", side_effect=[old, new]):
             result = queue._classification(b"old", b"new", ".docx")
 
         self.assertEqual(result["kind"], "small")
@@ -156,83 +156,6 @@ class DiffPipelineSafetyTest(unittest.TestCase):
         self.assertTrue(scan.call_args_list[0].kwargs["force"])
         self.assertFalse(scan.call_args_list[1].kwargs["force"])
         self.assertTrue(all(call.kwargs["verify_content"] for call in scan.call_args_list))
-
-    def test_append_outside_every_old_page_forces_full_rebuild(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "state").mkdir()
-            (root / "wiki").mkdir()
-            (root / "state" / "plan.json").write_text(
-                json.dumps({
-                    "source_line_count": 3,
-                    "source_sha256": "old",
-                    "pages": [{
-                        "number": 1,
-                        "filename": "001.md",
-                        "owner_ranges": [[1, 3]],
-                        "reference_ranges": [],
-                    }],
-                }),
-                encoding="utf-8",
-            )
-            (root / "wiki" / "001.md").write_text("old", encoding="utf-8")
-
-            result = invalidate_pages(root, [(4, 0, 4, 1)], "one\ntwo\nthree\nnew\n")
-
-            self.assertEqual(result, "full")
-            self.assertFalse(root.exists())
-
-    def test_owner_edit_reuses_and_remaps_reference_research(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "state").mkdir()
-            (root / "wiki").mkdir()
-            (root / "work" / "research-001").mkdir(parents=True)
-            page_cache = root / "work" / "page-001" / "section-01-attempt-01.md"
-            page_cache.parent.mkdir(parents=True)
-            page_cache.write_text("cached section", encoding="utf-8")
-            (root / "state" / "plan.json").write_text(
-                json.dumps({
-                    "source_line_count": 5,
-                    "source_sha256": "old",
-                    "pages": [{
-                        "number": 1,
-                        "filename": "001.md",
-                        "owner_ranges": [[1, 3]],
-                        "reference_ranges": [[4, 5]],
-                    }],
-                }),
-                encoding="utf-8",
-            )
-            cache = root / "work" / "research-001" / "references.json"
-            cache.write_text(
-                json.dumps({
-                    "useful_facts": [{
-                        "description": "fact",
-                        "reason": "reason",
-                        "insertion_point": "intro",
-                        "source_start": 4,
-                        "source_end": 5,
-                        "target_line": 1,
-                    }],
-                    "no_useful_information_reason": "",
-                }),
-                encoding="utf-8",
-            )
-
-            touched: set[str] = set()
-            result = invalidate_pages(
-                root,
-                [(2, 0, 2, 1)],
-                "one\ninserted\ntwo\nthree\nfour\nfive\n",
-                touched_pages=touched,
-            )
-
-            self.assertEqual(result, "incremental")
-            self.assertEqual(touched, {"001.md"})
-            self.assertTrue(page_cache.exists())
-            fact = json.loads(cache.read_text(encoding="utf-8"))["useful_facts"][0]
-            self.assertEqual((fact["source_start"], fact["source_end"]), (5, 6))
 
     def test_small_paragraph_deletion_uses_model_and_scopes_linker(self) -> None:
         from graph.workspace import writer
@@ -282,13 +205,6 @@ class DiffPipelineSafetyTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            calls: list[dict] = []
-            real_invalidate = invalidate_pages
-
-            def capture_invalidate(*args, **kwargs):
-                calls.append(kwargs)
-                return real_invalidate(*args, **kwargs)
-
             class FakeModel:
                 def __init__(self):
                     self.prompts: list[str] = []
@@ -309,14 +225,13 @@ class DiffPipelineSafetyTest(unittest.TestCase):
                 wiki_linker_mode="legacy",
             )
             model = FakeModel()
-            with patch("graph.wiki.incremental.invalidate_pages", side_effect=capture_invalidate), \
-                 patch.object(writer, "build_wiki_output", side_effect=AssertionError("full wiki runner invoked")):
+            with patch.object(writer, "build_wiki_output", side_effect=AssertionError("full wiki runner invoked")):
                 result = writer.write_wiki_pages(
                     project, rel, mode="wiki", settings=settings,
                     llm=model, embedder=None,
                 )
 
-            self.assertEqual(calls[0]["preserve_outputs"], True)
+            self.assertEqual(result.tier, 1)
             self.assertEqual(result.rebuild, "incremental")
             page = (project.wiki_dir(rel) / "001.md").read_text(encoding="utf-8")
             self.assertNotIn("本機能が主に動作する計算機および装置", page)
@@ -567,6 +482,230 @@ class DiffPipelineSafetyTest(unittest.TestCase):
             finally:
                 catalog.close()
             self.assertEqual(remaining, {"hidden"})
+
+    def test_regenerated_page_is_described_and_searched_only_for_its_chunks(self) -> None:
+        from graph.linker.catalog import Catalog
+        from graph.linker.chunks import make_chunks, to_json
+        from graph.linker.legacy import Candidate
+        from graph.linker.prompts import CHUNK_META_VERSION
+        from graph.linker.service import link_document
+        from graph.linker.wire import ChunkMeta, EdgeSuggestions
+        from graph.wiki.storage import write_json_atomic
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Project(Path(tmp) / "project", Path(tmp) / "mount").ensure()
+            rel = "doc.md"
+            old = make_chunks("doc", "general", "001.md", "# Doc\n\nold relation\n", id_seed=rel)[0]
+            peer = make_chunks("peer", "general", "001.md", "# Peer\n\npeer relation\n", id_seed="peer.md")[0]
+            catalog = Catalog.open(project.linker_database, mode="legacy")
+            try:
+                catalog.reconcile("doc", [old], team="general", raw_rel=rel)
+                catalog.reconcile("peer", [peer], team="general", raw_rel="peer.md")
+                catalog.insert_edge({
+                    "chunk_a": old.chunk_id, "chunk_b": peer.chunk_id,
+                    "label": "uses", "summary": "old relation", "source": "legacy_rrf",
+                })
+            finally:
+                catalog.close()
+
+            new_text = "# Doc\n\nnewly regenerated relation\n"
+            new = make_chunks("doc", "general", "001.md", new_text, id_seed=rel)[0]
+            planning = project.wiki_dir(rel) / "_planning"
+            (planning / "pages").mkdir(parents=True)
+            (planning / "pages" / "001.md").write_text(new_text, encoding="utf-8")
+            write_json_atomic(planning / "source.json", {"id_seed": rel})
+            write_json_atomic(planning / "linker.json", {"status": "pending", "resume": True, "mode": "legacy"})
+            cached = to_json("doc", "general", [old], id_seed=rel)
+            cached["meta_version"] = CHUNK_META_VERSION
+            write_json_atomic(planning / "chunks.json", cached)
+            searched: list[str] = []
+
+            class Model:
+                async def structured(self, schema, _messages, **_kwargs):
+                    if schema is ChunkMeta:
+                        return ChunkMeta(summary="new", keywords=["k"])
+                    if schema is EdgeSuggestions:
+                        return EdgeSuggestions(edges=[{
+                            "target_node_id": peer.chunk_id,
+                            "label": "uses", "summary": "new relation",
+                        }])
+                    raise AssertionError(schema)
+
+            def candidates(_catalog, item, **_kwargs):
+                searched.append(item.chunk_id)
+                return [Candidate(peer.chunk_id, "legacy_rrf")]
+
+            settings = SimpleNamespace(
+                wiki_linker_mode="legacy", wiki_output_language="日本語",
+                wiki_linker_concurrency=1, concurrency=1,
+            )
+            with patch("graph.linker.legacy.candidates", side_effect=candidates):
+                result = asyncio.run(link_document(
+                    project, rel, model=Model(), embedder=None, settings=settings,
+                    render=False, changed_pages={"doc/001.md"}, regenerated_pages={"doc/001.md"},
+                ))
+
+            self.assertEqual(result.meta_calls, 1)
+            self.assertEqual(searched, [new.chunk_id])
+            catalog = Catalog.open(project.linker_database, mode="legacy")
+            try:
+                self.assertEqual(catalog.chunk(new.chunk_id)["summary"], "new")
+            finally:
+                catalog.close()
+
+    def test_incremental_scope_with_many_old_edges_checks_only_visible_ones(self) -> None:
+        from graph.linker.catalog import Catalog
+        from graph.linker.chunks import make_chunks, to_json
+        from graph.linker.prompts import CHUNK_META_VERSION
+        from graph.linker.service import link_document
+        from graph.linker.wire import ChunkMeta, NeoEdgeSuggestions
+        from graph.wiki.storage import write_json_atomic
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Project(Path(tmp) / "project", Path(tmp) / "mount").ensure()
+            rel = "doc.md"
+            old = make_chunks("doc", "general", "001.md", "# Doc\n\nold Shared relation\n", id_seed=rel)[0]
+            old.meta = ChunkMeta(summary="doc", entities=[{"name": "Shared", "kind": "concept", "role": "defines"}])
+            catalog = Catalog.open(project.linker_database, mode="neo")
+            try:
+                catalog.reconcile("doc", [old], team="general", raw_rel=rel)
+                for index in range(30):
+                    document = f"entity{index:02d}"
+                    peer = make_chunks(document, "general", "001.md", f"# {document}\n\nShared\n", id_seed=f"{document}.md")[0]
+                    peer.meta = ChunkMeta(summary=document, entities=[{"name": "Shared", "kind": "concept", "role": "uses"}])
+                    catalog.reconcile(document, [peer], team="general", raw_rel=f"{document}.md")
+                    catalog.insert_edge({
+                        "chunk_a": old.chunk_id, "chunk_b": peer.chunk_id,
+                        "label": "uses", "summary": f"entity-{index}", "source": "define", "via": ["Shared"],
+                    })
+
+                behaviour_peers = []
+                for index in range(3):
+                    document = f"behaviour{index}"
+                    peer = make_chunks(document, "general", "001.md", f"# {document}\n\nbehaviour relation\n", id_seed=f"{document}.md")[0]
+                    catalog.reconcile(document, [peer], team="general", raw_rel=f"{document}.md")
+                    catalog.insert_edge({
+                        "chunk_a": old.chunk_id, "chunk_b": peer.chunk_id,
+                        "label": "prerequisite", "summary": f"behaviour-{index}", "source": f"hop{index + 1}",
+                    })
+                    behaviour_peers.append((document, peer))
+                visible_id = next(
+                    str(row["edge_id"]) for row in catalog.conn.execute("SELECT * FROM edges WHERE summary='behaviour-0'")
+                )
+            finally:
+                catalog.close()
+
+            planning = project.wiki_dir(rel) / "_planning"
+            (planning / "pages").mkdir(parents=True)
+            changed_text = "# Doc\n\nupdated Shared relation\n"
+            (planning / "pages" / "001.md").write_text(changed_text, encoding="utf-8")
+            write_json_atomic(planning / "source.json", {"id_seed": rel})
+            write_json_atomic(planning / "linker.json", {"status": "pending", "resume": True, "mode": "neo"})
+            cached = to_json("doc", "general", [old], id_seed=rel)
+            cached["meta_version"] = CHUNK_META_VERSION
+            write_json_atomic(planning / "chunks.json", cached)
+            visible_doc, _ = behaviour_peers[0]
+            visible_planning = project.wiki / visible_doc / "_planning"
+            visible_planning.mkdir(parents=True)
+            write_json_atomic(visible_planning / "navigation.json", {
+                "pages": {"001.md": {"references": [{"edge_id": visible_id}]}}
+            })
+
+            class Model:
+                async def structured(self, schema, _messages, **_kwargs):
+                    if schema is NeoEdgeSuggestions:
+                        return NeoEdgeSuggestions(edges=[])
+                    if schema is ChunkMeta:
+                        raise AssertionError("valid cached entity metadata should be reused")
+                    raise AssertionError(schema)
+
+            settings = SimpleNamespace(
+                wiki_linker_mode="neo", wiki_output_language="日本語",
+                wiki_linker_concurrency=1, concurrency=1,
+            )
+            result = asyncio.run(link_document(
+                project, rel, model=Model(), embedder=None, settings=settings,
+                render=False, changed_pages={"doc/001.md"},
+            ))
+
+            self.assertEqual(result.edge_calls, 1)
+            self.assertEqual(
+                set(result.affected_pages or []),
+                {"doc/001.md", f"{visible_doc}/001.md"},
+            )
+
+    def test_retitled_page_rerenders_linked_peers_without_model_calls(self) -> None:
+        from graph.linker.catalog import Catalog
+        from graph.linker.chunks import make_chunks, to_json
+        from graph.linker.prompts import CHUNK_META_VERSION, REFERENCE_PLAN_VERSION
+        from graph.linker.service import link_document
+        from graph.linker.wire import EdgeSuggestions, PageReferencePlan
+        from graph.wiki.storage import write_json_atomic
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Project(Path(tmp) / "project", Path(tmp) / "mount").ensure()
+            rel = "doc.md"
+            old_text = "# Old\n\nold body\n"
+            new_text = "# New\n\nupdated body\n"
+            old = make_chunks("doc", "general", "001.md", old_text, id_seed=rel)[0]
+            peer = make_chunks("peer", "general", "001.md", "# Peer\n\npeer body\n", id_seed="peer.md")[0]
+            catalog = Catalog.open(project.linker_database, mode="legacy")
+            try:
+                catalog.reconcile("doc", [old], team="general", raw_rel=rel)
+                catalog.reconcile("peer", [peer], team="general", raw_rel="peer.md")
+                catalog.insert_edge({
+                    "chunk_a": old.chunk_id, "chunk_b": peer.chunk_id,
+                    "label": "uses", "summary": "linked", "source": "legacy_rrf",
+                })
+                edge_id = str(catalog.conn.execute("SELECT edge_id FROM edges").fetchone()[0])
+            finally:
+                catalog.close()
+
+            planning = project.wiki_dir(rel) / "_planning"
+            (planning / "pages").mkdir(parents=True)
+            (planning / "pages" / "001.md").write_text(new_text, encoding="utf-8")
+            write_json_atomic(planning / "source.json", {"id_seed": rel})
+            write_json_atomic(planning / "linker.json", {"status": "pending", "resume": True, "mode": "legacy"})
+            cached = to_json("doc", "general", [old], id_seed=rel)
+            cached["meta_version"] = CHUNK_META_VERSION
+            write_json_atomic(planning / "chunks.json", cached)
+            peer_planning = project.wiki / "peer" / "_planning"
+            (peer_planning / "pages").mkdir(parents=True)
+            (peer_planning / "pages" / "001.md").write_text("# Peer\n\npeer body\n", encoding="utf-8")
+            state = {"version": REFERENCE_PLAN_VERSION, "candidate_ids": [edge_id], "references": [{
+                "edge_id": edge_id, "placement": "footer", "anchor": "", "summary": "linked",
+            }]}
+            write_json_atomic(planning / "navigation.json", {"pages": {"001.md": state}})
+            write_json_atomic(peer_planning / "navigation.json", {"pages": {"001.md": state}})
+
+            class Model:
+                def __init__(self):
+                    self.page_plan_calls = 0
+
+                async def structured(self, schema, _messages, **_kwargs):
+                    if schema is EdgeSuggestions:
+                        return EdgeSuggestions(edges=[{
+                            "target_node_id": peer.chunk_id,
+                            "label": "uses", "summary": "linked",
+                        }])
+                    if schema is PageReferencePlan:
+                        self.page_plan_calls += 1
+                        raise AssertionError("unchanged candidate pool should reuse the current page plan")
+                    raise AssertionError(schema)
+
+            model = Model()
+            settings = SimpleNamespace(
+                wiki_linker_mode="legacy", wiki_output_language="日本語",
+                wiki_linker_concurrency=1, concurrency=1,
+            )
+            result = asyncio.run(link_document(
+                project, rel, model=model, embedder=None, settings=settings,
+                changed_pages={"doc/001.md"}, render=True,
+            ))
+
+            self.assertIn("peer/001.md", result.affected_pages or [])
+            self.assertEqual(model.page_plan_calls, 0)
+            self.assertIn("New", (project.wiki / "peer" / "001.md").read_text(encoding="utf-8"))
 
     def test_candidate_copies_the_live_linker_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1261,6 +1400,84 @@ class MountDiffPipelineAcceptanceTest(unittest.TestCase):
         self.assertFalse(second["cancelled"], second)
         self.assertNotEqual(first_commit, self._last_good())
         self.assertEqual(self._done(second, "test.docx")["rebuild"], "full")
+
+    def test_19_forced_sync_rebuilds_unchanged_source(self) -> None:
+        self._build_initial()
+        scan = self._scan(force=True)
+        self.assertEqual(scan["classification"]["test.docx"]["kind"], "forced")
+        result = self._work()
+        done = self._done(result, "test.docx")
+        self.assertEqual((done["tier"], done["reason"]), (3, "forced"))
+
+    def test_20_small_edit_stays_on_the_fast_path(self) -> None:
+        self._build_initial()
+        self.events.clear()
+        make_minor_docx_change(self.source, "case-twenty-small")
+        self._scan()
+
+        def record(event: dict) -> None:
+            self.events.append(dict(event))
+
+        result = self._work(record)
+        done = self._done(result, "test.docx")
+        self.assertEqual(done["tier"], 1)
+        self.assertFalse(any(event.get("stage") == "seed" and event.get("step") == "start" for event in self.events))
+        self.assertFalse(any(event.get("stage") == "rewrite" and event.get("step") == "page_done" for event in self.events))
+        decision = next(
+            event for event in reversed(self.events)
+            if event.get("stage") == "wiki" and event.get("step") == "update_decision" and event.get("file") == self.raw_rel
+        )
+        changed_pages = set(decision.get("changed_pages", []))
+        curated = sum(event.get("stage") == "linker" and event.get("step") == "page_curated" for event in self.events)
+        self.assertLessEqual(
+            curated, len(changed_pages),
+            f"curated {curated} pages for {len(changed_pages)} changed pages: {sorted(changed_pages)}",
+        )
+
+    def test_21_section_rewrite_regenerates_only_that_section(self) -> None:
+        self._build_initial()
+        self.events.clear()
+        document = Document(self.source)
+        paragraphs = document.paragraphs
+        heading_pattern = re.compile(r"^[0-9０-９]+[．.、)）]")
+        headings = [index for index, paragraph in enumerate(paragraphs) if heading_pattern.match(paragraph.text.strip())]
+        self.assertGreaterEqual(len(headings), 4, "Japanese fixture needs at least four numbered sections")
+        start = headings[2] + 1
+        end = headings[3]
+        changed = [paragraph for paragraph in paragraphs[start:end] if paragraph.text.strip()]
+        self.assertTrue(changed, "third numbered section should contain paragraphs")
+        for index, paragraph in enumerate(changed, 1):
+            paragraph.text = f"改訂確認 第三節 {index} LLMWIKI-SECTION-UPDATE"
+        document.save(self.source)
+        self._scan()
+        result = self._work()
+        done = self._done(result, "test.docx")
+        self.assertEqual(done["tier"], 2)
+        decision = next(
+            event for event in reversed(self.events)
+            if event.get("stage") == "wiki" and event.get("step") == "update_decision" and event.get("file") == self.raw_rel
+        )
+        regenerated = int(decision["regenerate_pages"])
+        page_done = sum(event.get("stage") == "rewrite" and event.get("step") == "page_done" for event in self.events)
+        page_count = len(list((self.project.state_dir(self.raw_rel) / "state" / "pages").glob("*.json")))
+        self.assertEqual(page_done, regenerated)
+        self.assertLess(regenerated, page_count / 2, f"regenerated {regenerated} of {page_count} pages")
+
+    @unittest.skipUnless(shutil.which("soffice") or shutil.which("libreoffice"), "LibreOffice is required")
+    def test_22_legacy_doc_is_converted_and_published(self) -> None:
+        executable = shutil.which("soffice") or shutil.which("libreoffice")
+        with tempfile.TemporaryDirectory(prefix="legacy-doc-profile-") as profile:
+            subprocess.run([
+                executable, "--headless", "--nologo", "--nodefault", "--nolockcheck", "--nofirststartwizard",
+                f"-env:UserInstallation={Path(profile).as_uri()}",
+                "--convert-to", "doc", "--outdir", str(self.source.parent), str(self.source),
+            ], check=True, capture_output=True, timeout=120)
+        self.source.unlink()
+        self._scan()
+        self._drain()
+        row = self._source_row("test.doc")
+        self.assertEqual(row["parser"], "doc")
+        self.assertTrue(self.project.wiki_dir(raw_name_for("test.doc")).is_dir())
 
 
 if __name__ == "__main__":

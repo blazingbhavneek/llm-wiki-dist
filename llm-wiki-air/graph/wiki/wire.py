@@ -115,6 +115,7 @@ class IncrementalPagePatch(BaseModel):
 
 
 class IncrementalPageEditResult(BaseModel):
-    """Minimal page-local replacements covering every supplied source edit."""
+    """Page-local replacements; edits that do not affect this page are listed as unchanged."""
 
     patches: list[IncrementalPagePatch] = Field(default_factory=list)
+    unchanged_edit_ids: list[int] = Field(default_factory=list)

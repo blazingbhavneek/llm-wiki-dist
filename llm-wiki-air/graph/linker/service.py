@@ -347,6 +347,7 @@ async def link_document(
     project: Any, rel: str, *, model: Any, embedder: Any, settings: Any,
     on_progress: Progress = None, stop_check: StopCheck = None, render: bool = True,
     changed_pages: set[str] | None = None,
+    regenerated_pages: set[str] | None = None,
 ) -> LinkResult:
     started = time.monotonic()
     document = _document(project, rel)
@@ -359,6 +360,11 @@ async def link_document(
         }
     document_changed_pages = {
         page for page in (changed_page_rels or ()) if page.startswith(document + "/")
+    }
+    regenerated_page_rels = {
+        page if page.startswith(document + "/") else f"{document}/{page}"
+        for page in (regenerated_pages or ())
+        if page.startswith(document + "/") or "/" not in page
     }
     team = _team(document)
     mode = str(getattr(settings, "wiki_linker_mode", "legacy"))
@@ -398,6 +404,10 @@ async def link_document(
             for page in sorted((planning / "pages").glob("*.md")):
                 all_chunks.extend(chunks.make_chunks(document, team, page.name, page.read_text(encoding="utf-8"), id_seed=id_seed))
             old_rows = {row["chunk_id"]: row for row in catalog.chunks_for_document(document)}
+            old_titles = {
+                str(row["page_rel"]): str(row["title"])
+                for row in catalog.conn.execute("SELECT page_rel,title FROM pages WHERE document=?", (document,))
+            }
             old_edges_by_id: dict[str, dict[str, Any]] = {}
             old_page_rels: dict[str, str] = {}
             if incremental_scope and old_rows:
@@ -416,7 +426,7 @@ async def link_document(
             for item in all_chunks:
                 if item.text_sha256 in previous_cache:
                     item.meta = previous_cache[item.text_sha256]
-                elif not refresh_metadata and item.chunk_id in old_rows:
+                elif not refresh_metadata and item.chunk_id in old_rows and item.page_rel not in regenerated_page_rels:
                     item.meta = _row_meta(old_rows[item.chunk_id])
                     if incremental_scope:
                         item.meta = chunks.validate_meta(item.meta, item.text)
@@ -426,8 +436,12 @@ async def link_document(
                 stale_ids.intersection_update(
                     item.chunk_id for item in all_chunks if item.page_rel in changed_page_rels
                 )
+            fresh_ids = (
+                {item.chunk_id for item in all_chunks if item.page_rel in regenerated_page_rels and item.chunk_id in stale_ids}
+                if incremental_scope else set()
+            )
             if incremental_scope:
-                to_describe = []
+                to_describe = [item for item in all_chunks if item.chunk_id in fresh_ids and item.text_sha256 not in previous_cache]
             else:
                 to_describe = [item for item in all_chunks if refresh_metadata or not previously_complete or item.chunk_id in stale_ids]
             reported_chunks = len(stale_ids) if incremental_scope else len(to_describe)
@@ -466,6 +480,8 @@ async def link_document(
             diff["edges_removed"] = int(diff.get("edges_removed", 0)) + metadata_edges_removed
             if not incremental_scope:
                 catalog.embed_pending(embedder, team=team)
+            elif fresh_ids:
+                catalog.embed_pending(embedder, team=team, chunk_ids=fresh_ids)
             changed_ids = stale_ids | revised_ids
             affected_ids = changed_ids | set(diff["removed"])
             relevant_edges = [
@@ -505,6 +521,8 @@ async def link_document(
                 for edge in relevant_edges:
                     if stop_check and stop_check():
                         raise LinkerCancelled("cancelled during candidates")
+                    if str(edge["chunk_a"]) in fresh_ids or str(edge["chunk_b"]) in fresh_ids:
+                        continue  # regenerated text: rediscovered below or dropped
                     if catalog.chunk(str(edge["chunk_a"])) is None or catalog.chunk(str(edge["chunk_b"])) is None:
                         continue
                     source = str(edge["source"])
@@ -541,6 +559,16 @@ async def link_document(
                     ))
                     incremental_candidate_edges[(target_id, candidate_id)] = edge
                 candidates_for = list(grouped.values())
+                for item in all_chunks:
+                    if item.chunk_id not in fresh_ids:
+                        continue
+                    if stop_check and stop_check():
+                        raise LinkerCancelled("cancelled during candidates")
+                    if mode == "neo":
+                        from .neo import candidates as find_candidates
+                    else:
+                        from .legacy import candidates as find_candidates
+                    candidates_for.append((item, find_candidates(catalog, item, team=team)))
             else:
                 for item in to_describe:
                     if stop_check and stop_check():
@@ -617,7 +645,7 @@ async def link_document(
                 inserted_edges += int(catalog.insert_edge(edge, commit=False))
             catalog.conn.commit()
             if incremental_scope:
-                kept_edge_ids = {str(edge["edge_id"]) for edge in edge_rows if edge.get("edge_id")}
+                kept_edge_ids = {catalog.edge_id_for(edge) for edge in edge_rows}
                 changed_link_pages: set[str] = set()
                 for edge in relevant_edges:
                     edge_id = str(edge["edge_id"])
@@ -660,6 +688,15 @@ async def link_document(
             pages.update(document_changed_pages)
             pages.update(changed_link_pages)
             pages.update(filter(None, (catalog.page_of(cid) for cid in touched_chunk_ids)))
+            if incremental_scope:
+                new_titles = {item.page_rel: item.title for item in all_chunks}
+                retitled = {page for page, title in new_titles.items() if page in old_titles and old_titles[page] != title}
+                if retitled:
+                    retitled_ids = {item.chunk_id for item in all_chunks if item.page_rel in retitled}
+                    for edge in old_edges_by_id.values():
+                        for own, other in ((str(edge["chunk_a"]), str(edge["chunk_b"])), (str(edge["chunk_b"]), str(edge["chunk_a"]))):
+                            if own in retitled_ids and old_page_rels.get(other):
+                                pages.add(old_page_rels[other])
             touched_docs: set[str] = set()
             if render:
                 rendered_docs = await render_pages(project, catalog, pages, model=model, settings=settings, mode=mode, on_progress=on_progress)
@@ -695,6 +732,7 @@ async def link_documents(
     project: Any, rels: list[str], *, model: Any, embedder: Any, settings: Any,
     on_progress: Progress = None, stop_check: StopCheck = None,
     changed_pages: set[str] | None = None,
+    regenerated_pages: set[str] | None = None,
 ) -> LinkResult:
     """Link a batch, then curate and write every affected page exactly once."""
     aggregate = LinkResult([])
@@ -704,6 +742,7 @@ async def link_documents(
             project, rel, model=model, embedder=embedder, settings=settings,
             on_progress=on_progress, stop_check=stop_check, render=False,
             changed_pages=changed_pages,
+            regenerated_pages=regenerated_pages,
         )
         pages.update(result.affected_pages or [])
         aggregate.edges_added += result.edges_added

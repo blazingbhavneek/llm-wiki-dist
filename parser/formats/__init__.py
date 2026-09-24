@@ -17,6 +17,7 @@ from formats import docx as docx
 from formats import pdf as pdf
 from formats import pptx as pptx
 from formats import xlsx as xlsx
+from formats import legacy_office as legacy_office
 from formats import csv as csv  # last: no magic bytes, content-sniffed
 from formats.base import BaseParser, ParseOptions, ParseResult
 

@@ -128,6 +128,8 @@ def reuse_image_descriptions(
     previous: str,
     current: str,
     describe: Callable[[str, str], str],
+    *,
+    repeat_descriptions: bool = True,
 ) -> str:
     """Reuse descriptions by media hash and describe only unseen image bytes."""
 
@@ -141,6 +143,7 @@ def reuse_image_descriptions(
             )
 
     generated: dict[str, str] = {}
+    emitted: set[str] = set()
 
     def replace(match: re.Match[str]) -> str:
         block = match.group(0)
@@ -149,6 +152,12 @@ def reuse_image_descriptions(
         if not media or not description:
             return block
         key = sha256_text(media.group("data"))
+        if not repeat_descriptions:
+            if key in emitted:
+                start = description.start("desc")
+                end = description.end("desc")
+                return block[:start] + block[end:]
+            emitted.add(key)
         if key in cached:
             value = cached[key]
         else:

@@ -130,6 +130,7 @@ def parse_document(
             previous_markdown,
             markdown,
             lambda data_url, alt: _describe_image(data_url, alt, settings),
+            repeat_descriptions=Path(path).suffix.lower() != ".pptx",
         )
     return markdown
 

@@ -1,5 +1,7 @@
 # Mount Diff Pipeline Implementation Plan
 
+> Update behavior (tiers, formats, .doc/.xls) is specified in plan_diff_2.md.
+
 ## 1. Goal
 
 Implement reliable add, delete, update, rename, retry, and recovery behavior for

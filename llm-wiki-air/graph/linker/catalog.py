@@ -314,8 +314,10 @@ class Catalog:
             scored.append((sum((a - b) ** 2 for a, b in zip(vector, other)), str(row[0])))
         return [cid for _, cid in sorted(scored)[:k]]
 
-    def embed_pending(self, embedder: Any, *, team: str | None = None) -> int:
+    def embed_pending(self, embedder: Any, *, team: str | None = None, chunk_ids: set[str] | None = None) -> int:
         rows = self.conn.execute("SELECT * FROM chunks WHERE vectors_ready=0" + (" AND team=?" if team else ""), (team,) if team else ()).fetchall()
+        if chunk_ids is not None:
+            rows = [row for row in rows if str(row["chunk_id"]) in chunk_ids]
         if not rows or embedder is None:
             return 0
         model_name = str(getattr(embedder, "model_name", ""))
@@ -375,6 +377,22 @@ class Catalog:
         rows = self.conn.execute("SELECT chunk_a,chunk_b FROM edges WHERE chunk_a=? OR chunk_b=?", (chunk_id, chunk_id)).fetchall()
         return {str(row[1] if row[0] == chunk_id else row[0]) for row in rows}
 
+    @staticmethod
+    def edge_id_for(edge: dict[str, Any]) -> str:
+        """The stored id of an edge dict, or the id insert_edge would give it."""
+
+        if edge.get("edge_id"):
+            return str(edge["edge_id"])
+        a = str(edge.get("chunk_a") or edge.get("a", {}).get("chunk_id", ""))
+        b = str(edge.get("chunk_b") or edge.get("b", {}).get("chunk_id", ""))
+        source = str(edge.get("source") or "legacy_rrf")
+        raw_via = edge.get("via") or edge.get("via_json") or []
+        via = json.loads(raw_via) if isinstance(raw_via, str) else list(raw_via)
+        identity = sorted((a, b))
+        if source in {"use", "define"} and via:
+            identity.append(normalize_name(str(via[0])))
+        return "ledge-" + short_hash("\0".join(identity), 20)
+
     def insert_edge(self, edge: dict[str, Any], *, commit: bool = True) -> bool:
         a = str(edge.get("chunk_a") or edge.get("a", {}).get("chunk_id", "")); b = str(edge.get("chunk_b") or edge.get("b", {}).get("chunk_id", ""))
         if not a or not b or a == b:
@@ -393,10 +411,7 @@ class Catalog:
         source = str(edge.get("source") or "legacy_rrf")
         raw_via = edge.get("via") or edge.get("via_json") or []
         via = json.loads(raw_via) if isinstance(raw_via, str) else list(raw_via)
-        identity = sorted((a, b))
-        if source in {"use", "define"} and via:
-            identity.append(normalize_name(str(via[0])))
-        edge_id = str(edge.get("edge_id") or "ledge-" + short_hash("\0".join(identity), 20))
+        edge_id = self.edge_id_for(edge)
         cursor = self.conn.execute("INSERT OR IGNORE INTO edges(edge_id,chunk_a,chunk_b,label,summary,source,via_json,created_at) VALUES(?,?,?,?,?,?,?,?)", (edge_id, a, b, str(edge.get("label") or "related"), str(edge.get("summary") or ""), source, json.dumps(via, ensure_ascii=False), str(edge.get("created_at") or "")))
         if commit:
             self.conn.commit()

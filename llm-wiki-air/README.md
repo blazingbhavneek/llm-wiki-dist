@@ -439,10 +439,11 @@ unreconciled deletion.
 ## How each phase works
 
 **Convert** (`graph/workspace/convert.py`). Cheap `size + mtime_ns` diff against
-`metadata/convert.json`; supported extensions are `.md .docx .pdf .pptx .xlsx
-.xlsm .csv` (`publisher/scanner.py`). Markdown files are copied; everything
-else is POSTed to the doc-parser service unchanged. Removed sources delete
-their raw file.
+`metadata/convert.json`; supported extensions are `.md .docx .doc .pdf .pptx .xlsx
+.xlsm .xls .csv` (`publisher/scanner.py`). Markdown files are copied; everything
+else is POSTed to the doc-parser service unchanged. Word/Excel 97-2003 files are
+converted by the parser service with LibreOffice; macros in `.xls` are not kept.
+Removed sources delete their raw file.
 
 **Wiki generation** (`graph/wiki/`). Deterministic partition plus section-wise
 lossless rewriting: overlapping 250-line windows are described without

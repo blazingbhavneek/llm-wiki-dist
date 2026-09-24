@@ -76,6 +76,10 @@ class PipelineError(RuntimeError):
     """A deterministic seed or publication invariant failed."""
 
 
+class ResumeUnavailable(PipelineError):
+    """The caller required the stored seed plan, but it no longer matches."""
+
+
 @dataclass
 class SeedPage:
     number: int
@@ -1376,6 +1380,8 @@ async def run_pipeline(
         source_line_count=len(lines),
         prompt_version=SEED_PLAN_VERSION,
     ) if config.resume else None
+    if pages is None and config.require_resume:
+        raise ResumeUnavailable(f"stored seed plan for {source_path.name} could not be resumed")
     resumed_seed_plan = pages is not None
     if pages is not None:
         _emit(on_progress, "seed", "resumed", pages=len(pages), source_lines=len(lines))

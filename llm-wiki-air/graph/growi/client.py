@@ -931,6 +931,7 @@ class GrowiPublisher:
                             state = read_json(sidecar, default={})
                             if state.get("filename") == target.name:
                                 state["content_sha256"] = hashlib.sha256(main.encode("utf-8")).hexdigest()
+                                state["human_edited"] = True
                                 write_json_atomic(sidecar, state)
                                 break
             marker = target.parent / "_planning" / "linker.json"

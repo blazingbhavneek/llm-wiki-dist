@@ -32,6 +32,8 @@ from .scanner import Scan, SourceFile, scan_mount
 
 log = logging.getLogger(__name__)
 PARSER_TIMEOUT = 7200.0
+PARSE_MIN_RATIO = 0.30  # a re-parse this much smaller than before is treated as broken
+PARSE_GATE_MIN_CHARS = 2000  # tiny documents may legitimately lose most text
 
 
 @contextmanager
@@ -174,6 +176,18 @@ def _assert_source_unchanged(item: SourceFile, path: Path) -> None:
     digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
     if digest != item.source_sha256:
         raise RuntimeError(f"source changed during parse: {item.rel}")
+
+
+def _check_parse_size(rel: str, previous: str, current: str) -> None:
+    """Refuse a parse that lost most of the document's text (R7)."""
+
+    before = len(strip_image_media(previous).strip())
+    after = len(strip_image_media(current).strip())
+    if before >= PARSE_GATE_MIN_CHARS and after < PARSE_MIN_RATIO * before:
+        raise RuntimeError(
+            f"suspicious parse for {rel}: text shrank from {before} to {after} characters; "
+            f"if this is intended run `python main.py sync --force {rel}`"
+        )
 
 
 def _connection(settings: Any) -> Any | None:
@@ -496,6 +510,7 @@ def sync_once(
                 changed |= wanted & set(scan.files)
         changed = sorted(changed)
         incremental_pages: set[str] = set()
+        regenerated_pages: set[str] = set()
         incremental_publish = bool(changed) and not deleted
         scoped_candidates = None if include_pending else (sorted(scoped_raw) if wanted is not None else None)
         pending_before = _pending_link_rels(project, settings, scoped_candidates)
@@ -539,6 +554,8 @@ def sync_once(
                     )
                     markdown = _parse(item, project.mount / rel, settings, **parse_args)
                 _assert_source_unchanged(item, project.mount / rel)
+                if previous_markdown is not None and classification != "forced":
+                    _check_parse_size(rel, previous_markdown, markdown)
                 if on_progress:
                     on_progress({
                         "stage": "parse",
@@ -553,7 +570,7 @@ def sync_once(
                     on_progress({"stage": "wiki", "step": "start", "file": raw_rel})
                 with _progress_heartbeat(on_progress, stage="wiki", file=raw_rel):
                     requested_resume = not force if resume is None else resume
-                    if classification == "large":
+                    if classification == "forced":
                         requested_resume = False
                     result = write_wiki_pages(
                         project, raw_rel, mode=str(settings.ingest_mode), settings=settings,
@@ -569,6 +586,7 @@ def sync_once(
                     )
                 if getattr(result, "rebuild", "full") == "incremental":
                     incremental_pages.update(getattr(result, "changed_pages", []))
+                    regenerated_pages.update(getattr(result, "regenerated_pages", []))
                 else:
                     incremental_publish = False
                 if on_progress:
@@ -587,6 +605,9 @@ def sync_once(
                     "status": "changed" if previous_source else "added",
                     "touched": result.touched,
                     "rebuild": "incremental" if getattr(result, "rebuild", "full") == "incremental" else "full",
+                    "tier": getattr(result, "tier", 3),
+                    "reason": getattr(result, "reason", ""),
+                    "human_edits_overwritten": list(getattr(result, "human_edits_overwritten", [])),
                 })
                 log.info("run=%s path=%s stage=generate elapsed=%.2fs", run_id, rel, time.monotonic() - started)
             except asyncio.CancelledError:
@@ -620,6 +641,7 @@ def sync_once(
                         on_progress=on_progress,
                         stop_check=(lambda: not should_continue()) if should_continue is not None else None,
                         affected_pages=incremental_pages if incremental_publish else None,
+                        regenerated_pages=regenerated_pages if incremental_publish else None,
                     )
                 touched_raw.update(touched)
                 done.append({"path": "*", "status": "linked", "documents": len(pending_links), "touched": touched})

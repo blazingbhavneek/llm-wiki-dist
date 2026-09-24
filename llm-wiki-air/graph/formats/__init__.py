@@ -13,11 +13,18 @@ def kind_of(document_name: str) -> str:
     stem = PurePosixPath(document_name).stem
     _base, sep, ext = stem.rpartition("_")
     ext = ext.lower()
-    return "xlsx" if sep and ext == "xlsm" else ext if sep and ext in KINDS else "md"
+    aliases = {"xlsm": "xlsx", "xls": "xlsx", "doc": "docx"}
+    return aliases.get(ext, ext) if sep and (ext in KINDS or ext in aliases) else "md"
 
 
 def is_tabular(kind: str) -> bool:
     return kind in TABULAR
+
+
+def supports_page_updates(kind: str) -> bool:
+    """Formats whose wiki pages can be patched or regenerated one at a time."""
+
+    return not is_tabular(kind)
 
 
 async def structural_seed_plan(

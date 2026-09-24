@@ -49,6 +49,8 @@ class WikiConfig(BaseModel):
     output_language: str = "Japanese (日本語)"
     prompt_version: str = PROMPT_VERSION
     resume: bool = True
+    # Tier-2 updates must resume the stored plan; never silently re-plan.
+    require_resume: bool = False
     output_root: str = ".wiki/pages"
     document_slug: str = ""
     # Keep project runs stable so changed sources can resume incrementally.

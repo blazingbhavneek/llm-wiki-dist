@@ -483,6 +483,7 @@ def incremental_page_edit_prompt(
     image_context: str,
     output_language: str,
     feedback: Sequence[str] = (),
+    reference_only: bool = False,
 ) -> Prompt:
     """Ask the model for exact, page-local patches for a small source diff."""
 
@@ -504,9 +505,12 @@ def incremental_page_edit_prompt(
             "afterにはその置換後Markdownを入れる。ADDでも挿入位置の既存文をbeforeに含める。\n"
             "- 必要なら編集箇所の直前・直後も同じpatchに含め、afterで文章を自然につなぎ直す。"
             "それ以外の本文、見出し、表、画像、リンク、ナビゲーションは変更しない。\n"
-            "- 各EDIT番号をedit_idsへ1回以上含める。同じ変更がページ内の複数箇所に反映されている場合は、"
-            "対応する全patchで同じEDIT番号を使う。複数EDITが同じ連続範囲なら一つのpatchでよい。"
-            "patch同士のbefore範囲は重複させない。\n"
+            "- 各EDIT番号は、patchesのedit_idsかunchanged_edit_idsのどちらか一方に必ず1回含める。"
+            "同じ変更がページ内の複数箇所に反映されている場合は、対応する全patchで同じEDIT番号を使う。"
+            "複数EDITが同じ連続範囲なら一つのpatchでよい。patch同士のbefore範囲は重複させない。\n"
+            "- ページの記述に影響しないEDIT（書式だけの変更、番号の振り直し、OCRの揺れ、"
+            "このページが述べていない内容）はunchanged_edit_idsに入れ、patchを作らない。"
+            "ページが述べている事実を変えるEDITをunchanged_edit_idsに入れてはならない。\n"
             "- 削除対象が見出し、表、画像の場合は対象そのものを削除する。削除対象でない構造物は保持する。\n"
             "- 現行原文にない事実を追加しない。\n\n"
             "JSON形式:\n" + _schema_hint(IncrementalPageEditResult)
@@ -521,6 +525,11 @@ def incremental_page_edit_prompt(
             "# 画像プレースホルダー\n"
             f"{image_context or 'なし'}\n"
             "削除対象でないプレースホルダーは一字も変えず1回だけ残す。\n\n"
+            + (
+                "# 注意\nこのページはこれらの行を所有しておらず、他のページの内容として引用しているだけである。"
+                "このページが述べている事実が変わる場合だけ修正し、それ以外のEDITはunchanged_edit_idsに入れる。\n\n"
+                if reference_only else ""
+            )
             + feedback_block
             + "# 現在のWikiページ\n"
             f"{current_page}"

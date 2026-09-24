@@ -19,6 +19,7 @@ from docx import Document
 from docx.table import Table
 
 from graph.workspace.project import Project, open_project, raw_name_for
+from graph.wiki.incremental import line_hunks
 from graph.wiki.storage import read_json
 
 from .history import (
@@ -156,10 +157,9 @@ def _snapshot(root: Path) -> dict[str, tuple[str, int, int]]:
     return files
 
 
-def _docx_text(payload: bytes) -> tuple[list[str], list[str]]:
+def _docx_text(payload: bytes) -> list[str]:
     document = Document(io.BytesIO(payload))
     lines: list[str] = []
-    outline: list[str] = []
     for block in document.iter_inner_content():
         if isinstance(block, Table):
             for row in block.rows:
@@ -167,12 +167,9 @@ def _docx_text(payload: bytes) -> tuple[list[str], list[str]]:
                 if any(cells):
                     lines.append("\t".join(cells))
             continue
-        text = block.text
-        if text.strip():
-            lines.append(text)
-            if str(block.style.name).casefold() in {"title", "heading 1", "見出し 1"}:
-                outline.append(text)
-    return lines, outline
+        if block.text.strip():
+            lines.append(block.text)
+    return lines
 
 
 def _classification(
@@ -181,29 +178,22 @@ def _classification(
     suffix: str,
 ) -> dict[str, Any]:
     if suffix != ".docx":
-        return {"kind": "large", "ratio": 1.0, "hunks": 1, "reason": "unsupported-format"}
+        return {"kind": "unknown", "ratio": 0.0, "hunks": 0, "reason": "no-quick-classifier"}
     try:
-        old_lines, old_outline = _docx_text(old)
-        new_lines, new_outline = _docx_text(new)
-        opcodes = SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes()
-        changed = [(a, b, c, d) for tag, a, b, c, d in opcodes if tag != "equal"]
-        changed_lines = sum(max(b - a, d - c) for a, b, c, d in changed)
+        old_lines, new_lines = _docx_text(old), _docx_text(new)
+        hunks = line_hunks(old_lines, new_lines)
+        changed_lines = sum(max(old_len, new_len) for _o, old_len, _n, new_len in hunks)
         ratio = changed_lines / max(len(old_lines), len(new_lines), 1)
         threshold = SMALL_DOCUMENT_RATIO if max(len(old_lines), len(new_lines)) < SMALL_DOCUMENT_LINES else LARGE_DOCUMENT_RATIO
-        if old_outline != new_outline:
-            kind, reason = "large", "outline-changed"
-        elif ratio > threshold:
-            kind, reason = "large", "ratio"
-        else:
-            kind, reason = "small", "below-threshold"
-        return {"kind": kind, "ratio": round(ratio, 6), "hunks": len(changed), "reason": reason}
+        kind = "large" if ratio > threshold else "small"
+        return {"kind": kind, "ratio": round(ratio, 6), "hunks": len(hunks), "reason": "ratio" if kind == "large" else "below-threshold"}
     except Exception as exc:
         return {"kind": "large", "ratio": 1.0, "hunks": 0, "reason": f"classification-failed:{type(exc).__name__}"}
 
 
 def _docx_similarity(old: bytes, new: bytes) -> float:
     try:
-        return SequenceMatcher(None, _docx_text(old)[0], _docx_text(new)[0], autojunk=False).ratio()
+        return SequenceMatcher(None, _docx_text(old), _docx_text(new), autojunk=False).ratio()
     except Exception:
         return 0.0
 
@@ -422,7 +412,10 @@ def scan(
                 origin = ledger_rel_by_id.get(source_id, "")
                 operation = "move" if origin and origin != rel else "update" if old is not None else "add"
                 classification = {"kind": "none", "ratio": 0.0, "hunks": 0, "reason": "new"}
-                if operation in {"update", "move"} or old is not None:
+                if force and old is not None:
+                    classification = {"kind": "forced", "ratio": 0.0, "hunks": 0, "reason": "forced"}
+                    result["classification"][rel] = classification
+                elif operation in {"update", "move"} or old is not None:
                     active = conn.execute("SELECT target_blob_oid,status FROM jobs WHERE rel=?", (rel,)).fetchone()
                     old_oid = str(
                         (active["target_blob_oid"] if active is not None and active["status"] == "running" else "")
@@ -621,7 +614,7 @@ def supersession(project: Project, jobs: list[Job]) -> Literal["continue", "canc
             if int(row["version"]) == job.version and row["status"] == "running" and row["token"] == job.token:
                 continue
             operation = "move" if row["from_rel"] else str(row["operation"])
-            if job.operation in {"delete", "move"} or operation != "update" or str(row["classification"]) != "small":
+            if job.operation in {"delete", "move"} or operation != "update" or str(row["classification"]) in {"large", "forced"}:
                 return "cancel"
     return "continue"
 
@@ -782,11 +775,11 @@ def _work_once_locked(settings: Any, *, on_event: Any = None) -> dict[str, Any] 
                 decision = {"kind": job.classification, "ratio": 0.0, "hunks": 0, "reason": "queued"}
                 previous = live_ledger.sources.get(job.from_rel or job.rel, {})
                 old_oid = str(previous.get("source_blob_oid") or "")
-                if old_oid and job.target_blob_oid and job.operation != "move":
+                if job.classification != "forced" and old_oid and job.target_blob_oid and job.operation != "move":
                     decision = _classification(
                         read_blob(project, old_oid), read_blob(project, job.target_blob_oid), Path(job.rel).suffix.lower(),
                     )
-                if on_event and decision["kind"] in {"small", "large"}:
+                if on_event and decision["kind"] != "none":
                     on_event({"stage": "diff-classified", "path": job.rel, "decision": decision["kind"],
                               "ratio": decision["ratio"], "hunks": decision["hunks"], "reason": decision["reason"]})
                 details[job.rel] = {
