@@ -1,4 +1,4 @@
-"""One entry point for the no-Git publisher. `python main.py -h`.
+"""One entry point for the publisher. `python main.py -h`.
 
 check                       ping chat/embed/parser/GROWI endpoints
 convert                     external mount -> raw Markdown only
@@ -7,7 +7,7 @@ build link [<raw-rel>...]   link pending wiki pages only
 build all [<raw-rel>...]    wiki batch first, then link batch (bare build is an alias)
 publish                     publish the current wiki/ tree to GROWI
 index [<raw-rel>...]        publish per-document + root index pages for growi-search
-sync [<mount-rel>...]       one pass: external mount -> raw/ -> wiki/ -> links -> GROWI
+sync [<mount-rel>...]       scan and drain queue -> candidate -> GROWI -> commit
 watch [<mount-rel>...]      queued 10-second metadata watcher + worker
 queue scan|work|status      operate the persistent watcher queue
 reset                       trash all publisher-owned GROWI pages
@@ -113,9 +113,31 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    from publisher.pipeline import sync_once
+    from publisher.queue import retry_failed, scan, work_once, worker_lock
 
-    return _report(sync_once(_settings(args), only=args.items or None, force=args.force, on_progress=_progress if args.verbose else None))
+    settings = _settings(args)
+    project = open_project(settings)
+    combined: dict[str, Any] = {"done": [], "failures": []}
+    with worker_lock(project):
+        retry_failed(project)
+        first = True
+        while True:
+            scan(
+                settings,
+                only=args.items or None,
+                settle_seconds=0,
+                force=args.force and first,
+                verify_content=True,
+            )
+            first = False
+            result = work_once(settings, on_event=_progress if args.verbose else None)
+            if result is None:
+                break
+            combined["done"].extend(result.get("done", []))
+            combined["failures"].extend(result.get("failures", []))
+            if result.get("failures"):
+                break
+    return _report(combined)
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -136,6 +158,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 
 def cmd_queue(args: argparse.Namespace) -> int:
+    from publisher.pipeline import _lock
     from publisher.queue import recover, retry_failed, scan, status, work_once, worker_lock
 
     settings = _settings(args)
@@ -151,7 +174,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
         print(json.dumps({"retried": retry_failed(project)}))
         return 0
     with worker_lock(project):
-        recover(project)
+        with _lock(project):
+            recover(project, settings)
         while True:
             result = work_once(settings)
             if result is not None:
@@ -265,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--timeout", type=int, help="per-call model timeout in seconds (default WIKI_REQUEST_TIMEOUT)")
 
     convert = sub.add_parser("convert", help="convert the configured mount to raw Markdown only"); project_flags(convert); convert.set_defaults(fn=cmd_convert)
-    sync = sub.add_parser("sync", help="one reconciliation pass over the configured mount"); pipeline_flags(sync)
+    sync = sub.add_parser("sync", help="scan and drain the configured project's durable queue"); pipeline_flags(sync)
     sync.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
     sync.add_argument("--force", action="store_true", help="regenerate selected sources even when unchanged")
     sync.set_defaults(fn=cmd_sync)

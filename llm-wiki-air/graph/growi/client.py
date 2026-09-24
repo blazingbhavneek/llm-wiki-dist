@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from graph.common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
 from graph.wiki.page import strip_reader_references
+from graph.wiki.storage import read_json
 
 
 class GrowiAPIError(RuntimeError):
@@ -237,6 +238,29 @@ class GrowiClient:
             },
         )
         return self._page_from_payload(response.json())
+
+    async def rename_page(self, page_id: str, revision_id: str, path: str, *, recursively: bool = False) -> GrowiPage:
+        response = await self._request(
+            "PUT",
+            "/pages/rename",
+            json_body={
+                "pageId": page_id,
+                "revisionId": revision_id,
+                "newPagePath": path,
+                "isRecursively": recursively,
+                "isRenameRedirect": False,
+                "updateMetadata": False,
+            },
+        )
+        page = self._page_from_payload(response.json())
+        if not page.page_id:
+            refreshed = await self.get_page(page_id=page_id)
+            if refreshed is None:
+                raise RuntimeError(f"GROWI renamed page disappeared: {page_id}")
+            page = refreshed
+        if page.page_id != page_id:
+            raise RuntimeError(f"GROWI rename changed page ID: {page_id} -> {page.page_id}")
+        return page
 
     async def delete_pages(self, page_ids_to_revisions: dict[str, str]) -> None:
         items = list(page_ids_to_revisions.items())
@@ -597,6 +621,7 @@ async def publish_pages(
     write_path: str,
     root_path: str = "/",
     known_page_ids: dict[str, str] | None = None,
+    on_revision: Any = None,
 ) -> list[GrowiPage]:
     """Resolve every page ID first, then publish stable permalink bodies."""
     current: dict[str, GrowiPage] = {}
@@ -608,6 +633,7 @@ async def publish_pages(
         if existing is None:
             initial_body = _growi_markdown(_image_fallbacks(body))
             existing = _complete_page(await client.create_page(path, initial_body), path, initial_body)
+            await _maybe_await(on_revision, existing)
         if not existing.page_id:
             raise ValueError(f"GROWI returned no page ID for {path}")
         current[path] = existing
@@ -627,23 +653,30 @@ async def publish_pages(
         merged = _growi_markdown(merge_marked_sections(existing.body, body))
         if merged == existing.body:
             results.append(existing)
+            await _maybe_await(on_revision, existing)
             continue
         try:
-            results.append(_complete_page(
+            page = _complete_page(
                 await client.update_page(existing.page_id, existing.revision_id, merged), path, merged
-            ))
+            )
+            results.append(page)
+            await _maybe_await(on_revision, page)
         except GrowiAPIError as exc:
             if exc.status_code != 409:
                 raise
             refreshed = await client.get_page(path=path)
             if refreshed is None:
                 body = _growi_markdown(body)
-                results.append(_complete_page(await client.create_page(path, body), path, body))
+                page = _complete_page(await client.create_page(path, body), path, body)
+                results.append(page)
+                await _maybe_await(on_revision, page)
                 continue
             retry_body = _growi_markdown(merge_marked_sections(refreshed.body, body))
-            results.append(_complete_page(
+            page = _complete_page(
                 await client.update_page(refreshed.page_id, refreshed.revision_id, retry_body), path, retry_body
-            ))
+            )
+            results.append(page)
+            await _maybe_await(on_revision, page)
     return results
 
 
@@ -677,10 +710,18 @@ class GrowiPublisher:
     def __init__(self, client: GrowiClient, connection: Any) -> None:
         self.client = client
         self.connection = connection
+        self.on_revision: Any = None
 
     def doc_path(self, project: Any, rel: str) -> str:
         folder = project.wiki_dir(rel).relative_to(project.wiki).as_posix()
         return growi_path(self.connection.write_path, folder)
+
+    def page_marker_id(self, project: Any, local_path: str) -> str:
+        document = Path(local_path).parent.as_posix()
+        marker = read_json(Path(project.wiki) / document / "_planning" / "source.json", default={})
+        id_seed = str(marker.get("id_seed") or document)
+        stable_path = growi_path(self.connection.write_path, id_seed, Path(local_path).name)
+        return "page" + stable_path.replace(" ", "_")
 
     def _document_pages(self, project: Any, rel: str) -> list[dict[str, str]]:
         folder = project.wiki_dir(rel)
@@ -692,9 +733,10 @@ class GrowiPublisher:
             body = strip_reader_references(md.read_text(encoding="utf-8"))
             page_path = f"{doc_path}/{name}"
             main, footer = split_footer(body)
-            page_id = "page" + page_path.replace(" ", "_")
+            local_path = md.relative_to(project.wiki).as_posix()
+            page_id = self.page_marker_id(project, local_path)
             pages.append({
-                "local_path": md.relative_to(project.wiki).as_posix(),
+                "local_path": local_path,
                 "path": page_path,
                 "body": wrap_page(main, page_id=page_id, ranges=ranges.get(_canonical(md.name), []))
                 + "\n\n"
@@ -707,11 +749,16 @@ class GrowiPublisher:
         project: Any,
         rels: list[str],
         known_pages: dict[str, dict[str, Any]] | None = None,
+        only_pages: set[str] | None = None,
     ) -> dict[str, GrowiPage]:
         pages: list[dict[str, str]] = []
         document_paths: dict[str, set[str]] = {}
         for rel in dict.fromkeys(rels):
             document_pages = self._document_pages(project, rel)
+            if only_pages is not None:
+                document_pages = [
+                    page for page in document_pages if page["local_path"] in only_pages
+                ]
             pages.extend(document_pages)
             document_paths[self.doc_path(project, rel)] = {page["path"] for page in document_pages}
         if len({page["path"] for page in pages}) != len(pages):
@@ -727,9 +774,11 @@ class GrowiPublisher:
                 for path, row in (known_pages or {}).items()
                 if row.get("page_id")
             },
+            on_revision=self.on_revision,
         ))
-        for doc_path, keep in document_paths.items():
-            asyncio.run(self._trash_under(doc_path, keep=keep))
+        if only_pages is None:
+            for doc_path, keep in document_paths.items():
+                asyncio.run(self._trash_under(doc_path, keep=keep))
         return {item["local_path"]: page for item, page in zip(pages, results)}
 
     def discover_documents(self, project: Any, rels: list[str]) -> dict[str, GrowiPage]:
@@ -744,8 +793,75 @@ class GrowiPublisher:
             if page is not None
         }
 
+    def assert_known_revisions(self, pages: dict[str, dict[str, Any]]) -> None:
+        async def check() -> None:
+            for local_path, row in pages.items():
+                page_id = str(row.get("page_id") or "")
+                revision_id = str(row.get("revision_id") or "")
+                if not page_id or not revision_id:
+                    raise RuntimeError(f"cannot verify GROWI revision for {local_path}")
+                current = await self.client.get_page(page_id=page_id)
+                if current is not None and current.revision_id != revision_id:
+                    raise RuntimeError(f"GROWI page changed by another editor: {current.path}")
+
+        asyncio.run(check())
+
     def publish_document(self, project: Any, rel: str) -> list[GrowiPage]:
         return list(self.publish_documents(project, [rel]).values())
+
+    def move_document(
+        self,
+        project: Any,
+        old_rel: str,
+        new_rel: str,
+        known_pages: dict[str, dict[str, Any]],
+        *,
+        check_revisions: bool = True,
+    ) -> dict[str, GrowiPage]:
+        """Rename owned pages in place, then refresh their managed bodies."""
+        old_doc_path = self.doc_path(project, old_rel)
+        new_doc_path = self.doc_path(project, new_rel)
+
+        async def rename() -> dict[str, GrowiPage]:
+            moved: dict[str, GrowiPage] = {}
+            for local_path, row in sorted(known_pages.items()):
+                page_id = str(row.get("page_id") or "")
+                if not page_id:
+                    continue
+                current = await self.client.get_page(page_id=page_id)
+                if current is None:
+                    raise RuntimeError(f"GROWI page missing during move: {page_id}")
+                expected_revision = str(row.get("revision_id") or "")
+                if check_revisions and expected_revision and current.revision_id != expected_revision:
+                    raise RuntimeError(f"GROWI page changed by another editor: {current.path}")
+            root = await self.client.get_page(path=old_doc_path)
+            if root is not None:
+                root = await self.client.rename_page(root.page_id, root.revision_id, new_doc_path, recursively=True)
+                await _maybe_await(self.on_revision, root)
+            for local_path, row in sorted(known_pages.items()):
+                page_id = str(row.get("page_id") or "")
+                if not page_id:
+                    continue
+                current = await self.client.get_page(page_id=page_id)
+                if current is None:
+                    raise RuntimeError(f"GROWI page missing during move: {page_id}")
+                destination = f"{new_doc_path}/{growi_segment(Path(local_path).name)}"
+                page = current if current.path == destination else await self.client.rename_page(
+                    page_id, current.revision_id, destination
+                )
+                if page.page_id != page_id:
+                    raise RuntimeError(f"GROWI move did not retain page ID: {page_id}")
+                await _maybe_await(self.on_revision, page)
+                moved[local_path] = page
+            return moved
+
+        moved = asyncio.run(rename())
+        published = self.publish_documents(project, [new_rel], known_pages={
+            path: {"page_id": page.page_id} for path, page in moved.items()
+        })
+        if moved and {page.page_id for page in published.values()} != {page.page_id for page in moved.values()}:
+            raise RuntimeError("GROWI move changed the published page set")
+        return published
 
     def pull_changes(
         self,
@@ -789,7 +905,7 @@ class GrowiPublisher:
                 blocked.add(document)
                 conflicts.append(f"{local_path}: invalid local page path")
                 continue
-            marker_id = "page" + str(row.get("growi_path") or page.path).replace(" ", "_")
+            marker_id = str(row.get("marker_id") or "page" + str(row.get("growi_path") or page.path).replace(" ", "_"))
             markdown = managed_page_markdown(page.body, marker_id)
             if markdown is None:
                 blocked.add(document)
@@ -825,6 +941,7 @@ class GrowiPublisher:
             row["growi_path"] = page.path
             row["page_id"] = page.page_id
             row["revision_id"] = page.revision_id
+            row["marker_id"] = marker_id
             pulled.append(local_path)
         return pulled, conflicts, blocked
 
@@ -997,6 +1114,8 @@ async def sync_growi_pages(
 
 
 async def _maybe_await(callback: Any, *args: Any) -> Any:
+    if callback is None:
+        return None
     result = callback(*args)
     if hasattr(result, "__await__"):
         return await result

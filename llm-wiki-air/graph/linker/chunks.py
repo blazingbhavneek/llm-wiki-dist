@@ -103,17 +103,17 @@ def model_text(chunk: RawChunk | Chunk | str) -> str:
     return strip_big_tables(strip_image_media(text))[:12000]
 
 
-def chunk_id(document: str, filename: str, ordinal: int) -> str:
-    return "lchunk-" + short_hash(f"{document}\0{filename}\0{ordinal}", 20)
+def chunk_id(id_seed: str, filename: str, ordinal: int) -> str:
+    return "lchunk-" + short_hash(f"{id_seed}\0{filename}\0{ordinal}", 20)
 
 
-def make_chunks(document: str, team: str, filename: str, text: str) -> list[Chunk]:
+def make_chunks(document: str, team: str, filename: str, text: str, *, id_seed: str | None = None) -> list[Chunk]:
     text = strip_reader_references(text)
     title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ") and line[2:].strip()), Path(filename).stem)
     page_rel = f"{document}/{filename}"
     return [
         Chunk(
-            chunk_id=chunk_id(document, filename, raw.ordinal), document=document, team=team,
+            chunk_id=chunk_id(id_seed or document, filename, raw.ordinal), document=document, team=team,
             page_rel=page_rel, filename=filename, title=title, ordinal=raw.ordinal,
             heading=raw.heading, line_start=raw.line_start, line_end=raw.line_end,
             text=raw.text, text_sha256=short_hash(raw.text, 64),
@@ -201,7 +201,7 @@ def cache_by_hash(path: Path) -> dict[str, ChunkMeta]:
     return result
 
 
-def to_json(document: str, team: str, chunks: list[Chunk]) -> dict[str, Any]:
+def to_json(document: str, team: str, chunks: list[Chunk], *, id_seed: str | None = None) -> dict[str, Any]:
     pages: dict[str, dict[str, Any]] = {}
     for item in chunks:
         page = pages.setdefault(item.filename, {"filename": item.filename, "title": item.title, "original_sha256": "", "chunks": []})
@@ -210,7 +210,7 @@ def to_json(document: str, team: str, chunks: list[Chunk]) -> dict[str, Any]:
             "line_start": item.line_start, "line_end": item.line_end, "text_sha256": item.text_sha256,
             **item.meta.model_dump(mode="json"),
         })
-    return {"schema_version": 1, "meta_version": CHUNK_META_VERSION, "document": document, "team": team, "pages": list(pages.values())}
+    return {"schema_version": 1, "meta_version": CHUNK_META_VERSION, "document": document, "id_seed": id_seed or document, "team": team, "pages": list(pages.values())}
 
 
 def snapshot_originals(doc_dir: Path) -> dict[str, str]:

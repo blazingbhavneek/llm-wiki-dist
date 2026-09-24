@@ -14,6 +14,7 @@ tests/*
 !growi-search/tests/
 !tests/test_parser_client_route.py
 !tests/test_xlsm_lineage_equivalence.py
+!tests/test_mount_diff_pipeline.py
 !doc-parser/tests/
 doc-parser/tests/*
 !doc-parser/tests/test_profiles.py

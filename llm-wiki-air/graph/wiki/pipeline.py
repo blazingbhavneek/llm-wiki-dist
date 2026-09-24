@@ -570,7 +570,28 @@ async def _research_references(
     if not selected:
         return [], "# 参照調査結果\n\n他のWikiページはない。\n"
 
-    research_dir = clean_workdir(work_root / f"research-{page.number:03d}")
+    research_dir = work_root / f"research-{page.number:03d}"
+    cached = read_json(research_dir / "references.json", default={})
+    if (
+        isinstance(cached.get("useful_facts"), list)
+        and "no_useful_information_reason" in cached
+    ):
+        result = ReferenceResearchResult.model_validate(cached)
+        reason = result.no_useful_information_reason.strip()
+        evidence = [
+            _ReferenceEvidence(
+                page=candidate,
+                facts=_valid_reference_facts(result.useful_facts, candidate, page),
+                no_useful_information_reason=reason,
+            )
+            for candidate in selected
+        ]
+        research = _render_reference_research(page, evidence, seed_root=seed_root)
+        write_text_atomic(research_dir / "reference-research.md", research)
+        _emit(on_progress, "research", "resumed", page=page.title)
+        return evidence, research
+
+    research_dir = clean_workdir(research_dir)
     target_summary = page.summary.strip() or page.title
     references = "\n\n".join(
         (
@@ -882,8 +903,42 @@ async def _write_section(
                 else sorted(code_tokens(source_text))
             ),
         )
+        rendered_prompt = prompt.render()
+        cached_prompt = task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md"
+        cached_draft = task_dir / f"{stem}-attempt-{attempt:02d}.md"
+        cached_judge = task_dir / f"{stem}-judge-{attempt:02d}.json"
+        if (
+            attempt == 1
+            and cached_prompt.exists()
+            and cached_draft.exists()
+            and cached_prompt.read_text(encoding="utf-8") == rendered_prompt
+        ):
+            draft = cached_draft.read_text(encoding="utf-8")
+            errors = check_section(
+                draft,
+                lines=lines,
+                source_text=source_text,
+                block_ranges=(),
+                placeholders=placeholders,
+                facts=facts,
+                check_identifiers=config.source_kind not in {"csv", "xlsx"},
+            )
+            judgment = read_json(cached_judge, default={})
+            if not errors and judgment and not judgment.get("missing_important_information"):
+                _emit(
+                    on_progress,
+                    "write",
+                    "section_resumed",
+                    page=page.title,
+                    section=index,
+                )
+                return _SectionResult(
+                    markdown=draft,
+                    attempts=0,
+                    score=int(judgment.get("coverage_score", 0)),
+                )
         write_text_atomic(
-            task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md", prompt.render()
+            cached_prompt, rendered_prompt
         )
         try:
             raw = await model.text(
@@ -1009,7 +1064,16 @@ async def _write_intro(
         output_language=config.output_language,
         context=context,
     )
-    write_text_atomic(task_dir / "intro-prompt.md", prompt.render())
+    rendered_prompt = prompt.render()
+    cached_prompt = task_dir / "intro-prompt.md"
+    cached_intro = task_dir / "intro.md"
+    if (
+        cached_prompt.exists()
+        and cached_intro.exists()
+        and cached_prompt.read_text(encoding="utf-8") == rendered_prompt
+    ):
+        return cached_intro.read_text(encoding="utf-8").strip()
+    write_text_atomic(cached_prompt, rendered_prompt)
     try:
         raw = await model.text(
             prompt.messages(), max_output_tokens=config.intro_max_output_tokens
@@ -1050,7 +1114,8 @@ async def _rewrite_page(
         raise PipelineError(f"page {page.number} must own one contiguous range")
     start, end = page.owner_ranges[0]
     page_units = _page_units(page, units)
-    task_dir = clean_workdir(work_root / f"page-{page.number:03d}")
+    task_dir = work_root / f"page-{page.number:03d}"
+    task_dir.mkdir(parents=True, exist_ok=True)
 
     evidence, _research = await _research_references(
         page, pages=pages, tokens=tokens, model=model,
@@ -1163,9 +1228,6 @@ async def _rewrite_all(
         else:
             output_path.unlink(missing_ok=True)
             state_path.unlink(missing_ok=True)
-            for old in (work_root / f"page-{page.number:03d}", work_root / f"research-{page.number:03d}"):
-                if old.is_dir():
-                    shutil.rmtree(old)
             pending.append(page)
 
     async def one(page: SeedPage) -> RewriteResult:

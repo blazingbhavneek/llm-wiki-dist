@@ -166,7 +166,7 @@ class Catalog:
             for page in sorted(pages_dir.glob("*.md")):
                 page_data = next((p for p in data.get("pages", []) if p.get("filename") == page.name), {})
                 by_hash = {item.get("text_sha256"): item for item in page_data.get("chunks", [])}
-                for item in make_chunks(document, str(data.get("team") or document.split("/", 1)[0]), page.name, page.read_text(encoding="utf-8")):
+                for item in make_chunks(document, str(data.get("team") or document.split("/", 1)[0]), page.name, page.read_text(encoding="utf-8"), id_seed=str(data.get("id_seed") or document)):
                     cached = by_hash.get(item.text_sha256)
                     if cached:
                         from .chunks import _meta_from_json

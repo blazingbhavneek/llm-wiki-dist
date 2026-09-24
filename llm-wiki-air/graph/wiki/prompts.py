@@ -402,6 +402,8 @@ def section_write_prompt(
             "- 事実を捏造しない。原文と追加事実にない引数、動作、例、一般論を書かない。\n"
             "- 原文の技術情報を一切落とさない。識別子、定数、数値、単位、"
             "エラーコード、警告文は一字も変えずにそのまま写す。\n"
+            "- 出力は今回提示された原文に存在する内容だけに限定する。以前の版の出力を保持せず、"
+            "原文から削除された段落、文、表、図、箇条書きは出力から完全に削除する。\n"
             "- コードブロック、表、画像は`[[NEO-IMAGE:...]]`トークンとして与えられる。"
             "トークンを一字も変えず、元と同じ話題の直後に1回だけ置く。トークンの中身を書き起こさない。"
         ),
@@ -420,6 +422,8 @@ def section_write_prompt(
             "- 原文の語順や文をなぞる最小限の編集ではなく、この節が単独で完結するWikiページに"
             "なっているかを基準に、導入・解説・手順・注意の構成へ書き直す。ただし原文にない"
             "事実は書かない。\n"
+            "- 現在の原文にない旧版の段落や文を復活させてはならない。削除された内容は、"
+            "見出し、図、表など残っている要素を壊さずに本文から除去する。\n"
             "- 先頭の行番号は出典を示すためのもので、本文には書かない。\n"
             "- リンク（`[...](...)`）は書かない。「関連ページ」などの一覧も作らない。\n"
             "- 章番号、頁番号、目次など技術的な意味のない体裁だけは省いてよい。\n"
@@ -456,6 +460,7 @@ def intro_prompt(
         system=(
             "あなたは日本語技術Wikiの編集者である。Markdown本文だけを出力する。"
             "前置き、見出し、リンク、箇条書き、コードフェンスは書かない。"
+            "現在の本文と要約にない旧版の内容や、原文から削除された内容を復活させない。"
         ),
         body=(
             "次のWiki記事の冒頭に置く導入文を書く。2〜6文で、何のための機能・情報か、"
@@ -465,5 +470,59 @@ def intro_prompt(
             f"# 要約\n{page_summary or '要約なし'}\n\n"
             + context_block
             + f"# 本文\n{body}"
+        ),
+    )
+
+
+def incremental_page_edit_prompt(
+    *,
+    page_title: str,
+    current_page: str,
+    current_source: str,
+    edits: str,
+    image_context: str,
+    output_language: str,
+    feedback: Sequence[str] = (),
+) -> Prompt:
+    """Ask the model for exact, page-local patches for a small source diff."""
+
+    from .wire import IncrementalPageEditResult
+
+    feedback_block = ""
+    if feedback:
+        feedback_block = "# 前回出力の問題（全て修正する）\n- " + "\n- ".join(feedback) + "\n\n"
+    return Prompt(
+        kind="incremental_page_edit",
+        version=REWRITE_PROMPT_VERSION,
+        system=(
+            "あなたは既存の日本語技術Wikiを差分更新する編集者である。"
+            "指定された構造化結果だけを返す。\n"
+            "- EDITのADD、UPDATE、DELETEを一件も漏らさず厳密に反映する。\n"
+            "- DELETEは、表現が言い換えられていても対応する内容を完全に削除し、別表現で復活させない。\n"
+            "- UPDATEは旧内容を残さず新内容へ置き換え、ADDは適切な位置へ追加する。\n"
+            "- patchesのbeforeには現在のWikiページに一字一句同じ形で1回だけ存在する最小限の範囲を入れ、"
+            "afterにはその置換後Markdownを入れる。ADDでも挿入位置の既存文をbeforeに含める。\n"
+            "- 必要なら編集箇所の直前・直後も同じpatchに含め、afterで文章を自然につなぎ直す。"
+            "それ以外の本文、見出し、表、画像、リンク、ナビゲーションは変更しない。\n"
+            "- 各EDIT番号をedit_idsへ1回以上含める。同じ変更がページ内の複数箇所に反映されている場合は、"
+            "対応する全patchで同じEDIT番号を使う。複数EDITが同じ連続範囲なら一つのpatchでよい。"
+            "patch同士のbefore範囲は重複させない。\n"
+            "- 削除対象が見出し、表、画像の場合は対象そのものを削除する。削除対象でない構造物は保持する。\n"
+            "- 現行原文にない事実を追加しない。\n\n"
+            "JSON形式:\n" + _schema_hint(IncrementalPageEditResult)
+        ),
+        body=(
+            f"# 対象ページ\n{page_title}\n"
+            f"本文は{output_language}で書く。\n\n"
+            "# 必須編集\n"
+            f"{edits}\n\n"
+            "# 現行原文（正しい最新版）\n"
+            f"{current_source}\n\n"
+            "# 画像プレースホルダー\n"
+            f"{image_context or 'なし'}\n"
+            "削除対象でないプレースホルダーは一字も変えず1回だけ残す。\n\n"
+            + feedback_block
+            + "# 現在のWikiページ\n"
+            f"{current_page}"
         ),
     )

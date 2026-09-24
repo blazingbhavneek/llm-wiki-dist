@@ -23,18 +23,23 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
         key = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
         if seen.get(rel, {}).get("mtime_ns") == key["mtime_ns"] and seen.get(rel, {}).get("size") == key["size"]:
             continue
+        target = project.raw / Path(rel).parent / raw_name_for(Path(rel).name)
         try:
             if path.suffix.lower() == ".md":
                 markdown = path.read_text(encoding="utf-8")
             else:
                 if not parser_base_url:
                     raise RuntimeError("WIKI_PARSER_BASE_URL is required for non-Markdown files")
-                markdown = parse_document(path, base_url=parser_base_url, settings=settings)
+                markdown = parse_document(
+                    path,
+                    base_url=parser_base_url,
+                    settings=settings,
+                    previous_markdown=target.read_text(encoding="utf-8") if target.exists() else None,
+                )
         except UnsupportedDocument as exc:
             seen[rel] = {**key, "unsupported": str(exc)}; unsupported.append(rel); continue
         except Exception:
             failed.append(rel); continue
-        target = project.raw / Path(rel).parent / raw_name_for(Path(rel).name)
         target.parent.mkdir(parents=True, exist_ok=True); target.write_text(markdown, encoding="utf-8")
         seen[rel] = key; converted.append(rel)
         if on_progress:

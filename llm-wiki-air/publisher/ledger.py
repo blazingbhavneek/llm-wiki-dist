@@ -17,7 +17,7 @@ class Ledger:
 
     def as_json(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "sources": self.sources,
             "published_documents": self.published_documents,
             "published_pages": self.published_pages,
@@ -28,7 +28,7 @@ def load_ledger(path: Path) -> Ledger:
     if not Path(path).exists():
         return Ledger({}, {})
     data = read_json(path)
-    if not isinstance(data, dict) or data.get("schema_version") not in (1, 2):
+    if not isinstance(data, dict) or data.get("schema_version") not in (1, 2, 3):
         raise ValueError(f"invalid pipeline ledger: {path}")
     sources = data.get("sources", {})
     published = data.get("published_documents", {})

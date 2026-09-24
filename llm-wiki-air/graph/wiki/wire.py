@@ -104,3 +104,17 @@ class PageJudgeResult(BaseModel):
     coverage_score: int = Field(default=0, ge=0, le=100)
     missing_important_information: list[ImportantOmission] = Field(default_factory=list)
     notes: str = ""
+
+
+class IncrementalPagePatch(BaseModel):
+    """One exact replacement chosen by the model inside an existing page."""
+
+    edit_ids: list[int] = Field(default_factory=list)
+    before: str = ""
+    after: str = ""
+
+
+class IncrementalPageEditResult(BaseModel):
+    """Minimal page-local replacements covering every supplied source edit."""
+
+    patches: list[IncrementalPagePatch] = Field(default_factory=list)

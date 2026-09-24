@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from html import unescape
+from typing import Callable, Iterable, Sequence
 
 from .ids import image_id
 from .markdown_blocks import IMAGE_UNIT_CLOSE, IMAGE_UNIT_OPEN, build_block_index
@@ -32,6 +33,7 @@ _ALT_RE = re.compile(r"""alt=["'](?P<alt>[^"']*)["']""", re.IGNORECASE)
 _DESC_RE = re.compile(
     r"<image-description>(?P<desc>.*?)</image-description>", re.IGNORECASE | re.DOTALL
 )
+_UNIT_RE = re.compile(r"<image-unit\b[^>]*>.*?</image-unit>", re.IGNORECASE | re.DOTALL)
 _BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
 
 
@@ -120,6 +122,63 @@ def extract_image_units(lines: Sequence[str]) -> list[ImageUnit]:
         raise ValueError(f"unclosed <image-unit> opened at line {open_line}")
 
     return units
+
+
+def reuse_image_descriptions(
+    previous: str,
+    current: str,
+    describe: Callable[[str, str], str],
+) -> str:
+    """Reuse descriptions by media hash and describe only unseen image bytes."""
+
+    cached: dict[str, str] = {}
+    for match in _UNIT_RE.finditer(previous):
+        media = _MEDIA_RE.search(match.group(0))
+        description = _DESC_RE.search(match.group(0))
+        if media and description:
+            cached.setdefault(
+                sha256_text(media.group("data")), description.group("desc")
+            )
+
+    generated: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        block = match.group(0)
+        media = _MEDIA_RE.search(block)
+        description = _DESC_RE.search(block)
+        if not media or not description:
+            return block
+        key = sha256_text(media.group("data"))
+        if key in cached:
+            value = cached[key]
+        else:
+            if key not in generated:
+                alt = _ALT_RE.search(block)
+                data_url = f'data:{media.group("mime")};base64,{media.group("data")}'
+                generated[key] = describe(
+                    data_url,
+                    unescape(alt.group("alt")) if alt else "",
+                ).strip().replace(
+                    "</image-description>", "&lt;/image-description&gt;"
+                )
+            value = generated[key]
+        start = description.start("desc")
+        end = description.end("desc")
+        return block[:start] + value + block[end:]
+
+    return _UNIT_RE.sub(replace, current)
+
+
+def neutralize_image_descriptions(text: str) -> str:
+    """Remove description wording from diffs without changing line numbers."""
+
+    def replace(match: re.Match[str]) -> str:
+        block = match.group(0)
+        start = match.start("desc") - match.start()
+        end = match.end("desc") - match.start()
+        return block[:start] + ("\n" * match.group("desc").count("\n")) + block[end:]
+
+    return _DESC_RE.sub(replace, text)
 
 
 def block_units(lines: Sequence[str]) -> list[ImageUnit]:

@@ -217,7 +217,7 @@ Quick map — the numbered sections below explain each command in detail:
 | run the whole pipeline once | `sync` |
 | rebuild wiki / re-link / both locally, publish nothing | `build wiki\|link\|all` |
 | smoke-test one source end to end | `sync … "path/in/mount"` |
-| keep a project continuously fresh | `watch` (or cron + `watch`) |
+| keep a project continuously fresh | `watch`, or cron + `sync` |
 | inspect or drive the queue by hand | `queue scan\|work\|status\|retry` |
 | push the current wiki tree as it is | `publish` |
 | refresh growi-search index pages | `index [<raw-rel>...]` |
@@ -346,9 +346,10 @@ Build targets are paths relative to the project's `raw/` directory:
   "マニュアル/kdmパッケージ取扱説明書B改訂.pdf"
 ```
 
-This performs the complete pipeline for that source only. If linking changes a
-related document, that affected document is also republished; unrelated pending
-documents are not built, linked, or published.
+This content-checks that source and then drains the durable project queue. If
+other work is already queued for the project, it is completed in the same run.
+The mount is rescanned after each batch, so changes made during a long batch are
+queued before `sync` exits.
 
 ### 9. Watch one mount target for smoke testing
 
@@ -393,10 +394,15 @@ wins for overlapping changes.
 
 ### Run the watcher from cron
 
-Cron has one-minute resolution, so cron should keep the long-running watcher
-alive; the watcher itself performs the 10-second scans. After `check` has created
-the project data directories, add this with `crontab -e` (replace the repository
-path):
+For a one-shot cron job, run `sync`. It performs a full content audit, retries
+failed queue entries once, and drains the queue before exiting:
+
+```cron
+*/5 * * * * cd /absolute/path/to/llm-wiki-air && flock -n /tmp/llm-wiki-air-Moove-sync.lock .venv/bin/python main.py sync --project projectA >> data/Moove/metadata/sync.log 2>&1
+```
+
+Alternatively, cron can keep the long-running watcher alive; the watcher itself
+performs the 10-second scans:
 
 ```cron
 * * * * * cd /absolute/path/to/llm-wiki-air && flock -n /tmp/llm-wiki-air-Moove-watch.lock .venv/bin/python main.py watch --project projectA --interval 10 >> data/Moove/metadata/watch.log 2>&1
