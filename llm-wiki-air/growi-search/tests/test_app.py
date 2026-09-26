@@ -105,7 +105,7 @@ class Readiness(unittest.TestCase):
         with TestClient(application) as client:
             data = client.get("/api/ready").json()
             self.assertEqual(
-                set(data), {"ready", "growi", "search", "llm", "reranker", "embedder", "root_path"}
+                set(data), {"ready", "growi", "search", "llm", "reranker", "embedder", "jev", "root_path"}
             )
             self.assertTrue(data["growi"])
             self.assertFalse(data["llm"])  # no chat_base_url in test settings

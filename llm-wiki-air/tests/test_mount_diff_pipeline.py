@@ -146,6 +146,7 @@ class DiffPipelineSafetyTest(unittest.TestCase):
             patch("publisher.queue.retry_failed") as retry,
             patch("publisher.queue.scan") as scan,
             patch("publisher.queue.work_once", side_effect=[first, second, None]) as work,
+            patch("publisher.index.build_index", return_value={"done": [], "failures": []}) as index,
         ):
             result = main.cmd_sync(args)
 
@@ -153,6 +154,7 @@ class DiffPipelineSafetyTest(unittest.TestCase):
         retry.assert_called_once_with(project)
         self.assertEqual(work.call_count, 3)
         self.assertEqual(scan.call_count, 3)
+        index.assert_called_once_with(settings, on_progress=None)
         self.assertTrue(scan.call_args_list[0].kwargs["force"])
         self.assertFalse(scan.call_args_list[1].kwargs["force"])
         self.assertTrue(all(call.kwargs["verify_content"] for call in scan.call_args_list))

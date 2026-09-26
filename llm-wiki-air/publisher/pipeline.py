@@ -282,7 +282,10 @@ def _publish_sweep(
     only_pages: set[str] | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     begin_publish: Callable[[], None] | None = None,
+    settings: Any | None = None,
 ) -> list[str]:
+    from .index import build_index, delete_document_index  # index imports this module
+
     failures: list[str] = []
     folders = _folders(project)
     scoped_documents = (
@@ -403,12 +406,29 @@ def _publish_sweep(
                     path: page for path, page in ledger.published_pages.items() if path.startswith(prefix)
                 })
             publisher.delete_document(project, raw_rel)
+            delete_document_index(publisher, document)
             ledger.published_documents.pop(document, None)
             ledger.published_pages = {
                 path: row for path, row in ledger.published_pages.items() if not path.startswith(prefix)
             }
         except Exception as exc:
             failures.append(f"{document}: {type(exc).__name__}: {exc}")
+    if publisher is not None and settings is not None and not failures:
+        # Index pages are derived: they follow a batch that published cleanly, and a
+        # failure here is logged rather than failed, because rolling back a published
+        # document over a table of contents is worse. A failed batch indexes nothing and
+        # the retry indexes it once.
+        try:
+            for problem in build_index(
+                settings,
+                only=sorted(only) if only is not None else None,
+                locked=True,
+                ledger=ledger,
+                on_progress=on_progress,
+            )["failures"]:
+                log.warning("run=%s stage=index error=%s", run_id, problem)
+        except Exception as exc:
+            log.warning("run=%s stage=index error=%s: %s", run_id, type(exc).__name__, exc)
     return failures
 
 
@@ -671,6 +691,7 @@ def sync_once(
                 "on_progress": on_progress,
                 **({"only_pages": incremental_pages} if incremental_publish else {}),
                 **({"begin_publish": begin_publish} if begin_publish is not None else {}),
+                "settings": settings,
             }
             failures.extend(
                 _publish_sweep(project, ledger, publisher, run_id, **publish_args)
@@ -720,6 +741,7 @@ def delete_sources(
                 prepare_publish()
             failures.extend(_publish_sweep(
                 project, ledger, publisher, run_id, only=set(sources.values()) | touched,
+                settings=settings,
                 **({"begin_publish": begin_publish} if begin_publish is not None else {}),
             ))
         save_ledger(ledger_path, ledger)
@@ -867,6 +889,7 @@ def move_sources(
             if touched_raw:
                 failures.extend(_publish_sweep(
                     project, ledger, publisher, run_id, only=touched_raw, on_progress=on_progress,
+                    settings=settings,
                     **({"begin_publish": begin_publish} if begin_publish is not None else {}),
                 ))
             save_ledger(ledger_path, ledger)
@@ -1192,7 +1215,7 @@ def publish_only(settings: Any) -> dict[str, Any]:
     run_id = "pub-" + uuid.uuid4().hex[:16]
     with _lock(project):
         ledger = load_ledger(ledger_path)
-        failures = _publish_sweep(project, ledger, publisher, run_id)
+        failures = _publish_sweep(project, ledger, publisher, run_id, settings=settings)
         save_ledger(ledger_path, ledger)
         if not failures and (project.root / ".git").is_dir():
             from .history import checkpoint_live

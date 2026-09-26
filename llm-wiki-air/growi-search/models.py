@@ -73,7 +73,7 @@ class WikiLink(BaseModel):
 
 class Evidence(BaseModel):
     page_id: str
-    field: Literal["growi_es", "title_path", "section", "linked_context", "index_map"]
+    field: Literal["growi_es", "title_path", "section", "linked_context", "index_map", "jev"]
     text: str
     heading: str = ""
     start_line: int | None = None

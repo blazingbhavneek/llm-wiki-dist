@@ -110,6 +110,17 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         app.state.researcher = researcher or Researcher(client, settings, reranker, embedder)
         app.state.runs = {}
         if transport is None:  # warm the 00-目次 index map in the background (offline tests skip it)
+            jev = getattr(app.state.researcher, "jev", None)
+            status = (
+                "disabled (set WIKI_JEV_ENABLED=1)"
+                if not settings.jev_enabled
+                else "configured but unavailable"
+                if jev is None
+                else f"enabled backend={settings.jev_backend} adapter={type(jev).__name__}"
+            )
+            print(f"[growi-search] Jev: {status}", flush=True)
+            if settings.jev_enabled and jev is None:
+                raise RuntimeError("Jev is enabled but its local model or hosted endpoint is unavailable")
             threading.Thread(target=app.state.researcher.index_map.snapshot, name="index-map-warmup", daemon=True).start()
         try:
             app.state.growi_ok = bool(await asyncio.to_thread(client.health))
@@ -141,6 +152,7 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
                 "llm": st.llm_ready,
                 "reranker": app.state.reranker is not None,
                 "embedder": app.state.embedder is not None,
+                "jev": getattr(app.state.researcher, "jev", None) is not None,
                 "root_path": st.growi_root_path,
             }
         )

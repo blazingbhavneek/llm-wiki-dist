@@ -2,6 +2,8 @@
 
 Reads wiki/<doc>/_planning/{manifest,coverage,chunks}.json and metadata/pipeline.json.
 Writes metadata/index/**.md locally and <doc>/00-目次 + <root>/00-目次 pages in GROWI.
+Every publish sweep refreshes the pages it published (and trashes the index page of a
+deleted document), so an explicit `index` run is only needed to repair or dry-run them.
 Never touches wiki/, the ledger or _planning/, and the pages carry no chunk marker,
 so sync/watch/publish/pull/trash never see them.
 """
@@ -9,6 +11,8 @@ so sync/watch/publish/pull/trash never see them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import re
 import uuid
 from collections import Counter
@@ -18,7 +22,7 @@ from typing import Any, Callable
 from graph.growi.client import GrowiClient, GrowiPage, assert_publish_path, growi_path
 from graph.wiki.storage import read_json, write_text_atomic
 from graph.workspace.project import Project, open_project
-from publisher.ledger import load_ledger
+from publisher.ledger import Ledger, load_ledger
 from publisher.pipeline import _connection, _folders, _lock, _publisher
 
 INDEX_NAME = "00-目次"  # sorts before 001-…; growi-search reads it (WIKI_INDEX_PAGE_NAME)
@@ -28,6 +32,8 @@ MAX_ENTITIES_PER_PAGE = 8
 MAX_ROOT_KEYWORDS = 20
 _PREFIX_RE = re.compile(r"^\d+-")
 _ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+
+log = logging.getLogger(__name__)
 
 
 def _one_line(text: Any, limit: int = 300) -> str:
@@ -93,14 +99,15 @@ def render_root_index(target: str, docs: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-async def _upsert(client: GrowiClient, path: str, body: str, *, mode: str, write_path: str, root_path: str) -> GrowiPage:
+async def _upsert(client: GrowiClient, path: str, body: str, *, mode: str, write_path: str, root_path: str) -> tuple[GrowiPage, bool]:
+    """Create or update one index page; the second value says whether GROWI was written."""
     assert_publish_path(path, mode=mode, write_path=write_path, root_path=root_path)
     existing = await client.get_page(path=path)
     if existing is None:
-        return await client.create_page(path, body)
+        return await client.create_page(path, body), True
     if existing.body.strip() == body.strip():
-        return existing
-    return await client.update_page(existing.page_id, existing.revision_id, body)
+        return existing, False
+    return await client.update_page(existing.page_id, existing.revision_id, body), True
 
 
 async def _delete_if_index(client: GrowiClient, path: str) -> bool:
@@ -120,7 +127,15 @@ def _scoped_folders(project: Project, only: list[str] | None) -> dict[str, Path]
 
 
 def build_index(settings: Any, *, only: list[str] | None = None, publish: bool = True,
-                on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+                on_progress: Callable[[dict[str, Any]], None] | None = None,
+                locked: bool = False, ledger: Ledger | None = None) -> dict[str, Any]:
+    """Refresh one index page per document plus the root index.
+
+    ``only`` scopes which documents get their own page upserted; the root index is
+    always rendered from every document, so a scoped run cannot shrink it.
+    ``locked`` and ``ledger`` let a publish sweep call this while it already holds the
+    project lock, linking against the page IDs that sweep has just published.
+    """
     project = open_project(settings)
     connection = _connection(settings)
     publisher = _publisher(settings) if publish else None
@@ -130,44 +145,56 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     done: list[dict[str, Any]] = []
     failures: list[str] = []
     root_docs: list[dict[str, Any]] = []
-    with _lock(project):
-        ledger = load_ledger(project.metadata / "pipeline.json")
-        folders = _scoped_folders(project, only)
-        for position, (document, folder) in enumerate(sorted(folders.items()), start=1):
+    scoped = None if only is None else set(_scoped_folders(project, only))
+    folders = _folders(project)
+    total = len(scoped) if scoped is not None else len(folders)
+    indexed = 0
+    with contextlib.nullcontext() if locked else _lock(project):
+        ledger = ledger if ledger is not None else load_ledger(project.metadata / "pipeline.json")
+        for document, folder in sorted(folders.items()):
             doc_path = growi_path(connection.write_path, document) if connection else f"/{document}"
+            cards = document_cards(folder)
+            keywords = Counter(k for card in cards for k in card["keywords"])
+            entry = {
+                "document": document,
+                "link": growi_path(doc_path, INDEX_NAME) if connection else f"{doc_path}/{INDEX_NAME}",
+                "pages": len(cards),
+                "summary": next((c["summary"] for c in cards if c["summary"]), ""),
+                "keywords": [k for k, _ in keywords.most_common(MAX_ROOT_KEYWORDS)],
+            }
+            root_docs.append(entry)
+            if scoped is not None and document not in scoped:
+                continue
 
             def link_for(filename: str, _doc=document, _doc_path=doc_path) -> str:
                 row = ledger.published_pages.get(f"{_doc}/{filename}", {})
                 return f"/{row['page_id']}" if row.get("page_id") else growi_path(_doc_path, filename)
 
-            cards = document_cards(folder)
             body = render_document_index(Path(document).name, cards, link_for)
             write_text_atomic(project.metadata / "index" / document / "index.md", body)
-            link = growi_path(doc_path, INDEX_NAME)
+            status = "written"
             if publisher is not None:
                 try:
-                    page = asyncio.run(_upsert(publisher.client, link, body, mode=connection.mode,
-                                               write_path=connection.write_path, root_path=connection.root_path))
-                    link = f"/{page.page_id}"
+                    page, changed = asyncio.run(_upsert(publisher.client, entry["link"], body, mode=connection.mode,
+                                                        write_path=connection.write_path, root_path=connection.root_path))
+                    entry["link"] = f"/{page.page_id}"
+                    status = "indexed" if changed else "unchanged"
                 except Exception as exc:  # one document must not stop the others
                     failures.append(f"{document}: {type(exc).__name__}: {exc}")
                     continue
-            done.append({"document": document, "pages": len(cards), "status": "indexed" if publisher else "written"})
+            indexed += 1
+            done.append({"document": document, "pages": len(cards), "status": status})
             if on_progress:
-                on_progress({"stage": "index", "step": "document", "current": position, "total": len(folders), "document": document})
-            keywords = Counter(k for card in cards for k in card["keywords"])
-            root_docs.append({
-                "document": document, "link": link, "pages": len(cards),
-                "summary": next((c["summary"] for c in cards if c["summary"]), ""),
-                "keywords": [k for k, _ in keywords.most_common(MAX_ROOT_KEYWORDS)],
-            })
+                on_progress({"stage": "index", "step": "document", "current": indexed, "total": total, "document": document})
         target = str(settings.target_name).strip("/")
         root_body = render_root_index(target, root_docs)
         write_text_atomic(project.metadata / "index" / "index.md", root_body)
         if publisher is not None:
             try:
-                asyncio.run(_upsert(publisher.client, growi_path(connection.write_path, INDEX_NAME), root_body,
-                                    mode=connection.mode, write_path=connection.write_path, root_path=connection.root_path))
+                _, changed = asyncio.run(_upsert(
+                    publisher.client, growi_path(connection.write_path, INDEX_NAME), root_body,
+                    mode=connection.mode, write_path=connection.write_path, root_path=connection.root_path))
+                done.append({"document": target, "pages": len(root_docs), "status": "indexed" if changed else "unchanged", "root": True})
             except Exception as exc:
                 failures.append(f"root index: {type(exc).__name__}: {exc}")
     return {"run_id": run_id, "done": done, "failures": failures}
@@ -186,4 +213,17 @@ def delete_index_pages(settings: Any) -> dict[str, Any]:
     return {"run_id": "idx-del-" + uuid.uuid4().hex[:16], "done": [{"deleted": deleted}], "failures": []}
 
 
-__all__ = ["build_index", "delete_index_pages", "document_cards", "render_document_index", "render_root_index"]
+def delete_document_index(publisher: Any, document: str) -> None:
+    """Trash one document's index page after its wiki folder is removed.
+
+    Index pages carry no chunk marker, so `delete_document` leaves them behind. This is
+    derived output: a failure here is logged, never raised into the deletion that caused it.
+    """
+    try:
+        path = growi_path(publisher.connection.write_path, document, INDEX_NAME)
+        asyncio.run(_delete_if_index(publisher.client, path))
+    except Exception as exc:
+        log.warning("index page for %s: %s: %s", document, type(exc).__name__, exc)
+
+
+__all__ = ["build_index", "delete_document_index", "delete_index_pages", "document_cards", "render_document_index", "render_root_index"]

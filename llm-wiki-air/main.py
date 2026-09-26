@@ -8,6 +8,7 @@ build all [<raw-rel>...]    wiki batch first, then link batch (bare build is an 
 publish                     publish the current wiki/ tree to GROWI
 index [<raw-rel>...]        publish per-document + root index pages for growi-search
 sync [<mount-rel>...]       scan and drain queue -> candidate -> GROWI -> commit
+                            then reconcile every index page against the wiki tree
 watch [<mount-rel>...]      queued 10-second metadata watcher + worker
 queue scan|work|status      operate the persistent watcher queue
 reset                       trash all publisher-owned GROWI pages
@@ -137,6 +138,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
             combined["failures"].extend(result.get("failures", []))
             if result.get("failures"):
                 break
+    if not combined["failures"]:
+        # Index pages are derived output, so reconcile them against the whole wiki tree
+        # here: a wiki built before its index exists catches up, and a page whose body
+        # already matches GROWI is read but never rewritten.
+        from publisher.index import build_index
+
+        try:
+            index = build_index(settings, on_progress=_progress if args.verbose else None)
+        except Exception as exc:  # a stale table of contents must not fail a sync
+            index = {"done": [], "failures": [f"index: {type(exc).__name__}: {exc}"]}
+        combined["done"].extend(index["done"])
+        combined["failures"].extend(index["failures"])
     return _report(combined)
 
 
@@ -290,6 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     convert = sub.add_parser("convert", help="convert the configured mount to raw Markdown only"); project_flags(convert); convert.set_defaults(fn=cmd_convert)
     sync = sub.add_parser("sync", help="scan and drain the configured project's durable queue"); pipeline_flags(sync)
+    sync.description = "Drain the queue, then reconcile index pages for the whole wiki tree."
     sync.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
     sync.add_argument("--force", action="store_true", help="regenerate selected sources even when unchanged")
     sync.set_defaults(fn=cmd_sync)

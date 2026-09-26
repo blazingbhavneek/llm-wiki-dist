@@ -42,6 +42,14 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(low, min(value, high))
+
+
+def _bool(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class Settings(BaseModel):
     # GROWI
     growi_url: str = ""
@@ -66,6 +74,28 @@ class Settings(BaseModel):
     embed_base_url: str = ""
     embed_model: str = ""
     embed_api_key: str = "local"
+
+    # Jev relevance gate (optional; ES/router path is used when disabled)
+    jev_enabled: bool = False
+    jev_backend: str = "auto"          # auto | local | hosted
+    jev_local_path: str = ""           # directory containing jev_style_decision.py
+    jev_device: str = "auto"           # auto | cuda | mps | cpu for the local runtime
+    jev_dtype: str = "bfloat16"        # float32 | bfloat16 | float16 (bf16 falls back to fp16)
+    jev_base_url: str = ""             # hosted Jev-compatible /score endpoint
+    jev_api_key: str = ""
+    jev_model: str = "chaoliangUNSW/Jev-Style-0.8B-Decision-v3"
+    jev_timeout: int = 60
+    jev_threshold: float = 0.50
+    jev_seed_threshold: float = 0.80
+    jev_chunk_tokens: int = 25600
+    jev_chunk_overlap: int = 10000
+    jev_batch_size: int = 64
+    jev_max_page_reads: int = 0        # 0 = unlimited; independent of RunBudget
+    jev_max_list_calls: int = 0        # 0 = unlimited
+    jev_workers: int = 4               # concurrent fetch+classify threads in the sweep pipeline
+    jev_subagent_group_size: int = 5   # max seeds one seed-group subagent explores
+    jev_subagent_groups: int = 8       # max seed-group subagents per question
+    jev_prefilter_min_overlap: int = 2  # shared keyword grams needed before an expensive body score; 0 = off
 
     # Index pages published by `main.py index`
     index_page_name: str = "00-目次"
@@ -145,6 +175,26 @@ class Settings(BaseModel):
             embed_base_url=(env("WIKI_EMBED_BASE_URL") or "").rstrip("/"),
             embed_model=env("WIKI_EMBED_MODEL") or "",
             embed_api_key=env("WIKI_EMBED_API_KEY") or "local",
+            jev_enabled=_bool(env("WIKI_JEV_ENABLED")),
+            jev_backend=(env("WIKI_JEV_BACKEND") or "auto").strip().lower(),
+            jev_local_path=(env("WIKI_JEV_LOCAL_PATH") or "").strip(),
+            jev_device=(env("WIKI_JEV_DEVICE") or "auto").strip().lower(),
+            jev_dtype=(env("WIKI_JEV_DTYPE") or "bfloat16").strip().lower(),
+    jev_base_url=(env("WIKI_JEV_BASE_URL") or "").rstrip("/"),
+            jev_api_key=(env("WIKI_JEV_API_KEY") or "").strip(),
+            jev_model=env("WIKI_JEV_MODEL") or "chaoliangUNSW/Jev-Style-0.8B-Decision-v3",
+            jev_timeout=int(env("WIKI_JEV_TIMEOUT") or 60),
+            jev_threshold=_clamp_float(float(env("WIKI_JEV_THRESHOLD") or 0.5), 0.0, 1.0),
+            jev_seed_threshold=_clamp_float(float(env("WIKI_JEV_SEED_THRESHOLD") or 0.8), 0.0, 1.0),
+            jev_chunk_tokens=int(env("WIKI_JEV_CHUNK_TOKENS") or 25600),
+            jev_chunk_overlap=int(env("WIKI_JEV_CHUNK_OVERLAP") or 10000),
+            jev_batch_size=int(env("WIKI_JEV_BATCH_SIZE") or 64),
+            jev_max_page_reads=int(env("WIKI_JEV_MAX_PAGE_READS") or 0),
+            jev_max_list_calls=int(env("WIKI_JEV_MAX_LIST_CALLS") or 0),
+            jev_workers=max(1, int(env("WIKI_JEV_WORKERS") or 4)),
+            jev_subagent_group_size=max(1, int(env("WIKI_JEV_SUBAGENT_GROUP_SIZE") or 5)),
+            jev_subagent_groups=max(1, int(env("WIKI_JEV_SUBAGENT_GROUPS") or 8)),
+            jev_prefilter_min_overlap=max(0, int(env("WIKI_JEV_PREFILTER_MIN_OVERLAP") or 2)),
             index_page_name=env("WIKI_INDEX_PAGE_NAME") or "00-目次",
             index_cache_ttl=int(env("WIKI_INDEX_CACHE_TTL") or 600),
             index_map_top_k=int(env("WIKI_INDEX_MAP_TOP_K") or 20),
@@ -185,6 +235,23 @@ class Settings(BaseModel):
             raise ValueError("GROWI_URL is required")
         if not self.growi_token:
             raise ValueError("GROWI_TOKEN is required")
+        if self.jev_seed_threshold < self.jev_threshold:
+            raise ValueError("WIKI_JEV_SEED_THRESHOLD must be >= WIKI_JEV_THRESHOLD")
+        # The chunker reserves 512 tokens for the prompt/metadata.
+        if self.jev_chunk_tokens <= 512:
+            raise ValueError("WIKI_JEV_CHUNK_TOKENS must be > 512")
+        if not 0 <= self.jev_chunk_overlap < self.jev_chunk_tokens - 512:
+            raise ValueError("WIKI_JEV_CHUNK_OVERLAP must fit the body token budget")
+        if self.jev_batch_size < 1:
+            raise ValueError("WIKI_JEV_BATCH_SIZE must be >= 1")
+        if self.jev_max_page_reads < 0 or self.jev_max_list_calls < 0:
+            raise ValueError("Jev budgets must be >= 0 (0 = unlimited)")
+        if self.jev_workers < 1:
+            raise ValueError("WIKI_JEV_WORKERS must be >= 1")
+        if self.jev_subagent_group_size < 1 or self.jev_subagent_groups < 1:
+            raise ValueError("Jev seed-group size and count must be >= 1")
+        if self.jev_prefilter_min_overlap < 0:
+            raise ValueError("WIKI_JEV_PREFILTER_MIN_OVERLAP must be >= 0 (0 = no prefilter)")
 
     @property
     def llm_ready(self) -> bool:
@@ -205,4 +272,4 @@ class Settings(BaseModel):
         return hosts
 
     def public_dict(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"growi_token", "growi_attachment_token", "chat_api_key", "rerank_api_key", "embed_api_key", "usage_log_path"})
+        return self.model_dump(exclude={"growi_token", "growi_attachment_token", "chat_api_key", "rerank_api_key", "embed_api_key", "usage_log_path", "jev_api_key", "jev_local_path"})

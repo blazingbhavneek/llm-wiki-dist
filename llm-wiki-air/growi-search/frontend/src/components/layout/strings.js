@@ -170,6 +170,10 @@ export const STR = {
     explorer: (n) => `エクスプローラー ${n}`,
     searching: (who, q) => (who ? `${who} · “${q}” を検索中` : `“${q}” を検索中`),
     pagesFound: (c) => `${c} 件のページが見つかりました`,
+    jevQuery: (q, rewritten) =>
+      `${rewritten ? 'JEV に投げる質問（00-目次 の語彙で再構成）' : 'JEV に投げる質問（原文のまま）'}: ${q}`,
+    jevToc: (doc, note) => `目次要約 · ${doc}: ${note}`,
+    jevSwept: (p, f, y, a, m, c) => `JEV 走査: ${p} ページ（語彙で ${f} 件スキップ）、yes ${y} 件（平均 p=${a}・最高 p=${m}）、シード ${c} 件`,
     mapScanned: (d, p, s) => `索引から ${d} 文書 / ${p} ページを走査し、${s} 件を候補に追加`,
     budgetNote: (n) => `ページ取得上限に到達しました（${n} 件）`,
     budgetSearch: '検索回数の上限に到達しました',
@@ -380,6 +384,10 @@ export const STR = {
     explorer: (n) => `Explorer ${n}`,
     searching: (who, q) => (who ? `${who} · searching “${q}”` : `searching “${q}”`),
     pagesFound: (c) => `${c} pages found`,
+    jevQuery: (q, rewritten) =>
+      `${rewritten ? 'JEV query (rewritten from the index vocabulary)' : 'JEV query (raw question)'}: ${q}`,
+    jevToc: (doc, note) => `index summary · ${doc}: ${note}`,
+    jevSwept: (p, f, y, a, m, c) => `JEV scanned ${p} pages (skipped ${f} by keyword), ${y} yeses (mean p=${a}, top p=${m}), kept ${c} seeds`,
     mapScanned: (d, p, s) => `Scanned ${d} documents / ${p} pages from the index, added ${s} candidates`,
     budgetNote: (n) => `Page fetch budget reached (${n})`,
     budgetSearch: 'Search budget reached',

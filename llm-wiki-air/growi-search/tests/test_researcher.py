@@ -1,17 +1,26 @@
 """Researcher tests with fake GROWI / reranker / LLM. No network, no DB."""
 
 import os
+import json
+import tempfile
 import time
 import unittest
-from threading import Event
+from pathlib import Path
+from threading import Event, Lock
+from unittest import mock
 
 os.environ.setdefault("GROWI_URL", "http://growi.test")
 os.environ.setdefault("GROWI_TOKEN", "t")
 
+import httpx
+
+import gateway as G
 import researcher as R
 from config import Settings
 from growi_client import GrowiAPIError, SearchHit
 from models import AgentAnswer, WikiPage
+from prompts import JEV_QUERY_REWRITE_PROMPT
+from prompts import JEV_TOC_SUMMARY_PROMPT
 
 ID1 = "507f1f77bcf86cd799439011"
 ID2 = "507f1f77bcf86cd799439012"
@@ -523,6 +532,647 @@ class NoForbiddenImports(unittest.TestCase):
                     names & banned,
                     f"{file.name} imports forbidden symbol: {names & banned}",
                 )
+
+
+# --- Jev: adapters, helpers, sweep ------------------------------------------
+
+
+def jev_settings(**kw):
+    base = dict(growi_url="http://growi.test", growi_token="t", growi_root_path="/Moove",
+                jev_enabled=True, jev_threshold=0.5, jev_seed_threshold=0.8)
+    base.update(kw)
+    return Settings(**base)
+
+
+class JevAdapterTests(unittest.TestCase):
+    def hosted(self, handler, api_key=""):
+        settings = jev_settings(jev_backend="hosted", jev_base_url="http://jev.test", jev_api_key=api_key)
+        return G.HostedJevClassifier(settings, transport=httpx.MockTransport(handler))
+
+    def test_question_rendering(self):
+        text = G.jev_question_text("予算はいくらですか", subject="001-概要")
+        self.assertIn("予算はいくらですか", text)
+        self.assertIn("はい / いいえ", text)
+        self.assertIn("対象: 001-概要", text)
+
+    def test_hosted_request_shape_and_order(self):
+        seen = {}
+
+        def handler(request):
+            seen["path"] = request.url.path
+            seen["auth"] = request.headers.get("authorization")
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"probabilities": [{"yes": 0.9}, {"yes": 0.2}]})
+
+        clf = self.hosted(handler, api_key="sekret")
+        probs = clf.score_many({"document": "/d"},
+                               [G.JevQuestion("a", "q1"), G.JevQuestion("b", "q2")])
+        self.assertEqual(seen["path"], "/score")
+        self.assertEqual(seen["auth"], "Bearer sekret")
+        self.assertEqual(probs, [0.9, 0.2])  # request order preserved
+        body = seen["body"]
+        self.assertEqual(body["model"], "chaoliangUNSW/Jev-Style-0.8B-Decision-v3")
+        self.assertEqual(body["options"], {"yes": "はい", "no": "いいえ"})
+        self.assertEqual(body["category"], "noul")
+        self.assertEqual(body["many_mode"], "batched")
+        self.assertEqual([q["key"] for q in body["questions"]], ["a", "b"])
+
+    def test_hosted_no_auth_header_without_key(self):
+        seen = {}
+
+        def handler(request):
+            seen["auth"] = request.headers.get("authorization")
+            return httpx.Response(200, json={"probabilities": [0.5]})
+
+        self.hosted(handler).score_many({}, [G.JevQuestion("a", "q")])
+        self.assertIsNone(seen["auth"])
+
+    def test_hosted_keyed_results_aligned_by_key(self):
+        def handler(request):
+            return httpx.Response(200, json={"results": [
+                {"key": "b", "probabilities": {"はい": 0.25}},
+                {"key": "a", "probabilities": {"はい": 0.75}},
+            ]})
+
+        probs = self.hosted(handler).score_many(
+            {}, [G.JevQuestion("a", "q"), G.JevQuestion("b", "q")])
+        self.assertEqual(probs, [0.75, 0.25])
+
+    def test_hosted_rejects_bad_shapes(self):
+        qa, qb = G.JevQuestion("a", "q"), G.JevQuestion("b", "q")
+        cases = [
+            ([qa, qb], {"probabilities": [0.5]}),                      # wrong length
+            ([qa], b'{"probabilities": [NaN]}'),                        # NaN
+            ([qa], {"probabilities": [1.5]}),                          # out of range
+            ([qa], {"results": [{"key": "a", "probabilities": {"はい": 0.5}},
+                                 {"key": "a", "probabilities": {"はい": 0.4}}]}),  # duplicate keys
+            ([qa], {"results": [{"key": "z", "probabilities": {"はい": 0.5}}]}),   # missing key
+            ([qa], {"unexpected": True}),                              # unknown shape
+        ]
+        for questions, body in cases:
+            clf = self.hosted(lambda request, b=body: httpx.Response(
+                200, content=b if isinstance(b, bytes) else json.dumps(b).encode()))
+            with self.assertRaises(RuntimeError, msg=str(body)):
+                clf.score_many({}, questions)
+
+    def test_hosted_4xx_not_retried_5xx_retried_once(self):
+        calls = []
+        clf = self.hosted(lambda request: (calls.append(1), httpx.Response(400))[1])
+        with self.assertRaises(RuntimeError):
+            clf.score_many({}, [G.JevQuestion("a", "q")])
+        self.assertEqual(len(calls), 1)
+        calls.clear()
+        clf = self.hosted(lambda request: (calls.append(1), httpx.Response(503))[1])
+        with self.assertRaises(RuntimeError):
+            clf.score_many({}, [G.JevQuestion("a", "q")])
+        self.assertEqual(len(calls), 2)
+
+    def test_local_runtime_uses_official_decide_many_noul_api(self):
+        class Noul:
+            def __init__(self):
+                self.calls = []
+
+            def decide_many(self, state, questions):
+                self.calls.append(questions)
+                return [{"probabilities": {"true": 0.83, "false": 0.17}} for _ in questions]
+
+        runtime = Noul()
+        clf = G.LocalJevClassifier(runtime)
+        probs = clf.score_many({"document": "/d"},
+                               [G.JevQuestion("a", "q1"), G.JevQuestion("b", "q2")])
+        self.assertEqual(probs, [0.83, 0.83])
+        self.assertEqual(runtime.calls[0], [
+            {"t": "noul", "ins": "q1", "crit": None},
+            {"t": "noul", "ins": "q2", "crit": None},
+        ])
+
+        class Single:
+            def __init__(self):
+                self.qtypes = []
+
+            def decide(self, state, question, qtype=None):
+                self.qtypes.append(qtype)
+                return {"probabilities": {"true": 0.83}}
+
+        runtime2 = Single()
+        clf2 = G.LocalJevClassifier(runtime2)
+        self.assertEqual(clf2.score_many({}, [G.JevQuestion("a", "q")]), [0.83])
+        self.assertEqual(runtime2.qtypes, ["noul"])
+
+        class Bad(Noul):
+            def decide_many(self, state, questions):
+                return [{"probabilities": {"true": 2.0}}]
+
+        with self.assertRaises(RuntimeError):
+            G.LocalJevClassifier(Bad()).score_many({}, [G.JevQuestion("a", "q")])
+
+    def test_build_jev_factory(self):
+        self.assertIsNone(G.build_jev(Settings(jev_enabled=False, jev_base_url="http://x")))
+        self.assertIsNone(G.build_jev(Settings(jev_enabled=True, jev_backend="hosted")))
+        with mock.patch.object(G.LocalJevClassifier, "build", return_value=None) as local:
+            self.assertIsNone(G.build_jev(Settings(jev_enabled=True, jev_backend="local",
+                                                   jev_local_path=str(Path(tempfile.gettempdir()) / "nope-jev"))))
+            self.assertIsNone(G.build_jev(Settings(jev_enabled=True, jev_backend="auto")))
+            self.assertEqual(local.call_count, 2)
+        clf = G.build_jev(Settings(jev_enabled=True, jev_backend="hosted", jev_base_url="http://x"))
+        self.assertIsInstance(clf, G.HostedJevClassifier)
+        clf2 = G.build_jev(Settings(jev_enabled=True, jev_backend="auto", jev_base_url="http://x"))
+        self.assertIsInstance(clf2, G.HostedJevClassifier)
+
+    def test_local_build_loads_runtime_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "jev_style_decision.py").write_text(
+                "class JevStyleDecision:\n"
+                "    def __init__(self, path): self.path = path\n"
+                "    def decide_many(self, state, questions):\n"
+                "        return [{'probabilities': {'true': 0.42}} for q in questions]\n",
+                encoding="utf-8")
+            with mock.patch.object(G, "_jev_local_snapshot", return_value=Path(tmp)):
+                clf = G.build_jev(Settings(jev_enabled=True, jev_backend="local", jev_local_path=tmp))
+            self.assertIsInstance(clf, G.LocalJevClassifier)
+            self.assertEqual(clf.score_many({}, [G.JevQuestion("a", "q")]), [0.42])
+
+    def test_local_snapshot_uses_complete_directory_without_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            for name in G.JEV_REQUIRED_FILES:
+                (path / name).touch()
+            self.assertEqual(G._jev_local_snapshot(jev_settings(jev_local_path=tmp)), path)
+
+    def test_settings_env_validation_and_public_dict(self):
+        env = {"WIKI_JEV_ENABLED": "1", "WIKI_JEV_BACKEND": "hosted",
+               "WIKI_JEV_BASE_URL": "http://jev.internal:8080", "WIKI_JEV_API_KEY": "topsecret",
+               "WIKI_JEV_THRESHOLD": "0.6", "WIKI_JEV_SEED_THRESHOLD": "0.9"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            st = Settings.from_env()
+        self.assertTrue(st.jev_enabled)
+        self.assertEqual((st.jev_threshold, st.jev_seed_threshold), (0.6, 0.9))
+        pub = st.public_dict()
+        self.assertNotIn("jev_api_key", pub)
+        self.assertNotIn("jev_local_path", pub)
+        self.assertTrue(pub["jev_enabled"])
+        bad = jev_settings(jev_threshold=0.6, jev_seed_threshold=0.2)
+        with self.assertRaises(ValueError):
+            bad.validate_strict()
+
+    def test_chunk_settings_validated(self):
+        with self.assertRaises(ValueError):
+            jev_settings(jev_chunk_tokens=100, jev_chunk_overlap=999999).validate_strict()
+
+
+class JevChunkTests(unittest.TestCase):
+    def test_small_page_single_chunk(self):
+        self.assertEqual(R._jev_chunks("短い本文", 25600, 10000), ["短い本文"])
+
+    def test_max_respected_overlap_and_no_empty(self):
+        text = "\n\n".join(f"段落{i}\n" + ("あ" * 200) for i in range(60))
+        prefix = "タイトル /Moove/long"
+        chunks = R._jev_chunks(text, max_tokens=2000, overlap_tokens=400, prefix=prefix)
+        budget = 2000 - 512 - R._jev_est_tokens(prefix)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(R._jev_est_tokens(chunk), budget)
+            self.assertTrue(chunk.strip())
+        # overlap: the next chunk starts with the previous chunk's last paragraph
+        self.assertEqual(chunks[1].split("\n\n")[0], chunks[0].split("\n\n")[-1])
+
+    def test_oversized_single_paragraph_hard_split(self):
+        chunks = R._jev_chunks("う" * 20000, max_tokens=1000, overlap_tokens=0)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(R._jev_est_tokens(chunk), 1000 - 512)
+
+
+IDA = "507f1f77bcf86cd799439111"  # /Moove/A/page1 (doc A, entity ガバナンス)
+IDB = "507f1f77bcf86cd799439112"  # /Moove/B/define-governance (doc B definer)
+IDN = "507f1f77bcf86cd799439113"  # /Moove/C/note (no-index doc)
+IDSD = "507f1f77bcf86cd799439114"  # /Moove/C/sub/deep
+INDEX_FLAG = '<span hidden data-llm-wiki-index="1"></span>\n'
+
+
+class JevClient:
+    """Docs A and B have 00-目次 indexes; doc C has none."""
+
+    url = "http://growi.test"
+
+    def __init__(self):
+        self.page_calls = []
+        self.list_calls = []
+        self.search_calls = []
+        self.pages = {
+            "/Moove/00-目次": page_of("507f1f77bcf86cd799439121", "/Moove/00-目次",
+                                       INDEX_FLAG + "- [A](/Moove/A/00-目次) — A\n- [B](/Moove/B/00-目次) — B\n"),
+            "/Moove/A/00-目次": page_of("507f1f77bcf86cd799439122", "/Moove/A/00-目次",
+                                         INDEX_FLAG + "- [page1](/Moove/A/page1) — 概説\n  - エンティティ: ガバナンス\n"),
+            "/Moove/B/00-目次": page_of("507f1f77bcf86cd799439123", "/Moove/B/00-目次",
+                                         INDEX_FLAG + "- [define-governance](/Moove/B/define-governance) — 定義\n  - エンティティ: ガバナンス\n"),
+            IDA: page_of(IDA, "/Moove/A/page1", "# page1\n概説 本文\n"),
+            IDB: page_of(IDB, "/Moove/B/define-governance", "# define\nガバナンスの定義\n"),
+            "/Moove/C/note": page_of(IDN, "/Moove/C/note", "ノート ガバナンス 参照\n"),
+            "/Moove/C/sub/deep": page_of(IDSD, "/Moove/C/sub/deep", "深い 詳細 ノート\n"),
+        }
+        for page in list(self.pages.values()):  # id and path both resolve to the same page
+            if page.path:
+                self.pages.setdefault(page.path, page)
+            if page.id:
+                self.pages.setdefault(page.id, page)
+        self.children_map = {
+            "/Moove": [page_of("f-a", "/Moove/A"), page_of("f-b", "/Moove/B"), page_of("f-c", "/Moove/C")],
+            "/Moove/A": [self.pages["/Moove/A/00-目次"], self.pages[IDA]],
+            "/Moove/B": [self.pages["/Moove/B/00-目次"], self.pages[IDB]],
+            "/Moove/C": [self.pages["/Moove/C/note"], page_of("f-cs", "/Moove/C/sub")],
+            "/Moove/C/sub": [page_of("f-cidx", "/Moove/C/sub/00-目次",
+                                      INDEX_FLAG + "- [deep](/Moove/C/sub/deep) — 深い\n"),
+                             self.pages["/Moove/C/sub/deep"]],
+        }
+
+    def get_page(self, *, page_id=None, path=None):
+        self.page_calls.append(page_id or path)
+        return self.pages.get(page_id or path)
+
+    def list_children(self, *, page_id=None, path=None):
+        # Same argument contract as GrowiSearchClient.list_children: passing both
+        # (or neither) is a caller bug that must fail here, not in production.
+        if bool(page_id) == bool(path):
+            raise ValueError("exactly one of page_id / path is required")
+        self.list_calls.append(page_id or path)
+        return list(self.children_map.get(path or "", []))
+
+    def search_pages(self, query, *, path, limit, offset=0):
+        self.search_calls.append((query, path, limit))
+        return [hit(IDA, "/Moove/A/page1", "概説スニペット", 1)]
+
+
+class FakeJev:
+    """High probability when a yes term appears in the card state or page body."""
+
+    def __init__(self, yes_terms, high=0.95, low=0.05):
+        self.yes_terms = yes_terms
+        self.high, self.low = high, low
+        self.scored_keys = []
+
+    def score_many(self, state, questions):
+        cards = {c["path"]: c for c in state.get("cards") or []}
+        page_text = (state.get("page") or {}).get("text", "")
+        out = []
+        for question in questions:
+            self.scored_keys.append(question.key)
+            card = cards.get(question.key)
+            blob = json.dumps(card, ensure_ascii=False) if card else page_text
+            out.append(self.high if any(t in blob for t in self.yes_terms) else self.low)
+        return out
+
+
+REWRITTEN = "Moove ライブラリが提供する関数（ets_ 系・pmf_ 系）の一覧と説明が本文に記載されているか？"
+
+
+class RecordingJev(FakeJev):
+    """FakeJev that also keeps the exact question text every page was asked."""
+
+    def __init__(self, yes_terms, **kwargs):
+        super().__init__(yes_terms, **kwargs)
+        self.questions: list[str] = []
+
+    def score_many(self, state, questions):
+        self.questions.extend(question.text for question in questions)
+        return super().score_many(state, questions)
+
+
+class RewritingLLM(FakeLLM):
+    """Answers the per-document 目次 summary and the rewrite, as their prompts ask."""
+
+    def complete(self, prompt, payload):
+        self.complete_calls.append((prompt, payload))
+        if prompt == JEV_QUERY_REWRITE_PROMPT:
+            return REWRITTEN
+        if prompt == JEV_TOC_SUMMARY_PROMPT:
+            return "関数・API の一覧と説明を含む。"
+        return self.answer
+
+
+class BrokenJev:
+    def score_many(self, state, questions):
+        raise RuntimeError("endpoint down")
+
+
+class WideClient(JevClient):
+    """Doc C has no index and 30 children: the crawl outruns classification."""
+
+    def __init__(self):
+        super().__init__()
+        wide = [page_of(f"c{i:02d}", f"/Moove/C/p{i:02d}", f"ページ{i} 本文\n") for i in range(30)]
+        for page in wide:
+            self.pages[page.path] = page
+            self.pages[page.id] = page
+        self.children_map["/Moove/C"] = [self.pages["/Moove/C/note"],
+                                         page_of("f-cs", "/Moove/C/sub"), *wide]
+
+
+class JevSweepTests(unittest.TestCase):
+    def make(self, client=None, jev=None, **settings_kw):
+        client = client or JevClient()
+        # These fixtures ask about entities that live in card summaries, not page
+        # bodies, so the keyword gate is off unless a test opts in explicitly.
+        settings_kw.setdefault("jev_prefilter_min_overlap", 0)
+        settings = jev_settings(**settings_kw)
+        index = R.IndexMap(client, settings, None, None)
+        session = R.ResearchSession(client, settings, R.PageCache(120, 256), None,
+                                    index_map=index, jev=jev)
+        session.llm = FakeLLM(route_mode="deep")
+        return client, session
+
+    def sweep(self, session, query, client=None):
+        events = []
+        results = session._run_jev_sweep(query, events.append, None)
+        return results, events
+
+    def test_index_map_entity_catalog(self):
+        client, session = self.make()
+        index = session.index_map
+        self.assertEqual(len(index.definers_for("ガバナンス")), 2)
+        self.assertEqual(len(index.definers_for(" ｶﾞﾊﾞﾅﾝｽ ")), 2)  # NFKC/case/whitespace normalized
+        self.assertEqual(len(index.cards_for_document("A")), 1)
+        self.assertIsNotNone(index.card_for_target("/Moove/A/page1"))
+
+    def test_card_candidate_gets_exactly_one_full_read(self):
+        client, session = self.make(jev=FakeJev(["概説"]))
+        results, events = self.sweep(session, "概説について")
+        self.assertEqual([r["node"].id for r in results], [IDA])
+        self.assertEqual(results[0]["evidence"][0]["field"], "jev")
+        # card stage pass -> exactly one full-body confirmation
+        self.assertEqual(client.page_calls.count("/Moove/A/page1"), 1)
+
+    def test_card_pass_below_seed_threshold_pruned(self):
+        # Card summary matches (candidate) but a strict seed threshold rejects it.
+        client, session = self.make(jev=FakeJev(["概説"], high=0.65), jev_seed_threshold=0.8)
+        results, events = self.sweep(session, "概説について")
+        self.assertEqual(results, [])
+        self.assertTrue(any(e.get("stage") == "card" and e.get("status") == "candidate" for e in events))
+        self.assertTrue(any(e.get("stage") == "full" and e.get("status") == "pruned" for e in events))
+
+    def test_entity_definer_followed_across_documents(self):
+        # B is confirmed via its card; the shared entity pulls in A's definer card.
+        client, session = self.make(jev=FakeJev(["定義"]))
+        results, events = self.sweep(session, "定義について")
+        self.assertEqual([r["node"].id for r in results], [IDB])
+        complete = next(e for e in events if e.get("type") == "jev_complete")
+        self.assertGreater(complete["entity_edges_followed"], 0)
+        self.assertIn("/Moove/A/page1", client.page_calls)  # A read via the entity edge only
+
+    def test_low_confidence_definer_prunes_descendants(self):
+        client, session = self.make(jev=FakeJev(["定義"]))
+        results, _events = self.sweep(session, "定義について")
+        self.assertNotIn(IDA, [r["node"].id for r in results])  # A pruned -> no further frontier
+
+    def test_entity_cycle_terminates(self):
+        # A and B share ガバナンス and both confirm; each is processed exactly once.
+        client, session = self.make(jev=FakeJev(["概説", "定義"]))
+        results, _events = self.sweep(session, "ガバナンス")
+        self.assertEqual(sorted(r["node"].id for r in results), sorted([IDA, IDB]))
+        self.assertEqual(client.page_calls.count("/Moove/A/page1"), 1)
+        self.assertEqual(client.page_calls.count("/Moove/B/define-governance"), 1)
+
+    def test_no_index_document_recursively_scored(self):
+        client, session = self.make(jev=FakeJev(["深い"]))
+        results, _events = self.sweep(session, "深い")
+        self.assertEqual([r["node"].id for r in results], [IDSD])  # nested child found
+        # no markdown link on the deep page: no invented entity edges (B never read)
+        self.assertNotIn(IDB, client.page_calls)
+        self.assertNotIn("/Moove/B/define-governance", client.page_calls)
+
+    def test_jev_seeds_lead_and_emits_events(self):
+        client, session = self.make(jev=FakeJev(["概説"]))
+        events = []
+        out = session._try_route("概説について", events.append, None, "概説について")
+        self.assertIsNone(out)  # forced deep lead path
+        self.assertEqual(session._seed_ids, [IDA])
+        self.assertIn("jev", session._seed_context)
+        types = [e.get("type") for e in events]
+        self.assertIn("jev_gate", types)
+        self.assertIn("jev_complete", types)
+        self.assertIn("candidates", types)
+        # sweep page reads never touch the normal RunBudget and stay cached.
+        self.assertEqual(session.budget.pages_used, 0)
+        session.read_node("/Moove/A/page1")  # served from the sweep's memo
+        self.assertEqual(session.budget.pages_used, 0)
+
+    def test_adapter_failure_falls_back_to_es(self):
+        client, session = self.make(jev=BrokenJev())
+        events = []
+        session._try_route("概説について", events.append, None, "概説について")
+        self.assertTrue(any(e.get("type") == "jev_unavailable" for e in events))
+        self.assertTrue(client.search_calls)  # ES lane still ran
+
+    def test_disabled_jev_makes_no_calls(self):
+        client, session = self.make(jev=None)
+        events = []
+        session._try_route("概説について", events.append, None, "概説について")
+        self.assertFalse([e for e in events if str(e.get("type", "")).startswith("jev")])
+        self.assertTrue(client.search_calls)
+
+    def test_sweep_budget_denies_reads_without_failing(self):
+        client, session = self.make(jev=FakeJev(["概説"]), jev_max_page_reads=1)
+        events = []
+        out = session._try_route("概説について", events.append, None, "概説について")
+        complete = next(e for e in events if e.get("type") == "jev_complete")
+        self.assertLessEqual(complete["page_reads"], 1)
+        self.assertTrue(any(e.get("status") == "unread" for e in events))
+        self.assertTrue(client.search_calls)  # ES fallback took over
+        self.assertIsNone(out)
+
+    def test_live_progress_is_monotone_and_completes(self):
+        _client, session = self.make(jev=FakeJev(["概説"]))
+        _results, events = self.sweep(session, "概説について")
+        progress = [e for e in events if e.get("type") == "jev_progress"]
+        self.assertGreater(len(progress), 2)
+        percents = [e["percent"] for e in progress]
+        self.assertEqual(percents, sorted(percents))  # the bar never recedes as work is discovered
+        self.assertTrue(all(0 <= p <= 100 for p in percents))
+        self.assertTrue(all(e["done"] <= e["total"] for e in progress))
+        self.assertTrue(any(0 < p < 100 for p in percents))  # it actually moves
+        self.assertEqual(percents[-1], 100.0)
+
+    def test_classification_overlaps_the_crawl(self):
+        # A single worker + a 4-deep queue: classification must start while the
+        # sweep is still enumerating pages, not after the whole tree is listed.
+        client = WideClient()
+        _session_client, session = self.make(client=client, jev=FakeJev(["深い"]), jev_workers=1)
+        page_calls = []
+        original = session.jev.score_many
+
+        def spy(state, questions):
+            if state.get("page"):
+                page_calls.append(len(client.list_calls))
+            return original(state, questions)
+
+        session.jev.score_many = spy
+        results, _events = self.sweep(session, "深い")
+        self.assertEqual([r["node"].id for r in results], [IDSD])
+        self.assertTrue(page_calls)
+        self.assertLess(min(page_calls), len(client.list_calls))
+
+    def test_workers_classify_concurrently(self):
+        client, session = self.make(client=WideClient(), jev=FakeJev(["深い"]), jev_workers=4)
+        original = session.jev.score_many
+        inside = {"live": 0, "peak": 0}
+        gate = Lock()
+
+        def spy(state, questions):
+            if not state.get("page"):
+                return original(state, questions)
+            with gate:
+                inside["live"] += 1
+                inside["peak"] = max(inside["peak"], inside["live"])
+            time.sleep(0.02)  # hold the fake model long enough for overlap to show
+            with gate:
+                inside["live"] -= 1
+            return original(state, questions)
+
+        session.jev.score_many = spy
+        results, _events = self.sweep(session, "深い")
+        self.assertEqual([r["node"].id for r in results], [IDSD])
+        self.assertGreaterEqual(inside["peak"], 2)  # more than one page in flight
+
+
+    def test_seed_groups_slice_by_document(self):
+        seeds = [{"node": page_of("a1", "/Moove/A/1"), "score": 0.95, "document": "/Moove/A"},
+                 {"node": page_of("b1", "/Moove/B/1"), "score": 0.90, "document": "/Moove/B"},
+                 {"node": page_of("a2", "/Moove/A/2"), "score": 0.88, "document": "/Moove/A"}]
+        seeds += [{"node": page_of(f"a{i}", f"/Moove/A/{i}"), "score": 0.8 - i / 100, "document": "/Moove/A"}
+                  for i in range(3, 12)]
+        groups = R._seed_groups(seeds, group_size=5, max_groups=8)
+        self.assertTrue(all(len(group) <= 5 for group in groups))          # one agent, <=5 seeds
+        self.assertTrue(all(len({r["document"] for r in group}) == 1 for group in groups))
+        self.assertEqual(groups[0][0]["node"].id, "a1")                    # best seed leads
+        self.assertEqual(sum(len(group) for group in groups), len(seeds))  # nothing dropped
+        self.assertEqual(len(R._seed_groups(seeds, group_size=5, max_groups=2)), 2)
+
+    def test_jev_seeds_fan_out_one_agent_per_document(self):
+        # A and B each confirm exactly one seed -> exactly two groups, disjoint seeds.
+        _client, session = self.make(jev=FakeJev(["概説", "定義"]))
+        runs = []
+
+        def fake_subagent(_session, run, _question, prompt, _emit, _stop):
+            runs.append(run)
+            return {"start": run.start_id, "answer": "報告", "cited": [run.start_id]}
+
+        with mock.patch.object(R, "_run_subagent", side_effect=fake_subagent):
+            out = session._try_route("ガバナンス", [].append, None, "ガバナンス")
+        self.assertIsNone(out)  # deep lead path, driven by the sweep's findings
+        self.assertEqual(len(runs), 2)
+        for run in runs:
+            self.assertNotIn(run.start_id, run.offlimits)  # own seed stays readable
+        self.assertEqual({run.start_id for run in runs}, {IDA, IDB})
+        self.assertTrue(all(run.offlimits for run in runs))  # the other group's seed is blocked
+        self.assertIn("サブエージェント報告書", session._seed_context)  # reports merged for the lead
+        self.assertEqual(sorted(session._seed_ids), sorted([IDA, IDB]))
+
+    def test_group_subagent_cannot_read_another_groups_seed(self):
+        client, session = self.make(jev=FakeJev(["概説"]))
+        run = R.Subrun(start_id=IDA, index=1, offlimits={IDB, "/Moove/B/define-governance"})
+        ctx = R._SubContext(session=session, run=run, emit=lambda _e: None, stop_event=None)
+        self.assertIn("他の担当グループ", R._sub_read(ctx, IDB))
+        self.assertNotIn(IDB, client.page_calls)  # blocked before any GROWI read
+        self.assertEqual(run.read_ids, set())
+        R._sub_read(ctx, IDA)
+        self.assertEqual(run.read_ids, {IDA})  # its own seed still works
+
+    def test_prefilter_skips_pages_without_the_question_vocabulary(self):
+        # Doc C has no index: the whole subtree is swept, so it shows both outcomes.
+        client, session = self.make(jev=FakeJev(["ガバナンス"]), jev_prefilter_min_overlap=2)
+        quiet = page_of("507f1f77bcf86cd799439099", "/Moove/C/z", "ただの別資料")
+        client.pages[quiet.path] = quiet
+        client.pages[quiet.id] = quiet
+        client.children_map["/Moove/C"] = [client.pages["/Moove/C/note"], quiet]
+        _results, events = self.sweep(session, "ガバナンス 一覧")
+        statuses = {(e["node"]["title"], e["status"]) for e in events
+                    if e.get("type") == "jev_gate" and e.get("stage") == "full"}
+        self.assertIn(("note", "confirmed"), statuses)    # shares the vocabulary -> scored
+        self.assertIn(("z", "prefiltered"), statuses)     # no shared keyword -> no model call
+        complete = next(e for e in events if e.get("type") == "jev_complete")
+        self.assertGreaterEqual(complete["prefiltered"], 1)
+        self.assertEqual(complete["max_probability"], 0.95)
+
+    def test_group_prompt_lists_the_already_read_document_backlog(self):
+        _client, session = self.make(jev=FakeJev(["概説"]))
+        group = [{"node": page_of(IDA, "/Moove/A/page1"), "score": 0.9, "document": "/Moove/A",
+                  "why": [], "evidence": []}]
+        captured = {}
+
+        def fake(_session, run, _question, prompt, _emit, _stop):
+            captured["prompt"] = prompt
+            return {"start": run.start_id, "answer": "報告", "cited": []}
+
+        with mock.patch.object(R, "_run_subagent", side_effect=fake):
+            session._run_group_subagent(1, group, {IDB}, [ID2, ID3], "質問", lambda _e: None, None)
+        self.assertIn("追加候補ページ 2 件", captured["prompt"])
+        self.assertIn(ID2, captured["prompt"])
+        self.assertIn("省略せず", captured["prompt"])  # enumeration answers must not sample
+
+    def test_jev_asks_the_rewritten_query_not_the_raw_question(self):
+        # Every document's 目次 is summarised against the question first, and the
+        # rewrite is written from all of those notes. Its wording is what every page
+        # is asked: the raw question never reaches the classifier.
+        jev = RecordingJev(["概説"])
+        _client, session = self.make(jev=jev, chat_base_url="http://llm.test", chat_model="m")
+        llm = RewritingLLM()
+        session.llm = llm
+        _results, events = self.sweep(session, "give me all functions")
+        query_event = next(e for e in events if e["type"] == "jev_query")
+        self.assertTrue(query_event["rewritten"])
+        self.assertEqual(query_event["toc_entries"], 3)  # A, B and the nested sub 目次
+        self.assertTrue(all(REWRITTEN in text for text in jev.questions))
+        self.assertFalse(any("give me all functions" in text for text in jev.questions))
+        summaries = [json.loads(payload) for prompt, payload in llm.complete_calls
+                     if prompt == JEV_TOC_SUMMARY_PROMPT]
+        self.assertEqual(sorted(note["文書"] for note in summaries),
+                         ["/Moove/A", "/Moove/B", "/Moove/C/sub"])
+        self.assertTrue(all(note["この文書の目次"] for note in summaries))  # each saw its own 目次
+        self.assertEqual({note["質問"] for note in summaries}, {"give me all functions"})
+        digest = next(json.loads(payload) for prompt, payload in llm.complete_calls
+                      if prompt == JEV_QUERY_REWRITE_PROMPT)["この Wiki に存在するページ（目次）"]
+        for document in ("/Moove/A", "/Moove/B", "/Moove/C/sub"):
+            self.assertIn(f"[{document}]", digest)  # no document left out of the rewrite
+        self.assertIn("関数・API", digest)  # the notes, not the raw cards, feed the rewrite
+
+    def test_running_average_of_yes_probability_is_reported(self):
+        _client, session = self.make(jev=FakeJev(["概説"]))
+        _results, events = self.sweep(session, "概説について")
+        ticks = [e for e in events if e["type"] == "jev_progress" and e.get("scored")]
+        self.assertTrue(ticks)
+        self.assertTrue(all(0.0 <= tick["mean_yes_probability"] <= 1.0 for tick in ticks))
+        gates = [e for e in events if e.get("type") == "jev_gate"]
+        verdicts = [e for e in gates if e["status"] in ("confirmed", "pruned", "candidate")]
+        body = [e["probability"] for e in verdicts if e["stage"] == "full"]
+        yeses = [p for p in body if p > 0.5]
+        complete = next(e for e in events if e["type"] == "jev_complete")
+        self.assertEqual(complete["scored"], len(verdicts))
+        self.assertEqual(complete["yes"], len(yeses) + sum(
+            1 for e in verdicts if e["stage"] == "card" and e["probability"] > 0.5))
+        self.assertLess(len(yeses), len(body))  # the run really did score noes too
+        self.assertAlmostEqual(complete["mean_yes_probability"],
+                               round(sum(yeses) / len(yeses), 4), places=4)
+
+    def test_sweep_without_index_map_rewrites_from_a_live_inventory(self):
+        # Every 00-目次 is found by walking the tree to every depth (path only, never
+        # both list_children arguments at once) — a first-level scan would miss the
+        # nested one and report half the wiki as 関連なし.
+        jev = RecordingJev(["概説"])
+        _client, session = self.make(jev=jev, chat_base_url="http://llm.test", chat_model="m")
+        session.index_map = None
+        llm = RewritingLLM()
+        session.llm = llm
+        blocks = session._jev_toc_blocks(R._MapState(), R.JevSweepBudget(0, 0), None)
+        self.assertEqual(sorted(document for document, _text in blocks),
+                         ["/Moove/A", "/Moove/B", "/Moove/C/sub"])
+        self.assertIn("page1", dict(blocks)["/Moove/A"])
+        self.assertIn("深い", dict(blocks)["/Moove/C/sub"])  # two levels down
+        _results, events = self.sweep(session, "give me all functions")
+        self.assertTrue(next(e for e in events if e["type"] == "jev_query")["rewritten"])
+        digest = next(json.loads(payload) for prompt, payload in llm.complete_calls
+                      if prompt == JEV_QUERY_REWRITE_PROMPT)["この Wiki に存在するページ（目次）"]
+        for document in ("/Moove/A", "/Moove/B", "/Moove/C/sub"):
+            self.assertIn(f"[{document}]", digest)
 
 
 if __name__ == "__main__":

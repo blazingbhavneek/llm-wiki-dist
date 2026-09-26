@@ -13,6 +13,14 @@ function activityLine(ev, t) {
       return t.searching(who, ev.query)
     case 'candidates':
       return t.pagesFound(ev.count)
+    case 'jev_query':
+      return t.jevQuery(ev.text, ev.rewritten)
+    case 'jev_toc':
+      return t.jevToc(ev.document, ev.note)
+    case 'jev_complete':
+      return t.jevSwept((ev.pages_considered || 0) + (ev.prefiltered || 0), ev.prefiltered || 0,
+        ev.yes || 0, Number(ev.mean_yes_probability || 0).toFixed(2),
+        Number(ev.max_probability || 0).toFixed(2), ev.confirmed || 0)
     case 'map':
       return t.mapScanned(ev.documents, ev.pages, ev.selected)
     case 'budget':
@@ -155,6 +163,32 @@ export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) 
         } else if (ev.type === 'subagent_start' || ev.type === 'read') {
           const id = ev.node?.id
           if (id) patchLast((m) => ({ ...m, visitedIds: [...new Set([...(m.visitedIds || []), id])] }))
+        }
+
+        // Jev sweep progress lives in one fixed slot on the message, updated in place.
+        if (ev.type === 'jev_progress') {
+          return patchLast((m) => ({
+            ...m,
+            jev: {
+              done: ev.done || 0,
+              total: ev.total || 0,
+              percent: ev.percent || 0,
+              yes: ev.yes ?? null,
+              mean: ev.mean_yes_probability ?? null,
+            },
+          }))
+        }
+
+        if (ev.type === 'jev_complete' || ev.type === 'jev_unavailable') {
+          patchLast((m) => ({
+            ...m,
+            jev: {
+              ...(m.jev || {}),
+              percent: ev.type === 'jev_complete' ? 100 : m.jev?.percent || 0,
+              complete: true,
+            },
+          }))
+          // falls through: jev_complete also adds its one-line summary to the activity list
         }
 
         if (ev.type === 'diagram_pending') {

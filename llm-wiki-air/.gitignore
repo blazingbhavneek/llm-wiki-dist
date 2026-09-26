@@ -23,3 +23,4 @@ doc-parser/tests/*
 !doc-parser/tests/test_profiles.py
 zip.py
 growi-llm-wiki.zip
+growi-search/chaoliangUNSW

@@ -127,7 +127,7 @@ and no writes.
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /api/ready` | `{ready, growi, search, llm, reranker, embedder, root_path}` (capabilities reported separately). |
+| `GET /api/ready` | `{ready, growi, search, llm, reranker, embedder, jev, root_path}` (capabilities reported separately; booleans only, never paths or keys). |
 | `GET /api/growi` | `{enabled, url, root_path, doc_parser_url}` — **never** the token. |
 | `GET /api/settings` | Public runtime defaults for the settings screen; secrets are excluded. |
 | `GET /health` | process liveness, also served unprefixed. |
@@ -169,6 +169,119 @@ missing page → `404 page_not_found`.
    (`WIKI_MAX_PAGE_FETCHES_PER_RUN`, `WIKI_MAX_SEARCH_CALLS_PER_RUN`); duplicate
    reads/searches are memoized and a process-local TTL page cache (
    `WIKI_PAGE_CACHE_*`) is shared across subagents. Nothing is persisted to disk.
+
+## Jev relevance gate (optional)
+
+Jev ([chaoliangUNSW/Jev-Style-0.8B-Decision-v3](https://huggingface.co/chaoliangUNSW/Jev-Style-0.8B-Decision-v3))
+is a per-question **relevance gate**, not an answer generator. When enabled,
+each `/api/ask` question first runs an exhaustive sweep of every visible
+document: `00-目次` cards are batch-scored, candidates are confirmed by full
+page reads (chunked to the model's 25,600-token input ceiling with the
+configured overlap), and entity-defining card edges are followed across
+documents. Confirmed pages become seeds for the existing lead/subagent flow.
+Before anything is scored, the question is **rewritten against the whole wiki** in
+two stages, so the sweep is written from what the entire wiki covers:
+
+1. **Find every 目次** — the tree is walked to **every depth** (cycles and the
+   sweep's own list-call budget apply) and every `00-目次` / `…一覧` page found is
+   read whole. Subdirectories carry their own `00-目次`, so a first-level scan
+   describes one chapter and reports the rest of the wiki as 関連なし.
+2. **Per-目次 summary** — one LLM call per index page, in parallel
+   (`WIKI_JEV_WORKERS` at a time), each answering what that part of the wiki can
+   provide for this question, in the corpus's own words. Nothing is truncated before
+   its summary is written, so no document can be crowded out of the prompt.
+3. **Rewrite** — one call over all of those notes, producing a single page-target
+   question in the corpus's own vocabulary. That text — not the original question —
+   is what every page is asked and what the keyword gate compares against, which is
+   how an English question can still match a Japanese manual.
+
+Each summary is printed and streamed as it lands (`JEV 目次 digest: 24 目次 …`, then
+`JEV に投げる質問…`), so you can read the whole-wiki picture before the run finishes.
+The gate question asks whether a page **contains the answer**, never whether it
+is merely *related* — relatedness makes a single-domain corpus answer yes to
+everything, which is how a "list every function" question ends up with 950 seeds.
+Before a page is allowed to cost a body-score call it must also share keywords
+with the rewritten question, so the sweep spends its model calls on plausible
+pages only.
+Crawling and classification are pipelined: one thread enumerates documents,
+cards and pages and publishes full-read targets on a bounded queue while
+`WIKI_JEV_WORKERS` threads fetch and classify, so GROWI traversal and page reads
+overlap classification instead of running before it.
+
+Confirmed seeds then drive the research directly: they are grouped by document
+and sliced into at most `WIKI_JEV_SUBAGENT_GROUPS` groups of at most
+`WIKI_JEV_SUBAGENT_GROUP_SIZE` seeds, and each group gets its own subagent
+(running `WIKI_SUBAGENT_CONCURRENCY` at a time). A group only ever sees its own
+seeds; reading a page another group owns is refused by the `read` tool, so the
+groups follow genuinely new paths instead of overlapping. The merged reports plus
+the seed blocks become the lead agent's context.
+
+Jev is **disabled by default**; when disabled, unavailable, or failing, the
+existing ES → index map → router path runs unchanged (a `jev_unavailable` SSE
+event is emitted and Elasticsearch remains the recall fallback).
+
+```bash
+# local model: checks the Hugging Face cache, then downloads before readiness
+WIKI_JEV_ENABLED=1
+WIKI_JEV_BACKEND=local
+# optional fixed destination; omit to use the standard Hugging Face cache
+WIKI_JEV_LOCAL_PATH=/opt/models/Jev-Style-0.8B-Decision-v3
+# pin the GPU: a CUDA device that is missing or invisible fails at startup instead of
+# scoring silently on CPU. bfloat16 halves memory and time vs the float32 default and
+# drops to float16 on GPUs without bf16.
+WIKI_JEV_DEVICE=cuda
+WIKI_JEV_DTYPE=bfloat16
+
+# hosted Jev-compatible scorer sidecar
+WIKI_JEV_ENABLED=1
+WIKI_JEV_BACKEND=hosted
+WIKI_JEV_BASE_URL=http://jev-score.internal:8080   # POST {base}/score
+WIKI_JEV_API_KEY=secret-if-required
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `WIKI_JEV_THRESHOLD` | candidate gate on card scores (default `0.50`). |
+| `WIKI_JEV_SEED_THRESHOLD` | full-read seed gate (default `0.80`, must be ≥ threshold). |
+| `WIKI_JEV_DEVICE` | local runtime device: `auto` (default), `cuda`, `mps`, `cpu`. Set `cuda` in production so a GPU that disappears is a startup error, not a 30× slowdown. |
+| `WIKI_JEV_DTYPE` | local runtime weights: `bfloat16` (default), `float16`, `float32`. bf16 becomes fp16 automatically when the GPU has no bf16. Questions are scored one per forward pass — the GPU is the speed lever, not batching. |
+| `WIKI_JEV_CHUNK_TOKENS` / `WIKI_JEV_CHUNK_OVERLAP` | body chunking (defaults `25600` / `10000`). |
+| `WIKI_JEV_BATCH_SIZE` | cards per batched score call (default `64`). |
+| `WIKI_JEV_WORKERS` | concurrent fetch+classify threads in the sweep pipeline (default `4`). The local adapter serializes model calls, so extra workers overlap GROWI reads, not scoring; a hosted adapter gains real parallel scoring. |
+| `WIKI_JEV_SUBAGENT_GROUP_SIZE` / `WIKI_JEV_SUBAGENT_GROUPS` | seeds per seed-group subagent / max such subagents per question (defaults `5` / `8`). Size `WIKI_JEV_SUBAGENT_GROUPS × WIKI_JEV_SUBAGENT_GROUP_SIZE` pages into `WIKI_MAX_PAGE_FETCHES_PER_RUN` or the groups starve. |
+| `WIKI_JEV_PREFILTER_MIN_OVERLAP` | keyword units a page must share with the rewritten question before it gets an expensive body score (default `2`, `0` = off). Dropped pages are counted in `jev_complete.prefiltered`: if that number climbs and seeds collapse, even the rewrite missed the corpus's vocabulary — lower this to `1`, then `0`. |
+| `WIKI_JEV_MAX_PAGE_READS` / `WIKI_JEV_MAX_LIST_CALLS` | independent sweep safety valves; `0` = unlimited. The sweep is exhaustive and can cost many GROWI reads. |
+
+Sweep reads use their own budget (never the per-run `WIKI_MAX_PAGE_FETCHES_PER_RUN`)
+and warm the shared page cache. The sweep streams `jev_progress`
+(`done` / `total` / `percent` plus `scored`, `yes`, `mean_yes_probability` and
+`mean_yes_card_probability`; the total grows as the crawl discovers work, so the
+percent never recedes and ends at 100) plus the per-page `jev_gate` /
+`jev_complete` / `jev_unavailable` events. The frontend renders `jev_progress` as
+one fixed 250px bar that fills in place with the running average of `p(はい)` next
+to it, and `jev_complete` prints a one-line
+summary (`N seeds from M pages, top p=0.62`) so a sweep that clears no seed is
+visible instead of silently falling back to Elasticsearch. The gate events
+themselves stay invisible.
+The average is over **the verdicts leaning yes only** (`p > 0.5`), because averaging
+over a corpus where most pages are irrelevant just accumulates noes. Card and body
+verdicts are averaged separately — a card summary and a full page body are different
+distributions — and the yes *count* travels with the average, since an average over
+zero yeses and an average of zero confidence would otherwise look identical. The
+console gets the same numbers as a heartbeat every 25 verdicts
+(`Jev sweep: 63% 646/1019 scored=612 yes=18 avg_p=0.71 card_avg_p=0.83`).
+The `/score`
+wire contract (structured `state` + ordered `questions` → ordered `p(はい)`)
+is **this service's adapter contract**, not a claim that the Hugging Face page
+exposes a generic text-generation endpoint. Local mode checks a complete
+`WIKI_JEV_LOCAL_PATH` first; when it is unset, it checks the standard Hugging
+Face cache. Only a missing/incomplete snapshot is downloaded, synchronously at
+server startup, before `/api/ready` can succeed. The local runtime dependencies
+are declared by this project, and a failed download/load fails startup instead
+of deferring work to the first user query.
+Local mode uses the reference PyTorch kernels unless `causal_conv1d` and
+`flash-linear-attention` are installed; the sweep is correct without them but
+several times slower per page.
 
 ## Tests
 

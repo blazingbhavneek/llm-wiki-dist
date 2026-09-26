@@ -30,6 +30,7 @@ const STR = {
     stopping: '停止中…',
     thinking: '考えています…',
     working: '作業中…',
+    jevSweep: 'JEV スキャン',
     answerDone: '回答が完了しました',
     requestFailed: 'リクエストに失敗しました',
     hideSteps: '手順を隠す',
@@ -68,6 +69,7 @@ const STR = {
     stopping: 'Stopping…',
     thinking: 'Thinking…',
     working: 'Working…',
+    jevSweep: 'JEV sweep',
     answerDone: 'Answer ready',
     requestFailed: 'Request failed',
     hideSteps: 'Hide steps',
@@ -370,12 +372,14 @@ function AssistantMessage({
 
             {streaming && (
               <div className="rounded-xl border border-blue-100 bg-blue-50/40 px-4 py-3">
+                {m.jev && <JevBar jev={m.jev} />}
                 <ActivityTray activity={activity} streaming />
               </div>
             )}
 
             {hasSteps && stepsOpen && (
               <div className="mb-4 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                {m.jev && <JevBar jev={m.jev} />}
                 <ActivityTray activity={activity} />
               </div>
             )}
@@ -505,6 +509,48 @@ function ResearchMap({ map, visitedIds, onOpenNode }) {
           </div>
         ))}
       </div>
+    </div>
+  )
+}
+
+const JEV_BAR_WIDTH = 250
+
+/** Fixed-width live sweep bar: one slot per message, filled in place by jev_progress. */
+function JevBar({ jev }) {
+  const t = useT(STR)
+  const percent = Math.max(0, Math.min(100, Number(jev?.percent) || 0))
+
+  return (
+    <div className="mb-2 flex items-center gap-2">
+      <span className="shrink-0 text-[11px] font-bold tracking-wide text-neutral-400">
+        {t.jevSweep}
+      </span>
+
+      <div
+        role="progressbar"
+        aria-label={t.jevSweep}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(percent)}
+        className="h-2 shrink-0 overflow-hidden rounded-full bg-neutral-200"
+        style={{ width: JEV_BAR_WIDTH, maxWidth: '100%' }}
+      >
+        <div
+          className={`h-full rounded-full transition-[width] duration-200 ease-linear ${jev?.complete ? 'bg-neutral-400' : 'bg-blue-600'}`}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+
+      <span className="shrink-0 font-mono text-[11px] tabular-nums text-neutral-500">
+        {`${percent.toFixed(0)}%${jev?.total ? ` ${jev.done}/${jev.total}` : ''}` +
+          // avg is the body-stage mean: with yeses only from the card stage it is
+          // legitimately empty, and printing 0.00 there would read as zero confidence.
+          `${typeof jev?.yes === 'number'
+            ? jev.yes
+              ? ` yes ${jev.yes}${jev.mean ? ` avg p=${jev.mean.toFixed(2)}` : ''}`
+              : ' yes 0'
+            : ''}`}
+      </span>
     </div>
   )
 }

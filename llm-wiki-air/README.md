@@ -220,18 +220,27 @@ Quick map — the numbered sections below explain each command in detail:
 | keep a project continuously fresh | `watch`, or cron + `sync` |
 | inspect or drive the queue by hand | `queue scan\|work\|status\|retry` |
 | push the current wiki tree as it is | `publish` |
-| refresh growi-search index pages | `index [<raw-rel>...]` |
+| repair or dry-run the growi-search index pages | `index [<raw-rel>...]` |
 | fix one document's links | `link relink <doc>` |
 | remove this publisher's GROWI pages | `reset` |
 
 ### Refresh growi-search index pages
 
-After any sync or publish, refresh the index pages read by growi-search
-(`<document>/00-目次` per document plus `/<target>/00-目次`; `001-…` stays the first real page):
+Every publish sweep maintains the index pages read by growi-search as part of the same
+run: it upserts `<document>/00-目次` for the documents it published, rewrites the
+`/<target>/00-目次` root page from every document, and trashes the index page of a
+deleted document (`001-…` stays the first real page). A failed index page is logged,
+never rolled back over, so a table of contents can never undo a published document.
+`sync` additionally reconciles the whole wiki tree afterwards, so a project whose wiki
+predates the index catches up on the next run; pages GROWI already has byte-for-byte are
+read, not rewritten.
+Run the command yourself only to repair or inspect them:
 
 ```bash
-# publish per-document and root index pages
+# republish every index page (also what a full `publish` does)
 .venv/bin/python main.py -v index --project projectA
+# refresh only one document's page (the root page still lists every document)
+.venv/bin/python main.py -v index --project projectA path/to/doc.docx
 # dry run: write data/<target>/metadata/index/**/index.md only
 .venv/bin/python main.py index --project projectA --no-publish
 # remove the index pages
