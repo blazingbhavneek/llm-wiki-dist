@@ -68,6 +68,44 @@ def rebuild(project: Project, settings: Settings, mode: str, no_edges: bool = Fa
         run_async_blocking(link_document(project, raw_rel, model=model, embedder=embedder, settings=settings))
 
 
+async def _calibrate(engine, rows):
+    from jev import JevQuestion, JevRequest
+    requests = [JevRequest({"target": str(row["text_a"])[:6000], "candidate": str(row["text_b"])[:6000]},
+                           JevQuestion("候補の節は、対象の節の読者が内容を理解・実行するために読むべき具体的な情報（前提・結果・制約・代替・同じ対象の別の側面など）を含んでいますか？ 同じ語が出てくるだけ、一般的な関連があるだけなら いいえ と答えてください。\n選択肢: はい / いいえ", key=str(i)))
+                for i, row in enumerate(rows)]
+    return await engine.adecide_batch(requests, return_exceptions=True)
+
+
+def calibrate_jev(project: Project, sample: int) -> None:
+    from .prompts import EDGE_VERSION_NEO
+    catalog = Catalog.open(project.linker_database, mode="neo")
+    try:
+        rows = catalog.conn.execute(
+            "SELECT d.accepted,a.body AS text_a,b.body AS text_b FROM edge_decisions d "
+            "JOIN chunks a ON a.text_sha256=d.hash_a JOIN chunks b ON b.text_sha256=d.hash_b "
+            "WHERE d.mode='neo' AND d.edge_version=? ORDER BY d.hash_a,d.hash_b LIMIT ?",
+            (EDGE_VERSION_NEO, sample)).fetchall()
+    finally:
+        catalog.close()
+    if not rows:
+        print("No LLM edge decisions available for calibration")
+        return
+    from jev import get_engine
+    results = run_async_blocking(_calibrate(get_engine(), rows))
+    pairs = [(float(result.p_yes), bool(row["accepted"])) for result, row in zip(results, rows)
+             if not isinstance(result, BaseException)]
+    positives = sum(actual for _probability, actual in pairs)
+    best = None
+    for threshold in (i / 10 for i in range(3, 10)):
+        tp = sum(p >= threshold and actual for p, actual in pairs)
+        predicted = sum(p >= threshold for p, _actual in pairs)
+        precision = tp / predicted if predicted else 0.0
+        recall = tp / positives if positives else 0.0
+        print(f"threshold={threshold:.1f} precision={precision:.3f} recall={recall:.3f} sample={len(pairs)}")
+        if precision >= .9 and (best is None or recall > best[1]): best = (threshold, recall)
+    print(f"best_precision_at_least_0.9={best[0]:.1f} recall={best[1]:.3f}" if best else "no threshold reached 0.9 precision")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m graph.linker")
     parser.add_argument("--project", required=True)
@@ -78,6 +116,8 @@ def main() -> None:
     rebuild_parser.add_argument("--no-edges", action="store_true")
     relink_parser = sub.add_parser("relink")
     relink_parser.add_argument("document")
+    calibrate_parser = sub.add_parser("calibrate-jev")
+    calibrate_parser.add_argument("--sample", type=int, default=300)
     sub.add_parser("status")
     args = parser.parse_args()
     settings = Settings.from_env(args.project)
@@ -98,6 +138,9 @@ def main() -> None:
         return
     if args.command == "rebuild":
         rebuild(project, settings, args.mode, args.no_edges)
+        return
+    if args.command == "calibrate-jev":
+        calibrate_jev(project, args.sample)
         return
     rel = args.document.strip("/")
     if rel in _documents(project):

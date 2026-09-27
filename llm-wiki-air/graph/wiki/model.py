@@ -30,6 +30,7 @@ class ModelPort(Protocol):
         messages: Sequence[BaseMessage],
         *,
         max_output_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> BaseModel:  # pragma: no cover - protocol declaration
         ...
 
@@ -68,11 +69,13 @@ class ChatModelPort:
         messages: Sequence[BaseMessage],
         *,
         max_output_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> BaseModel:
         from graph.clients.chat import structured_ainvoke
 
         return await structured_ainvoke(
-            self.llm, schema, list(messages), max_output_tokens=max_output_tokens
+            self.llm, schema, list(messages), max_output_tokens=max_output_tokens,
+            temperature=temperature,
         )
 
     async def text(
@@ -80,12 +83,15 @@ class ChatModelPort:
         messages: Sequence[BaseMessage],
         *,
         max_output_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> str:
         """One bounded plain-text completion; the caller validates the content."""
 
         kwargs: dict[str, Any] = {}
         if max_output_tokens is not None:
             kwargs["max_tokens"] = max_output_tokens
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         kwargs["extra_body"] = {
             "chat_template_kwargs": {"enable_thinking": self.config.text_thinking}
         }

@@ -44,29 +44,47 @@ def _entity_names(catalog: Catalog, chunk_id: str) -> set[str]:
     return {normalize_name(item.get("name", "")) for item in json.loads(row["entities_json"] or "[]") if item.get("name")}
 
 
-def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None) -> list[Any]:
+def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None, settings: Any = None, judge: bool = False) -> list[Any]:
     from .legacy import Candidate
 
     team = team or chunk.team
     selected: list[Candidate] = []
     selected_ids: set[str] = set()
+    def local(ids: list[str]) -> list[str]:
+        # A shared name inside one document is a link. Across documents it is only a lead:
+        # generic names (table headers, "overview") collide there, so those go to the judge.
+        foreign = [cid for cid in ids if (row := catalog.chunk(cid)) is None or row["document"] != chunk.document]
+        for cid in foreign:
+            if cid not in selected_ids:
+                selected.append(Candidate(cid, "name_match", [entity.name])); selected_ids.add(cid)
+        return [cid for cid in ids if cid not in foreign]
+
     for entity in chunk.entities:
         name = normalize_name(entity.name)
+        canon = catalog.canonical(team, name)
         if entity.role == "uses":
-            definers = catalog.entity_chunks(team, name, role="defines", exclude_page=chunk.page_rel)
+            definers = local(catalog.entity_chunks(team, canon, role="defines", exclude_page=chunk.page_rel))
             if len(definers) == 1:
                 selected.append(Candidate(definers[0], "use", [entity.name], True, "defines", f"「{entity.name}」の定義")); selected_ids.add(definers[0])
             elif len(definers) >= 2:
                 for definer in definers:
                     selected.append(Candidate(definer, "use", [entity.name])); selected_ids.add(definer)
         else:
-            users = catalog.entity_chunks(team, name, role="uses", exclude_page=chunk.page_rel)
+            users = local(catalog.entity_chunks(team, canon, role="uses", exclude_page=chunk.page_rel))
             for user in users:
                 selected.append(Candidate(user, "define", [entity.name], True, "uses", f"「{entity.name}」を使用")); selected_ids.add(user)
+            if judge:
+                for definer in catalog.entity_chunks(team, canon, role="defines", exclude_page=chunk.page_rel):
+                    if definer not in selected_ids:
+                        selected.append(Candidate(definer, "define_define", [entity.name])); selected_ids.add(definer)
     entity_names = {normalize_name(item.name) for item in chunk.entities}
-    obvious = set(_similar_ids(catalog, chunk, team))
-    for cid, _score in catalog.behaviour_chunks(team, entity_names, exclude_page=chunk.page_rel)[:HOP1_MAX]:
-        if cid not in obvious and cid not in selected_ids:
+    caps = [HOP1_MAX, HOP2_MAX, HOP3_MAX]
+    if judge and settings is not None:
+        try: caps = [int(value) for value in settings.wiki_linker_hop_caps.split(",")]
+        except (AttributeError, TypeError, ValueError): pass
+    obvious = set() if judge else set(_similar_ids(catalog, chunk, team))
+    for cid, _score in catalog.behaviour_chunks(team, entity_names, exclude_page=chunk.page_rel)[:caps[0]]:
+        if cid not in obvious and cid not in selected_ids and (not judge or not (_entity_names(catalog, cid) & entity_names)):
             selected.append(Candidate(cid, "hop1", [next(iter(entity_names))] if entity_names else [])); selected_ids.add(cid)
 
     hop2: list[Candidate] = []
@@ -79,11 +97,11 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None) -> list
                 cid = str(row["chunk_id"])
                 if catalog.page_of(cid) != chunk.page_rel and cid not in obvious and cid not in selected_ids and not (_entity_names(catalog, cid) & entity_names):
                     hop2.append(Candidate(cid, "hop2", [e1, e2])); selected_ids.add(cid)
-                    if len(hop2) >= HOP2_MAX:
+                    if len(hop2) >= caps[1]:
                         break
-            if len(hop2) >= HOP2_MAX:
+            if len(hop2) >= caps[1]:
                 break
-        if len(hop2) >= HOP2_MAX:
+        if len(hop2) >= caps[1]:
             break
     selected.extend(hop2)
     hop3: list[Candidate] = []
@@ -100,15 +118,25 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None) -> list
                     cid = str(row["chunk_id"])
                     if catalog.page_of(cid) != chunk.page_rel and cid not in obvious and cid not in selected_ids and not (_entity_names(catalog, cid) & entity_names):
                         hop3.append(Candidate(cid, "hop3", [e1, e2, e3])); selected_ids.add(cid)
-                        if len(hop3) >= HOP3_MAX:
+                        if len(hop3) >= caps[2]:
                             break
-                if len(hop3) >= HOP3_MAX:
+                if len(hop3) >= caps[2]:
                     break
-            if len(hop3) >= HOP3_MAX:
+            if len(hop3) >= caps[2]:
                 break
-        if len(hop3) >= HOP3_MAX:
+        if len(hop3) >= caps[2]:
             break
     selected.extend(hop3)
+    if judge:
+        text = f"{chunk.title} {chunk.heading} {chunk.summary} {' '.join(chunk.keywords)}"
+        limit = getattr(settings, "wiki_linker_screen_candidates", 50)
+        # A large document fills a team-wide search with its own sections, so other
+        # documents are searched separately and always get candidates of their own.
+        found = (catalog.fts_search(text, team, limit, exclude_page=chunk.page_rel)
+                 + catalog.fts_search(text, team, limit, exclude_page=chunk.page_rel, exclude_document=chunk.document))
+        for cid in found:
+            if cid not in selected_ids:
+                selected.append(Candidate(cid, "topical")); selected_ids.add(cid)
     return selected
 
 

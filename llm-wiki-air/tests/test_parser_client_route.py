@@ -179,5 +179,72 @@ class ParserClientTests(unittest.TestCase):
         )
 
 
+class _NoDescribeSettings(_Settings):
+    parser_describe_images = False
+
+
+class ParserClientDescribeSwitchTests(unittest.TestCase):
+    def _workbook_bytes(self) -> bytes:
+        stream = io.BytesIO()
+        Workbook().save(stream)
+        return stream.getvalue()
+
+    def test_disabled_sends_false_on_fresh_convert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.xlsx"
+            path.write_bytes(self._workbook_bytes())
+            with patch.object(
+                parser_client.requests,
+                "post",
+                return_value=_Resp({"markdown": "# x"}),
+            ) as post:
+                result = parse_document(
+                    path,
+                    base_url="http://parser",
+                    settings=_NoDescribeSettings(),
+                )
+            self.assertEqual(result, "# x")
+            self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "false")
+
+    def test_disabled_update_reuses_cache_without_vision_call(self) -> None:
+        previous = _image("YWJj", "keep me")
+        current = previous.replace("keep me", "") + "\n" + _image("ZGVm")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.xlsx"
+            path.write_bytes(self._workbook_bytes())
+            with patch.object(
+                parser_client.requests,
+                "post",
+                return_value=_Resp({"markdown": current}),
+            ) as post:
+                result = parse_document(
+                    path,
+                    base_url="http://parser",
+                    settings=_NoDescribeSettings(),
+                    previous_markdown=previous,
+                )
+            # Only the parser call happens; no chat/completions vision call.
+            self.assertEqual(post.call_count, 1)
+            self.assertIn("<image-description>keep me</image-description>", result)
+            self.assertIn("<image-description></image-description>", result)
+
+    def test_explicit_kwarg_overrides_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.xlsx"
+            path.write_bytes(self._workbook_bytes())
+            with patch.object(
+                parser_client.requests,
+                "post",
+                return_value=_Resp({"markdown": "# x"}),
+            ) as post:
+                parse_document(
+                    path,
+                    base_url="http://parser",
+                    settings=_NoDescribeSettings(),
+                    describe_images=True,
+                )
+            self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "true")
+
+
 if __name__ == "__main__":
     unittest.main()

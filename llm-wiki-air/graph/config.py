@@ -152,6 +152,7 @@ class Settings(BaseModel):
     # wiki mode: lossless section-wise rewrite, see graph/wiki
     wiki_section_target_lines: int = 80
     wiki_write_attempts: int = 3
+    wiki_planner_concurrency: int = app_concurrency()
     wiki_rewrite_concurrency: int = app_concurrency()
     # per-request timeout for wiki/linker model calls; slow local models may need more
     wiki_request_timeout: int = 300
@@ -160,6 +161,18 @@ class Settings(BaseModel):
     wiki_linker_enabled: bool = True
     wiki_linker_mode: Literal["legacy", "neo"] = "neo"
     wiki_linker_concurrency: int = 0
+    wiki_linker_judge: Literal["llm", "jev"] = "jev"
+    wiki_linker_role_threshold: float = Field(default=0.5, ge=0, le=1)
+    wiki_linker_alias_threshold: float = Field(default=0.8, ge=0, le=1)
+    wiki_linker_screen_candidates: int = Field(default=50, ge=1)
+    wiki_linker_screen_threshold: float = Field(default=0.4, ge=0, le=1)
+    wiki_linker_verify_top: int = Field(default=5, ge=1)
+    wiki_linker_verify_threshold: float = Field(default=0.7, ge=0, le=1)
+    # Jev verify scores in [floor, verify_threshold) get a yes/no LLM second opinion; 0 turns it off.
+    wiki_linker_tiebreak_floor: float = Field(default=0.4, ge=0, le=1)
+    wiki_linker_curate_keep: int = Field(default=8, ge=1)
+    wiki_linker_hop_caps: str = "40,40,20"
+    wiki_index_related_docs: bool = False
     # Kept as an explicit fail-fast compatibility flag for old engine callers.
     engine_semantic_edges: bool = False
     # One project selected from configs/<name>.ini or an absolute INI path.
@@ -168,6 +181,10 @@ class Settings(BaseModel):
     mount_path: str = ""
     parser_base_url: str = ""
     parser_timeout: float = 7200.0
+    # Ask the doc-parser to generate vision descriptions for extracted images.
+    # Set WIKI_PARSER_DESCRIBE_IMAGES=0 to convert without any LLM image calls
+    # (parser gets describe_images=false; unseen images keep empty descriptions).
+    parser_describe_images: bool = True
     growi_url: str = ""
     growi_token: str = ""
     growi_mode: Literal["attach", "own"] = "attach"
@@ -315,6 +332,9 @@ class Settings(BaseModel):
                 env("WIKI_SECTION_TARGET_LINES", cls.wiki_section_target_lines)
             ),
             wiki_write_attempts=int(env("WIKI_WRITE_ATTEMPTS", cls.wiki_write_attempts)),
+            wiki_planner_concurrency=max(
+                1, int(env("WIKI_PLANNER_CONCURRENCY", concurrency))
+            ),
             wiki_request_timeout=int(env("WIKI_REQUEST_TIMEOUT", cls.wiki_request_timeout)),
             wiki_rewrite_concurrency=int(
                 env("WIKI_REWRITE_CONCURRENCY", concurrency)
@@ -324,6 +344,17 @@ class Settings(BaseModel):
                 "WIKI_LINKER_ENABLED", "1" if cls.wiki_linker_enabled else "0"
             ).lower() in ("1", "true", "yes", "on"),
             wiki_linker_mode=env("WIKI_LINKER_MODE", cls.wiki_linker_mode),
+            wiki_linker_judge=env("WIKI_LINKER_JUDGE", cls.wiki_linker_judge),
+            wiki_linker_role_threshold=float(env("WIKI_LINKER_ROLE_THRESHOLD", cls.wiki_linker_role_threshold)),
+            wiki_linker_alias_threshold=float(env("WIKI_LINKER_ALIAS_THRESHOLD", cls.wiki_linker_alias_threshold)),
+            wiki_linker_screen_candidates=int(env("WIKI_LINKER_SCREEN_CANDIDATES", cls.wiki_linker_screen_candidates)),
+            wiki_linker_screen_threshold=float(env("WIKI_LINKER_SCREEN_THRESHOLD", cls.wiki_linker_screen_threshold)),
+            wiki_linker_verify_top=int(env("WIKI_LINKER_VERIFY_TOP", cls.wiki_linker_verify_top)),
+            wiki_linker_verify_threshold=float(env("WIKI_LINKER_VERIFY_THRESHOLD", cls.wiki_linker_verify_threshold)),
+            wiki_linker_tiebreak_floor=float(env("WIKI_LINKER_TIEBREAK_FLOOR", cls.wiki_linker_tiebreak_floor)),
+            wiki_linker_curate_keep=int(env("WIKI_LINKER_CURATE_KEEP", cls.wiki_linker_curate_keep)),
+            wiki_linker_hop_caps=env("WIKI_LINKER_HOP_CAPS", cls.wiki_linker_hop_caps),
+            wiki_index_related_docs=env("WIKI_INDEX_RELATED_DOCS", "1" if cls.wiki_index_related_docs else "0").lower() in ("1", "true", "yes", "on"),
             wiki_linker_concurrency=int(
                 env("WIKI_LINKER_CONCURRENCY", concurrency)
             ),
@@ -333,6 +364,10 @@ class Settings(BaseModel):
             mount_path=mount_path,
             parser_base_url=env("WIKI_PARSER_BASE_URL", cls.parser_base_url),
             parser_timeout=float(env("WIKI_PARSER_TIMEOUT", cls.parser_timeout)),
+            parser_describe_images=env(
+                "WIKI_PARSER_DESCRIBE_IMAGES",
+                "1" if cls.parser_describe_images else "0",
+            ).lower() in ("1", "true", "yes", "on"),
             growi_url=project_growi_url or env("GROWI_URL", cls.growi_url),
             growi_token=_normalize_growi_token(project_growi_token or env("GROWI_TOKEN", cls.growi_token)),
             growi_mode=env("GROWI_MODE", cls.growi_mode),
@@ -452,6 +487,7 @@ class Settings(BaseModel):
             overrides["concurrency"] = shared
             for field_name in (
                 "wiki_rewrite_concurrency",
+                "wiki_planner_concurrency",
                 "wiki_linker_concurrency",
                 "ingest_concurrency",
                 "service_max_agents",

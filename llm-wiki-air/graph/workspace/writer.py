@@ -263,7 +263,7 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
         output_language=getattr(settings, "wiki_output_language", "Japanese (日本語)"),
         section_target_lines=int(getattr(settings, "wiki_section_target_lines", 80)),
         write_attempts=int(getattr(settings, "wiki_write_attempts", 3)),
-        planner_concurrency=concurrency,
+        planner_concurrency=int(getattr(settings, "wiki_planner_concurrency", concurrency)),
         rewrite_concurrency=int(
             getattr(settings, "wiki_rewrite_concurrency", concurrency)
         ),

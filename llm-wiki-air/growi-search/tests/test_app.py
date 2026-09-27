@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ["GROWI_URL"] = "http://growi.test"
 os.environ["GROWI_TOKEN"] = "SEKRET-9f3a"
@@ -16,6 +17,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 import app as appmod
+import config as configmod
 from config import Settings
 from models import AgentAnswer, WikiPage
 
@@ -105,10 +107,21 @@ class Readiness(unittest.TestCase):
         with TestClient(application) as client:
             data = client.get("/api/ready").json()
             self.assertEqual(
-                set(data), {"ready", "growi", "search", "llm", "reranker", "embedder", "jev", "root_path"}
+                set(data), {"ready", "growi", "search", "llm", "reranker", "embedder", "jev", "mirror", "root_path"}
             )
             self.assertTrue(data["growi"])
             self.assertFalse(data["llm"])  # no chat_base_url in test settings
+            self.assertFalse(data["reranker"])
+
+
+    def test_capabilities_without_models(self):
+        settings = Settings(growi_url="http://growi.test", growi_token=TOKEN,
+                            embed_base_url="", embed_model="", rerank_base_url="", rerank_model="")
+        application, _ = make_app(settings=settings)
+        with TestClient(application) as client:
+            data = client.get("/api/ready").json()
+            self.assertTrue(data["ready"])
+            self.assertFalse(data["embedder"])
             self.assertFalse(data["reranker"])
 
     def test_token_never_leaks(self):
@@ -118,6 +131,26 @@ class Readiness(unittest.TestCase):
                 self.assertNotIn(TOKEN, client.get(url).text, url)
             self.assertNotIn(TOKEN, client.post("/api/ask", json={"question": "x"}).text)
 
+
+class EnvironmentDefaults(unittest.TestCase):
+    def test_shared_model_urls_do_not_enable_optional_channels(self):
+        def load_dotenv(path, override=False):
+            if Path(path).parent.name == "llm-wiki-air":
+                os.environ.setdefault("WIKI_EMBED_BASE_URL", "http://embed.test/v1")
+                os.environ.setdefault("WIKI_RERANK_BASE_URL", "http://rerank.test")
+
+        env = {"GROWI_URL": "http://growi.test", "GROWI_TOKEN": TOKEN}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(configmod, "load_dotenv", side_effect=load_dotenv):
+                settings = Settings.from_env()
+            self.assertEqual(settings.embed_base_url, "")
+            self.assertEqual(settings.rerank_base_url, "")
+
+        env["WIKI_EMBED_BASE_URL"] = "http://process.test/v1"
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(configmod, "load_dotenv", side_effect=load_dotenv):
+                settings = Settings.from_env()
+            self.assertEqual(settings.embed_base_url, "http://process.test/v1")
 
 class Search(unittest.TestCase):
     def test_empty_query(self):
@@ -223,6 +256,30 @@ class SSE(unittest.TestCase):
         self.assertEqual(answer["answer"], "ANSWER-TEXT")
         self.assertTrue(events[0]["run_id"])
 
+    def test_gates_dropped_and_progress_throttled(self):
+        class NoisyResearcher(FakeResearcher):
+            async def ask(self, question, on_event=None, overrides=None, stop_event=None, context="", cited_node_ids=None):
+                for i in range(1000):
+                    on_event({"type": "jev_gate", "page_id": str(i)})
+                    on_event({"type": "jev_progress", "percent": 100 if i == 999 else i / 10})
+                on_event({"type": "route", "node": "teamA", "p": 0.1, "kept": False})
+                on_event({"type": "route", "mode": "deep"})
+                return self.answers[0]
+
+        application, _ = make_app(researcher=NoisyResearcher())
+        with TestClient(application) as client:
+            with client.stream("POST", "/api/ask/stream", json={"question": "質問"}) as res:
+                body = "".join(res.iter_text())
+        events = parse_sse(body)
+        types = [event["type"] for event in events]
+        progress = [event for event in events if event["type"] == "jev_progress"]
+        self.assertNotIn("jev_gate", types)
+        # Walker route decisions are dropped; the researcher's route line still shows.
+        self.assertEqual([e for e in events if e["type"] == "route"], [{"type": "route", "mode": "deep"}])
+        self.assertLess(len(progress), 50)
+        self.assertTrue(any(event["percent"] == 100 for event in progress))
+        self.assertIn("answer", types)
+
     def test_stop_endpoint(self):
         application, _ = make_app()
         with TestClient(application) as client:
@@ -270,8 +327,35 @@ class NewReadOnlyRoutes(unittest.TestCase):
         with TestClient(application) as client:
             data = client.get("/api/settings").json()
             self.assertIn("chat_model", data)
+            self.assertIn("llm_max_concurrency", data)
             for secret in ("growi_token", "chat_api_key", "rerank_api_key"):
                 self.assertNotIn(secret, data)
+
+    def test_mirror_not_started_offline(self):
+        settings = Settings(growi_url="http://growi.test", growi_token=TOKEN, mirror_dir="/tmp/mirror")
+        researcher = FakeResearcher()
+        researcher.mirror = mock.Mock()
+        application, _ = make_app(settings=settings, researcher=researcher, transport=mock_transport())
+        with TestClient(application):
+            researcher.mirror.start.assert_not_called()
+
+    def test_failed_jev_startup_stops_mirror_and_client(self):
+        settings = Settings(growi_url="http://growi.test", growi_token=TOKEN, jev_enabled=True)
+        researcher = FakeResearcher()
+        researcher.mirror = mock.Mock()
+        researcher.jev = None
+        client = mock.Mock()
+        application = appmod.create_app(settings, researcher=researcher)
+        with mock.patch.object(appmod, "GrowiSearchClient", return_value=client):
+            with self.assertRaisesRegex(RuntimeError, "Jev is enabled"):
+                async def enter_lifespan():
+                    async with application.router.lifespan_context(application):
+                        pass
+
+                asyncio.run(enter_lifespan())
+        researcher.mirror.start.assert_called_once()
+        researcher.mirror.stop.assert_called_once()
+        client.close.assert_called_once()
 
     def test_attachment_proxy_and_validation(self):
         def handler(request):

@@ -48,6 +48,7 @@ class RenderEdge:
     forward: bool = True
     source: str = ""
     via: list[str] = field(default_factory=list)
+    peer_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ def footer_edges(edges: list[RenderEdge], *, page_rel: str = "", limit: int | No
     kept: list[RenderEdge] = []
     similar = 0
     for edge in ordered(edges, page_rel):
-        if edge.source == "similar" or (edge.source not in {"use", "define"} and edge.label.strip().lower() not in USEFUL_LABELS):
+        if edge.source == "similar" or (edge.source not in {"use", "define", "jev"} and edge.label.strip().lower() not in USEFUL_LABELS):
             continue
         if any(term in edge.summary for term in INTERNAL_SUMMARY_TERMS):
             continue

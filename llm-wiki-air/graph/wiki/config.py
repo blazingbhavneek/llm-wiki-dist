@@ -17,8 +17,8 @@ class WikiConfig(BaseModel):
     planner_concurrency: int = Field(default_factory=app_concurrency)
     planner_attempts: int = 5
     regional_window_count: int = 10
-    # Zero means retry the final range compiler until it succeeds or is cancelled.
-    map_attempts: int = 0
+    # Final range compiler tries per run; the document fails after this many.
+    map_attempts: int = 100
     planner_max_output_tokens: int = 4000
     map_max_output_tokens: int = 32000
     # Planner target per page; pages over twice this are split at headings by Python.
@@ -42,6 +42,8 @@ class WikiConfig(BaseModel):
     chat_api_key: str = "local"
     chat_model: str = "gemma-4-31B"
     temperature: float = 0.0
+    # Retries after a rejected answer sample hotter so the model does not repeat it.
+    retry_temperature: float = 1.0
     request_timeout: int = 300
     # Reasoning on plain-text rewrite/intro calls (structured calls keep the
     # server default). Python's lossless checks gate the output either way.

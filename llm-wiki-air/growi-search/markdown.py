@@ -18,7 +18,8 @@ _ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
 _NAV_LABEL_RE = re.compile(r"(?:前のページ|次のページ|親)\s*[:：]\s*$")
 _INDEX_ITEM_RE = re.compile(r"^- \[(?P<title>[^\]]*)\]\((?P<target>[^)\s]+)\)(?:\s+[—–-]\s*(?P<summary>.*))?\s*$")
 _INDEX_FIELD_RE = re.compile(r"^\s{2,}- (?P<label>[^:：]+)[:：]\s*(?P<value>.*)$")
-_INDEX_FIELDS = {"章": "chapter", "キーワード": "keywords", "エンティティ": "entities", "ページ数": "pages"}
+_INDEX_FIELDS = {"章": "chapter", "キーワード": "keywords", "エンティティ": "entities", "ページ数": "pages",
+                 "種別": "kind", "文書数": "documents", "内容": "contents"}
 
 
 def strip_search_highlights(text: str) -> str:
@@ -72,6 +73,10 @@ class IndexCard:
     entities: list[str] = field(default_factory=list)
     pages: int = 0
     document: str = ""
+    kind: str = ""
+    documents: int = 0
+    contents: list[str] = field(default_factory=list)
+    doc_ref: str = ""
 
 
 @dataclass
@@ -270,6 +275,11 @@ def is_index_page(body: str) -> bool:
     return 'data-llm-wiki-index="' in (body or "")
 
 
+def index_kind(body: str) -> str:
+    match = re.search(r'data-llm-wiki-index="([^"<>]*)"', body or "")
+    return match.group(1) if match else ""
+
+
 def parse_index(body: str) -> list[IndexCard]:
     cards: list[IndexCard] = []
     for line in (body or "").splitlines():
@@ -288,6 +298,14 @@ def parse_index(body: str) -> list[IndexCard]:
             setattr(cards[-1], key, [v.strip() for v in re.split(r"[、,]", value) if v.strip()])
         elif key == "pages":
             cards[-1].pages = int(value) if value.isdigit() else 0
+        elif key == "kind":
+            cards[-1].kind = {"フォルダ": "folder", "文書": "document"}.get(value, "")
+        elif key == "documents":
+            cards[-1].documents = int(value) if value.isdigit() else 0
+        elif key == "contents":
+            value = re.sub(r"（他\d+件）$", "", value)
+            cards[-1].contents = [v.strip() for v in re.split(r"[、,]", value)
+                                  if v.strip() and not re.fullmatch(r"（他\d+件）", v.strip())]
     return cards
 
 

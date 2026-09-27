@@ -83,6 +83,7 @@ def parse_document(
     settings: Any,
     timeout_s: float = 7200,
     previous_markdown: str | None = None,
+    describe_images: bool | None = None,
 ) -> str:
     headers = {
         key: value
@@ -93,13 +94,20 @@ def parse_document(
         }.items()
         if value
     }
+    if describe_images is None:
+        # Settings flag (WIKI_PARSER_DESCRIBE_IMAGES) lets converts run with
+        # no vision endpoint; explicit callers still win. Missing attribute
+        # means the historical default: describe on fresh converts.
+        describe_images = bool(getattr(settings, "parser_describe_images", True))
     manifest = build_manifest(path)
     with Path(path).open("rb") as handle:
         response = requests.post(
             f"{base_url.rstrip('/')}{LLM_WIKI_PARSE_PATH}",
             params={
                 "images": "true",
-                "describe_images": "false" if previous_markdown is not None else "true",
+                "describe_images": "true"
+                if (describe_images and previous_markdown is None)
+                else "false",
             },
             headers=headers,
             data={"manifest": json.dumps(manifest, ensure_ascii=False)} if manifest else None,
@@ -126,10 +134,16 @@ def parse_document(
         raise RuntimeError("doc-parser: pages must be a list of strings")
     markdown = apply_manifest(markdown, manifest) if manifest else markdown
     if previous_markdown is not None:
+        if describe_images:
+            describe = lambda data_url, alt: _describe_image(data_url, alt, settings)
+        else:
+            # No vision endpoint: still reuse cached descriptions, but leave
+            # unseen images undescribed instead of calling the LLM.
+            describe = lambda _data_url, _alt: ""
         markdown = reuse_image_descriptions(
             previous_markdown,
             markdown,
-            lambda data_url, alt: _describe_image(data_url, alt, settings),
+            describe,
             repeat_descriptions=Path(path).suffix.lower() != ".pptx",
         )
     return markdown

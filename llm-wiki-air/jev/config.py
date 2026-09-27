@@ -1,0 +1,84 @@
+import os
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class JevConfig:
+    backend: str = "torch"
+    model: str = "chaoliangUNSW/Jev-Style-0.8B-Decision-v3"
+    model_revision: str = ""
+    local_path: str = ""
+    device: str = "auto"
+    dtype: str = "bfloat16"
+    base_url: str = ""
+    api_key: str = ""
+    timeout: int = 60
+    gguf_model: str = "chaoliangUNSW/Jev-Style-0.8B-Decision-v3-GGUF"
+    gguf_local_path: str = ""
+    gguf_quant: str = "F16"
+    gguf_many_mode: str = "exact"
+    gguf_binary: str = ""
+    max_batch_requests: int = 64
+    record_path: str = ""
+    record_max: int = 300
+    max_batch_tokens: int = 65536
+    batch_wait_ms: int = 2
+    token_cache_mb: int = 512
+    share_state: bool = False
+    share_state_max_forks: int = 8
+    stats_seconds: int = 60
+    compile: bool = False
+
+    @classmethod
+    def from_env(cls, env=os.environ):
+        get = env.get
+        backend = (get("WIKI_JEV_BACKEND") or "torch").strip().lower()
+        base, local = get("WIKI_JEV_BASE_URL", ""), get("WIKI_JEV_LOCAL_PATH", "")
+        if backend == "local":
+            backend = "torch"
+        elif backend == "auto":
+            backend = "hosted" if base and not local else "torch"
+        fields = dict(
+            backend=backend, model=get("WIKI_JEV_MODEL", "chaoliangUNSW/Jev-Style-0.8B-Decision-v3"),
+            model_revision=get("WIKI_JEV_MODEL_REVISION", ""), local_path=local,
+            device=get("WIKI_JEV_DEVICE", "auto").lower(), dtype=get("WIKI_JEV_DTYPE", "bfloat16").lower(),
+            base_url=base, api_key=get("WIKI_JEV_API_KEY", ""),
+            timeout=_int(get, "WIKI_JEV_TIMEOUT", 60),
+            gguf_model=get("WIKI_JEV_GGUF_MODEL", "chaoliangUNSW/Jev-Style-0.8B-Decision-v3-GGUF"),
+            gguf_local_path=get("WIKI_JEV_GGUF_LOCAL_PATH", ""), gguf_quant=get("WIKI_JEV_GGUF_QUANT", "F16"),
+            gguf_many_mode=get("WIKI_JEV_GGUF_MANY_MODE", "exact"), gguf_binary=get("WIKI_JEV_SCORE_BIN", ""),
+            max_batch_requests=_int(get, "WIKI_JEV_MAX_BATCH_REQUESTS", 64),
+            record_path=get("WIKI_JEV_RECORD", ""), record_max=_int(get, "WIKI_JEV_RECORD_MAX", 300),
+            max_batch_tokens=_int(get, "WIKI_JEV_MAX_BATCH_TOKENS", 65536),
+            batch_wait_ms=_int(get, "WIKI_JEV_BATCH_WAIT_MS", 2),
+            token_cache_mb=_int(get, "WIKI_JEV_TOKEN_CACHE_MB", 512),
+            share_state=_bool(get("WIKI_JEV_SHARE_STATE", "0")),
+            share_state_max_forks=_int(get, "WIKI_JEV_SHARE_STATE_MAX_FORKS", 8),
+            stats_seconds=_int(get, "WIKI_JEV_STATS_SECONDS", 60),
+            compile=_bool(get("WIKI_JEV_COMPILE", "0")),
+        )
+        if backend not in {"torch", "gguf", "hosted"}:
+            raise ValueError("WIKI_JEV_BACKEND must be torch, gguf or hosted")
+        if fields["device"] not in {"auto", "cuda", "mps", "cpu"}:
+            raise ValueError("WIKI_JEV_DEVICE must be auto, cuda, mps or cpu")
+        if fields["dtype"] not in {"float32", "bfloat16", "float16"}:
+            raise ValueError("WIKI_JEV_DTYPE must be float32, bfloat16 or float16")
+        if fields["gguf_many_mode"] not in {"exact", "batched"}:
+            raise ValueError("WIKI_JEV_GGUF_MANY_MODE must be exact or batched")
+        for key in ("timeout", "max_batch_requests", "record_max", "max_batch_tokens", "token_cache_mb", "share_state_max_forks"):
+            if fields[key] <= 0:
+                raise ValueError(f"WIKI_JEV_{key.upper()} must be positive")
+        if fields["batch_wait_ms"] < 0 or fields["stats_seconds"] < 0:
+            raise ValueError("WIKI_JEV_BATCH_WAIT_MS and WIKI_JEV_STATS_SECONDS must be non-negative")
+        return cls(**fields)
+
+
+def _int(get, name, default):
+    try:
+        return int(get(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def _bool(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}

@@ -115,6 +115,26 @@ class IndexPages(unittest.TestCase):
         self.assertTrue(md.is_index_page(self.BODY))
         self.assertFalse(md.is_index_page("# ordinary page\n"))
 
+    def test_index_kind(self):
+        self.assertEqual(md.index_kind(self.BODY), "document")
+        self.assertEqual(md.index_kind('<span hidden data-llm-wiki-index="1"></span>'), "1")
+        self.assertEqual(md.index_kind("# ordinary page"), "")
+
+    def test_parse_index_reads_folder_fields(self):
+        cards = md.parse_index("""# teamA
+<span hidden data-llm-wiki-index="folder"></span>
+- [sub](/t/teamA/sub/00-目次) — alpha
+  - 種別: フォルダ
+  - 文書数: 3
+  - 内容: a、b（他2件）
+""")
+        self.assertEqual(cards[0].kind, "folder")
+        self.assertEqual(cards[0].documents, 3)
+        self.assertEqual(cards[0].contents, ["a", "b"])
+
+    def test_legacy_cards_have_no_kind(self):
+        self.assertEqual([card.kind for card in md.parse_index(self.BODY)], ["", ""])
+
 
 class ResolveTarget(unittest.TestCase):
     def test_id(self):

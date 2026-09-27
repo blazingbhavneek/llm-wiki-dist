@@ -11,6 +11,8 @@ function activityLine(ev, t) {
   switch (ev.type) {
     case 'search':
       return t.searching(who, ev.query)
+    case 'find':
+      return t.finding(who, ev.description, ev.results?.length || 0)
     case 'candidates':
       return t.pagesFound(ev.count)
     case 'jev_query':
@@ -44,7 +46,13 @@ function activityLine(ev, t) {
     case 'follow_link':
       return t.following(who, nm(ev.node), ev.neighbors)
     case 'subagent_done':
-      return t.subDone(who, ev.cited?.length || 0)
+      return t.subDone(who, ev.cited?.length || 0, ev.report)
+    case 'cascade_doc_done':
+      return t.cascadeDocDone(ev.document, ev.seeds || 0)
+    case 'cascade_early_stop':
+      return t.cascadeEarlyStop
+    case 'cascade_fallback':
+      return t.cascadeFallback(ev.reason)
     case 'compiling':
       return t.compiling
     case 'diagram_pending':
@@ -142,6 +150,10 @@ export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) 
             text: t.agentStoppedText,
             activity: activity.length ? [...activity] : m.activity || [],
           }))
+        }
+
+        if (ev.type === 'answer_delta') {
+          return patchLast((m) => ({ ...m, text: (m.text || '') + ev.text }))
         }
 
         if (ev.type === 'answer') {

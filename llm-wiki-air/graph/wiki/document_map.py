@@ -631,7 +631,8 @@ async def _compile_seed_plan(
                 attempt = max(int(path.name.split("-")[1]) for path in responses)
             except (IndexError, ValueError):
                 attempt = 0
-    while config.map_attempts <= 0 or attempt < config.map_attempts:
+    # A fresh budget per run: resumed attempt numbers only name files.
+    for _ in range(max(1, config.map_attempts)):
         attempt += 1
         if stop_check and stop_check():
             raise asyncio.CancelledError("seed plan compilation cancelled")
@@ -655,6 +656,7 @@ async def _compile_seed_plan(
                 SeedPlan,
                 prompt.messages(),
                 max_output_tokens=config.map_max_output_tokens,
+                temperature=config.retry_temperature if last_error else None,
             )
             candidate = raw if isinstance(raw, SeedPlan) else SeedPlan.model_validate(raw)
             previous_plan = json.dumps(

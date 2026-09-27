@@ -94,6 +94,8 @@ class Catalog:
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, title, heading, summary, keywords, claims, body, tokenize='trigram');
             CREATE TABLE IF NOT EXISTS entities (name_norm TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, role TEXT NOT NULL, chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE, team TEXT NOT NULL, PRIMARY KEY(name_norm, chunk_id, role));
             CREATE INDEX IF NOT EXISTS entities_lookup ON entities(team, name_norm, role);
+            CREATE TABLE IF NOT EXISTS entity_canon (team TEXT NOT NULL, name_norm TEXT NOT NULL, canon TEXT NOT NULL, PRIMARY KEY(team,name_norm));
+            CREATE TABLE IF NOT EXISTS alias_decisions (team TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL, version TEXT NOT NULL, p REAL NOT NULL, PRIMARY KEY(team,a,b,version));
             CREATE TABLE IF NOT EXISTS behaviours (chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE, subject_norm TEXT NOT NULL, action TEXT NOT NULL, object_norm TEXT NOT NULL, team TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS behaviours_subject ON behaviours(team, subject_norm);
             CREATE INDEX IF NOT EXISTS behaviours_object ON behaviours(team, object_norm);
@@ -267,12 +269,12 @@ class Catalog:
         row = self.conn.execute("SELECT document FROM chunks WHERE chunk_id=?", (chunk_id,)).fetchone()
         return str(row[0]) if row else None
 
-    def fts_search(self, text: str, team: str, limit: int, exclude_page: str = "") -> list[str]:
+    def fts_search(self, text: str, team: str, limit: int, exclude_page: str = "", exclude_document: str = "") -> list[str]:
         tokens = re_tokens(text)[:40]
         if not tokens:
             return []
         query = " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
-        rows = self.conn.execute("SELECT f.chunk_id FROM chunks_fts AS f JOIN chunks c ON c.chunk_id=f.chunk_id WHERE c.team=? AND c.page_rel<>? AND chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?", (team, exclude_page, query, limit)).fetchall()
+        rows = self.conn.execute("SELECT f.chunk_id FROM chunks_fts AS f JOIN chunks c ON c.chunk_id=f.chunk_id WHERE c.team=? AND c.page_rel<>? AND c.document<>? AND chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?", (team, exclude_page, exclude_document, query, limit)).fetchall()
         return [str(row[0]) for row in rows]
 
     def _ensure_vec_tables(self, dim: int) -> None:
@@ -356,12 +358,33 @@ class Catalog:
         return [str(row[0]) for row in rows]
 
     def entity_chunks(self, team: str, name_norm: str, *, role: str | None = None, exclude_page: str = "") -> list[str]:
-        sql = "SELECT e.chunk_id FROM entities e JOIN chunks c ON c.chunk_id=e.chunk_id WHERE e.team=? AND e.name_norm=? AND c.page_rel<>?"
-        params: list[Any] = [team, name_norm, exclude_page]
+        sql = "SELECT e.chunk_id FROM entities e JOIN chunks c ON c.chunk_id=e.chunk_id LEFT JOIN entity_canon ec ON ec.team=e.team AND ec.name_norm=e.name_norm WHERE e.team=? AND COALESCE(ec.canon,e.name_norm)=? AND c.page_rel<>?"
+        params: list[Any] = [team, self.canonical(team, name_norm), exclude_page]
         if role:
             sql += " AND e.role=?"; params.append(role)
         sql += " ORDER BY e.chunk_id"
         return [str(row[0]) for row in self.conn.execute(sql, params)]
+
+    def canonical(self, team: str, name_norm: str) -> str:
+        row = self.conn.execute("SELECT canon FROM entity_canon WHERE team=? AND name_norm=?", (team, name_norm)).fetchone()
+        return str(row[0]) if row else name_norm
+
+    def set_canonical(self, team: str, groups: list[list[str]]) -> None:
+        self.conn.execute("DELETE FROM entity_canon WHERE team=?", (team,))
+        self.conn.executemany("INSERT INTO entity_canon(team,name_norm,canon) VALUES(?,?,?)",
+                              [(team, name, min(group)) for group in groups for name in group])
+
+    def entity_names(self, team: str) -> list[tuple[str, str]]:
+        return [(str(row[0]), str(row[1])) for row in self.conn.execute(
+            "SELECT name_norm,MIN(name) FROM entities WHERE team=? GROUP BY name_norm ORDER BY name_norm", (team,))]
+
+    def alias_decision_get(self, team: str, a: str, b: str, version: str) -> float | None:
+        row = self.conn.execute("SELECT p FROM alias_decisions WHERE team=? AND a=? AND b=? AND version=?", (team, a, b, version)).fetchone()
+        return float(row[0]) if row else None
+
+    def alias_decision_put(self, team: str, a: str, b: str, version: str, p: float) -> None:
+        a, b = sorted((a, b))
+        self.conn.execute("INSERT INTO alias_decisions(team,a,b,version,p) VALUES(?,?,?,?,?) ON CONFLICT(team,a,b,version) DO UPDATE SET p=excluded.p", (team, a, b, version, p))
 
     def behaviour_chunks(self, team: str, names: set[str], *, exclude_page: str = "") -> list[tuple[str, int]]:
         if not names:
@@ -437,7 +460,7 @@ class Catalog:
         return cur.rowcount
 
     def edges_for_page(self, page_rel: str) -> list[sqlite3.Row]:
-        return self.conn.execute("SELECT e.*, a.page_rel AS page_a_rel,pa.filename AS page_a_filename,pa.title AS page_a_title,a.heading AS page_a_heading,b.page_rel AS page_b_rel,pb.filename AS page_b_filename,pb.title AS page_b_title,b.heading AS page_b_heading FROM edges e JOIN chunks a ON a.chunk_id=e.chunk_a JOIN pages pa ON pa.page_rel=a.page_rel JOIN chunks b ON b.chunk_id=e.chunk_b JOIN pages pb ON pb.page_rel=b.page_rel WHERE a.page_rel=? OR b.page_rel=? ORDER BY e.edge_id", (page_rel, page_rel)).fetchall()
+        return self.conn.execute("SELECT e.*, a.page_rel AS page_a_rel,pa.filename AS page_a_filename,pa.title AS page_a_title,a.heading AS page_a_heading,a.summary AS summary_a,b.page_rel AS page_b_rel,pb.filename AS page_b_filename,pb.title AS page_b_title,b.heading AS page_b_heading,b.summary AS summary_b FROM edges e JOIN chunks a ON a.chunk_id=e.chunk_a JOIN pages pa ON pa.page_rel=a.page_rel JOIN chunks b ON b.chunk_id=e.chunk_b JOIN pages pb ON pb.page_rel=b.page_rel WHERE a.page_rel=? OR b.page_rel=? ORDER BY e.edge_id", (page_rel, page_rel)).fetchall()
 
     def all_edges_for_documents(self, documents: set[str]) -> list[sqlite3.Row]:
         if not documents:

@@ -45,8 +45,8 @@ endpoints. See [`growi-search/README.md`](growi-search/README.md).
 - Python **3.13+** (see `pyproject.toml`; `uv.lock` is committed, `uv sync`
   creates `.venv/`)
 - Reachable services on the company network: an OpenAI-compatible **chat**
-  endpoint, an **embedding** endpoint, a **doc-parser** service (only needed
-  for non-Markdown sources), and a **GROWI** instance with an API token
+  endpoint, a **doc-parser** service (only needed for non-Markdown sources),
+  and a **GROWI** instance with an API token
 
 `.env` is committed in this repo and already points at those company endpoints,
 so a fresh clone needs no setup beyond the virtualenv. `.env.example` exists
@@ -92,8 +92,27 @@ Two layers: a shared `.env` at the repo root, and one INI per project under
 Settings defaults (graph/config.py)  ->  .env  ->  configs/<name>.ini  ->  CLI flags
 ```
 
-Set `WIKI_CONCURRENCY` in `.env` to control planner, wiki/Excel generation,
-ingestion, linker, and API-agent parallelism from one place.
+`WIKI_CONCURRENCY` sets the shared builder default. Set a stage value to tune it
+independently. The growi-search limits are read by that service from its
+environment:
+
+| Variable | Default | Controls |
+| --- | --- | --- |
+| `WIKI_CONCURRENCY` | 4 | Builder-wide parallelism default |
+| `WIKI_PLANNER_CONCURRENCY` | `WIKI_CONCURRENCY` | Wiki planner LLM calls |
+| `WIKI_REWRITE_CONCURRENCY` | `WIKI_CONCURRENCY` | Wiki rewrite LLM calls |
+| `WIKI_LINKER_CONCURRENCY` | `WIKI_CONCURRENCY` | Linker work |
+| `WIKI_INGEST_CONCURRENCY` | `WIKI_CONCURRENCY` | Ingest work |
+| `WIKI_SEARCH_LLM_MAX_CONCURRENCY` | 4 | growi-search LLM requests across the process |
+| `WIKI_SUBAGENT_CONCURRENCY` | 2 | Per-question subagent concurrency default |
+
+growi-search never runs more than `WIKI_SEARCH_LLM_MAX_CONCURRENCY` LLM requests
+at once, across all users; the settings screen can change the per-question value
+up to that ceiling.
+
+The builder linker uses full-text search without embeddings by default
+(`WIKI_EMBED_BACKEND=off`). Its configured embedding URL stays available if that
+channel is enabled again.
 
 ## Structuring a project INI
 
@@ -226,11 +245,14 @@ Quick map — the numbered sections below explain each command in detail:
 
 ### Refresh growi-search index pages
 
-Every publish sweep maintains the index pages read by growi-search as part of the same
-run: it upserts `<document>/00-目次` for the documents it published, rewrites the
-`/<target>/00-目次` root page from every document, and trashes the index page of a
-deleted document (`001-…` stays the first real page). A failed index page is logged,
-never rolled back over, so a table of contents can never undo a published document.
+Every publish sweep maintains a folder index tree for growi-search. Each document
+keeps its `<document>/00-目次` page listing its pages. Each containing folder gets
+an index listing its direct child folders and documents with mechanically
+aggregated terms. The root index lists team names only, plus full cards for
+documents directly at the root; folder summaries never combine content from
+different teams. Deleted documents and now-empty folder indexes are removed.
+(`001-…` stays the first real page.) A failed index page is logged, never rolled
+back over, so a table of contents can never undo a published document.
 `sync` additionally reconciles the whole wiki tree afterwards, so a project whose wiki
 predates the index catches up on the next run; pages GROWI already has byte-for-byte are
 read, not rewritten.
@@ -239,7 +261,7 @@ Run the command yourself only to repair or inspect them:
 ```bash
 # republish every index page (also what a full `publish` does)
 .venv/bin/python main.py -v index --project projectA
-# refresh only one document's page (the root page still lists every document)
+# refresh one document and its ancestor folder indexes
 .venv/bin/python main.py -v index --project projectA path/to/doc.docx
 # dry run: write data/<target>/metadata/index/**/index.md only
 .venv/bin/python main.py index --project projectA --no-publish

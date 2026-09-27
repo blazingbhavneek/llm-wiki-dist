@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shutil
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from graph.clients.chat import extract_json_from_text
 from graph.common.hashing import short_hash
 from graph.common.markdown import strip_big_tables, strip_image_media
 from graph.wiki.page import fence_flags, strip_reader_references
@@ -17,6 +19,40 @@ from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
 
 from .prompts import CHUNK_META_VERSION, chunk_meta_prompt
 from .wire import ChunkBehaviour, ChunkEntity, ChunkMeta
+
+# Bounds for one chunk-metadata call: temperature 0 loops on long lists, and without a
+# token cap one call could generate until the request timeout. The cap includes thinking.
+META_MAX_TOKENS = 6000
+META_TEMPERATURE = 0.7
+
+
+def _is_lead(item: "Chunk", sectioned: set[str]) -> bool:
+    """The paragraph above a page's first section: the wiki's own summary of that page."""
+    return not item.heading and item.page_rel in sectioned
+
+
+def _lead_meta(item: "Chunk") -> ChunkMeta:
+    # Its text already is a summary, and it never defines a name (see jev_judge.check_roles),
+    # so an LLM call would only re-extract names the sections below carry anyway.
+    body = " ".join(line for line in item.model_text.splitlines() if line.strip() and not line.startswith("#"))
+    return ChunkMeta(summary=body or item.title)
+
+
+async def _describe(model: Any, messages: list[Any]) -> ChunkMeta:
+    """One plain JSON call; the schema is already in the system prompt.
+
+    model.structured first sends a strict-schema request with thinking off, and on real
+    chunks that request ran to the token cap every time before its plain-JSON fallback
+    answered. Going straight to the plain call halves the calls per chunk.
+    """
+    error: Exception | None = None
+    for _attempt in range(2):
+        try:
+            raw = await model.text(messages, max_output_tokens=META_MAX_TOKENS, temperature=META_TEMPERATURE)
+            return ChunkMeta.model_validate(extract_json_from_text(raw))
+        except Exception as exc:  # noqa: BLE001 - one retry, then the caller's fallback
+            error = exc
+    raise error
 
 def normalize_name(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value or "").casefold().split())
@@ -178,7 +214,7 @@ def validate_meta(meta: ChunkMeta, text: str) -> ChunkMeta:
     return ChunkMeta(
         summary=collapse(meta.summary, 1000), keywords=keywords, entity=collapse(meta.entity, 1000),
         claims=claims, bridge_probe=collapse(meta.bridge_probe, 1000), entities=entities,
-        behaviours=behaviours,
+        behaviours=behaviours, role_judge=meta.role_judge,
     )
 
 
@@ -258,15 +294,59 @@ def _apply_entity_replacements(processed: list[Chunk], entities: list[ChunkEntit
     return changed
 
 
-async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str, concurrency: int, cache: dict[str, ChunkMeta] | None = None, artifact_dir: Path | None = None, stop_check: Callable[[], bool] | None = None) -> tuple[int, int]:
+async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str, concurrency: int, cache: dict[str, ChunkMeta] | None = None, artifact_dir: Path | None = None, stop_check: Callable[[], bool] | None = None, parallel: bool = False) -> tuple[int, int]:
     cache = cache or {}
     calls = fallbacks = 0
+    if parallel:
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+        pending = []
+        sectioned = {item.page_rel for item in chunks if item.heading}
+        for item in chunks:
+            if item.text_sha256 in cache:
+                item.meta = validate_meta(cache[item.text_sha256], item.text)
+                continue
+            if _is_lead(item, sectioned):
+                item.meta = validate_meta(_lead_meta(item), item.text)
+                continue
+            if stop_check and stop_check():
+                raise RuntimeError("linker cancelled")
+            prompt = chunk_meta_prompt(page_title=item.title, heading=item.heading, document=item.document,
+                                       text=item.model_text, output_language=output_language, known_entities=[])
+            if artifact_dir:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.prompt.md", prompt.render())
+            async def describe(target=item, request=prompt):
+                async with semaphore:
+                    try:
+                        result = await _describe(model, request.messages())
+                        return validate_meta(result if isinstance(result, ChunkMeta) else ChunkMeta.model_validate(result), target.text), None
+                    except Exception as exc:
+                        return ChunkMeta(summary=target.model_text[:300]), exc
+            pending.append((item, asyncio.create_task(describe())))
+        for item, task in pending:
+            item.meta, error = await task
+            calls += 1
+            if error:
+                fallbacks += 1
+                if artifact_dir:
+                    write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}-error.txt", f"{type(error).__name__}: {error}")
+            if artifact_dir:
+                write_json_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.json", item.meta)
+        processed: list[Chunk] = []
+        for item in chunks:
+            _apply_entity_replacements(processed, item.entities)
+            processed.append(item)
+        return calls, fallbacks
+
     registry: dict[str, ChunkEntity] = {}
     processed: list[Chunk] = []
 
+    sectioned = {item.page_rel for item in chunks if item.heading}
     for item in chunks:
         if item.text_sha256 in cache:
             item.meta = validate_meta(cache[item.text_sha256], item.text)
+        elif _is_lead(item, sectioned):
+            item.meta = validate_meta(_lead_meta(item), item.text)
         else:
             if stop_check and stop_check():
                 raise RuntimeError("linker cancelled")
@@ -280,7 +360,7 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
                 write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.prompt.md", prompt.render())
             calls += 1
             try:
-                result = await model.structured(ChunkMeta, prompt.messages())
+                result = await _describe(model, prompt.messages())
                 item.meta = validate_meta(result if isinstance(result, ChunkMeta) else ChunkMeta.model_validate(result), item.text)
             except Exception as exc:
                 item.meta = ChunkMeta(summary=item.model_text[:300])

@@ -225,7 +225,9 @@ def seed_plan_compile_prompt(
     correction = ""
     if last_error:
         correction = (
-            "\n前回の構造化結果は無効だった。以下の検証結果を読み、全ページを再提出すること。\n"
+            "\n\n前回の構造化結果は無効だった。以下の検証結果を読み、全ページを再提出すること。\n"
+            "検証エラーの修正は意味計画より優先する。意味計画の範囲が重複・欠落していても"
+            "そのまま写さず、上の絶対条件を満たすよう境界を直すこと。同じ結果を繰り返さないこと。\n"
             f"検証エラー: {last_error}\n"
             f"前回の結果:\n{previous_plan or '（取得できず）'}\n"
         )
@@ -256,7 +258,7 @@ def seed_plan_compile_prompt(
             "- ページを空にせず、題名と短いsummaryを付ける。\n"
             "- ページは最大"
             f"{2 * page_target_lines}行。超えるページは見出し・エンティティの境界で分ける。\n"
-            f"{correction}\n\n意味計画:\n{semantic_plan}\n\n地域地図:\n{regional_reports}"
+            f"\n\n意味計画:\n{semantic_plan}\n\n地域地図:\n{regional_reports}{correction}"
         ),
     )
 

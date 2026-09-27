@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import random
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Lock
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 import httpx
 from langchain_core.callbacks import UsageMetadataCallbackHandler
@@ -25,6 +24,22 @@ from langchain_openai import ChatOpenAI
 from config import Settings
 
 log = logging.getLogger("growi_search_gateway")
+_LLM_HTTP_CLIENT: httpx.Client | None = None
+_LLM_HTTP_CLIENT_LOCK = Lock()
+
+
+def llm_http_client(max_concurrency: int) -> httpx.Client:
+    """Return the shared process-wide pool; its size is fixed by the first call."""
+    global _LLM_HTTP_CLIENT
+    if _LLM_HTTP_CLIENT is None:
+        with _LLM_HTTP_CLIENT_LOCK:
+            if _LLM_HTTP_CLIENT is None:
+                size = max(1, int(max_concurrency))
+                _LLM_HTTP_CLIENT = httpx.Client(
+                    limits=httpx.Limits(max_connections=size, max_keepalive_connections=size),
+                    timeout=httpx.Timeout(300, pool=None),
+                )
+    return _LLM_HTTP_CLIENT
 
 
 def _normalize_base_url(value: str) -> str:
@@ -47,6 +62,8 @@ class LlmClient:
         *,
         temperature: float = 0.0,
         timeout: int = 300,
+        max_tokens: int = 0,
+        max_concurrency: int = 4,
         retry_attempts: int = 2,
         retry_delay_seconds: float = 1.0,
     ) -> None:
@@ -55,6 +72,8 @@ class LlmClient:
         self.api_key = api_key or "local"
         self.temperature = temperature
         self.timeout = timeout
+        self.max_tokens = max(0, int(max_tokens))
+        self.max_concurrency = max(1, int(max_concurrency))
         self.retry_attempts = max(0, retry_attempts)
         self.retry_delay_seconds = max(0.0, retry_delay_seconds)
         self.llm = self._make_llm()
@@ -66,9 +85,11 @@ class LlmClient:
             base_url=self.base_url,
             api_key=self.api_key,
             temperature=self.temperature,
-            timeout=self.timeout,
+            timeout=httpx.Timeout(self.timeout, pool=None),
+            http_client=llm_http_client(self.max_concurrency),
             max_retries=self.retry_attempts,
             stream_usage=True,
+            max_tokens=self.max_tokens or None,
         )
 
     def run_messages(self, messages: list[dict[str, Any]]) -> str:
@@ -107,6 +128,31 @@ class LlmClient:
                 {"role": "user", "content": user_content},
             ]
         )
+
+    def stream(self, system: str, user: str, on_delta: Callable[[str], None]) -> str:
+        """Stream text chunks and return the same complete response."""
+        text: list[str] = []
+        usage: dict[str, Any] = {}
+        for chunk in self.llm.stream(self._norm([
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ])):
+            usage = getattr(chunk, "usage_metadata", None) or usage
+            content = getattr(chunk, "content", "")
+            if isinstance(content, str):
+                piece = content
+            elif isinstance(content, list):
+                piece = "".join(
+                    item if isinstance(item, str) else str(item.get("text", ""))
+                    for item in content if isinstance(item, (str, dict))
+                )
+            else:
+                piece = ""
+            if piece:
+                text.append(piece)
+                on_delta(piece)
+        self.last_usage = usage
+        return "".join(text)
 
     def complete_structured(
         self, system_prompt: str, user_content: str, output_model: type[Any]
@@ -311,41 +357,16 @@ class Reranker:
         return ranked[: max(0, k)]
 
 
-# --- Jev relevance classifier ----------------------------------------------
-#
-# Jev is a per-question relevance gate, not an answer generator. Two adapters
-# share one interface so the researcher never parses free-form model text.
-
-JEV_YES_KEYS = ("true", "はい", "yes", "Yes")
-JEV_OPTIONS = {"yes": "はい", "no": "いいえ"}
-JEV_REQUIRED_FILES = (
-    "jev_style_decision.py",
-    "config.json",
-    "model.safetensors",
-    "readout_config.json",
-    "tokenizer.json",
-)
-
+# --- Jev relevance question helpers ----------------------------------------
 
 @dataclass(frozen=True)
 class JevQuestion:
-    key: str                 # stable page/chunk/card key
-    text: str                # Japanese yes/no question
-
-
-class JevClassifier(Protocol):
-    def score_many(
-        self, state: dict[str, Any], questions: list["JevQuestion"]
-    ) -> list[float]: ...
+    key: str
+    text: str
 
 
 def jev_question_text(query: str, subject: str = "") -> str:
-    """Canonical Japanese yes/no question. The renderer owns this wording.
-
-    Strict by design: it asks whether the page *contains the answer*, not whether
-    it is related. Asking about relatedness makes a domain corpus answer yes to
-    everything (any page that happens to name a function), which drowns the sweep.
-    """
+    """Canonical Japanese yes/no question, asking whether the page contains the answer."""
     target = f"対象: {subject}\n" if subject else ""
     return (
         f"{target}"
@@ -359,264 +380,69 @@ def jev_question_text(query: str, subject: str = "") -> str:
     )
 
 
-def render_jev_state(state: dict[str, Any]) -> str:
-    """Render the structured state dict into the canonical prompt block."""
-    lines = ["状態:"]
-    page = state.get("page") or {}
-    if page:
-        lines += ["# 対象ページ", f"タイトル: {page.get('title', '')}", f"パス: {page.get('path', '')}"]
-        lines += ["本文（または目次カードの要約・キーワード）:", str(page.get("text", ""))]
-    for card in state.get("cards") or []:
-        lines += [
-            f"# カード: {card.get('title', '')}",
-            f"パス: {card.get('path', '')}",
-            str(card.get("summary", "")),
-        ]
-        if card.get("keywords"):
-            lines.append("キーワード: " + "、".join(card["keywords"]))
-        if card.get("entities"):
-            lines.append("エンティティ: " + "、".join(card["entities"]))
-    defs = state.get("entity_definitions") or []
-    if defs:
-        lines.append("# このページで使われているエンティティを定義している他のページ")
-        for definition in defs:
-            lines.append(
-                f"- {definition.get('entity', '')} → {definition.get('title', '')}: {definition.get('summary', '')}"
-            )
-    return "\n".join(lines)
+def jev_route_question(description: str) -> str:
+    return ("上記のフォルダまたは文書の配下に、次の内容を説明しているページ、またはその手がかりになる"
+            "ページが含まれている可能性はありますか？\n"
+            f"内容: {description}\n"
+            "明らかに別の分野・別の種類の資料だけを含む場合のみ いいえ と答えてください。\n"
+            "選択肢: はい / いいえ")
 
 
-def _jev_yes_probability(container: Any) -> float:
-    """Extract p(はい) from a probabilities mapping; reject bad values."""
-    if isinstance(container, (int, float)) and not isinstance(container, bool):
-        value = float(container)
-    elif isinstance(container, dict):
-        value = float("nan")
-        for key in JEV_YES_KEYS:
-            if key in container:
-                value = float(container[key])
-                break
+def jev_page_question(description: str) -> str:
+    return ("上記のページは、次の内容そのもの（説明・定義・手順・一覧・値など）を実際に述べていますか？\n"
+            f"内容: {description}\n"
+            "関連する話題に触れているだけのページ、他のページへのリンクや目次だけのページは "
+            "いいえ と答えてください。\n"
+            "選択肢: はい / いいえ")
+
+
+def jev_toc_question(query: str) -> str:
+    return ("この目次に、次の質問に関係する項目は含まれていますか？\n"
+            f"質問: {query}\n"
+            "選択肢: はい / いいえ")
+
+
+def jev_cascade_list_question() -> str:
+    return ("この質問は、該当する項目をすべて列挙することを求めていますか？\n"
+            "選択肢: はい / いいえ")
+
+
+def jev_cascade_fact_question() -> str:
+    return ("この質問は、1つの事実や値だけで答えられますか？\n"
+            "選択肢: はい / いいえ")
+
+
+def jev_cascade_profile_questions() -> tuple[str, str]:
+    return jev_cascade_list_question(), jev_cascade_fact_question()
+
+
+def jev_cascade_section_question(query: str, list_profile: bool = False) -> str:
+    if list_profile:
+        lead = "上記の節は、次の質問が求める項目の一部（一覧の一項目など）を実際に含んでいますか？"
     else:
-        value = float("nan")
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise RuntimeError(f"invalid jev probability: {container!r}")
-    return value
+        lead = "上記の節は、次の質問に対する答えの全部または一部を実際に含んでいますか？"
+    return f"{lead}\n質問: {query}\n選択肢: はい / いいえ"
 
 
-class HostedJevClassifier:
-    """Jev-compatible /score sidecar (for example a jev-score service)."""
-
-    def __init__(self, settings: Settings, transport: Any = None) -> None:
-        base = (settings.jev_base_url or "").rstrip("/")
-        self.url = base if base.endswith("/score") else f"{base}/score"
-        self.model = settings.jev_model
-        self.timeout = max(1, int(settings.jev_timeout or 60))
-        self.api_key = settings.jev_api_key
-        self._client = httpx.Client(timeout=self.timeout, transport=transport)
-
-    def close(self) -> None:
-        self._client.close()
-
-    def score_many(self, state: dict[str, Any], questions: list[JevQuestion]) -> list[float]:
-        if not questions:
-            return []
-        payload = {
-            "model": self.model,
-            "state": state,
-            "questions": [{"key": q.key, "text": q.text} for q in questions],
-            "options": JEV_OPTIONS,
-            "category": "noul",
-            "many_mode": "batched",
-        }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        last: Exception | None = None
-        for attempt in range(2):  # one bounded retry, transport/5xx only
-            try:
-                response = self._client.post(self.url, json=payload, headers=headers)
-            except httpx.HTTPError as exc:
-                last = exc
-                if attempt == 0:
-                    continue
-                raise RuntimeError(f"jev score request failed: {exc}") from exc
-            if response.status_code >= 500:
-                last = RuntimeError(f"HTTP {response.status_code}")
-                if attempt == 0:
-                    continue
-                raise RuntimeError(f"jev score endpoint failed: HTTP {response.status_code}")
-            if response.is_error:  # 4xx: never retry, fail closed
-                raise RuntimeError(f"jev score endpoint rejected request: HTTP {response.status_code}")
-            try:
-                return self._parse(response.json(), questions)
-            except (ValueError, RuntimeError) as exc:
-                # Malformed body is a hard failure (retrying cannot fix shape).
-                raise RuntimeError(f"jev score response invalid: {exc}") from exc
-        raise RuntimeError(f"jev score request failed: {last}")
-
-    @staticmethod
-    def _parse(body: Any, questions: list[JevQuestion]) -> list[float]:
-        count = len(questions)
-        if isinstance(body, dict) and isinstance(body.get("probabilities"), list):
-            raw = body["probabilities"]
-            if len(raw) != count:
-                raise RuntimeError(f"expected {count} probabilities, got {len(raw)}")
-            return [
-                _jev_yes_probability(item.get("probabilities", item) if isinstance(item, dict) else item)
-                for item in raw
-            ]
-        if isinstance(body, dict) and isinstance(body.get("results"), list):
-            raw = body["results"]
-            keys = [item.get("key") if isinstance(item, dict) else None for item in raw]
-            if all(k is not None for k in keys):
-                if len(set(keys)) != len(keys):
-                    raise RuntimeError("duplicate result keys")
-                wanted = [q.key for q in questions]
-                if set(keys) != set(wanted):
-                    raise RuntimeError("result keys do not match request keys")
-                by_key = {
-                    item["key"]: _jev_yes_probability(item.get("probabilities", item))
-                    for item in raw
-                }
-                return [by_key[key] for key in wanted]
-            if len(raw) != count:
-                raise RuntimeError(f"expected {count} results, got {len(raw)}")
-            return [
-                _jev_yes_probability(item.get("probabilities", item) if isinstance(item, dict) else item)
-                for item in raw
-            ]
-        raise RuntimeError("unrecognized jev score response shape")
-
-
-def _jev_runtime_options(settings: Settings) -> tuple[str | None, str]:
-    """Device and dtype for the local runtime.
-
-    `auto` lets the runtime pick. bfloat16 halves both memory and time against the
-    runtime's float32 default, and quietly becomes float16 on a GPU that predates it.
-    """
-    device = (settings.jev_device or "auto").strip().lower()
-    dtype = (settings.jev_dtype or "float32").strip().lower()
-    resolved = None if device in ("", "auto") else device
-    if dtype == "bfloat16":
-        try:
-            import torch
-
-            on_gpu = resolved == "cuda" or (resolved is None and torch.cuda.is_available())
-            if on_gpu and not torch.cuda.is_bf16_supported():
-                dtype = "float16"
-        except Exception:  # noqa: BLE001 - no torch/CUDA information, keep what was asked for
-            pass
-    return resolved, dtype
-
-
-class LocalJevClassifier:
-    """Wraps a local JevStyleDecision runtime loaded from jev_local_path."""
-
-    def __init__(self, runtime: Any) -> None:
-        self.runtime = runtime
-        self._lock = Lock()
-
-    @classmethod
-    def build(cls, settings: Settings) -> "LocalJevClassifier | None":
-        import importlib.util
-
-        path = _jev_local_snapshot(settings)
-        module_file = path / "jev_style_decision.py"
-        try:
-            spec = importlib.util.spec_from_file_location("jev_style_decision", module_file)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"cannot load {module_file}")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            device, dtype = _jev_runtime_options(settings)
-            try:
-                runtime = module.JevStyleDecision(str(path), device=device, dtype=dtype)
-            except TypeError:  # runtime build without device/dtype arguments
-                runtime = module.JevStyleDecision(str(path))
-            print(f"[growi-search] Jev local runtime: device={getattr(runtime, 'device', device)} "
-                  f"dtype={getattr(runtime, 'dtype', dtype)}", flush=True)
-        except Exception as exc:  # noqa: BLE001 - missing optional ML deps etc.
-            log.warning("jev local runtime failed to load: %s; jev disabled", exc)
-            return None
-        return cls(runtime)
-
-    def score_many(self, state: dict[str, Any], questions: list[JevQuestion]) -> list[float]:
-        with self._lock:
-            typed = [{"t": "noul", "ins": question.text, "crit": None} for question in questions]
-            try:
-                if hasattr(self.runtime, "decide_many"):
-                    results = self.runtime.decide_many(state, typed)
-                else:
-                    results = [self.runtime.decide(state, q.text, qtype="noul") for q in questions]
-            except Exception as exc:  # noqa: BLE001 - surface as adapter failure
-                raise RuntimeError(f"local jev runtime failed: {exc}") from exc
-            if len(results) != len(questions):
-                raise RuntimeError("local jev runtime returned misaligned results")
-            out: list[float] = []
-            for question, result in zip(questions, results):
-                container = result.get("probabilities", result) if isinstance(result, dict) else result
-                try:
-                    out.append(_jev_yes_probability(container))
-                except RuntimeError as exc:
-                    raise RuntimeError(f"{exc} for {question.key}") from exc
-            return out
-
-
-def _jev_local_snapshot(settings: Settings):
-    """Return a complete local model directory, downloading only at startup."""
-    from pathlib import Path
-
-    def complete(path: Path) -> bool:
-        return path.is_dir() and all((path / name).is_file() for name in JEV_REQUIRED_FILES)
-
-    configured = Path(settings.jev_local_path).expanduser() if settings.jev_local_path else None
-    if configured is not None and complete(configured):
-        print(f"[growi-search] Jev model: using local files at {configured}", flush=True)
-        return configured
-
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise RuntimeError("huggingface-hub is required for local Jev startup download") from exc
-
-    kwargs = {"repo_id": settings.jev_model}
-    if configured is not None:
-        print(f"[growi-search] Jev model: downloading {settings.jev_model} to {configured}", flush=True)
-        kwargs["local_dir"] = str(configured)
-        path = Path(snapshot_download(**kwargs))
-    else:
-        try:
-            path = Path(snapshot_download(local_files_only=True, **kwargs))
-            if not complete(path):
-                raise FileNotFoundError("cached snapshot is incomplete")
-            print(f"[growi-search] Jev model: using Hugging Face cache at {path}", flush=True)
-            return path
-        except Exception:  # no complete cached snapshot: download before readiness
-            print(f"[growi-search] Jev model: downloading {settings.jev_model} to Hugging Face cache", flush=True)
-            path = Path(snapshot_download(**kwargs))
-    if not complete(path):
-        raise RuntimeError(f"downloaded Jev snapshot is incomplete: {path}")
-    print(f"[growi-search] Jev model: ready at {path}", flush=True)
-    return path
-
-
-def build_jev(settings: Settings) -> JevClassifier | None:
-    """Factory: returns one reusable adapter, or None (jev disabled)."""
+def build_jev(settings: Settings):
+    """Return the shared Jev engine, or None when disabled/unavailable."""
     if not settings.jev_enabled:
         return None
-    backend = (settings.jev_backend or "auto").strip().lower()
-    local, hosted = bool(settings.jev_local_path), bool(settings.jev_base_url)
     try:
-        if backend == "hosted" or (backend == "auto" and hosted and not local):
-            return HostedJevClassifier(settings) if hosted else _jev_none("base URL not set")
-        if backend == "local" or backend == "auto":
-            return LocalJevClassifier.build(settings)
-    except Exception as exc:  # noqa: BLE001 - jev must never break search startup
-        log.warning("jev adapter construction failed: %s; jev disabled", exc)
+        import jev
+        config = jev.JevConfig.from_env()
+        backend = settings.jev_backend.strip().lower()
+        if backend == "auto":
+            backend = "hosted" if settings.jev_base_url and not settings.jev_local_path else "torch"
+        elif backend == "local":
+            backend = "torch"
+        if backend == "hosted" and not settings.jev_base_url:
+            return None
+        config = replace(config, backend=backend, local_path=settings.jev_local_path,
+                         device=settings.jev_device, dtype=settings.jev_dtype,
+                         base_url=settings.jev_base_url, api_key=settings.jev_api_key,
+                         model=settings.jev_model, timeout=settings.jev_timeout)
+        return jev.get_engine(config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("jev engine construction failed: %s; jev disabled", exc)
         return None
-    return _jev_none(f"backend={backend!r} with no local path or base URL")
-
-
-def _jev_none(reason: str) -> None:
-    log.warning("jev disabled: %s", reason)
-    return None

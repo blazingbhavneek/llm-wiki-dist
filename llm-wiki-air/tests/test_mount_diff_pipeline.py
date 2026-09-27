@@ -491,7 +491,7 @@ class DiffPipelineSafetyTest(unittest.TestCase):
         from graph.linker.legacy import Candidate
         from graph.linker.prompts import CHUNK_META_VERSION
         from graph.linker.service import link_document
-        from graph.linker.wire import ChunkMeta, EdgeSuggestions
+        from graph.linker.wire import EdgeSuggestions
         from graph.wiki.storage import write_json_atomic
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -523,9 +523,10 @@ class DiffPipelineSafetyTest(unittest.TestCase):
             searched: list[str] = []
 
             class Model:
+                async def text(self, _messages, **_kwargs):
+                    return '{"summary": "new", "keywords": ["k"]}'
+
                 async def structured(self, schema, _messages, **_kwargs):
-                    if schema is ChunkMeta:
-                        return ChunkMeta(summary="new", keywords=["k"])
                     if schema is EdgeSuggestions:
                         return EdgeSuggestions(edges=[{
                             "target_node_id": peer.chunk_id,

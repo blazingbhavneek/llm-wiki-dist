@@ -37,6 +37,7 @@ async def structured_ainvoke(
     max_output_tokens: int | None = None,
     *,
     thinking: bool = True,
+    temperature: float | None = None,
 ) -> BaseModel:
     """One bounded structured call with the same fallback policy the chunk writer used.
 
@@ -56,14 +57,18 @@ async def structured_ainvoke(
             return await operation
         return await asyncio.wait_for(operation, timeout=hard_timeout)
 
-    bind: dict[str, Any] = {}
+    limits: dict[str, Any] = {}
     if max_output_tokens is not None:
-        bind["max_tokens"] = max_output_tokens
-    bind["extra_body"] = {"chat_template_kwargs": {"enable_thinking": thinking}}
-    call_llm = llm.bind(**bind) if bind else llm
+        limits["max_tokens"] = max_output_tokens
+    if temperature is not None:
+        limits["temperature"] = temperature
+    call_llm = llm.bind(**limits, extra_body={"chat_template_kwargs": {"enable_thinking": thinking}})
 
     try:
-        structured = call_llm.with_structured_output(schema_cls)
+        # with_structured_output drops kwargs bound before it, so the cap goes here;
+        # without it the first attempt had no max_tokens and could generate for 15 min.
+        # Thinking stays at the server default on this attempt, as before.
+        structured = llm.with_structured_output(schema_cls, **limits)
         result = await invoke(structured, messages)
         if isinstance(result, schema_cls):
             return result

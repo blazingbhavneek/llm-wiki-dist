@@ -102,6 +102,7 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
             }
             with (
                 patch.dict(os.environ, environment, clear=False),
+                patch("formats.pdf._cli_available", return_value=False),
                 patch(
                     "formats.pdf._run_mineru_api_once",
                     return_value=str(markdown_path),
@@ -128,6 +129,7 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
                     {"MINERU_API_URL": "http://mineru.example:8000"},
                     clear=False,
                 ),
+                patch("formats.pdf._cli_available", return_value=False),
                 patch(
                     "formats.pdf._run_mineru_api_once",
                     side_effect=[
@@ -143,11 +145,60 @@ class PdfParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invoke.call_count, 2)
         sleep.assert_called_once_with(10)
 
-    def test_mineru_requires_external_api_url(self) -> None:
+    def test_mineru_uses_cli_without_api_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch.dict(os.environ, {"MINERU_API_URL": ""}, clear=False):
-                with self.assertRaisesRegex(MineruError, "MINERU_API_URL"):
-                    run_mineru(str(Path(directory) / "document.pdf"), directory)
+            root = Path(directory)
+            pdf_path = root / "document.pdf"
+            output_dir = root / "output"
+            markdown_path = output_dir / "document.md"
+            pdf_path.write_bytes(b"%PDF-1.7 fake")
+
+            environment = {"MINERU_API_URL": "", "MINERU_COMMAND": "mineru-kit"}
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch("formats.pdf._cli_available", return_value=True),
+                patch(
+                    "formats.pdf._run_mineru_cli_once",
+                    return_value=str(markdown_path),
+                ) as invoke_cli,
+                patch(
+                    "formats.pdf._run_mineru_api_once",
+                    side_effect=AssertionError("API must not be called"),
+                ),
+            ):
+                result = run_mineru(str(pdf_path), str(output_dir))
+
+        self.assertEqual(result, str(markdown_path))
+        invoke_cli.assert_called_once_with(str(pdf_path), str(output_dir))
+
+    def test_mineru_prefers_cli_over_dead_api_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "document.pdf"
+            output_dir = root / "output"
+            markdown_path = output_dir / "document.md"
+            pdf_path.write_bytes(b"%PDF-1.7 fake")
+
+            environment = {
+                "MINERU_API_URL": "http://10.160.144.101:51020/v1",
+                "MINERU_COMMAND": "mineru-kit",
+            }
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch("formats.pdf._cli_available", return_value=True),
+                patch(
+                    "formats.pdf._run_mineru_cli_once",
+                    return_value=str(markdown_path),
+                ) as invoke_cli,
+                patch(
+                    "formats.pdf._run_mineru_api_once",
+                    side_effect=AssertionError("API must not be called"),
+                ),
+            ):
+                result = run_mineru(str(pdf_path), str(output_dir))
+
+        self.assertEqual(result, str(markdown_path))
+        invoke_cli.assert_called_once_with(str(pdf_path), str(output_dir))
 
     async def test_gpu_extract_then_describes_unique_images_in_parallel_stage(self) -> None:
         workers = FakeWorkers()

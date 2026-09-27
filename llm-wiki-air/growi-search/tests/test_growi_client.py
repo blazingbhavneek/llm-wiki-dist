@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import httpx
@@ -151,6 +152,92 @@ class Children(unittest.TestCase):
         self.assertEqual(kids[0].id, OTHER)
         self.assertEqual(len(calls), 1)  # no grandchild requests
         self.assertIn("/_api/v3/page-listing/children", calls[0])
+
+
+class ListDescendants(unittest.TestCase):
+    def test_request_shape_and_mapping(self):
+        seen = {}
+
+        def handler(request):
+            seen.update(path=request.url.path, params=request.url.params)
+            return httpx.Response(200, json={"pages": [
+                page_doc(descendantCount=3), page_doc(OTHER, "/user/outside")], "totalCount": 9})
+
+        pages, total = client_for(handler).list_descendants("/Moove", limit=500, page=1)
+        self.assertEqual(seen["path"], "/_api/v3/pages/list")
+        self.assertEqual(dict(seen["params"]), {"path": "/Moove", "limit": "500", "page": "1"})
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0].revision_id, "rev1")
+        self.assertEqual(pages[0].descendant_count, 3)
+        self.assertEqual(total, 9)
+
+    def test_iterates_pages_and_dedupes(self):
+        def handler(request):
+            page = int(request.url.params["page"])
+            items = [[page_doc(ID, "/Moove/A"), page_doc(OTHER, "/Moove/B")],
+                     [page_doc(OTHER, "/Moove/B"), page_doc("507f1f77bcf86cd799439013", "/Moove/C")]][page - 1]
+            return httpx.Response(200, json={"data": {"pages": items, "totalCount": 3}})
+
+        pages = list(client_for(handler).iter_descendants("/Moove", limit=2))
+        self.assertEqual([page.path for page in pages], ["/Moove/A", "/Moove/B", "/Moove/C"])
+
+    def test_404_is_empty(self):
+        pages, total = client_for(lambda _r: httpx.Response(404)).list_descendants("/Moove")
+        self.assertEqual((pages, total), ([], 0))
+
+
+class RecentPages(unittest.TestCase):
+    def test_request_shape(self):
+        seen = {}
+
+        def handler(request):
+            seen.update(path=request.url.path, params=request.url.params)
+            return httpx.Response(200, json={"pages": [page_doc(), page_doc(OTHER, "/Elsewhere") ]})
+
+        pages = client_for(handler).recent_pages(limit=17, offset=8)
+        self.assertEqual(seen["path"], "/_api/v3/pages/recent")
+        self.assertEqual(dict(seen["params"]), {"limit": "17", "offset": "8"})
+        self.assertEqual([page.id for page in pages], [ID])
+
+
+class Activity(unittest.TestCase):
+    def test_offset_and_filter_always_sent(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"serializedPaginationResult": {"docs": [{"action": "PAGE_UPDATE"}]}})
+
+        client = client_for(handler)
+        self.assertEqual(len(client.activity()), 1)
+        self.assertEqual(len(client.activity(actions=["PAGE_UPDATE"])), 1)
+        first, second = requests
+        self.assertEqual(first.url.params["offset"], "0")
+        self.assertEqual(first.url.params["searchFilter"], "{}")
+        self.assertEqual(json.loads(second.url.params["searchFilter"]), {"actions": ["PAGE_UPDATE"]})
+
+    def test_forbidden_raises(self):
+        with self.assertRaises(GrowiAPIError) as ctx:
+            client_for(lambda _r: httpx.Response(403)).activity()
+        self.assertEqual(ctx.exception.status_code, 403)
+
+
+class PageInfos(unittest.TestCase):
+    def test_array_param_and_chunking(self):
+        requests = []
+
+        def handler(request):
+            ids = request.url.params.get_list("pageIds[]")
+            requests.append((request, ids))
+            return httpx.Response(200, json={"data": {pid: {"path": f"/Moove/{pid}", "revisionShortBody": "body"}
+                                                        for pid in ids}})
+
+        ids = [f"id{i}" for i in range(150)]
+        infos = client_for(handler).page_infos(ids)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(len(requests[0][1]), 100)
+        self.assertEqual(len(infos), 150)
+        self.assertEqual(requests[0][0].url.params["attachShortBody"], "true")
 
 
 class Attachment(unittest.TestCase):

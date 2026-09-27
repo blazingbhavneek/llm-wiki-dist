@@ -8,13 +8,23 @@ full-corpus enumeration, nothing that lists every page.
 
 from __future__ import annotations
 
+import json
 from threading import BoundedSemaphore
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
 from markdown import strip_search_highlights
 from models import WikiPage
+
+
+# Re-check these against the deployed GROWI version's interfaces/activity.ts.
+PAGE_ACTIONS = (
+    "PAGE_CREATE", "PAGE_UPDATE", "PAGE_RENAME", "PAGE_DUPLICATE", "PAGE_DELETE",
+    "PAGE_DELETE_COMPLETELY", "PAGE_REVERT", "PAGE_RECURSIVELY_RENAME",
+    "PAGE_RECURSIVELY_DELETE", "PAGE_RECURSIVELY_DELETE_COMPLETELY",
+    "PAGE_RECURSIVELY_REVERT", "PAGE_EMPTY_TRASH",
+)
 
 
 class GrowiAPIError(RuntimeError):
@@ -312,3 +322,82 @@ class GrowiSearchClient:
             wiki.document = wiki.path
             out.append(wiki)
         return out
+
+    def list_descendants(
+        self, path: str, *, limit: int = 500, page: int = 1
+    ) -> tuple[list[WikiPage], int]:
+        try:
+            payload = self._request("GET", "/_api/v3/pages/list",
+                                    {"path": path, "limit": limit, "page": page})
+        except GrowiAPIError as exc:
+            if exc.status_code == 404:
+                return [], 0
+            raise
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(data, dict):
+            return [], 0
+        pages = data.get("pages") or []
+        out = []
+        for item in pages:
+            if isinstance(item, dict):
+                wiki = self._page_dict(item)
+                if wiki.path and _in_scope(wiki.path, self.root_path):
+                    out.append(wiki)
+        return out, int(data.get("totalCount") or 0)
+
+    def iter_descendants(self, path: str, *, limit: int = 500) -> Iterator[WikiPage]:
+        seen: set[str] = set()
+        scanned = 0
+        page = 1
+        while True:
+            pages, total = self.list_descendants(path, limit=limit, page=page)
+            scanned += len(pages)
+            for wiki in pages:
+                key = wiki.id or wiki.path
+                if key not in seen:
+                    seen.add(key)
+                    yield wiki
+            if len(pages) < limit or scanned >= total:
+                return
+            page += 1
+
+    def recent_pages(self, *, limit: int = 100, offset: int = 0) -> list[WikiPage]:
+        payload = self._request("GET", "/_api/v3/pages/recent", {"limit": limit, "offset": offset})
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        pages = data.get("pages", []) if isinstance(data, dict) else data
+        return [wiki for item in pages or [] if isinstance(item, dict)
+                if (wiki := self._page_dict(item)).path and _in_scope(wiki.path, self.root_path)]
+
+    def activity(
+        self, *, limit: int = 100, offset: int = 0, actions: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Read audit records; GROWI admin access and AUDIT_LOG_ENABLED are required."""
+        filters = {"actions": actions} if actions is not None else {}
+        payload = self._request("GET", "/_api/v3/activity", {
+            "limit": min(limit, 100), "offset": offset,
+            "searchFilter": json.dumps(filters, separators=(",", ":")),
+        })
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(data, dict):
+            return []
+        result = data.get("serializedPaginationResult", data)
+        docs = result.get("docs", []) if isinstance(result, dict) else []
+        return [doc for doc in docs if isinstance(doc, dict)]
+
+    def page_infos(self, page_ids: list[str], *, short_body: bool = True) -> dict[str, dict]:
+        infos: dict[str, dict] = {}
+        for start in range(0, len(page_ids), 100):
+            payload = self._request("GET", "/_api/v3/page-listing/info", {
+                "pageIds[]": page_ids[start:start + 100], "attachShortBody": short_body,
+            })
+            data = payload.get("data", payload) if isinstance(payload, dict) else {}
+            values = data.get("pageInfos", data.get("pages", data)) if isinstance(data, dict) else {}
+            if isinstance(values, list):
+                values = {str(item.get("_id") or item.get("id") or item.get("pageId") or ""): item
+                          for item in values if isinstance(item, dict)}
+            if not isinstance(values, dict):
+                continue
+            for page_id, info in values.items():
+                if isinstance(info, dict) and info.get("path") and _in_scope(str(info["path"]), self.root_path):
+                    infos[str(page_id)] = info
+        return infos

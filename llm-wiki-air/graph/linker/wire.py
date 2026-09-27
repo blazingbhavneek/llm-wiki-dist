@@ -26,6 +26,7 @@ class ChunkMeta(BaseModel):
     bridge_probe: str = ""
     entities: list[ChunkEntity] = Field(default_factory=list)
     behaviours: list[ChunkBehaviour] = Field(default_factory=list)
+    role_judge: str = ""
 
 
 class EdgeSuggestion(BaseModel):

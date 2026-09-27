@@ -8,6 +8,9 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import time
 import zipfile
 from pathlib import Path
@@ -218,11 +221,34 @@ def _v4_middle_json_to_content_list(payload: dict, output_dir: Path) -> list[dic
         if path.is_file()
     }
     blocks: list[dict] = []
-    for page in payload.get("pages", []):
-        page_idx = page.get("page_idx")
-        for block in page.get("blocks", []):
+    pages = payload.get("pages") or payload.get("pdf_info") or []
+    for page_idx, page in enumerate(pages):
+        if isinstance(page, str):
+            if page.strip():
+                blocks.append({"page_idx": page_idx, "type": "text", "text": page})
+            continue
+        if not isinstance(page, dict):
+            continue
+        page_idx = page.get("page_idx", page_idx)
+        page_blocks = page.get("blocks") or page.get("para_blocks") or []
+        for block in page_blocks:
+            if isinstance(block, str):
+                if block.strip():
+                    blocks.append({"page_idx": page_idx, "type": "text", "text": block})
+                continue
+            if not isinstance(block, dict):
+                continue
             block_type = block.get("type")
             content = block.get("content") or []
+            if isinstance(content, str):
+                content = [{"type": "text", "content": content}]
+            elif isinstance(content, list):
+                content = [
+                    item if isinstance(item, dict) else {"type": "text", "content": str(item)}
+                    for item in content
+                ]
+            else:
+                content = []
             if block_type == "table":
                 captions = [
                     str(item.get("content", ""))
@@ -420,27 +446,119 @@ def _run_mineru_api_once(pdf_path: str, output_dir: str) -> str:
     return str(markdown_path)
 
 
-def run_mineru(pdf_path: str, output_dir: str) -> str:
-    """Submit a PDF to the configured MinerU v4 API and return Markdown."""
-    _mineru_api_base_url()
-    for attempt in range(2):
+def _run_mineru_cli_once(pdf_path: str, output_dir: str) -> str:
+    """Run the local MinerU CLI (``mineru-kit parse``) and return Markdown."""
+    source = Path(pdf_path)
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    timeout_s = float(os.getenv("MINERU_TIMEOUT_SECONDS", "1800"))
+    tier = os.getenv("MINERU_API_TIER", "advanced").strip() or "advanced"
+    command = shlex.split(os.getenv("MINERU_COMMAND", "mineru-kit"))
+    if not command:
+        raise MineruError("MINERU_COMMAND is empty")
+
+    try:
+        completed = subprocess.run(
+            [
+                *command,
+                "parse",
+                str(source),
+                "-o",
+                str(destination),
+                "--format",
+                "zip",
+                "--tier",
+                tier,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise MineruError(f"MinerU executable was not found: {command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise MineruError(f"MinerU timed out after {timeout_s:g} seconds") from exc
+
+    if completed.returncode:
+        details = (completed.stderr or completed.stdout or "no output").strip()[-4000:]
+        raise MineruError(
+            f"MinerU exited with status {completed.returncode}: {details}"
+        )
+
+    for archive in sorted(destination.rglob("*.zip")):
+        _safe_extract_zip(archive.read_bytes(), destination)
+
+    markdown_path = _find_markdown(destination, source.stem)
+    middle_candidates = sorted(destination.rglob("middle_json.json"))
+    middle_path = next(
+        (path for path in middle_candidates if path.parent == markdown_path.parent),
+        middle_candidates[0] if middle_candidates else None,
+    )
+    if middle_path is not None:
         try:
-            return _run_mineru_api_once(pdf_path, output_dir)
-        except (
-            MineruError,
-            httpx.HTTPError,
-            ValueError,
-            KeyError,
-            AttributeError,
-        ) as exc:
-            if attempt == 0:
-                logger.warning("MinerU API failed; retrying once in 10 seconds: %s", exc)
-                time.sleep(10)
-                continue
-            if isinstance(exc, MineruError):
+            middle_payload = json.loads(middle_path.read_text(encoding="utf-8"))
+            content_list = _v4_middle_json_to_content_list(
+                middle_payload, markdown_path.parent
+            )
+            (middle_path.parent / "content_list.json").write_text(
+                json.dumps(content_list, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError) as exc:
+            raise MineruError(f"MinerU CLI returned invalid middle JSON: {exc}") from exc
+    return str(markdown_path)
+
+
+def _cli_available() -> bool:
+    """Return whether the local MinerU CLI resolves on PATH."""
+    command = shlex.split(os.getenv("MINERU_COMMAND", "mineru-kit") or "")
+    return bool(command) and shutil.which(command[0]) is not None
+
+
+def run_mineru(pdf_path: str, output_dir: str) -> str:
+    """Run MinerU locally via CLI, or via the v4 API when MINERU_API_URL is set.
+
+    The parser itself runs MinerU: when the ``MINERU_COMMAND`` executable
+    (default ``mineru-kit``) is installed it is used directly and the API is
+    never contacted. Otherwise the configured v4 API is used, so containers
+    without a local MinerU install keep working.
+    """
+    if _cli_available():
+        for attempt in range(2):
+            try:
+                return _run_mineru_cli_once(pdf_path, output_dir)
+            except MineruError as exc:
+                if attempt == 0:
+                    logger.warning("MinerU CLI failed; retrying once in 10 seconds: %s", exc)
+                    time.sleep(10)
+                    continue
                 raise
-            raise MineruError(f"MinerU API request failed: {exc}") from exc
-    raise AssertionError("unreachable")
+        raise AssertionError("unreachable")
+    if os.getenv("MINERU_API_URL", "").strip():
+        for attempt in range(2):
+            try:
+                return _run_mineru_api_once(pdf_path, output_dir)
+            except (
+                MineruError,
+                httpx.HTTPError,
+                ValueError,
+                KeyError,
+                AttributeError,
+            ) as exc:
+                if attempt == 0:
+                    logger.warning("MinerU API failed; retrying once in 10 seconds: %s", exc)
+                    time.sleep(10)
+                    continue
+                if isinstance(exc, MineruError):
+                    raise
+                raise MineruError(f"Mineru API request failed: {exc}") from exc
+        raise AssertionError("unreachable")
+    raise MineruError(
+        "No MinerU backend: install the local CLI "
+        f"({os.getenv('MINERU_COMMAND', 'mineru-kit')!r} not found on PATH) "
+        "or set MINERU_API_URL"
+    )
 
 
 class PdfParser(BaseParser):

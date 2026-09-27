@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from graph.wiki.storage import read_json, write_json_atomic
 from . import chunks
 from .catalog import Catalog, LinkerModeMismatch
 from .legacy import Candidate
-from .prompts import CHUNK_META_VERSION, EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
+from .prompts import CHUNK_META_VERSION, EDGE_VERSION_JEV, EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
 from .render import (
     BIG_DOCUMENT_LINES, INTERNAL_SUMMARY_TERMS, MAX_BIG_INLINE_ENTRIES,
     MAX_FOOTER_ENTRIES, MAX_INLINE_ENTRIES, USEFUL_LABELS, RenderEdge,
@@ -30,6 +31,7 @@ StopCheck = Callable[[], bool] | None
 MAX_EDGE_CANDIDATES = 8
 MAX_EDGES_PER_TARGET = 2
 MAX_PAGE_CANDIDATES = 40
+log = logging.getLogger(__name__)
 
 
 def _concurrency(settings: Any) -> int:
@@ -56,6 +58,7 @@ class LinkResult:
     edge_calls: int = 0
     meta_fallbacks: int = 0
     affected_pages: list[str] | None = None
+    jev_fallbacks: int = 0
 
     @property
     def touched(self) -> list[str]:
@@ -104,7 +107,7 @@ def _neo_entity_edge_is_valid(catalog: Catalog, edge: dict[str, Any]) -> bool:
 
     def has_role(row: Any, role: str) -> bool:
         return any(
-            chunks.normalize_name(str(entity.get("name", ""))) == name
+            catalog.canonical(str(row["team"]), chunks.normalize_name(str(entity.get("name", "")))) == catalog.canonical(str(row["team"]), name)
             and entity.get("role") == role
             for entity in json.loads(row["entities_json"] or "[]")
         )
@@ -115,8 +118,8 @@ def _neo_entity_edge_is_valid(catalog: Catalog, edge: dict[str, Any]) -> bool:
 
 def _edge_from_row(row: Any, page_rel: str) -> RenderEdge:
     if row["page_a_rel"] == page_rel:
-        return RenderEdge(row["edge_id"], row["page_b_rel"], row["page_b_title"], row["page_b_heading"], row["label"], row["summary"], True, row["source"], json.loads(row["via_json"] or "[]"))
-    return RenderEdge(row["edge_id"], row["page_a_rel"], row["page_a_title"], row["page_a_heading"], row["label"], row["summary"], False, row["source"], json.loads(row["via_json"] or "[]"))
+        return RenderEdge(row["edge_id"], row["page_b_rel"], row["page_b_title"], row["page_b_heading"], row["label"], row["summary"], True, row["source"], json.loads(row["via_json"] or "[]"), row["summary_b"])
+    return RenderEdge(row["edge_id"], row["page_a_rel"], row["page_a_title"], row["page_a_heading"], row["label"], row["summary"], False, row["source"], json.loads(row["via_json"] or "[]"), row["summary_a"])
 
 
 def _raw_rel(catalog: Catalog, document: str) -> str:
@@ -153,9 +156,10 @@ def _valid_choices(current: list[dict[str, Any]], edges: list[RenderEdge], *, in
             continue
         inline += placement == "inline"
         footer += placement == "footer"
-        summary = str(raw.get("summary", "")).strip() or edge.summary
+        fallback_summary = edge.summary or edge.peer_summary
+        summary = str(raw.get("summary", "")).strip() or fallback_summary
         if any(term in summary for term in INTERNAL_SUMMARY_TERMS):
-            summary = edge.summary
+            summary = fallback_summary
         result.append({"edge_id": edge_id, "placement": placement, "anchor": str(raw.get("anchor", "")).strip(), "summary": summary})
         seen_ids.add(edge_id)
         seen_pages.add(edge.peer_page_rel)
@@ -164,12 +168,24 @@ def _valid_choices(current: list[dict[str, Any]], edges: list[RenderEdge], *, in
 
 async def _curate_page(
     *, page_rel: str, original: str, edges: list[RenderEdge], current: list[dict[str, Any]],
-    previous_candidates: list[str], model: Any, settings: Any, big_document: bool, mode: str,
+    previous_candidates: list[str], model: Any, settings: Any, big_document: bool, mode: str, jev_engine: Any = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     from .prompts import reference_plan_messages
     from .wire import PageReferencePlan
 
     candidates = footer_edges(edges, page_rel=page_rel, limit=None)
+    if jev_engine is not None and str(getattr(settings, "wiki_linker_judge", "llm")) == "jev":
+        from .jev_judge import curate
+        try:
+            selected = await curate(jev_engine, original[:12000], [
+                {"edge_id": edge.edge_id, "peer_title": edge.peer_title, "peer_heading": edge.peer_heading, "summary": edge.peer_summary or edge.summary,
+                 "cross": edge.peer_page_rel.rsplit("/", 1)[0] != page_rel.rsplit("/", 1)[0]}
+                for edge in candidates if edge.source not in {"use", "define"}
+            ], settings)
+            selected = set(selected)
+            candidates = [edge for edge in candidates if edge.source in {"use", "define"} or edge.edge_id in selected]
+        except Exception as exc:
+            log.warning("Jev page curation failed for %s: %s", page_rel, exc)
     inline_limit = MAX_NEO_BEHAVIOUR_INLINE_ENTRIES if mode == "neo" else MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES
     current = _valid_choices(current, candidates, inline_limit=inline_limit)
     current_ids = {choice["edge_id"] for choice in current}
@@ -184,7 +200,7 @@ async def _curate_page(
     if not pool:
         return [], []
     if model is None:
-        return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary} for edge in pool[:3]]), candidate_ids
+        return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary or edge.peer_summary} for edge in pool[:3]]), candidate_ids
     current_payload = [{**choice, "target": by_id[choice["edge_id"]].peer_title} for choice in current if choice["edge_id"] in by_id]
     candidate_payload = []
     for edge in pool:
@@ -193,7 +209,7 @@ async def _curate_page(
             "state": "current" if edge.edge_id in current_ids else "new",
             "target_page": edge.peer_title,
             "target_section": edge.peer_heading,
-            "evidence": edge.summary,
+            "evidence": edge.summary or edge.peer_summary,
             "relation_hint": edge.label,
         })
     messages = reference_plan_messages(
@@ -216,7 +232,7 @@ async def _curate_page(
         return _valid_choices(proposed, pool, inline_limit=inline_limit), candidate_ids
     except Exception:
         # A transient curator failure must not erase good links already visible to readers.
-        return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary} for edge in pool[:3]]), candidate_ids
+        return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary or edge.peer_summary} for edge in pool[:3]]), candidate_ids
 
 
 async def render_pages(
@@ -226,6 +242,13 @@ async def render_pages(
     from .prompts import REFERENCE_PLAN_VERSION
 
     concurrency = _concurrency(settings)
+    jev_engine = None
+    if str(getattr(settings, "wiki_linker_judge", "llm")) == "jev":
+        try:
+            from jev import get_engine
+            jev_engine = get_engine()
+        except Exception as exc:
+            log.warning("Jev linker engine unavailable for page curation: %s", exc)
     semaphore = asyncio.Semaphore(concurrency)
     jobs: list[tuple[str, str, Path, str, list[RenderEdge], dict[str, Any], bool]] = []
     navigation_by_doc: dict[str, dict[str, Any]] = {}
@@ -249,7 +272,7 @@ async def render_pages(
                 page_rel=page_rel, original=original, edges=curation_edges,
                 current=list(state.get("references", [])),
                 previous_candidates=list(state.get("candidate_ids", [])) if state.get("version") == REFERENCE_PLAN_VERSION else [],
-                model=model, settings=settings, big_document=big, mode=mode,
+                model=model, settings=settings, big_document=big, mode=mode, jev_engine=jev_engine,
             )
         completed += 1
         if on_progress:
@@ -343,6 +366,22 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
     return accepted[:MAX_EDGES_PER_TARGET], calls
 
 
+async def _filter_target(catalog, model, target, candidates_, *, mode, version, artifact_dir,
+                         stop_check, output_language, strict, judge, jev_engine, settings, use_jev=True):
+    if judge == "jev" and jev_engine is not None and use_jev:
+        try:
+            from .jev_judge import judge_edges
+            return (await judge_edges(catalog, jev_engine, target, candidates_, settings, model=model)), len(candidates_), 0
+        except Exception as exc:
+            log.warning("Jev edge judge failed for %s: %s", target.chunk_id, exc)
+            accepted, calls = await _filter_groups(catalog, model, target, candidates_, mode, version,
+                                                   artifact_dir, stop_check, output_language, strict=False)
+            return accepted, calls, 1
+    accepted, calls = await _filter_groups(catalog, model, target, candidates_, mode, version,
+                                           artifact_dir, stop_check, output_language, strict=strict)
+    return accepted, calls, 0
+
+
 async def link_document(
     project: Any, rel: str, *, model: Any, embedder: Any, settings: Any,
     on_progress: Progress = None, stop_check: StopCheck = None, render: bool = True,
@@ -368,6 +407,9 @@ async def link_document(
     }
     team = _team(document)
     mode = str(getattr(settings, "wiki_linker_mode", "legacy"))
+    judge = str(getattr(settings, "wiki_linker_judge", "llm"))
+    if judge not in {"llm", "jev"}:
+        raise ValueError("wiki_linker_judge must be llm or jev")
     if mode not in {"legacy", "neo"}:
         raise ValueError("wiki_linker_mode must be legacy or neo")
     planning = Path(project.wiki_dir(rel)) / "_planning"
@@ -387,8 +429,19 @@ async def link_document(
     if on_progress:
         on_progress({"stage": "linker", "step": "pending", "document": rel})
     catalog: Catalog | None = None
+    jev_engine = None
+    jev_fallbacks = 0
+    jev_failed_chunks: set[str] = set()
     try:
-        catalog = Catalog.open(project.linker_database, mode=mode)
+        edge_version = EDGE_VERSION_JEV if judge == "jev" else EDGE_VERSION_NEO if mode == "neo" else EDGE_VERSION_LEGACY
+        if judge == "jev":
+            try:
+                from jev import get_engine
+                jev_engine = get_engine()
+            except Exception as exc:
+                log.warning("Jev linker engine unavailable; using LLM: %s", exc)
+                jev_fallbacks += 1
+        catalog = Catalog.open(project.linker_database, mode=mode, edge_version=edge_version)
         with catalog.lock(project):
             catalog.sync_from_planning(project, skip_document=document)
             chunk_cache_path = planning / "chunks.json"
@@ -457,7 +510,7 @@ async def link_document(
             output_language = str(getattr(settings, "wiki_output_language", "Japanese (日本語)"))
             if to_describe and model is not None:
                 before_meta = {item.chunk_id: item.meta.model_dump_json() for item in all_chunks}
-                meta_calls, meta_fallbacks = await chunks.describe_all(to_describe, model=model, output_language=output_language, concurrency=_concurrency(settings), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check)
+                meta_calls, meta_fallbacks = await chunks.describe_all(to_describe, model=model, output_language=output_language, concurrency=_concurrency(settings), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check, parallel=judge == "jev")
                 revised_ids = {item.chunk_id for item in all_chunks if item.meta.model_dump_json() != before_meta[item.chunk_id]}
                 if changed_page_rels is not None and not refresh_metadata:
                     to_describe = [
@@ -466,12 +519,32 @@ async def link_document(
                     ]
                 else:
                     to_describe = [item for item in all_chunks if item.chunk_id in stale_ids or item.chunk_id in revised_ids or not previously_complete]
+            if judge == "jev" and jev_engine is not None:
+                from .jev_judge import check_roles
+                previous_roles = {item.chunk_id: [entity.role for entity in item.entities] for item in all_chunks}
+                jev_fallbacks += await check_roles(jev_engine, all_chunks, settings)
+                jev_failed_chunks.update(item.chunk_id for item in all_chunks
+                                         if item.entities and item.meta.role_judge != "jev-1")
+                revised_ids.update(item.chunk_id for item in all_chunks
+                                   if previous_roles[item.chunk_id] != [entity.role for entity in item.entities])
             chunk_data = chunks.to_json(document, team, all_chunks, id_seed=id_seed)
             chunk_data["raw_rel"] = rel
             for page in chunk_data["pages"]:
                 page["original_sha256"] = original_hashes.get(page["filename"], "")
             write_json_atomic(planning / "chunks.json", chunk_data)
+            known_team_names = {name_norm for name_norm, _name in catalog.entity_names(team)}
             catalog.upsert_chunks(all_chunks)
+            if judge == "jev" and jev_engine is not None:
+                from .jev_judge import resolve_aliases
+                try:
+                    names = sorted({(chunks.normalize_name(entity.name), entity.name)
+                                    for chunk in all_chunks for entity in chunk.entities
+                                    if chunks.normalize_name(entity.name) not in known_team_names})
+                    await resolve_aliases(catalog, jev_engine, team, names, settings)
+                except Exception as exc:
+                    jev_fallbacks += 1
+                    jev_failed_chunks.update(item.chunk_id for item in all_chunks)
+                    log.warning("Jev alias resolution failed for %s: %s", document, exc)
             # A rebuilt catalog has no edges for this document yet; links.json (kept
             # across republish) restores the ones whose endpoint text is unchanged.
             catalog.restore_edges(planning / "links.json")
@@ -511,7 +584,6 @@ async def link_document(
                         if any(str(choice.get("edge_id")) == edge_id for choice in state.get("references", [])):
                             visible_edge_pages.setdefault(edge_id, set()).add(page_rel)
 
-            edge_version = EDGE_VERSION_NEO if mode == "neo" else EDGE_VERSION_LEGACY
             edge_rows: list[dict[str, Any]] = []
             incremental_candidate_edges: dict[tuple[str, str], dict[str, Any]] = {}
             candidates_for: list[tuple[Any, list[Candidate]]] = []
@@ -566,20 +638,46 @@ async def link_document(
                         raise LinkerCancelled("cancelled during candidates")
                     if mode == "neo":
                         from .neo import candidates as find_candidates
+                        found = find_candidates(catalog, item, team=team, settings=settings, judge=judge == "jev")
                     else:
                         from .legacy import candidates as find_candidates
-                    candidates_for.append((item, find_candidates(catalog, item, team=team)))
+                        found = find_candidates(catalog, item, team=team)
+                    candidates_for.append((item, found))
             else:
                 for item in to_describe:
                     if stop_check and stop_check():
                         raise LinkerCancelled("cancelled during candidates")
                     if mode == "neo":
                         from .neo import candidates as find_candidates
-                        found = find_candidates(catalog, item, team=team)
+                        found = find_candidates(catalog, item, team=team, settings=settings, judge=judge == "jev")
                     else:
                         from .legacy import candidates as find_candidates
                         found = find_candidates(catalog, item, team=team)
                     candidates_for.append((item, found))
+            if judge == "jev" and jev_engine is not None and mode == "neo":
+                from .jev_judge import primary_definer
+                for item, found in candidates_for:
+                    by_name = {}
+                    for candidate in found:
+                        if candidate.source == "use" and not candidate.programmatic:
+                            by_name.setdefault(catalog.canonical(team, chunks.normalize_name(candidate.via[0])), []).append(candidate)
+                    for canon, group in by_name.items():
+                        if len(group) < 2:
+                            continue
+                        try:
+                            chosen = await primary_definer(catalog, jev_engine, team, canon,
+                                                           [candidate.chunk_id for candidate in group], settings)
+                            for candidate in group:
+                                if candidate.chunk_id == chosen:
+                                    candidate.programmatic = True
+                                    candidate.label = "defines"
+                                    candidate.summary = f"「{candidate.via[0]}」の定義"
+                                else:
+                                    found.remove(candidate)
+                        except Exception as exc:
+                            jev_fallbacks += 1
+                            jev_failed_chunks.add(item.chunk_id)
+                            log.warning("Jev primary definer failed for %s: %s", canon, exc)
             if incremental_scope and on_progress:
                 on_progress({
                     "stage": "linker", "step": "incremental_scope", "document": rel,
@@ -601,7 +699,11 @@ async def link_document(
                     if decision:
                         if decision["accepted"]:
                             previous = incremental_candidate_edges.get((item.chunk_id, candidate.chunk_id))
-                            edge_rows.append(previous or {"chunk_a": item.chunk_id, "chunk_b": candidate.chunk_id, "label": decision["label"], "summary": decision["summary"], "source": candidate.source, "via": candidate.via})
+                            edge_rows.append(previous or {"chunk_a": item.chunk_id, "chunk_b": candidate.chunk_id,
+                                                           "label": "related" if judge == "jev" else decision["label"],
+                                                           "summary": "" if judge == "jev" else decision["summary"],
+                                                           "source": "jev" if judge == "jev" else candidate.source,
+                                                           "via": [candidate.source, *candidate.via] if judge == "jev" else candidate.via})
                     elif model is not None:
                         pending.append(candidate)
                 if pending:
@@ -612,12 +714,16 @@ async def link_document(
             completed = 0
 
             async def filter_target(item: chunks.Chunk, pending: list[Candidate]) -> tuple[list[dict[str, Any]], int]:
-                nonlocal completed
+                nonlocal completed, jev_fallbacks
                 async with semaphore:
-                    result = await _filter_groups(
-                        catalog, model, item, pending, mode, edge_version,
-                        run_dir, stop_check, output_language, strict=incremental_scope,
+                    accepted, calls, fallbacks = await _filter_target(
+                        catalog, model, item, pending, mode=mode, version=edge_version,
+                        artifact_dir=run_dir, stop_check=stop_check, output_language=output_language,
+                        strict=incremental_scope, judge=judge, jev_engine=jev_engine,
+                        settings=settings, use_jev=item.chunk_id not in jev_failed_chunks,
                     )
+                    jev_fallbacks += fallbacks
+                    result = (accepted, calls)
                 completed += 1
                 if on_progress:
                     on_progress({"stage": "linker", "step": "edge_target_done", "document": rel, "current": completed, "total": len(unresolved)})
@@ -713,11 +819,11 @@ async def link_document(
                 },
             }
             catalog.write_links_json(project, all_docs)
-            complete = {"schema_version": 2, "status": "complete" if render else "render_pending", "mode": mode, "scope": "incremental" if incremental_scope else "full", "meta_version": CHUNK_META_VERSION, "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            complete = {"schema_version": 2, "status": "complete" if render else "render_pending", "mode": mode, "scope": "incremental" if incremental_scope else "full", "meta_version": CHUNK_META_VERSION, "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "jev_fallbacks": jev_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             write_json_atomic(planning / "linker.json", complete)
             if on_progress:
                 on_progress({"stage": "linker", "step": "done", "document": rel, "edges": len(edge_rows)})
-            return LinkResult(sorted(touched_docs), inserted_edges, int(diff.get("edges_removed", 0)), meta_calls, edge_calls, meta_fallbacks, sorted(pages))
+            return LinkResult(sorted(touched_docs), inserted_edges, int(diff.get("edges_removed", 0)), meta_calls, edge_calls, meta_fallbacks, sorted(pages), jev_fallbacks)
     except Exception as exc:
         write_json_atomic(planning / "linker.json", {"schema_version": 2, "status": "failed", "mode": mode, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"[:500]})
         if on_progress:
@@ -750,6 +856,7 @@ async def link_documents(
         aggregate.meta_calls += result.meta_calls
         aggregate.edge_calls += result.edge_calls
         aggregate.meta_fallbacks += result.meta_fallbacks
+        aggregate.jev_fallbacks += result.jev_fallbacks
     mode = str(getattr(settings, "wiki_linker_mode", "legacy"))
     if pages:
         catalog = Catalog.open(project.linker_database, mode=mode)

@@ -12,6 +12,7 @@ import logging
 import queue
 import re
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -109,33 +110,41 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         app.state.embedder = embedder
         app.state.researcher = researcher or Researcher(client, settings, reranker, embedder)
         app.state.runs = {}
-        if transport is None:  # warm the 00-目次 index map in the background (offline tests skip it)
-            jev = getattr(app.state.researcher, "jev", None)
-            status = (
-                "disabled (set WIKI_JEV_ENABLED=1)"
-                if not settings.jev_enabled
-                else "configured but unavailable"
-                if jev is None
-                else f"enabled backend={settings.jev_backend} adapter={type(jev).__name__}"
-            )
-            print(f"[growi-search] Jev: {status}", flush=True)
-            if settings.jev_enabled and jev is None:
-                raise RuntimeError("Jev is enabled but its local model or hosted endpoint is unavailable")
-            threading.Thread(target=app.state.researcher.index_map.snapshot, name="index-map-warmup", daemon=True).start()
         try:
-            app.state.growi_ok = bool(await asyncio.to_thread(client.health))
-        except Exception as exc:  # noqa: BLE001 - startup probe is informational
-            app.state.growi_ok = False
-            log.warning("GROWI health check failed at startup: %s", exc)
-        log.info(
-            "growi-search ready (growi=%s root=%s llm=%s reranker=%s)",
-            settings.growi_url,
-            settings.growi_root_path,
-            settings.llm_ready,
-            reranker is not None,
-        )
-        yield
-        client.close()
+            if transport is None:  # warm the 00-目次 index map in the background (offline tests skip it)
+                mirror = getattr(app.state.researcher, "mirror", None)
+                if mirror is not None:
+                    mirror.start()
+                jev = getattr(app.state.researcher, "jev", None)
+                status = (
+                    "disabled (set WIKI_JEV_ENABLED=1)"
+                    if not settings.jev_enabled
+                    else "configured but unavailable"
+                    if jev is None
+                    else f"enabled backend={jev.backend.name}"
+                )
+                print(f"[growi-search] Jev: {status}", flush=True)
+                if settings.jev_enabled and jev is None:
+                    raise RuntimeError("Jev is enabled but its local model or hosted endpoint is unavailable")
+                threading.Thread(target=app.state.researcher.index_map.snapshot, name="index-map-warmup", daemon=True).start()
+            try:
+                app.state.growi_ok = bool(await asyncio.to_thread(client.health))
+            except Exception as exc:  # noqa: BLE001 - startup probe is informational
+                app.state.growi_ok = False
+                log.warning("GROWI health check failed at startup: %s", exc)
+            log.info(
+                "growi-search ready (growi=%s root=%s llm=%s reranker=%s)",
+                settings.growi_url,
+                settings.growi_root_path,
+                settings.llm_ready,
+                reranker is not None,
+            )
+            yield
+        finally:
+            mirror = getattr(app.state.researcher, "mirror", None)
+            if mirror is not None:
+                mirror.stop()
+            client.close()
 
     app = FastAPI(title="growi-search", lifespan=lifespan)
 
@@ -153,6 +162,8 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
                 "reranker": app.state.reranker is not None,
                 "embedder": app.state.embedder is not None,
                 "jev": getattr(app.state.researcher, "jev", None) is not None,
+                "mirror": bool(getattr(app.state.researcher, "mirror", None) and
+                               app.state.researcher.mirror.ready),
                 "root_path": st.growi_root_path,
             }
         )
@@ -296,8 +307,22 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         run_id = uuid.uuid4().hex
         stop_event = threading.Event()
         out: queue.Queue = queue.Queue()
+        progress_lock = threading.Lock()
+        last_progress = 0.0
 
         def emit(event: dict[str, Any]) -> None:
+            nonlocal last_progress
+            kind = event.get("type")
+            # Walker/cascade route decisions are evaluation data; the chat UI still
+            # shows the reuse/shallow/deep route of the researcher.
+            if kind == "jev_gate" or (kind == "route" and event.get("mode") not in {"reuse", "shallow", "deep"}):
+                return
+            if kind == "jev_progress":
+                now = time.monotonic()
+                with progress_lock:
+                    if event.get("percent") != 100 and now - last_progress < 0.25:
+                        return
+                    last_progress = now
             out.put(event)
 
         async def runner() -> None:

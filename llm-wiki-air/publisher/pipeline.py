@@ -538,10 +538,16 @@ def sync_once(
         try:
             embedder = Embedder(settings) if changed or pending_before else None
         except Exception as exc:
-            log.warning("run=%s stage=embedder error=%s: %s", run_id, type(exc).__name__, exc)
+            if (str(getattr(settings, "embed_backend", "server")) == "off"
+                    and isinstance(exc, ValueError)
+                    and str(exc) == "the linker requires WIKI_EMBED_BACKEND=server"):
+                log.info("run=%s embedder disabled (WIKI_EMBED_BACKEND=off)", run_id)
+            else:
+                log.warning("run=%s stage=embedder error=%s: %s", run_id, type(exc).__name__, exc)
             embedder = None
         source_details = source_details or {}
-        for rel in changed:
+        retried: set[str] = set()
+        for rel in changed:  # grows: a failed document is retried once at the end
             if should_continue is not None and not should_continue():
                 cancelled = True
                 break
@@ -637,6 +643,12 @@ def sync_once(
                 if should_continue is not None and not should_continue():
                     cancelled = True
                     break
+                if rel not in retried:
+                    retried.add(rel)
+                    changed.append(rel)
+                    log.warning("run=%s path=%s stage=generate retry_later error=%s: %s", run_id, rel, type(exc).__name__, exc)
+                    continue
+                # Second failure: skip until the next sync (the error row has no hash).
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 ledger.sources[rel] = _source_row(item, raw_rel, error, details=details, previous=previous_source)
                 save_ledger(ledger_path, ledger)
@@ -1186,7 +1198,12 @@ def link_raw(settings: Any, *, only: list[str] | None = None, force: bool = Fals
         try:
             embedder = Embedder(settings)
         except Exception as exc:
-            log.warning("run=%s stage=embedder error=%s: %s", run_id, type(exc).__name__, exc)
+            if (str(getattr(settings, "embed_backend", "server")) == "off"
+                    and isinstance(exc, ValueError)
+                    and str(exc) == "the linker requires WIKI_EMBED_BACKEND=server"):
+                log.info("run=%s embedder disabled (WIKI_EMBED_BACKEND=off)", run_id)
+            else:
+                log.warning("run=%s stage=embedder error=%s: %s", run_id, type(exc).__name__, exc)
             embedder = None
         try:
             touched = run_linkers(project, pending, settings=settings, llm=model, embedder=embedder, on_progress=on_progress)

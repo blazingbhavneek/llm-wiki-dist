@@ -4,11 +4,10 @@ A **read-only**, self-contained search + research service over a **live GROWI**
 instance. It trims the heavier `llm-wiki` graph service down to exactly three
 things:
 
-1. **Live GROWI keyword search + page reads** (no SQLite, no local index, no
-   vector store — every read hits GROWI through its REST API).
-2. **A reranker-augmented retrieval pipeline** (GROWI Elasticsearch order,
-   optionally re-ranked by a `/v1/rerank` server, then optional section-level
-   rerank of a couple of hydrated pages).
+1. **GROWI keyword search + page reads**, with a local disk mirror for page
+   bodies after warm-up (no SQLite, vector store, or search index).
+2. **Keyword-based retrieval** using GROWI's Elasticsearch order and index-card
+   term overlap. Embeddings and reranking are optional and disabled by default.
 3. **A lead-agent + bounded parallel subagent researcher** that answers a
    question with citations, streamed to the browser over SSE.
 
@@ -37,8 +36,7 @@ growi-search/
 - Python **3.13** and [`uv`](https://docs.astral.sh/uv/).
 - Node **20+** / npm to build the frontend.
 - A reachable GROWI v3 instance and (for `/api/ask`) an OpenAI-compatible chat
-  endpoint. A reranker server is optional — when absent, search keeps
-  Elasticsearch order.
+  endpoint. Embedding and reranker endpoints are not required.
 
 ## Setup
 
@@ -50,6 +48,13 @@ cp /dev/null .env             # optional service-local overrides
 
 Configuration is read from an optional `growi-search/.env` first, then the
 repository `.env` supplies any missing values. Minimal required set:
+
+The service-local `.env` sets `WIKI_EMBED_BASE_URL=` and
+`WIKI_RERANK_BASE_URL=` empty so search uses keyword overlap and Elasticsearch
+order. If that ignored local file is absent, the service also defaults these
+URLs to empty before loading the shared builder `.env`. Process-level
+environment variables and non-empty service-local values can still enable them;
+an inherited process value takes precedence over both files.
 
 To reuse an existing project configuration, set `WIKI_PROJECT=projectA` (or an
 absolute INI path). Its `growi_url`, `growi_token`, `target_name` (as the GROWI
@@ -64,14 +69,36 @@ settings still control all other search-service behavior.
 | `GROWI_ROOT_PATH` | no | Restrict all results/browsing to this path; default `/`. |
 | `WIKI_CHAT_BASE_URL` | ask | Chat endpoint (falls back to `OPENAI_BASE_URL`). |
 | `WIKI_CHAT_MODEL` | ask | Chat model (falls back to `WIKI_MODEL`). |
-| `WIKI_RERANK_BASE_URL` | no | `/v1/rerank` server; if absent, ES order is kept. |
-| `WIKI_EMBED_BASE_URL` / `WIKI_EMBED_MODEL` | no | OpenAI-compatible embeddings for index-card ranking; keyword overlap is used when absent. |
+| `WIKI_SEARCH_LLM_MAX_CONCURRENCY` | no | Process-wide maximum concurrent LLM requests; default `4`. |
+| `WIKI_SUBAGENT_CONCURRENCY` | no | Per-question concurrency, clamped to the process-wide LLM maximum; default `2`. |
+| `WIKI_EMBED_BASE_URL` / `WIKI_EMBED_MODEL` | no | Optional index-card embedding ranking. Empty URL disables it. |
+| `WIKI_RERANK_BASE_URL` | no | Optional `/v1/rerank` service. Empty URL preserves Elasticsearch order. |
 | `WIKI_INDEX_PAGE_NAME` | no | Published index page name; default `00-目次` (what `main.py index` writes). |
 | `WIKI_INDEX_CACHE_TTL` / `WIKI_INDEX_MAP_TOP_K` / `WIKI_INDEX_MAP_EMBED_K` | no | Index-map refresh interval and ranking limits. |
+| `WIKI_WALKER_THRESHOLD` / `WIKI_WALKER_ROUTE_THRESHOLD` | no | Minimum Jev probability for a page result / folder or document expansion; defaults `0.5` / `0.15`. |
+| `WIKI_WALKER_MIN_CHILDREN` / `WIKI_WALKER_K` | no | Minimum children retained while routing / maximum `find` results; defaults `2` / `3`. |
+| `WIKI_WALKER_MAX_ITEMS` | no | Maximum Jev questions per walk; default `150`. |
+| `WIKI_WALKER_ES_RESCUE` | no | Set to `1` to add GROWI Elasticsearch hits as extra walker start nodes; default `0`. |
+| `WIKI_JEV_MODE` | no | `exhaustive` (default) or opt-in `cascade`; exhaustive remains the default pending real-corpus evaluation. |
+| `WIKI_CASCADE_MAX_DOCS` / `WIKI_CASCADE_SECTION_THRESHOLD` | no | Cascade routing and section thresholds; defaults `40` / `0.3`. |
+| `WIKI_CASCADE_SUBAGENTS` | no | Cascade subagent limit; default `15`, clamped to `1..32`. |
+| `WIKI_CASCADE_CONTEXT_TOKENS` / `WIKI_CASCADE_SUBAGENT_STEPS` | no | Evidence-token budget and tool steps per cascade subagent; defaults `48000` / `4`. |
+| `WIKI_CASCADE_EARLY_STOP` / `WIKI_ANSWER_CACHE` | no | Cascade sufficiency threshold (`0.9`) and optional mirror-backed answer cache (default off). |
+| `WIKI_JEV_TOC_GATE` / `WIKI_JEV_TOC_GATE_THRESHOLD` | no | Optional Jev check before TOC summarization; default off / `0.2`. |
+| `WIKI_JEV_DETERMINISTIC` / `WIKI_JEV_VERDICT_CACHE` | no | Optional deterministic note/rewrite calls and mirror verdict cache; both default off. |
+| `WIKI_LEAD_AFTER_REPORTS` / `WIKI_AGENT_TOOL_CONCURRENCY` | no | `agent` (default) or `synthesis`; agent tool calls default to concurrency `1`. |
 | `WIKI_ALLOWED_LLM_HOSTS` | no | Optional comma-separated allowlist for per-request LLM override hosts; the configured chat host is always allowed. |
 | `WIKI_PREFIX` | no | Public path prefix; default `/growi-search`. |
 
-The full, documented env contract (candidates, top-k, budgets, cache, subagent
+The local mirror defaults to `../data/growi-search-mirror`, polls every 10
+seconds, and relists every 30 minutes. Set `WIKI_MIRROR_DIR=` to disable it.
+`WIKI_MIRROR_CHANGES=auto` prefers the audit log and falls back to recent-page
+polling when audit access is denied. In recent mode, edits are polled but
+deletes and renames are detected at the periodic full relist. The mirror stores
+compressed page bodies on disk and a bounded in-memory hot set; the namespace
+contains a hash of the token, never the token itself.
+
+The full env contract (candidate limits, budgets, mirror, cache, subagent
 limits, doc-parser URL, usage log, …) is implemented in `config.py`.
 
 ## Run
@@ -153,28 +180,30 @@ missing page → `404 page_not_found`.
 ## How retrieval works
 
 1. `/api/search` (and the router's first hop) makes **exactly one** GROWI
-   `/_api/search` call, ranks the `<title>\n<path>\n<snippet>` candidates with
-   the reranker (ES order if unavailable), and returns snippets — never page
-   bodies.
-1. The optional index map reads the root `/<root>/00-目次` and each document's
-   `<document>/00-目次`. It ranks page cards by embedding cosine plus reranking,
-   or by term overlap plus reranking when embeddings are unavailable. Index
-   refreshes are process-local and do not consume per-run page budgets.
-2. `/api/ask` runs the router: `shallow` answers from ≤ `WIKI_SHALLOW_PAGE_READS`
-   hydrated pages (section-reranked evidence); `deep` hands the lead agent the
-   candidates. Failed hydration falls back to deep.
-3. The lead agent (`search` / `explore` / `finish`) spawns bounded parallel
+   `/_api/search` call and returns snippets in Elasticsearch order — never page
+   bodies. Reranking is optional.
+2. The optional index map reads the root `/<root>/00-目次` tree and document
+   indexes. It ranks page cards by term overlap when embeddings are disabled;
+   embeddings and reranking can be enabled separately. Index refreshes are
+   process-local and do not consume per-run page budgets.
+3. `/api/ask` runs the router: `shallow` answers from ≤ `WIKI_SHALLOW_PAGE_READS`
+   hydrated pages; section reranking is optional. `deep` hands the lead agent
+   the candidates. Failed hydration falls back to deep.
+4. The lead agent (`search` / `explore` / `finish`) spawns bounded parallel
    subagents (`read` / `follow_link` **outgoing-only** / `search` / `finish`).
    Every page body and ES call is charged to a shared per-run budget
    (`WIKI_MAX_PAGE_FETCHES_PER_RUN`, `WIKI_MAX_SEARCH_CALLS_PER_RUN`); duplicate
-   reads/searches are memoized and a process-local TTL page cache (
-   `WIKI_PAGE_CACHE_*`) is shared across subagents. Nothing is persisted to disk.
+   reads/searches are memoized and the process-local TTL page cache
+   (`WIKI_PAGE_CACHE_*`) is shared across subagents. With the mirror enabled,
+   page bodies are also persisted in its disk cache.
 
 ## Jev relevance gate (optional)
 
 Jev ([chaoliangUNSW/Jev-Style-0.8B-Decision-v3](https://huggingface.co/chaoliangUNSW/Jev-Style-0.8B-Decision-v3))
 is a per-question **relevance gate**, not an answer generator. When enabled,
-each `/api/ask` question first runs an exhaustive sweep of every visible
+each `/api/ask` question runs either the default exhaustive sweep or the opt-in
+cascade pipeline (`WIKI_JEV_MODE=cascade`). Keep exhaustive mode as the default
+until WP-15 meets its quality targets on the real corpus. In exhaustive mode, each question first runs a sweep of every visible
 document: `00-目次` cards are batch-scored, candidates are confirmed by full
 page reads (chunked to the model's 25,600-token input ceiling with the
 configured overlap), and entity-defining card edges are followed across
@@ -243,11 +272,13 @@ WIKI_JEV_API_KEY=secret-if-required
 | --- | --- |
 | `WIKI_JEV_THRESHOLD` | candidate gate on card scores (default `0.50`). |
 | `WIKI_JEV_SEED_THRESHOLD` | full-read seed gate (default `0.80`, must be ≥ threshold). |
-| `WIKI_JEV_DEVICE` | local runtime device: `auto` (default), `cuda`, `mps`, `cpu`. Set `cuda` in production so a GPU that disappears is a startup error, not a 30× slowdown. |
-| `WIKI_JEV_DTYPE` | local runtime weights: `bfloat16` (default), `float16`, `float32`. bf16 becomes fp16 automatically when the GPU has no bf16. Questions are scored one per forward pass — the GPU is the speed lever, not batching. |
+| `WIKI_JEV_DEVICE` | local runtime device: `auto` (default), `cuda`, `mps`, `cpu`. |
+| `WIKI_JEV_DTYPE` | local runtime weights: `bfloat16` (default), `float16`, `float32`. |
+| `WIKI_JEV_MODEL_REVISION` | Optional Hugging Face commit pin for the runtime and model snapshot. |
+| `WIKI_JEV_MAX_BATCH_REQUESTS` | Engine request cap (default `64`). |
+| `WIKI_JEV_RECORD` / `WIKI_JEV_RECORD_MAX` | Optional JSONL path and maximum requests to record for parity checks (default `300`). |
 | `WIKI_JEV_CHUNK_TOKENS` / `WIKI_JEV_CHUNK_OVERLAP` | body chunking (defaults `25600` / `10000`). |
-| `WIKI_JEV_BATCH_SIZE` | cards per batched score call (default `64`). |
-| `WIKI_JEV_WORKERS` | concurrent fetch+classify threads in the sweep pipeline (default `4`). The local adapter serializes model calls, so extra workers overlap GROWI reads, not scoring; a hosted adapter gains real parallel scoring. |
+| `WIKI_JEV_WORKERS` | concurrent fetch+classify threads in the sweep pipeline (default `4`). The shared `jev/` engine owns model access on one worker while callers prepare requests. |
 | `WIKI_JEV_SUBAGENT_GROUP_SIZE` / `WIKI_JEV_SUBAGENT_GROUPS` | seeds per seed-group subagent / max such subagents per question (defaults `5` / `8`). Size `WIKI_JEV_SUBAGENT_GROUPS × WIKI_JEV_SUBAGENT_GROUP_SIZE` pages into `WIKI_MAX_PAGE_FETCHES_PER_RUN` or the groups starve. |
 | `WIKI_JEV_PREFILTER_MIN_OVERLAP` | keyword units a page must share with the rewritten question before it gets an expensive body score (default `2`, `0` = off). Dropped pages are counted in `jev_complete.prefiltered`: if that number climbs and seeds collapse, even the rewrite missed the corpus's vocabulary — lower this to `1`, then `0`. |
 | `WIKI_JEV_MAX_PAGE_READS` / `WIKI_JEV_MAX_LIST_CALLS` | independent sweep safety valves; `0` = unlimited. The sweep is exhaustive and can cost many GROWI reads. |
@@ -270,10 +301,11 @@ distributions — and the yes *count* travels with the average, since an average
 zero yeses and an average of zero confidence would otherwise look identical. The
 console gets the same numbers as a heartbeat every 25 verdicts
 (`Jev sweep: 63% 646/1019 scored=612 yes=18 avg_p=0.71 card_avg_p=0.83`).
-The `/score`
-wire contract (structured `state` + ordered `questions` → ordered `p(はい)`)
-is **this service's adapter contract**, not a claim that the Hugging Face page
-exposes a generic text-generation endpoint. Local mode checks a complete
+The `/score` wire contract (structured `state` + ordered `questions` → ordered
+`p(はい)`) is **this service's adapter contract**, not a claim that the Hugging
+Face page exposes a generic text-generation endpoint. All backends are selected
+inside the shared `jev/` package; growi-search only calls its `score_many` shim.
+Local mode checks a complete
 `WIKI_JEV_LOCAL_PATH` first; when it is unset, it checks the standard Hugging
 Face cache. Only a missing/incomplete snapshot is downloaded, synchronously at
 server startup, before `/api/ready` can succeed. The local runtime dependencies

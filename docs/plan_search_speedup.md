@@ -2662,13 +2662,21 @@ variable must also be:
 |---|---|---|---|---|
 | Baseline | | | `62eca14`, exhaustive | timings of 5 fixed questions (WP-01) |
 | WP-07 mirror | | | warmed mirror | `growi_get`, `growi_list` per question |
-| WP-09 P0 | | | torch bf16 | parity max \|Δp\| vs float32; benchmark row |
-| WP-10 P1 | | | batching | benchmark rows at concurrency 1/8/32; `fast_kernels` |
-| WP-10 P2 | | | gguf exact / batched, torch share-state | benchmark `--decide-many` rows, parity |
+| WP-09 P0 | 2026-09-26 | synthetic (3 parity cases) | RTX 5060 Ti; local 0.8B model, bf16 | max \|Δp\| vs float32 `0.0008957`; 0 flips |
+| WP-10 P1 | 2026-09-26 | synthetic 2K-token states (10 states, concurrency 4) | batched scoring; `fast_kernels=false` | `3.75 q/s` (1 q/state); `5.54 q/s` (5 q/state) |
+| WP-10 P2 | 2026-09-26 | synthetic parity | shared-state scoring | max \|Δp\| `0.0172`; parity failed, remains disabled |
 | WP-12 | | | `calibrate-jev` | chosen thresholds, precision / recall |
 | WP-13 | | | per-card states | `jev_cards` ms before/after |
 | WP-16 A–D | | | each item on | evaluation metrics |
 | WP-17 | | | cascade | evaluation metrics, time to first finding / answer token |
+
+**WP-15 evaluation status (2026-09-26):** The sequential runner and comparison harness
+are implemented, and the two-run comparison smoke test passes on synthetic records.
+No real teacher run or quality metrics are available: this host has no
+`data/eval/questions.jsonl`, and the configured Growi endpoint timed out. The real
+corpus evaluation gate remains open; no recall target is claimed as met.
+The WP-09/10 values above are synthetic GPU smoke measurements, not corpus-level
+performance or quality gates; no unmeasured concurrency rows are inferred.
 
 ### 2.4 Final acceptance checklist (the whole plan)
 

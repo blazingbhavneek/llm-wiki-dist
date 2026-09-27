@@ -18,7 +18,7 @@ const STR = {
     depth: 'リサーチの深さ',
     depthHelp: (a, b) => `各エクスプローラーは回答前に ${a}〜${b} 個のノードを読みます。`,
     net: '検索の網',
-    netHelp: (k, top) => `各検索は Elasticsearch 候補 ${k} 件と索引カード ${top} 件を再ランクします。`,
+    netHelp: (k, top) => `各検索で Elasticsearch 候補 ${k} 件と索引カード ${top} 件を使います。`,
     subagents: 'サブエージェント',
     subHelp: (n, at) => `${n} 個の並列エクスプローラー（同時最大 ${at}）。`,
     cloudWarn: '⚠ クラウドエンドポイントです。探索量を増やすと費用も増える可能性があります。',
@@ -40,7 +40,7 @@ const STR = {
     depth: 'Research depth',
     depthHelp: (a, b) => `Each explorer reads ${a}–${b} nodes before answering.`,
     net: 'Search breadth',
-    netHelp: (k, top) => `Each search reranks ${k} Elasticsearch candidates and ${top} index cards.`,
+    netHelp: (k, top) => `Each search uses ${k} Elasticsearch candidates and ${top} index cards.`,
     subagents: 'Sub-agents',
     subHelp: (n, at) => `${n} parallel explorers (up to ${at} concurrent).`,
     cloudWarn: '⚠ This is a cloud endpoint. More exploration may increase cost.',
@@ -55,6 +55,7 @@ const FALLBACK_DEFAULTS = {
   chat_api_key: '',
   chat_model: '',
   chat_temperature: 0.2,
+  llm_max_concurrency: 4,
   subagent_min_reads: 1,
   subagent_max_reads: 4,
   subagent_max_steps: 20,
@@ -110,13 +111,13 @@ function nearestLevel(table, field, value) {
   }, { index: 0, distance: Infinity }).index
 }
 
-const agentsFields = (n) => ({ subagent_count: n, subagent_concurrency: Math.min(n, 4) })
+const agentsFields = (n, ceiling) => ({ subagent_count: n, subagent_concurrency: Math.min(n, ceiling) })
 
-function buildPatch({ chat, depth, net, agents }) {
+function buildPatch({ chat, depth, net, agents, ceiling }) {
   return {
     ...DEPTH[depth].fields,
     ...NET[net].fields,
-    ...agentsFields(agents),
+    ...agentsFields(agents, ceiling),
     chat_base_url: clean(chat.chat_base_url),
     // The server key is never sent to the browser; only override it when the user typed one.
     ...(clean(chat.chat_api_key) ? { chat_api_key: clean(chat.chat_api_key) } : {}),
@@ -161,7 +162,8 @@ export default function SettingsView({ overrides, onApply }) {
     return () => { live = false }
   }, [])
 
-  const patch = useMemo(() => buildPatch({ chat, depth, net, agents }), [chat, depth, net, agents])
+  const ceiling = Number(defaults.llm_max_concurrency) || 4
+  const patch = useMemo(() => buildPatch({ chat, depth, net, agents, ceiling }), [chat, depth, net, agents, ceiling])
 
   useEffect(() => {
     if (!initialized) return
@@ -208,7 +210,7 @@ export default function SettingsView({ overrides, onApply }) {
           <LevelSlider label={t.net} value={net} labels={t.netLevels} onChange={setNet} />
           <p className="-mt-4 text-[12px] text-neutral-500">{t.netHelp(NET[net].fields.search_candidates, NET[net].fields.index_map_top_k)}</p>
           <Slider label={t.subagents} min="1" max={MAX_AGENTS} step="1" value={agents} onChange={(v) => setAgents(Math.max(1, Math.min(MAX_AGENTS, Number(v))))} />
-          <p className="-mt-4 text-[12px] text-neutral-500">{t.subHelp(agents, Math.min(agents, 4))}</p>
+          <p className="-mt-4 text-[12px] text-neutral-500">{t.subHelp(agents, Math.min(agents, ceiling))}</p>
         </div>
       </section>
 
