@@ -33,13 +33,19 @@ def _apply_model_patches(current: str, result: Any, expected: set[int]) -> str:
     replacements: list[tuple[int, int, str]] = []
     for patch in patches:
         before = str(patch.before)
-        if not before or current.count(before) != 1:
-            raise ValueError("each patch.before must occur exactly once in the current page")
+        found = current.count(before) if before else 0
+        if found != 1:
+            fix = ("copy it character for character from the current page" if not found
+                   else "include more surrounding text so it matches only one place")
+            raise ValueError(f"each patch.before must occur exactly once in the current page; "
+                             f"{before[:120]!r} occurs {found} times: {fix}")
         start = current.index(before)
         replacements.append((start, start + len(before), str(patch.after)))
     replacements.sort()
-    if any(left[1] > right[0] for left, right in zip(replacements, replacements[1:])):
-        raise ValueError("patch.before ranges overlap")
+    for left, right in zip(replacements, replacements[1:]):
+        if left[1] > right[0]:
+            raise ValueError(f"patch.before ranges overlap ({current[left[0]:left[1]][:80]!r} and "
+                             f"{current[right[0]:right[1]][:80]!r}): merge them into one patch listing both edit ids")
     updated = current
     for start, end, after in reversed(replacements):
         updated = updated[:start] + after + updated[end:]
@@ -452,6 +458,7 @@ def write_wiki_pages(
     identity_seed: str | None = None,
 ) -> WriteResult:
     from graph.formats import kind_of, supports_page_updates
+    from graph.formats.xlsx import decide_update as decide_workbook
     from graph.wiki.export import export_ingest_layout
     from graph.wiki.incremental import FULL_MIN_REGEN_SHARE, UpdateDecision, apply_update, decide_update, drop_pages
     from graph.wiki.pipeline import ResumeUnavailable
@@ -462,8 +469,11 @@ def write_wiki_pages(
     old_source = state_root / "source" / "original.md"
     new_text = project.raw_file(rel).read_text(encoding="utf-8")
     old_text = ""
+    workbook = None
     if not resume:
         decision = UpdateDecision(tier=3, reason="forced")
+    elif mode == "wiki" and kind == "xlsx" and (workbook := decide_workbook(state_root, new_text, project.wiki_dir(rel))):
+        decision = workbook[0]
     elif mode != "wiki" or not supports_page_updates(kind):
         decision = UpdateDecision(tier=3, reason="format-full-only")
     elif not old_source.exists() or not (state_root / "state" / "plan.json").exists():
@@ -498,7 +508,18 @@ def write_wiki_pages(
     work.mkdir(parents=True)
     try:
         out_dir: Path | None = None
-        if decision.tier in (0, 1, 2):
+        if workbook is not None and decision.tier in (0, 2):
+            # A workbook keeps state only for its 解説 run: sheet pages are re-rendered and
+            # the run resumes every 解説 page except the dropped ones. Unchanged: keep all.
+            if decision.reason != "unchanged":
+                human = apply_update(state_root / "excel-story", decision, workbook[1])
+                out_dir = build_wiki_output(
+                    source_path=project.raw_file(rel), document_name=rel, out_dir=work / "out",
+                    mode=mode, settings=settings, llm=llm, embedder=embedder,
+                    state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
+                    source_kind=kind, resume=True,
+                ).out_dir
+        elif decision.tier in (0, 1, 2):
             human = apply_update(state_root, decision, new_text)
             write_text_atomic(old_source, new_text)
             failed: dict[str, str] = {}
@@ -513,7 +534,7 @@ def write_wiki_pages(
                 decision.regenerate |= set(failed)
                 decision.tier, decision.reason = 2, "patch-escalated"
                 if on_progress:
-                    on_progress({"stage": "wiki", "step": "patch_escalated", "file": rel, "pages": sorted(failed)})
+                    on_progress({"stage": "wiki", "step": "patch_escalated", "file": rel, "pages": sorted(failed), "errors": failed})
             if len(decision.regenerate) > FULL_MIN_REGEN_SHARE * max(len(names), 1):
                 decision = UpdateDecision(tier=3, reason="escalated-most-pages")
             elif decision.regenerate:
@@ -539,11 +560,14 @@ def write_wiki_pages(
                 state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
                 source_kind=kind, resume=False,
             ).out_dir
-        rebuild = "full" if decision.tier == 3 else "incremental"
+        # A rebuilt workbook republishes and relinks as a whole (the linker's caches make
+        # unchanged sheets cheap); only its 解説 regeneration is incremental.
+        rebuild = "full" if decision.tier == 3 or (workbook is not None and out_dir is not None) else "incremental"
         after = _page_hashes(state_root / "wiki", _plan_filenames(state_root)) if rebuild == "incremental" else {}
         changed_output_pages = {name for name, digest in after.items() if before.get(name) != digest}
         target = project.wiki_dir(rel)
-        publish_output(out_dir, target)
+        if out_dir is not None:
+            publish_output(out_dir, target)
         write_source_stamp(target, project.raw_file(rel), rel, identity_seed=identity_seed)
         marker = target / "_planning" / "linker.json"
         status = "pending" if getattr(settings, "wiki_linker_enabled", True) else "disabled"

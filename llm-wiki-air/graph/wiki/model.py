@@ -46,6 +46,10 @@ class ModelPort(Protocol):
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 
+# Calls that set no cap would get the rest of the context (262K), so a reasoning loop ran
+# until the request timeout. This bounds them; the reasoning counts toward it.
+DEFAULT_MAX_OUTPUT_TOKENS = 16000
+
 class ChatModelPort:
     """OpenAI-compatible chat endpoint via langchain structured output."""
 
@@ -74,7 +78,7 @@ class ChatModelPort:
         from graph.clients.chat import structured_ainvoke
 
         return await structured_ainvoke(
-            self.llm, schema, list(messages), max_output_tokens=max_output_tokens,
+            self.llm, schema, list(messages), max_output_tokens=max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS,
             temperature=temperature,
         )
 
@@ -87,9 +91,7 @@ class ChatModelPort:
     ) -> str:
         """One bounded plain-text completion; the caller validates the content."""
 
-        kwargs: dict[str, Any] = {}
-        if max_output_tokens is not None:
-            kwargs["max_tokens"] = max_output_tokens
+        kwargs: dict[str, Any] = {"max_tokens": max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS}
         if temperature is not None:
             kwargs["temperature"] = temperature
         kwargs["extra_body"] = {

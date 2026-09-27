@@ -76,10 +76,39 @@ def _validate_legacy_state(project: Project, ledger: Any) -> None:
     orphaned = (
         set(project.raw_files()) - known_raw
         or {path.parent.parent for path in project.wiki.rglob("_planning/source.json")} - known_wiki
-        or {path.parent.parent for path in (project.metadata / "state").rglob("state/plan.json")} - known_state
+        # Tabular documents keep a nested run (e.g. `<state>/excel-story`) inside their state.
+        or {path.parent.parent for path in (project.metadata / "state").rglob("state/plan.json")
+            if not known_state & {path.parent.parent, *path.parent.parent.parents}}
     )
     if orphaned:
         raise RuntimeError("cannot create Git baseline: generated data is not represented by pipeline.json; run a normal repair sync")
+
+
+def _adopt_built_documents(project: Project) -> None:
+    """`convert` + `build` + `publish` leave no source rows. Record the mount file each
+    published document was built from, so the first sync diffs against it instead of
+    refusing to start. The document's id seed is kept, so its GROWI paths do not move."""
+    from .ledger import load_ledger, save_ledger
+    from .pipeline import _raw_rel, _source_row
+    from .scanner import scan_mount
+
+    ledger_path = project.metadata / "pipeline.json"
+    ledger = load_ledger(ledger_path)
+    claimed = {str(row.get("raw_rel") or "") for row in ledger.sources.values()}
+    adopted = False
+    for rel, item in scan_mount(project.mount).files.items():
+        raw_rel = _raw_rel(item)
+        raw, wiki = project.raw_file(raw_rel), project.wiki_dir(raw_rel)
+        marker = read_json(wiki / "_planning" / "source.json", default={})
+        if (rel in ledger.sources or raw_rel in claimed or not raw.is_file()
+                or marker.get("raw") != raw_rel
+                or marker.get("sha256") != hashlib.sha256(raw.read_bytes()).hexdigest()
+                or wiki.relative_to(project.wiki).as_posix() not in ledger.published_documents):
+            continue
+        ledger.sources[rel] = _source_row(item, raw_rel, details={"id_seed": str(marker.get("id_seed") or raw_rel)})
+        adopted = True
+    if adopted:
+        save_ledger(ledger_path, ledger)
 
 
 def _validate_empty_unledgered_state(project: Project) -> None:
@@ -138,6 +167,7 @@ def ensure_repository(project: Project) -> str:
 
         ledger_path = project.metadata / "pipeline.json"
         if ledger_path.exists():
+            _adopt_built_documents(project)
             _validate_legacy_state(project, load_ledger(ledger_path))
         else:
             _validate_empty_unledgered_state(project)
@@ -166,6 +196,7 @@ def ensure_repository(project: Project) -> str:
             ignore.write_text(existing.rstrip() + ("\n" if existing.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
             ledger_path = project.metadata / "pipeline.json"
             if ledger_path.exists():
+                _adopt_built_documents(project)
                 _validate_legacy_state(project, load_ledger(ledger_path))
             else:
                 _validate_empty_unledgered_state(project)

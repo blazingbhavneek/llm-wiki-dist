@@ -757,6 +757,40 @@ class DiffPipelineSafetyTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not represented by pipeline.json"):
                 ensure_repository(project)
 
+    def test_history_adopts_a_published_build_without_source_rows(self) -> None:
+        # `convert` + `build` + `publish` leave published documents but no source rows.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mount = root / "mount"
+            mount.mkdir()
+            project = Project(root / "data", mount).ensure()
+            published = {}
+            for name in ("a.docx", "b.xlsx"):
+                (mount / name).write_bytes(f"source {name}".encode())
+                raw_rel = raw_name_for(name)
+                project.raw_file(raw_rel).write_text(f"# {name}\n", encoding="utf-8")
+                wiki = project.wiki_dir(raw_rel)
+                (wiki / "_planning").mkdir(parents=True)
+                (wiki / "001.md").write_text("page", encoding="utf-8")
+                digest = hashlib.sha256(project.raw_file(raw_rel).read_bytes()).hexdigest()
+                (wiki / "_planning" / "source.json").write_text(
+                    json.dumps({"raw": raw_rel, "sha256": digest, "id_seed": raw_rel}), encoding="utf-8")
+                state = project.state_dir(raw_rel) / "state"
+                state.mkdir(parents=True)
+                (state / "plan.json").write_text("{}", encoding="utf-8")
+                published[wiki.relative_to(project.wiki).as_posix()] = {"raw_rel": raw_rel}
+            nested = project.state_dir(raw_name_for("b.xlsx")) / "excel-story" / "state"
+            nested.mkdir(parents=True)
+            (nested / "plan.json").write_text("{}", encoding="utf-8")
+            save_ledger(project.metadata / "pipeline.json", Ledger({}, published))
+
+            ensure_repository(project)
+
+            sources = load_ledger(project.metadata / "pipeline.json").sources
+            self.assertEqual(set(sources), {"a.docx", "b.xlsx"})
+            self.assertEqual(sources["a.docx"]["id_seed"], raw_name_for("a.docx"))  # GROWI paths stay put
+            self.assertTrue(sources["a.docx"]["source_blob_oid"])
+
     def test_queued_blob_survives_git_garbage_collection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

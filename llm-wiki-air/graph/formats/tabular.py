@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv as _csv
+import hashlib
 import io
 import json
 import re
@@ -508,7 +509,7 @@ async def write_tables(
     generate_analyses: bool = True,
 ) -> list[dict[str, Any]]:
     from langchain_core.messages import HumanMessage
-    from graph.wiki.storage import write_json_atomic, write_text_atomic
+    from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
 
     docs = Path(run_dir) / "docs"
     docs.mkdir(parents=True, exist_ok=True)
@@ -541,16 +542,27 @@ async def write_tables(
                     "sheet": sheet,
                 })
             regions = [] if is_vba else find_regions(grid)
-            description = await describe_vba(
-                sheet,
-                table_text,
-                model=model,
-                language=config.output_language,
-            ) if is_vba else None
-            structure = SheetStructure(
-                summary=description.summary,
-                tables=[],
-            ) if description else SheetStructure(summary="（大きすぎるため原本のみ）", tables=[]) if not regions or "_Sparse cell view" in table_text else await decide_structure(sheet, grid, regions, model=model, config=config)
+            # An unchanged sheet reuses its LLM answers, so a workbook update pays only for
+            # the sheets that changed. The cache lives in the run state a full rebuild deletes.
+            digest = hashlib.sha256(f"{sheet}\0{table_text}".encode("utf-8")).hexdigest()[:32]
+            cache = Path(config.run_dir) / "sheet-cache" / f"{digest}.json" if getattr(config, "run_dir", None) else None
+            cached = read_json(cache, default={}) if cache else {}
+            if cached:
+                description = VbaDescription.model_validate(cached["vba"]) if cached.get("vba") else None
+                structure = SheetStructure.model_validate(cached["structure"])
+            else:
+                description = await describe_vba(
+                    sheet,
+                    table_text,
+                    model=model,
+                    language=config.output_language,
+                ) if is_vba else None
+                structure = SheetStructure(
+                    summary=description.summary,
+                    tables=[],
+                ) if description else SheetStructure(summary="（大きすぎるため原本のみ）", tables=[]) if not regions or "_Sparse cell view" in table_text else await decide_structure(sheet, grid, regions, model=model, config=config)
+                if cache:
+                    write_json_atomic(cache, {"vba": description.model_dump() if description else None, "structure": structure.model_dump()})
             tables = []
             for spec in structure.tables:
                 columns, records = records_for(grid, spec)

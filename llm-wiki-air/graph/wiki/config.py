@@ -20,7 +20,8 @@ class WikiConfig(BaseModel):
     # Final range compiler tries per run; the document fails after this many.
     map_attempts: int = 100
     planner_max_output_tokens: int = 4000
-    map_max_output_tokens: int = 32000
+    # Plans are small JSON; the cap only bounds reasoning loops (one ran 10 min on a 15-line file).
+    map_max_output_tokens: int = 16000
     # Planner target per page; pages over twice this are split at headings by Python.
     page_target_lines: int = 100
 
@@ -29,7 +30,9 @@ class WikiConfig(BaseModel):
     section_target_lines: int = 80
     section_min_lines: int = 8
     write_attempts: int = 3
-    write_max_output_tokens: int = 8000
+    # Reasoning plus the whole section (a long table section is ~7K tokens). Higher lets a
+    # reasoning loop run ~15 min per attempt; lower cuts table rows off.
+    write_max_output_tokens: int = 16000
     intro_max_output_tokens: int = 1500
     reference_candidates: int = 6
     reference_attempts: int = 3

@@ -284,6 +284,65 @@ async def _append_story(
         })
 
 
+STORY_LINE_RE = re.compile(r"^Excelシート部分 \d+ / シート: (.*?) / 参照セル範囲: (.*?) / 内容: ", re.MULTILINE)
+
+
+def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any, str] | None:
+    """Tier for a changed workbook, decided on its 解説 run (one story line per sheet).
+
+    Same sheets and columns (cells or rows changed): sheet pages are re-rendered and only
+    the 解説 pages that cover or quote a changed sheet are regenerated. A sheet added,
+    removed or renamed, or a changed column span, rebuilds the workbook. Returns
+    (decision, new story text), or None when no previous 解説 run exists.
+    """
+    import hashlib
+
+    from graph.wiki.incremental import FULL_MIN_REGEN_SHARE, UpdateDecision, source_lines
+    from graph.wiki.storage import read_json
+
+    story_run, old_path = Path(state_root) / "excel-story", Path(state_root) / "excel-story-source.md"
+    plan = read_json(story_run / "state" / "plan.json", default={})
+    if not old_path.exists() or not plan.get("pages"):
+        return None
+    new_story, _spans = _story_source(split_sheets(new_text.splitlines()))
+    marker = read_json(Path(wiki_dir) / "_planning" / "source.json", default={})
+    if marker.get("sha256") == hashlib.sha256(new_text.encode("utf-8")).hexdigest():
+        return UpdateDecision(tier=0, reason="unchanged"), new_story
+    old_story = old_path.read_text(encoding="utf-8")
+
+    def shape(text: str) -> list[tuple[str, tuple[int, int]]]:
+        # Sheet names and each sheet's column span; a big sheet's size-cut parts
+        # ("-partN") move their cell boundaries on any edit, so they are merged.
+        sheets: dict[str, tuple[int, int]] = {}
+        for sheet, cells in STORY_LINE_RE.findall(text):
+            columns = [sum(26 ** i * (ord(c) - 64) for i, c in enumerate(reversed(letters)))
+                       for letters in re.findall(r"[!:]\$?([A-Z]+)\$?\d", cells)]
+            base = re.sub(r"-part\d+$", "", sheet, flags=re.IGNORECASE)
+            low, high = sheets.get(base, (10 ** 9, 0))
+            sheets[base] = (min([low, *columns]), max([high, *columns]))
+        return list(sheets.items())
+
+    old_lines, new_lines = source_lines(old_story), source_lines(new_story)
+    if (shape(old_story) != shape(new_story) or len(old_lines) != len(new_lines)
+            or int(plan.get("source_line_count", -1)) != len(old_lines)):
+        return UpdateDecision(tier=3, reason="sheets-or-columns-changed"), new_story
+    # Same sheets in the same order, one story line each: lines map one to one, so a
+    # changed sheet regenerates every 解説 page that covers or quotes it (no stale value).
+    changed = {number for number, (old, new) in enumerate(zip(old_lines, new_lines), 1) if old != new}
+
+    def touches(ranges: list[list[int]]) -> bool:
+        return any(int(first) <= number <= int(last) for first, last in ranges for number in changed)
+
+    stale = {str(page["filename"]) for page in plan["pages"] if touches(page.get("reference_ranges", []))}
+    regenerate = stale | {str(page["filename"]) for page in plan["pages"] if touches(page.get("owner_ranges", []))}
+    if len(regenerate) > FULL_MIN_REGEN_SHARE * len(plan["pages"]):
+        return UpdateDecision(tier=3, reason="most-pages-changed"), new_story
+    return UpdateDecision(
+        tier=2 if regenerate else 0, reason="sheets-changed" if regenerate else "story-unchanged",
+        old_count=len(old_lines), new_count=len(new_lines), regenerate=regenerate, research_stale=stale,
+    ), new_story
+
+
 async def run(source_path: Path, *, run_dir: Path, model: Any, config: Any, on_progress=None, stop_check=None):
     lines = source_path.read_text(encoding="utf-8").splitlines()
     sheets = split_sheets(lines)
