@@ -71,7 +71,11 @@ class DeckSections(BaseModel):
     sections: list[Section] = Field(default_factory=list)
 
 
-async def judge_sections(slides: Sequence[Slide], *, model: Any, language: str) -> list[Section]:
+async def judge_sections(
+    slides: Sequence[Slide], *, model: Any, language: str,
+    attempts: int = 1, retry_temperature: float | None = None,
+    stop_check=None,
+) -> list[Section]:
     from langchain_core.messages import HumanMessage
 
     candidates = divider_candidates(slides)
@@ -82,11 +86,38 @@ async def judge_sections(slides: Sequence[Slide], *, model: Any, language: str) 
         "スライド番号\t区切り候補\t本文行数\t見出し/冒頭\n" + rows + f"\n\n出力言語: {language}。JSON のみ。"
     )
     numbers = {s.number for s in slides}
-    try:
-        result = await model.structured(DeckSections, [HumanMessage(content=prompt)])
-        starts = sorted({s.start_slide: s.title for s in result.sections if s.start_slide in numbers}.items())
-    except Exception:
-        starts = []
+    feedback = ""
+    starts: list[tuple[int, str]] = []
+    for _attempt in range(max(1, attempts)):
+        if stop_check and stop_check():
+            raise RuntimeError("slide section planning cancelled")
+        correction = (
+            "\n\n前回の構造化結果は検証に失敗した。スライド番号を修正して返すこと。\n"
+            f"検証エラー: {feedback}\n"
+            if feedback else ""
+        )
+        try:
+            result = await model.structured(
+                DeckSections,
+                [HumanMessage(content=prompt + correction)],
+                temperature=retry_temperature,
+            )
+            raw_starts = [int(section.start_slide) for section in result.sections]
+            invalid = sorted(set(raw_starts) - numbers)
+            starts = sorted(
+                {s.start_slide: s.title for s in result.sections if s.start_slide in numbers}.items()
+            )
+            if invalid:
+                feedback = f"存在しないスライド番号を指定した: {invalid}"
+            elif not starts:
+                feedback = "有効なセクション開始スライドが1件もない"
+            elif starts[0][0] != min(numbers):
+                feedback = f"最初のセクションはスライド{min(numbers)}から開始する必要がある"
+            else:
+                break
+        except Exception as exc:
+            starts = []
+            feedback = f"{type(exc).__name__}: {exc}"
     if not starts or starts[0][0] != min(numbers):
         starts = [(n, next(s.title or s.first_text for s in slides if s.number == n)) for n in (candidates or [min(numbers)])]
         if starts[0][0] != min(numbers):
@@ -98,7 +129,14 @@ async def plan(lines: Sequence[str], *, config: Any, model: Any, on_progress=Non
     slides = split_slides(lines, delimiter=config.slide_delimiter, title=config.slide_title)
     if len(slides) < 2:
         return None
-    sections = await judge_sections(slides, model=model, language=config.output_language)
+    sections = await judge_sections(
+        slides,
+        model=model,
+        language=config.output_language,
+        attempts=config.planner_attempts,
+        retry_temperature=config.retry_temperature,
+        stop_check=stop_check,
+    )
     starts = [s.start_slide for s in sections]
     groups = []
     for index, section in enumerate(sections):

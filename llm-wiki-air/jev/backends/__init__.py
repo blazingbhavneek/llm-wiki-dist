@@ -20,4 +20,7 @@ def make_backend(config):
     if config.backend == "hosted":
         from .hosted import HostedBackend
         return HostedBackend(config)
+    if config.backend in {"llm2jev", "systemone", "sglang", "vllm", "jpt"}:
+        from .llm2jev import Llm2JevBackend
+        return Llm2JevBackend(config)
     raise ValueError(f"unknown Jev backend: {config.backend}")

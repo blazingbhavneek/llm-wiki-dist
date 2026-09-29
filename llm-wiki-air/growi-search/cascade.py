@@ -18,7 +18,7 @@ from gateway import (JevQuestion, jev_cascade_profile_questions,
 from jev.types import JevQuestion as EngineQuestion, JevRequest, JevUnavailable
 from models import AgentAnswer
 from prompts import JEV_QUERY_REWRITE_PROMPT, PACKED_SUBAGENT_PROMPT, SYNTHESIS_PROMPT
-from researcher import AgentStopped, IndexMap, _check_stop, sanitize_text
+from researcher import AgentStopped, IndexMap, _check_stop, _llm_output_capped, sanitize_text
 
 log = logging.getLogger("growi_search_cascade")
 
@@ -425,10 +425,17 @@ def _run_cascade(session: Any, question: str, emit: Callable,
                                            for section in selected]})
     payload = json.dumps({"question": question, "seeds": seed_evidence, "reports": reports}, ensure_ascii=False)
     deltas = []
-    answer = session.llm.stream(SYNTHESIS_PROMPT, payload,
-                                lambda delta: (deltas.append(delta), emit({"type": "answer_delta", "text": delta})))
+    answer = session.llm.stream(
+        SYNTHESIS_PROMPT,
+        payload,
+        lambda delta: (deltas.append(delta), emit({"type": "answer_delta", "text": delta})),
+        max_tokens=session.settings.final_compiler_tokens,
+    )
     session._record_usage()
     answer = sanitize_text(answer or "".join(deltas))
+    if _llm_output_capped(session.llm, session.settings.final_compiler_tokens) or not answer.strip():
+        # A capped/empty compiler response must not erase the completed reports.
+        answer = sanitize_text("\n\n".join(reports).strip())
     known = set(seed_ids) | set(cited)
     citation_block = answer.split("引用:", 1)[-1] if "引用:" in answer else ""
     answer_ids = re.findall(r"^\s*([0-9a-fA-F]{24})\s*:", citation_block, flags=re.M)

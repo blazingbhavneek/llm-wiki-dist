@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Callable
 
 import httpx
@@ -77,7 +77,25 @@ class LlmClient:
         self.retry_attempts = max(0, retry_attempts)
         self.retry_delay_seconds = max(0.0, retry_delay_seconds)
         self.llm = self._make_llm()
+        self._call_state = local()
         self.last_usage: dict[str, Any] = {}
+        self.last_finish_reason = ""
+
+    @property
+    def last_usage(self) -> dict[str, Any]:
+        return getattr(self._call_state, "usage", {})
+
+    @last_usage.setter
+    def last_usage(self, value: dict[str, Any]) -> None:
+        self._call_state.usage = value
+
+    @property
+    def last_finish_reason(self) -> str:
+        return getattr(self._call_state, "finish_reason", "")
+
+    @last_finish_reason.setter
+    def last_finish_reason(self, value: str) -> None:
+        self._call_state.finish_reason = value
 
     def _make_llm(self) -> ChatOpenAI:
         return ChatOpenAI(
@@ -92,10 +110,18 @@ class LlmClient:
             max_tokens=self.max_tokens or None,
         )
 
-    def run_messages(self, messages: list[dict[str, Any]]) -> str:
+    def _for_output_tokens(self, max_tokens: int | None) -> Any:
+        """Bind a per-call output budget without changing this client's default."""
+        if max_tokens is None or int(max_tokens) <= 0:
+            return self.llm
+        return self.llm.bind(max_tokens=int(max_tokens))
+
+    def run_messages(self, messages: list[dict[str, Any]], max_tokens: int | None = None) -> str:
         def operation() -> str:
-            response = self.llm.invoke(self._norm(messages))
+            self.last_finish_reason = ""
+            response = self._for_output_tokens(max_tokens).invoke(self._norm(messages))
             self.last_usage = getattr(response, "usage_metadata", None) or {}
+            self.last_finish_reason = (getattr(response, "response_metadata", None) or {}).get("finish_reason", "")
             text = _as_text(getattr(response, "content", ""))
             if not text:
                 raise RuntimeError("LLM returned empty response")
@@ -121,23 +147,27 @@ class LlmClient:
 
         return self._with_retries(operation, f"structured:{output_model.__name__}")
 
-    def complete(self, system_prompt: str, user_content: str) -> str:
+    def complete(self, system_prompt: str, user_content: str, max_tokens: int | None = None) -> str:
         return self.run_messages(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
-            ]
+            ], max_tokens=max_tokens
         )
 
-    def stream(self, system: str, user: str, on_delta: Callable[[str], None]) -> str:
+    def stream(self, system: str, user: str, on_delta: Callable[[str], None],
+               max_tokens: int | None = None) -> str:
         """Stream text chunks and return the same complete response."""
         text: list[str] = []
         usage: dict[str, Any] = {}
-        for chunk in self.llm.stream(self._norm([
+        self.last_finish_reason = ""
+        for chunk in self._for_output_tokens(max_tokens).stream(self._norm([
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ])):
             usage = getattr(chunk, "usage_metadata", None) or usage
+            self.last_finish_reason = ((getattr(chunk, "response_metadata", None) or {}).get("finish_reason")
+                                       or self.last_finish_reason)
             content = getattr(chunk, "content", "")
             if isinstance(content, str):
                 piece = content
@@ -366,7 +396,7 @@ class JevQuestion:
 
 
 def jev_question_text(query: str, subject: str = "") -> str:
-    """Canonical Japanese yes/no question, asking whether the page contains the answer."""
+    """Canonical Japanese yes/no question, asking whether the page contains the scoped answer."""
     target = f"対象: {subject}\n" if subject else ""
     return (
         f"{target}"
@@ -374,6 +404,7 @@ def jev_question_text(query: str, subject: str = "") -> str:
         "（要求された一覧・表・値・定義・手順が、このページ内で実際に述べられているもの）を"
         "含んでいますか？\n"
         f"質問: {query}\n"
+        "質問の範囲に応じた必要な証拠（値、定義、複数項目、章など）を実際に含む必要があります。"
         "同じ話題を一般論として述べているだけ、用語や関数名が略式的に現れるだけ、"
         "他のページへのリンクや目次になっているだけのページは いいえ と答えてください。\n"
         "選択肢: はい / いいえ"
@@ -397,8 +428,12 @@ def jev_page_question(description: str) -> str:
 
 
 def jev_toc_question(query: str) -> str:
-    return ("この目次に、次の質問に関係する項目は含まれていますか？\n"
-            f"質問: {query}\n"
+    return ("この文書の00-目次にある項目だけを根拠に、質問の検索意図に必要な証拠を含むページへ"
+            "到達できる具体的な手がかりがあるか判定してください。単に同じ製品・分野に属するだけ、"
+            "対象名が一度出るだけ、リンク集・目次・概要だけの場合は いいえ です。\n"
+            f"検索意図: {query}\n"
+            "質問の範囲が広い場合は、要求された複数項目・一覧・章の手がかりが必要です。"
+            "範囲が狭い場合は、指定された対象と必要な詳細に一致する手がかりが必要です。\n"
             "選択肢: はい / いいえ")
 
 
@@ -436,7 +471,7 @@ def build_jev(settings: Settings):
             backend = "hosted" if settings.jev_base_url and not settings.jev_local_path else "torch"
         elif backend == "local":
             backend = "torch"
-        if backend == "hosted" and not settings.jev_base_url:
+        if backend in {"hosted", "llm2jev", "systemone", "sglang", "vllm", "jpt"} and not settings.jev_base_url:
             return None
         config = replace(config, backend=backend, local_path=settings.jev_local_path,
                          device=settings.jev_device, dtype=settings.jev_dtype,

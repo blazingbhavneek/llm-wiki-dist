@@ -129,8 +129,88 @@ class IndexTreeTest(unittest.TestCase):
         doc = self.project.wiki / "teamB/docC"
         shutil.rmtree(doc)
         self.build(["teamB/docC.md"])
+        self.assertFalse((self.project.metadata / "index/teamB/docC/index.md").exists())
         self.assertFalse((self.project.metadata / "index/teamB/index.md").exists())
         self.assertNotIn("[teamB]", self.read_index())
+
+    def test_scoped_move_removes_old_indexes_and_writes_the_new_tree(self):
+        self.build()
+        old = self.project.wiki / "teamB/docC"
+        new = self.project.wiki / "archive/docD"
+        new.parent.mkdir(parents=True)
+        shutil.move(old, new)
+
+        self.build(["teamB/docC.md", "archive/docD.md"])
+
+        self.assertFalse((self.project.metadata / "index/teamB/docC/index.md").exists())
+        self.assertFalse((self.project.metadata / "index/teamB/index.md").exists())
+        self.assertTrue((self.project.metadata / "index/archive/docD/index.md").exists())
+        self.assertIn("[archive]", self.read_index())
+        self.assertNotIn("[teamB]", self.read_index())
+
+    def test_full_build_sweeps_stale_local_index_copies(self):
+        self.build()
+        stale = self.project.metadata / "index/old/location/index.md"
+        stale.parent.mkdir(parents=True)
+        stale.write_text('<span hidden data-llm-wiki-index="document"></span>\n', encoding="utf-8")
+
+        self.build()
+
+        self.assertFalse(stale.exists())
+        self.assertFalse(stale.parent.exists())
+
+    def test_full_build_sweeps_stale_owned_growi_indexes(self):
+        from graph.growi.client import GrowiPage
+
+        class Client:
+            def __init__(self):
+                self.pages = {
+                    "/t/old/location/00-目次": GrowiPage(
+                        page_id="stale", revision_id="1",
+                        path="/t/old/location/00-目次",
+                        body='<span hidden data-llm-wiki-index="document"></span>\n',
+                    ),
+                }
+                self.next_id = 0
+
+            async def get_page(self, *, path=None, page_id=None):
+                if path is not None:
+                    return self.pages.get(path)
+                return next((page for page in self.pages.values() if page.page_id == page_id), None)
+
+            async def list_all_pages(self, _root):
+                return list(self.pages.values())
+
+            async def create_page(self, path, body):
+                self.next_id += 1
+                page = GrowiPage(page_id=f"id{self.next_id}", revision_id="1", path=path, body=body)
+                self.pages[path] = page
+                return page
+
+            async def update_page(self, page_id, revision_id, body):
+                path = next(path for path, page in self.pages.items() if page.page_id == page_id)
+                page = GrowiPage(
+                    page_id=page_id, revision_id=str(int(revision_id) + 1), path=path, body=body,
+                )
+                self.pages[path] = page
+                return page
+
+            async def delete_pages(self, pages):
+                ids = set(pages)
+                for path, page in list(self.pages.items()):
+                    if page.page_id in ids:
+                        del self.pages[path]
+
+        client = Client()
+        connection = SimpleNamespace(write_path="/t", root_path="/t", mode="attach")
+        publisher = SimpleNamespace(client=client, connection=connection)
+        with mock.patch("publisher.index._connection", return_value=connection), \
+             mock.patch("publisher.index._publisher", return_value=publisher):
+            result = build_index(self.settings, publish=True)
+
+        self.assertEqual(result["failures"], [])
+        self.assertNotIn("/t/old/location/00-目次", client.pages)
+        self.assertIn("/t/00-目次", client.pages)
 
     def test_growi_upserts_and_deletes(self):
         class Client:
@@ -176,6 +256,7 @@ class IndexTreeTest(unittest.TestCase):
             self.assertEqual(client.calls, [])
             shutil.rmtree(self.project.wiki / "teamB/docC")
             build_index(self.settings, only=["teamB/docC.md"], publish=True)
+            self.assertIn(("delete", "/t/teamB/docC/00-目次"), client.calls)
             self.assertIn(("delete", "/t/teamB/00-目次"), client.calls)
 
 
@@ -245,6 +326,31 @@ class LinkerJevJudgeTest(unittest.TestCase):
             ini.write_text(ini.read_text(encoding="utf-8") + "\n[settings]\nwiki_linker_judge=jev\n", encoding="utf-8")
             with mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(Settings.from_env(str(ini)).wiki_linker_judge, "jev")
+
+    def test_project_gguf_settings_override_environment_backend(self):
+        from jev import JevConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); mount = root / "mount"; mount.mkdir()
+            ini = root / "project.ini"
+            ini.write_text(
+                f"[project]\ntarget_name=t\ndata_root={root / 'data'}\nsource_mount={mount}\n"
+                "\n[settings]\nwiki_jev_backend=gguf\n"
+                "wiki_jev_gguf_local_path=/models/jev-gguf\n"
+                "wiki_jev_gguf_quant=Q4_K_M\n"
+                "wiki_jev_gguf_many_mode=batched\n"
+                "wiki_jev_score_bin=/models/jev-score\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"WIKI_JEV_BACKEND": "llm2jev"}, clear=True):
+                settings = Settings.from_env(str(ini))
+                config = JevConfig.from_settings(settings)
+
+        self.assertEqual(config.backend, "gguf")
+        self.assertEqual(config.gguf_local_path, "/models/jev-gguf")
+        self.assertEqual(config.gguf_quant, "Q4_K_M")
+        self.assertEqual(config.gguf_many_mode, "batched")
+        self.assertEqual(config.gguf_binary, "/models/jev-score")
 
     def test_role_check_overrides_llm_role_and_skips_completed(self):
         chunk = make_chunks("team/doc", "team", "p.md", "# title\n## API\nWidget is the API.")[1]
@@ -429,7 +535,7 @@ class LinkerJevJudgeTest(unittest.TestCase):
                 self.assertEqual(len(asked), 8)  # every cross-document link Jev accepted is checked
             finally: catalog.close()
 
-    def test_verify_uses_longer_target_and_candidate_bodies(self):
+    def test_shared_target_state_and_verify_candidate_body(self):
         with tempfile.TemporaryDirectory() as tmp:
             catalog = Catalog.open(Path(tmp) / "catalog.db", mode="neo")
             try:
@@ -441,11 +547,39 @@ class LinkerJevJudgeTest(unittest.TestCase):
                 asyncio.run(judge_edges(catalog, engine, target,
                     [SimpleNamespace(chunk_id=candidate.chunk_id, source="topical", via=[])], self.settings()))
                 screen_req = engine.calls[0][0]
-                verify_req = engine.calls[1][0]
-                self.assertEqual(len(screen_req.state["target"]["text"]), 1500)
-                self.assertNotIn("text", screen_req.state["candidate"])
-                self.assertEqual(len(verify_req.state["target"]["text"]), 6000)
-                self.assertEqual(len(verify_req.state["candidate"]["text"]), 6000)
+                verify_reqs = engine.calls[1]
+                # One shared target state per stage; the long candidate body rides
+                # token-sized parts instead of a 6000-char truncation.
+                self.assertEqual(set(screen_req.state), {"target"})
+                self.assertTrue(all(set(r.state) == {"target"} for r in verify_reqs))
+                self.assertEqual(len(verify_reqs[0].state["target"]["text"]), 6000)
+                self.assertNotIn("本文: ", screen_req.question.text)
+                self.assertTrue(all("本文: " in r.question.text for r in verify_reqs))
+                bodies = [r.question.text.split("本文: ", 1)[1].split("\n候補の節は", 1)[0]
+                          for r in verify_reqs]
+                row = catalog.chunk(candidate.chunk_id)
+                self.assertEqual("".join(bodies), row["body"])  # full body across parts, nothing cut
+            finally: catalog.close()
+
+    def test_verify_splits_long_bodies_into_best_of_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Catalog.open(Path(tmp) / "catalog.db", mode="neo")
+            try:
+                target = make_chunks("team/target", "team", "t.md", "# Target\n## H\nA page with a target.")[1]
+                candidate = make_chunks("team/peer", "team", "p.md", "# Peer\n## H\n" + "あ" * 20000)[1]
+                catalog.upsert_document("team/target", "team", "", [target])
+                catalog.upsert_document("team/peer", "team", "", [candidate])
+                engine = self.Engine()
+                accepted = asyncio.run(judge_edges(catalog, engine, target,
+                    [SimpleNamespace(chunk_id=candidate.chunk_id, source="topical", via=[])], self.settings()))
+                verify_reqs = engine.calls[1]
+                self.assertGreater(len(verify_reqs), 1)  # split into parts, never truncated
+                self.assertTrue(all(r.question.key == candidate.chunk_id for r in verify_reqs))
+                bodies = [r.question.text.split("本文: ", 1)[1].split("\n候補の節は", 1)[0]
+                          for r in verify_reqs]
+                row = catalog.chunk(candidate.chunk_id)
+                self.assertEqual("".join(bodies), row["body"])
+                self.assertEqual([edge["chunk_b"] for edge in accepted], [candidate.chunk_id])
             finally: catalog.close()
 
     def test_no_uses_uses_candidates(self):

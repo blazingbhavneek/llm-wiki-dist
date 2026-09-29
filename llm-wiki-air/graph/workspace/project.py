@@ -6,7 +6,7 @@ import io
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterable
 
 
 def wiki_folder_name(raw_name: str) -> str:
@@ -24,6 +24,50 @@ def raw_name_for(mount_name: str) -> str:
     if ext == "md" and sep and base and tail.isalnum():
         return path.name  # already raw-style `<stem>_<srcent>.md`: don't double-suffix
     return f"{path.stem}_{ext}.md"
+
+
+def generated_rels(mount_rel: str) -> tuple[str, str]:
+    """Return the raw-file and wiki/state-directory paths for one mount path."""
+
+    source = PurePosixPath(mount_rel)
+    raw = source.parent / raw_name_for(source.name)
+    wiki = raw.parent / wiki_folder_name(raw.name)
+    return raw.as_posix(), wiki.as_posix()
+
+
+def assert_unique_generated_paths(mount_rels: Iterable[str]) -> None:
+    """Reject mount layouts that cannot be represented without overwriting output."""
+
+    raw_owners: dict[str, str] = {}
+    wiki_owners: dict[str, str] = {}
+    for mount_rel in mount_rels:
+        rel = PurePosixPath(mount_rel).as_posix()
+        raw_rel, wiki_rel = generated_rels(rel)
+        for kind, generated, owners in (
+            ("raw path", raw_rel, raw_owners),
+            ("wiki/state path", wiki_rel, wiki_owners),
+        ):
+            previous = owners.get(generated)
+            if previous is not None and previous != rel:
+                raise ValueError(
+                    f"mount paths resolve to the same {kind} {generated!r}: "
+                    f"{previous!r}, {rel!r}"
+                )
+            owners[generated] = rel
+
+    # Raw documents are files. A source directory whose mapped name is another
+    # document's raw filename would otherwise make the tree impossible to write.
+    for raw_rel, owner in raw_owners.items():
+        for parent in PurePosixPath(raw_rel).parents:
+            parent_rel = parent.as_posix()
+            if parent_rel == ".":
+                break
+            parent_owner = raw_owners.get(parent_rel)
+            if parent_owner is not None:
+                raise ValueError(
+                    f"generated raw path is both a file and a directory {parent_rel!r}: "
+                    f"{parent_owner!r}, {owner!r}"
+                )
 
 
 RESERVED_TEAMS = {"all", "admin", "assets"}

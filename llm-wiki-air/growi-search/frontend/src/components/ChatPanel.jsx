@@ -31,6 +31,7 @@ const STR = {
     thinking: '考えています…',
     working: '作業中…',
     jevSweep: 'JEV スキャン',
+    jevTocScan: '00-目次 スキャン',
     answerDone: '回答が完了しました',
     requestFailed: 'リクエストに失敗しました',
     hideSteps: '手順を隠す',
@@ -70,6 +71,7 @@ const STR = {
     thinking: 'Thinking…',
     working: 'Working…',
     jevSweep: 'JEV sweep',
+    jevTocScan: 'index scan',
     answerDone: 'Answer ready',
     requestFailed: 'Request failed',
     hideSteps: 'Hide steps',
@@ -519,16 +521,17 @@ const JEV_BAR_WIDTH = 250
 function JevBar({ jev }) {
   const t = useT(STR)
   const percent = Math.max(0, Math.min(100, Number(jev?.percent) || 0))
+  const label = jev?.stage === 'toc' ? t.jevTocScan : t.jevSweep
 
   return (
     <div className="mb-2 flex items-center gap-2">
       <span className="shrink-0 text-[11px] font-bold tracking-wide text-neutral-400">
-        {t.jevSweep}
+        {label}
       </span>
 
       <div
         role="progressbar"
-        aria-label={t.jevSweep}
+        aria-label={label}
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={Math.round(percent)}

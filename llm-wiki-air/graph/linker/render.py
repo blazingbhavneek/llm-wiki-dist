@@ -13,7 +13,7 @@ from graph.wiki.page import link_entity_mentions, link_titles, strip_reader_refe
 from graph.wiki.storage import write_text_atomic
 
 FOOTER_TITLE = "## 関連資料"
-MAX_FOOTER_ENTRIES = 15
+MAX_FOOTER_ENTRIES = 20
 MAX_INLINE_ENTRIES = 8
 MAX_BIG_INLINE_ENTRIES = 12
 MAX_NEO_BEHAVIOUR_INLINE_ENTRIES = 3
@@ -111,9 +111,20 @@ def display(edge: RenderEdge) -> tuple[str, str, str]:
     return ("" if edge.forward else "← "), edge.label, edge.summary
 
 
+def render_limits(mode: str, big_document: bool = False, settings: Any = None) -> tuple[int, int]:
+    """(inline, footer) visible-link caps; ``settings`` override the module defaults."""
+    inline_field = ("wiki_linker_inline_max_neo" if mode == "neo"
+                    else "wiki_linker_inline_max_big" if big_document else "wiki_linker_inline_max")
+    inline_default = (MAX_NEO_BEHAVIOUR_INLINE_ENTRIES if mode == "neo"
+                      else MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES)
+    return (int(getattr(settings, inline_field, inline_default)),
+            int(getattr(settings, "wiki_linker_footer_max", MAX_FOOTER_ENTRIES)))
+
+
 def render_page(
     original: str, *, page_rel: str, edges: list[RenderEdge], mode: str,
     big_document: bool = False, choices: list[dict[str, Any]] | None = None,
+    settings: Any = None,
 ) -> str:
     body = strip_reader_references(original).rstrip("\n") + "\n"
     entity_paths: set[str] = set()
@@ -134,7 +145,7 @@ def render_page(
             if linked != body or f"[{entity}]({path})" in body:
                 body = linked
                 entity_paths.add(path)
-    inline_budget = MAX_NEO_BEHAVIOUR_INLINE_ENTRIES if mode == "neo" else MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES
+    inline_budget, footer_max = render_limits(mode, big_document, settings)
     curated_edges = edges if mode == "legacy" else [edge for edge in edges if edge.source not in {"use", "define"}]
     by_id = {edge.edge_id: edge for edge in footer_edges(curated_edges, page_rel=page_rel, limit=None)}
     if choices is None:
@@ -176,7 +187,7 @@ def render_page(
             continue
         seen_paths.add(path)
         unique_footer.append((edge, summary))
-    footer = unique_footer[:MAX_FOOTER_ENTRIES]
+    footer = unique_footer[:footer_max]
     if not footer:
         return body
     lines = [FOOTER_START, FOOTER_TITLE, ""]
@@ -218,4 +229,4 @@ def write_if_changed(path: Path, text: str) -> bool:
     return True
 
 
-__all__ = ["BIG_DOCUMENT_LINES", "FOOTER_END", "FOOTER_START", "FOOTER_TITLE", "FooterLink", "INTERNAL_SUMMARY_TERMS", "LABEL_PRIORITY", "MAX_BIG_INLINE_ENTRIES", "MAX_FOOTER_ENTRIES", "MAX_INLINE_ENTRIES", "MAX_NEO_BEHAVIOUR_INLINE_ENTRIES", "MAX_SIMILAR_ENTRIES", "USEFUL_LABELS", "display", "footer_edges", "peer_defines", "RenderEdge", "ordered", "parse_footer", "relative_link", "render_page", "write_if_changed"]
+__all__ = ["BIG_DOCUMENT_LINES", "FOOTER_END", "FOOTER_START", "FOOTER_TITLE", "FooterLink", "INTERNAL_SUMMARY_TERMS", "LABEL_PRIORITY", "MAX_BIG_INLINE_ENTRIES", "MAX_FOOTER_ENTRIES", "MAX_INLINE_ENTRIES", "MAX_NEO_BEHAVIOUR_INLINE_ENTRIES", "MAX_SIMILAR_ENTRIES", "USEFUL_LABELS", "display", "footer_edges", "peer_defines", "RenderEdge", "ordered", "parse_footer", "relative_link", "render_limits", "render_page", "write_if_changed"]

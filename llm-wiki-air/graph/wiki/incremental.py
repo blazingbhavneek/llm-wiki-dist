@@ -45,11 +45,11 @@ def source_lines(text: str) -> list[str]:
 
 
 def diff_lines(text: str) -> list[str]:
-    """Source lines with image descriptions blanked; line numbers are unchanged."""
+    """Source lines with every image spelling reduced to its content identity."""
 
-    from .images import neutralize_image_descriptions
+    from graph.common.images import canonicalize_images
 
-    return split_source_lines(neutralize_image_descriptions(normalize_source(text)))
+    return split_source_lines(canonicalize_images(normalize_source(text)))
 
 
 def _diff_input(lines: Sequence[str]) -> str:
@@ -290,6 +290,14 @@ def decide_update(
     owned: dict[int, set[int]] = {}
     referenced: dict[int, set[int]] = {}
     for index, hunk in enumerate(hunks):
+        # Canonical image wrappers can add/remove blank physical lines.  Keep
+        # those hunks in BoundaryMap so ranges move correctly, but never ask an
+        # LLM to edit a page when no meaningful source content changed.
+        if not (
+            _nonblank(old, hunk[0], hunk[1])
+            or _nonblank(new, hunk[2], hunk[3])
+        ):
+            continue
         owners = _owner_pages(hunk, pages)
         for page in owners:
             owned.setdefault(page, set()).add(index)
@@ -346,6 +354,8 @@ def decide_update(
         decision.tier, decision.reason = 2, "regenerate"
     elif not decision.patch and decision.retitle:
         decision.reason = "retitle"
+    elif not decision.patch:
+        decision.tier, decision.reason = 0, "image-representation"
     return decision
 
 

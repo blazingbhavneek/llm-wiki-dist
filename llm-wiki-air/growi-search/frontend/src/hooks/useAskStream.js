@@ -19,6 +19,14 @@ function activityLine(ev, t) {
       return t.jevQuery(ev.text, ev.rewritten)
     case 'jev_toc':
       return t.jevToc(ev.document, ev.note)
+    case 'jev_toc_scan':
+      return t.jevTocScanning(ev.documents)
+    case 'jev_toc_digest':
+      return t.jevTocKept(ev.scanned, ev.kept, ev.groups, ev.chars)
+    case 'jev_toc_chunk':
+      return t.jevTocChunk(ev.document, ev.part, ev.reason)
+    case 'jev_toc_failed':
+      return t.jevTocFailed(ev.reason)
     case 'jev_complete':
       return t.jevSwept((ev.pages_considered || 0) + (ev.prefiltered || 0), ev.prefiltered || 0,
         ev.yes || 0, Number(ev.mean_yes_probability || 0).toFixed(2),
@@ -47,6 +55,10 @@ function activityLine(ev, t) {
       return t.following(who, nm(ev.node), ev.neighbors)
     case 'subagent_done':
       return t.subDone(who, ev.cited?.length || 0, ev.report)
+    case 'reports_folded':
+      return t.reportsFolded(ev.reports, ev.chars)
+    case 'lead_failed':
+      return t.leadFailed(ev.reason)
     case 'cascade_doc_done':
       return t.cascadeDocDone(ev.document, ev.seeds || 0)
     case 'cascade_early_stop':
@@ -187,6 +199,7 @@ export function useAskStream({ t, overrides, fireToast, onAskStart, onAnswer }) 
               percent: ev.percent || 0,
               yes: ev.yes ?? null,
               mean: ev.mean_yes_probability ?? null,
+              stage: ev.stage || 'sweep',
             },
           }))
         }

@@ -19,6 +19,7 @@ from urllib.parse import urljoin
 import httpx
 from pydantic import BaseModel
 
+from graph.common.images import DATA_IMAGE_RE, find_images
 from graph.common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
 from graph.wiki.page import strip_reader_references
 from graph.wiki.storage import read_json
@@ -325,12 +326,7 @@ _PERMALINK_RE = re.compile(
     r"(?<!!)(?P<prefix>\[[^\]\n]*\]\()/(?P<page_id>[^/#)\n]+)(?P<fragment>#[^)\n]*)?\)"
 )
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
-_IMAGE_UNIT_RE = re.compile(r"<image-unit\b[^>]*>.*?</image-unit>", re.I | re.S)
 _IMAGE_DESCRIPTION_RE = re.compile(r"<image-description\b[^>]*>(.*?)</image-description>", re.I | re.S)
-_IMAGE_DATA_RE = re.compile(
-    r'''<img\b[^>]*\bsrc=["']data:(?P<mime>image/[a-z0-9.+-]+);base64,(?P<data>[a-z0-9+/=\s]+)["']''',
-    re.I,
-)
 _CHUNK_COMMENT_RE = re.compile(r"^<!-- chunk: (?P<payload>.*?)-->[ \t]*$", re.MULTILINE)
 _CHUNK_END_COMMENT_RE = re.compile(
     r"^<!-- chunk-end: (?P<payload>.*?)-->[ \t]*$", re.MULTILINE
@@ -367,7 +363,10 @@ def _marker_id(match: re.Match[str]) -> str:
 def _image_description(unit: str) -> str:
     match = _IMAGE_DESCRIPTION_RE.search(unit)
     text = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))) if match else ""
-    return " ".join(text.split()) or "画像"
+    if text.strip():
+        return " ".join(text.split())
+    images = find_images(unit)
+    return " ".join(images[0].alt.split()) if images and images[0].alt.strip() else "画像"
 
 
 def _markdown_image(description: str, path: str = "") -> str:
@@ -375,33 +374,35 @@ def _markdown_image(description: str, path: str = "") -> str:
     return f"![{alt}]({path})"
 
 
-def _image_fallback(unit: str) -> str:
-    return _markdown_image(_image_description(unit))
-
-
 def _image_fallbacks(body: str) -> str:
-    return _IMAGE_UNIT_RE.sub(lambda match: _image_fallback(match.group(0)), body)
+    output: list[str] = []
+    end = 0
+    for image in find_images(body):
+        output.append(body[end:image.start])
+        output.append(_markdown_image(_image_description(image.raw), image.src if not image.media_sha256 else ""))
+        end = image.end
+    output.append(body[end:])
+    return "".join(output)
 
 
 async def _publish_images(client: GrowiClient, body: str, page_id: str) -> str:
-    matches = list(_IMAGE_UNIT_RE.finditer(body))
+    matches = find_images(body)
     if not matches:
         return body
     attachments = await client.list_attachments(page_id)
     output: list[str] = []
     end = 0
     for match in matches:
-        output.append(body[end:match.start()])
-        unit = match.group(0)
-        image = _IMAGE_DATA_RE.search(unit)
-        description = _image_description(unit)
-        if image is None:
-            output.append(_image_fallback(unit))
-            end = match.end()
+        output.append(body[end:match.start])
+        description = _image_description(match.raw)
+        data = DATA_IMAGE_RE.match(match.src)
+        if data is None:
+            output.append(_markdown_image(description, match.src))
+            end = match.end
             continue
-        mime = image.group("mime").lower()
+        mime = data.group("mime").lower()
         try:
-            content = base64.b64decode("".join(image.group("data").split()), validate=True)
+            content = base64.b64decode("".join(data.group("data").split()), validate=True)
         except (ValueError, binascii.Error) as exc:
             raise ValueError("invalid embedded image data") from exc
         extension = mimetypes.guess_extension(mime) or ".bin"
@@ -413,7 +414,7 @@ async def _publish_images(client: GrowiClient, body: str, page_id: str) -> str:
             path = await client.upload_attachment(page_id, name, content, mime)
             attachments[name] = path
         output.append(_markdown_image(description, path))
-        end = match.end()
+        end = match.end
     output.append(body[end:])
     return "".join(output)
 

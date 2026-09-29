@@ -6,6 +6,7 @@ import copy
 import hashlib
 import io
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -18,13 +19,13 @@ from typing import Any, Literal
 from docx import Document
 from docx.table import Table
 
-from graph.workspace.project import Project, open_project, raw_name_for
+from graph.workspace.project import Project, assert_unique_generated_paths, open_project, raw_name_for
 from graph.wiki.incremental import line_hunks
 from graph.wiki.storage import read_json
 
 from .history import (
-    amend_candidate, candidate, candidate_is_clean, candidate_project, commit_candidate, ensure_repository, last_good, promote,
-    prune_candidates, read_blob, reopen_candidate, restore_last_good, stage_blob,
+    amend_candidate, candidate, candidate_is_clean, candidate_project, commit_candidate, ensure_repository, last_good, list_candidate_ids, promote,
+    prune_candidates, read_blob, remove_candidate, reopen_candidate, restore_last_good, resumed_candidate, stage_blob,
 )
 from .ledger import load_ledger
 from .scanner import IGNORED_DIRS, IGNORED_NAMES, SUPPORTED, _inside
@@ -154,6 +155,7 @@ def _snapshot(root: Path) -> dict[str, tuple[str, int, int]]:
         rel = path.relative_to(root).as_posix()
         raw_rel = (Path(rel).parent / raw_name_for(Path(rel).name)).as_posix()
         files[rel] = (raw_rel, stat.st_size, stat.st_mtime_ns)
+    assert_unique_generated_paths(files)
     return files
 
 
@@ -504,7 +506,103 @@ def _job_from_row(row: sqlite3.Row) -> Job:
     )
 
 
-def recover(project: Project, settings: Any | None = None) -> int:
+def _resumable_transaction(project: Project) -> dict[str, Any] | None:
+    """Oldest interrupted building/prepared transaction usable for --continue.
+
+    A transaction qualifies only when its worktree directory still exists on
+    disk and its base is still the current last-good (no promotion happened
+    since the interruption).
+    """
+    try:
+        base = last_good(project)
+    except Exception:
+        return None
+    with _connect(project) as conn:
+        rows = list(conn.execute("SELECT * FROM transactions ORDER BY started_at"))
+    for row in rows:
+        data = dict(row)
+        if str(data.get("phase") or "") not in {"building", "prepared"}:
+            continue
+        if str(data.get("base_commit") or "") != base:
+            continue
+        try:
+            exists = candidate_project(project, str(data.get("operation_id") or "")).root.exists()
+        except (ValueError, OSError):
+            continue
+        if exists:
+            return data
+    return None
+
+
+def _adopt_resumable_orphan(project: Project) -> str | None:
+    """Recover a dirty same-base candidate whose transaction row was lost.
+
+    Older workers removed the transaction row after a pre-publication pipeline
+    failure even though ``keep=True`` retained the worktree.  On an explicit
+    ``--continue``, adopt the newest such worktree when work for the same base
+    is still pending.  Successful candidates are clean and stale-base
+    candidates are rejected, so neither is mistaken for resumable progress.
+    """
+    base = last_good(project)
+    with _connect(project) as conn:
+        if conn.execute("SELECT 1 FROM transactions LIMIT 1").fetchone() is not None:
+            return None
+        pending = conn.execute(
+            """SELECT 1 FROM jobs
+               WHERE status IN ('queued','running','failed') AND base_commit=? LIMIT 1""",
+            (base,),
+        ).fetchone()
+    if pending is None:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for operation_id in list_candidate_ids(project):
+        try:
+            staged = candidate_project(project, operation_id)
+            head = subprocess.run(
+                ["git", "-C", str(staged.root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if head != base or candidate_is_clean(staged, base):
+                continue
+            candidates.append((staged.root.stat().st_mtime_ns, operation_id))
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            continue
+    if not candidates:
+        return None
+    operation_id = max(candidates)[1]
+    _transaction(project, operation_id, base, "building")
+    return operation_id
+
+
+def _prune_orphan_candidates(project: Project, *, keep: str | None = None) -> None:
+    """Remove candidate dirs that no transaction row references.
+
+    Successful batches leave their kept worktree behind (deferred deletion);
+    the next iteration discards them here.  The resumable ``keep`` id and any
+    dir still referenced by the transactions table are preserved.
+    """
+    with _connect(project) as conn:
+        live = {str(row[0]) for row in conn.execute("SELECT operation_id FROM transactions")}
+    for operation_id in list_candidate_ids(project):
+        if operation_id == keep or operation_id in live:
+            continue
+        try:
+            remove_candidate(project, operation_id)
+        except (ValueError, OSError):
+            continue
+
+
+def resumable_operation_id(project: Project, *, adopt_orphan: bool = False) -> str | None:
+    """Operation id of the kept candidate ``--continue`` would resume, if any."""
+    row = _resumable_transaction(project)
+    if row is None and adopt_orphan and _adopt_resumable_orphan(project) is not None:
+        row = _resumable_transaction(project)
+    return str(row["operation_id"]) if row is not None else None
+
+
+def recover(project: Project, settings: Any | None = None, *, preserve_operation_id: str | None = None) -> int:
     """Restore interrupted publication, then return claimed work to the queue."""
     ensure_repository(project)
     with _connect(project) as conn:
@@ -562,8 +660,15 @@ def recover(project: Project, settings: Any | None = None) -> int:
                         settings, staged, jobs, known_revisions=_transaction_revisions(project, operation_id)
                     )
                     _transaction(project, operation_id, str(transaction["base_commit"]), "restored", restored)
-            _finish_transaction(project, operation_id)
-    prune_candidates(project)
+            if not (preserve_operation_id is not None
+                    and operation_id == preserve_operation_id
+                    and phase in {"building", "prepared"}):
+                _finish_transaction(project, operation_id)
+    if preserve_operation_id is not None:
+        # Deferred deletion: keep the resumable worktree, discard only orphans.
+        _prune_orphan_candidates(project, keep=preserve_operation_id)
+    else:
+        prune_candidates(project)
     if settings is not None and getattr(settings, "wiki_linker_enabled", True) and not project.linker_database.exists():
         from graph.linker.catalog import Catalog
 
@@ -573,11 +678,27 @@ def recover(project: Project, settings: Any | None = None) -> int:
         finally:
             catalog.close()
     with _connect(project) as conn:
-        cursor = conn.execute(
-            """UPDATE jobs SET status='queued',token='',error='',updated_at=?
-               WHERE status='running' OR (status='failed' AND error LIKE 'recovery required:%')""",
-            (time.time(),),
-        )
+        preserved_base = ""
+        if preserve_operation_id is not None:
+            row = conn.execute(
+                "SELECT base_commit FROM transactions WHERE operation_id=?",
+                (preserve_operation_id,),
+            ).fetchone()
+            preserved_base = str(row[0]) if row is not None else ""
+        if preserved_base:
+            cursor = conn.execute(
+                """UPDATE jobs SET status='queued',token='',error='',updated_at=?
+                   WHERE status='running'
+                      OR (status='failed' AND error LIKE 'recovery required:%')
+                      OR (status='failed' AND base_commit=?)""",
+                (time.time(), preserved_base),
+            )
+        else:
+            cursor = conn.execute(
+                """UPDATE jobs SET status='queued',token='',error='',updated_at=?
+                   WHERE status='running' OR (status='failed' AND error LIKE 'recovery required:%')""",
+                (time.time(),),
+            )
     return cursor.rowcount
 
 
@@ -714,16 +835,41 @@ def _finish_transaction(project: Project, operation_id: str) -> None:
         conn.execute("DELETE FROM transactions WHERE operation_id=?", (operation_id,))
 
 
-def _work_once_locked(settings: Any, *, on_event: Any = None) -> dict[str, Any] | None:
-    """Run one immutable candidate from last-good, then publish and promote it."""
+def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool = False) -> dict[str, Any] | None:
+    """Run one immutable candidate from last-good, then publish and promote it.
+
+    With ``continue_run`` (``--continue``) an interrupted building/prepared
+    candidate is reused with its LLM checkpoints intact; otherwise leftover
+    worktrees are discarded up front.  Deletion is deferred: the worker keeps
+    its worktree on exit (``keep=True``) and the next startup decides.
+    """
     from .pipeline import delete_sources, move_sources, restore_publication, sync_once
 
     project = open_project(settings)
     ensure_repository(project)
+    resumable_id: str | None = None
+    resumable_commit = ""
+    if continue_run:
+        resumable = _resumable_transaction(project)
+        if resumable is None and _adopt_resumable_orphan(project) is not None:
+            resumable = _resumable_transaction(project)
+        if resumable is not None:
+            resumable_id = str(resumable["operation_id"])
+            resumable_commit = str(resumable["candidate_commit"] or resumable["base_commit"])
+        _prune_orphan_candidates(project, keep=resumable_id)
+    else:
+        prune_candidates(project)
     with _connect(project) as conn:
         unfinished = conn.execute("SELECT 1 FROM transactions LIMIT 1").fetchone() is not None
     if unfinished:
-        recover(project, settings)
+        recover(project, settings, preserve_operation_id=resumable_id)
+        if resumable_id is not None:
+            refreshed = _resumable_transaction(project)
+            if refreshed is None or str(refreshed["operation_id"]) != resumable_id:
+                resumable_id = None
+                resumable_commit = ""
+            else:
+                resumable_commit = str(refreshed["candidate_commit"] or refreshed["base_commit"])
     jobs = claim(project, "fast")
     if not jobs:
         with _connect(project) as conn:
@@ -734,14 +880,27 @@ def _work_once_locked(settings: Any, *, on_event: Any = None) -> dict[str, Any] 
         return None
     if on_event is not None:
         on_event({"stage": "queue-claim", "lane": jobs[0].lane, "paths": [job.rel for job in jobs]})
-    operation_id = "op-" + uuid.uuid4().hex
-    base = last_good(project)
-    _transaction(project, operation_id, base, "building")
+    reuse = resumable_id is not None
+    if reuse:
+        assert resumable_id is not None
+        operation_id = resumable_id
+        base = last_good(project)
+        if on_event is not None:
+            on_event({"stage": "queue-resume", "operation_id": operation_id, "base_commit": base})
+    else:
+        operation_id = "op-" + uuid.uuid4().hex
+        base = last_good(project)
+        _transaction(project, operation_id, base, "building")
     is_current = lambda: supersession(project, jobs) == "continue"
     result: dict[str, Any]
     publishing = False
     try:
-        with candidate(project, operation_id) as staged:
+        if reuse:
+            assert resumable_id is not None
+            staged_ctx = resumed_candidate(project, operation_id, resumable_commit or base)
+        else:
+            staged_ctx = candidate(project, operation_id, keep=True)
+        with staged_ctx as staged:
             for job in jobs:
                 if job.target_blob_oid:
                     target = staged.mount / job.rel
@@ -809,6 +968,7 @@ def _work_once_locked(settings: Any, *, on_event: Any = None) -> dict[str, Any] 
                     result["done"].extend(moved["done"])
                     result["failures"].extend(moved["failures"])
                     result["cancelled"] = moved["cancelled"]
+                    result.setdefault("index_paths", []).extend(moved.get("index_paths") or [])
                 if normal_jobs and not result["failures"] and not result["cancelled"]:
                     synced = sync_once(
                         staged_settings, only=[job.rel for job in normal_jobs], force=True, resume=True,
@@ -822,6 +982,8 @@ def _work_once_locked(settings: Any, *, on_event: Any = None) -> dict[str, Any] 
                     result["done"].extend(synced["done"])
                     result["failures"].extend(synced["failures"])
                     result["cancelled"] = synced["cancelled"]
+                    result.setdefault("index_paths", []).extend(synced.get("index_paths") or [])
+                result["index_paths"] = sorted(set(result.get("index_paths") or []))
             if not result.get("cancelled") and not result.get("failures"):
                 commit = amend_candidate(staged) if prepared_commit else commit_candidate(
                     staged, f"publish {operation_id}", _commit_metadata(staged, jobs, base, operation_id)
@@ -865,12 +1027,38 @@ def _work_once_locked(settings: Any, *, on_event: Any = None) -> dict[str, Any] 
     return {"lane": jobs[0].lane, "jobs": len(jobs), "paths": [job.rel for job in jobs], **result}
 
 
-def work_once(settings: Any, *, on_event: Any = None) -> dict[str, Any] | None:
-    """Serialize candidate promotion with direct live-project operations."""
+def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False) -> dict[str, Any] | None:
+    """Promote one candidate, then reconcile derived indexes from live state."""
     from .pipeline import _lock
 
     with _lock(open_project(settings)):
-        return _work_once_locked(settings, on_event=on_event)
+        result = _work_once_locked(settings, on_event=on_event, continue_run=continue_run)
+        if result is None or result.get("failures") or result.get("cancelled"):
+            return result
+
+        # metadata/index is deliberately derived and is not part of the Git commit.
+        # GROWI indexes were reconciled in the candidate publication; reconcile them
+        # idempotently from promoted state as well, while materializing the matching
+        # local copies before another publisher can change the live tree.
+        try:
+            from .index import build_index
+
+            index = build_index(
+                settings,
+                only=result.get("index_paths"),
+                on_progress=on_event,
+                locked=True,
+            )
+            result["index"] = {
+                "updated": len(index.get("done", [])),
+                "failures": list(index.get("failures", [])),
+            }
+        except Exception as exc:
+            result["index"] = {
+                "updated": 0,
+                "failures": [f"index: {type(exc).__name__}: {exc}"],
+            }
+        return result
 
 
 @contextmanager
@@ -897,6 +1085,7 @@ def serve(
     growi_interval: float = 300.0,
     force: bool = False,
     on_event: Any = None,
+    continue_run: bool = False,
 ) -> None:
     """Scan cheaply while the foreground worker runs long jobs."""
     from .pipeline import _lock, pull_growi_once
@@ -927,18 +1116,32 @@ def serve(
 
     with worker_lock(project):
         with _lock(project):
-            recover(project, settings)
+            _preserved_id = resumable_operation_id(project, adopt_orphan=True) if continue_run else None
+            recover(project, settings, preserve_operation_id=(
+                _preserved_id
+            ))
         scanner = threading.Thread(target=scan_loop, name="mount-metadata-scanner", daemon=True)
         scanner.start()
         next_growi = time.monotonic()
         try:
             while True:
-                result = work_once(settings, on_event=on_event)
+                result = work_once(settings, on_event=on_event, continue_run=continue_run)
+                # Only the first iteration can resume a kept worktree; later
+                # batches in the same process are always fresh.
+                continue_run = False
                 if result is not None:
                     emit("queue", result)
                     continue
                 if growi_interval > 0 and time.monotonic() >= next_growi:
-                    emit("growi-pull", pull_growi_once(settings))
+                    pulled = pull_growi_once(settings)
+                    emit("growi-pull", pulled)
+                    if not pulled.get("failures"):
+                        try:
+                            from .index import build_index
+
+                            emit("index", build_index(settings, on_progress=on_event))
+                        except Exception as exc:
+                            emit("index-error", f"{type(exc).__name__}: {exc}")
                     scan(settings, only=only, settle_seconds=interval, verify_content=True)
                     next_growi = time.monotonic() + growi_interval
                 stop.wait(0.5)
@@ -948,6 +1151,6 @@ def serve(
 
 
 __all__ = [
-    "Job", "claim", "current", "finish", "recover", "retry_failed", "scan", "serve",
+    "Job", "claim", "current", "finish", "recover", "resumable_operation_id", "retry_failed", "scan", "serve",
     "status", "supersession", "work_once", "worker_lock",
 ]

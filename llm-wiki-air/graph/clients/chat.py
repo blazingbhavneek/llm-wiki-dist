@@ -12,7 +12,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 
-def make_llm(model: str, base_url: str, api_key: str, temperature: float = 0.0, timeout: int = 300) -> ChatOpenAI:
+def make_llm(model: str, base_url: str, api_key: str, temperature: float = 0.7, timeout: int = 300) -> ChatOpenAI:
     return ChatOpenAI(model=model, base_url=base_url, api_key=api_key, temperature=temperature, timeout=timeout)
 
 

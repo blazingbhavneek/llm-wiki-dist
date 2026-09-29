@@ -87,9 +87,17 @@ def _apply_incremental_edits(
     """Let the model patch every tier-1 page. Returns (changed pages, failed pages)."""
 
     import asyncio
+    from collections import Counter
 
     from graph.common.async_tools import run_async_blocking
-    from graph.wiki.images import extract_image_units, placeholders_in, restore_images, scrub_base64
+    from graph.wiki.images import (
+        extract_image_units,
+        image_identity_counts,
+        placeholders_in,
+        restore_images,
+        sanitize_lines,
+        scrub_base64,
+    )
     from graph.wiki.incremental import source_lines
     from graph.wiki.model import ChatModelPort
     from graph.wiki.page import check_section, code_tokens, verbatim_blocks
@@ -105,18 +113,10 @@ def _apply_incremental_edits(
     old_units = extract_image_units(old_lines)
     new_units = extract_image_units(new_lines)
 
-    def sanitized(lines: list[str], units: list[Any]) -> list[str]:
-        result = list(lines)
-        for unit in units:
-            result[unit.source_start - 1] = unit.prompt_marker
-            for number in range(unit.source_start + 1, unit.source_end + 1):
-                result[number - 1] = f"<media payload omitted: {unit.image_id}>"
-        return result
-
-    old_prompt_lines = sanitized(old_lines, old_units)
-    new_prompt_lines = sanitized(new_lines, new_units)
+    old_prompt_lines = sanitize_lines(old_lines, old_units)
+    new_prompt_lines = sanitize_lines(new_lines, new_units)
     model = llm if hasattr(llm, "structured") else ChatModelPort(wiki_config(settings, run_dir=state_root), llm=llm)
-    attempts = max(1, int(getattr(settings, "wiki_write_attempts", 3)))
+    attempts = max(5, int(getattr(settings, "wiki_write_attempts", 5)))
     semaphore = asyncio.Semaphore(
         max(1, int(getattr(settings, "wiki_rewrite_concurrency", getattr(settings, "concurrency", app_concurrency()))))
     )
@@ -156,6 +156,9 @@ def _apply_incremental_edits(
         image_context = "\n".join(f"- {placeholder}: {unit.prompt_marker}" for placeholder, unit in image_units.items())
         edits = _edit_blocks(old_prompt_lines, new_prompt_lines, hunks, indexes)
         feedback: list[str] = []
+        retry_temperature = getattr(
+            getattr(model, "config", None), "retry_temperature", 0.7
+        )
         for _attempt in range(attempts):
             prompt = incremental_page_edit_prompt(
                 page_title=str(page.get("title") or Path(filename).stem),
@@ -170,7 +173,17 @@ def _apply_incremental_edits(
             try:
                 async with semaphore:
                     try:
-                        result = await model.structured(IncrementalPageEditResult, prompt.messages(), max_output_tokens=8000)
+                        kwargs = {
+                            "max_output_tokens": 8000,
+                            "temperature": (
+                                retry_temperature
+                                if feedback
+                                else getattr(getattr(model, "config", None), "temperature", 0.7)
+                            ),
+                        }
+                        result = await model.structured(
+                            IncrementalPageEditResult, prompt.messages(), **kwargs
+                        )
                     except TypeError:
                         result = await model.structured(IncrementalPageEditResult, prompt.messages())
                 result = result if isinstance(result, IncrementalPageEditResult) else IncrementalPageEditResult.model_validate(result)
@@ -183,17 +196,31 @@ def _apply_incremental_edits(
                     raise ValueError(f"unresolved image placeholders: {', '.join(unresolved)}")
                 errors: list[str] = []
                 touched_hashes = {unit.unit_sha256 for unit in old_touched_units}
-                for unit in page_units:
-                    if unit.unit_sha256 not in touched_hashes and final.count(unit.raw) != 1:
-                        errors.append(f"unrelated image {unit.image_id} was changed or removed")
+                required = Counter(
+                    unit.unit_sha256
+                    for unit in page_units
+                    if unit.unit_sha256 not in touched_hashes
+                )
                 if owned:
-                    for unit in current_units:
-                        if final.count(unit.raw) != 1:
-                            errors.append(f"current source image {unit.image_id} must appear exactly once")
-                current_hashes = {unit.unit_sha256 for unit in current_units}
-                for unit in old_touched_units:
-                    if unit.unit_sha256 not in current_hashes and unit.raw in final:
-                        errors.append(f"deleted image {unit.image_id} is still present")
+                    current = Counter(unit.unit_sha256 for unit in current_units)
+                    for identity, count in current.items():
+                        required[identity] = max(required[identity], count)
+                final_counts = image_identity_counts(final)
+                labels = {
+                    unit.unit_sha256: unit.image_id
+                    for unit in [*page_units, *current_units, *old_touched_units]
+                }
+                checked = set(required) | {
+                    unit.unit_sha256 for unit in old_touched_units
+                }
+                for identity in checked:
+                    expected = required[identity]
+                    actual = final_counts.get(identity, 0)
+                    if actual != expected:
+                        errors.append(
+                            f"image {labels.get(identity, identity[:12])} count must be "
+                            f"{expected}, got {actual}"
+                        )
                 if owned:
                     for first, last in ranges:
                         errors.extend(check_section(
@@ -265,7 +292,7 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
         chat_base_url=settings.chat_base_url,
         chat_api_key=settings.chat_api_key,
         chat_model=settings.chat_model,
-        temperature=0.0,
+        temperature=0.7,
         output_language=getattr(settings, "wiki_output_language", "Japanese (日本語)"),
         section_target_lines=int(getattr(settings, "wiki_section_target_lines", 80)),
         write_attempts=int(getattr(settings, "wiki_write_attempts", 3)),
@@ -426,6 +453,16 @@ def _plan_filenames(state_root: Path) -> set[str]:
     return {str(page["filename"]) for page in read_json(Path(state_root) / "state" / "plan.json", default={}).get("pages", [])}
 
 
+def _wiki_run_complete(state_root: Path) -> bool:
+    """Return whether every page required by the stored plan is publishable."""
+
+    state_root = Path(state_root)
+    names = _plan_filenames(state_root)
+    return bool(names) and all(
+        (state_root / "wiki" / name).is_file() for name in names
+    )
+
+
 def _page_hashes(folder: Path, names: set[str]) -> dict[str, str]:
     return {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -480,12 +517,22 @@ def write_wiki_pages(
         decision = UpdateDecision(tier=3, reason="no-previous-state")
     else:
         old_text = old_source.read_text(encoding="utf-8")
-        decision = decide_update(
-            state_root, old_text, new_text, kind=kind,
-            structure_target_lines=int(getattr(settings, "structure_target_lines", 250)),
-            structure_min_lines=int(getattr(settings, "structure_min_lines", 40)),
-            pdf_use_headings=bool(getattr(settings, "pdf_use_headings", False)),
-        )
+        if not _wiki_run_complete(state_root):
+            decision = UpdateDecision(
+                tier=3,
+                reason=(
+                    "interrupted-initial-build"
+                    if old_text == new_text
+                    else "incomplete-previous-state"
+                ),
+            )
+        else:
+            decision = decide_update(
+                state_root, old_text, new_text, kind=kind,
+                structure_target_lines=int(getattr(settings, "structure_target_lines", 250)),
+                structure_min_lines=int(getattr(settings, "structure_min_lines", 40)),
+                pdf_use_headings=bool(getattr(settings, "pdf_use_headings", False)),
+            )
 
     wiki_document = Path(project.wiki_dir(rel)).relative_to(project.wiki)
 
@@ -499,6 +546,19 @@ def write_wiki_pages(
 
     if on_progress:
         on_progress(decision_event())
+    # A stopped first build has already written its source snapshot and may
+    # contain expensive observation/planning/rewrite checkpoints even though
+    # plan.json does not exist yet.  That is different from an ordinary full
+    # rebuild: keep the run directory and let run_pipeline validate/reuse its
+    # input-keyed checkpoints.  Previously the tier-3 path deleted state_root
+    # here, so queue --continue restarted an interrupted initial build from
+    # zero before the wiki pipeline ever saw resume=True.
+    resume_initial_build = (
+        resume
+        and decision.reason in {"no-previous-state", "interrupted-initial-build"}
+        and old_source.exists()
+        and old_source.read_text(encoding="utf-8") == new_text
+    )
     names = _plan_filenames(state_root)
     before = _page_hashes(state_root / "wiki", names)
     human: list[str] = []
@@ -536,7 +596,7 @@ def write_wiki_pages(
                 if on_progress:
                     on_progress({"stage": "wiki", "step": "patch_escalated", "file": rel, "pages": sorted(failed), "errors": failed})
             if len(decision.regenerate) > FULL_MIN_REGEN_SHARE * max(len(names), 1):
-                decision = UpdateDecision(tier=3, reason="escalated-most-pages")
+                decision.tier, decision.reason = 3, "escalated-most-pages"
             elif decision.regenerate:
                 try:
                     out_dir = build_wiki_output(
@@ -550,15 +610,19 @@ def write_wiki_pages(
             else:
                 out_dir = export_ingest_layout(state_root, work / "out", document_name=rel)
         if decision.tier == 3:
-            if decision.reason not in {"forced", "format-full-only", "no-previous-state"} and on_progress:
+            if decision.reason not in {
+                "forced", "format-full-only", "no-previous-state",
+                "interrupted-initial-build", "incomplete-previous-state",
+            } and on_progress:
                 on_progress(decision_event())
             human = sorted(set(human) | set(_human_edited(state_root)))
-            shutil.rmtree(state_root, ignore_errors=True)
+            if not resume_initial_build:
+                shutil.rmtree(state_root, ignore_errors=True)
             out_dir = build_wiki_output(
                 source_path=project.raw_file(rel), document_name=rel, out_dir=work / "out",
                 mode=mode, settings=settings, llm=llm, embedder=embedder,
                 state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
-                source_kind=kind, resume=False,
+                source_kind=kind, resume=resume_initial_build,
             ).out_dir
         # A rebuilt workbook republishes and relinks as a whole (the linker's caches make
         # unchanged sheets cheap); only its 解説 regeneration is incremental.

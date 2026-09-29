@@ -248,6 +248,7 @@ async def _observe_one(
                 WindowInventory,
                 prompt.messages(),
                 max_output_tokens=config.planner_max_output_tokens,
+                temperature=config.retry_temperature if last_error else config.temperature,
             )
             candidate = (
                 raw

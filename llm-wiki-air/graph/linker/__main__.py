@@ -76,7 +76,7 @@ async def _calibrate(engine, rows):
     return await engine.adecide_batch(requests, return_exceptions=True)
 
 
-def calibrate_jev(project: Project, sample: int) -> None:
+def calibrate_jev(project: Project, settings: Settings, sample: int) -> None:
     from .prompts import EDGE_VERSION_NEO
     catalog = Catalog.open(project.linker_database, mode="neo")
     try:
@@ -90,8 +90,8 @@ def calibrate_jev(project: Project, sample: int) -> None:
     if not rows:
         print("No LLM edge decisions available for calibration")
         return
-    from jev import get_engine
-    results = run_async_blocking(_calibrate(get_engine(), rows))
+    from jev import get_engine_for
+    results = run_async_blocking(_calibrate(get_engine_for(settings), rows))
     pairs = [(float(result.p_yes), bool(row["accepted"])) for result, row in zip(results, rows)
              if not isinstance(result, BaseException)]
     positives = sum(actual for _probability, actual in pairs)
@@ -140,7 +140,7 @@ def main() -> None:
         rebuild(project, settings, args.mode, args.no_edges)
         return
     if args.command == "calibrate-jev":
-        calibrate_jev(project, args.sample)
+        calibrate_jev(project, settings, args.sample)
         return
     rel = args.document.strip("/")
     if rel in _documents(project):

@@ -69,8 +69,13 @@ settings still control all other search-service behavior.
 | `GROWI_ROOT_PATH` | no | Restrict all results/browsing to this path; default `/`. |
 | `WIKI_CHAT_BASE_URL` | ask | Chat endpoint (falls back to `OPENAI_BASE_URL`). |
 | `WIKI_CHAT_MODEL` | ask | Chat model (falls back to `WIKI_MODEL`). |
+| `WIKI_LLM_CONTEXT_TOKENS` | no | Model context window used to partition compiler and synthesis inputs (default `131072`; set this to the deployed model's actual window). No source text is discarded. |
 | `WIKI_SEARCH_LLM_MAX_CONCURRENCY` | no | Process-wide maximum concurrent LLM requests; default `4`. |
 | `WIKI_SUBAGENT_CONCURRENCY` | no | Per-question concurrency, clamped to the process-wide LLM maximum; default `2`. |
+| `WIKI_SUBAGENT_REPORT_TOKENS` | no | Output-token ceiling for one subagent reply (default `16384`, clamped `256..16384`). |
+| `WIKI_REPORT_FOLD_TOKENS` / `WIKI_FINAL_COMPILER_TOKENS` | no | Generation limits for level-1 report folds and the final answer compiler; defaults `32768` / `65536`. These are output limits, not evidence/input limits. |
+| `WIKI_COMPILER_CONCURRENCY` | no | Independent level-1 compiler pool size; default `4`. Compilers run while explorer groups are still finishing. |
+| `WIKI_LLM_MAX_RETRIES` | no | Connection retries inside the lead and subagent model calls (default `2`, `0` = off). Only connection errors / 408 / 409 / 429 / 5xx are retried. |
 | `WIKI_EMBED_BASE_URL` / `WIKI_EMBED_MODEL` | no | Optional index-card embedding ranking. Empty URL disables it. |
 | `WIKI_RERANK_BASE_URL` | no | Optional `/v1/rerank` service. Empty URL preserves Elasticsearch order. |
 | `WIKI_INDEX_PAGE_NAME` | no | Published index page name; default `00-目次` (what `main.py index` writes). |
@@ -86,7 +91,7 @@ settings still control all other search-service behavior.
 | `WIKI_CASCADE_EARLY_STOP` / `WIKI_ANSWER_CACHE` | no | Cascade sufficiency threshold (`0.9`) and optional mirror-backed answer cache (default off). |
 | `WIKI_JEV_TOC_GATE` / `WIKI_JEV_TOC_GATE_THRESHOLD` | no | Optional Jev check before TOC summarization; default off / `0.2`. |
 | `WIKI_JEV_DETERMINISTIC` / `WIKI_JEV_VERDICT_CACHE` | no | Optional deterministic note/rewrite calls and mirror verdict cache; both default off. |
-| `WIKI_LEAD_AFTER_REPORTS` / `WIKI_AGENT_TOOL_CONCURRENCY` | no | `agent` (default) or `synthesis`; agent tool calls default to concurrency `1`. |
+| `WIKI_LEAD_AFTER_REPORTS` / `WIKI_AGENT_TOOL_CONCURRENCY` | no | Compiled Jev reports always use direct `synthesis`; agent tool calls elsewhere default to concurrency `1`. |
 | `WIKI_ALLOWED_LLM_HOSTS` | no | Optional comma-separated allowlist for per-request LLM override hosts; the configured chat host is always allowed. |
 | `WIKI_PREFIX` | no | Public path prefix; default `/growi-search`. |
 
@@ -203,47 +208,57 @@ Jev ([chaoliangUNSW/Jev-Style-0.8B-Decision-v3](https://huggingface.co/chaoliang
 is a per-question **relevance gate**, not an answer generator. When enabled,
 each `/api/ask` question runs either the default exhaustive sweep or the opt-in
 cascade pipeline (`WIKI_JEV_MODE=cascade`). Keep exhaustive mode as the default
-until WP-15 meets its quality targets on the real corpus. In exhaustive mode, each question first runs a sweep of every visible
-document: `00-目次` cards are batch-scored, candidates are confirmed by full
-page reads (chunked to the model's 25,600-token input ceiling with the
-configured overlap), and entity-defining card edges are followed across
-documents. Confirmed pages become seeds for the existing lead/subagent flow.
-Before anything is scored, the question is **rewritten against the whole wiki** in
-two stages, so the sweep is written from what the entire wiki covers:
+until WP-15 meets its quality targets on the real corpus. In exhaustive mode,
+each question scores page entries in document `00-目次` pages reachable from a
+project root `00-目次`. With `GROWI_ROOT_PATH=/`, each first-level project with a
+valid root index is a separate entry point. Unlisted pages are not scored. A
+"yes" card is fetched as a research seed without a second, full-body Jev check.
+Before cards are scored, the question is scoped against reachable document
+indexes:
 
-1. **Find every 目次** — the tree is walked to **every depth** (cycles and the
-   sweep's own list-call budget apply) and every `00-目次` / `…一覧` page found is
-   read whole. Subdirectories carry their own `00-目次`, so a first-level scan
-   describes one chapter and reports the rest of the wiki as 関連なし.
-2. **Per-目次 summary** — one LLM call per index page, in parallel
-   (`WIKI_JEV_WORKERS` at a time), each answering what that part of the wiki can
-   provide for this question, in the corpus's own words. Nothing is truncated before
-   its summary is written, so no document can be crowded out of the prompt.
-3. **Rewrite** — one call over all of those notes, producing a single page-target
-   question in the corpus's own vocabulary. That text — not the original question —
-   is what every page is asked and what the keyword gate compares against, which is
-   how an English question can still match a Japanese manual.
+1. **Find document 目次** — from each project that has its own root `00-目次`,
+   walk that project's page tree to every depth and read every document-level
+   `00-目次`. The GROWI-level `/` is never treated as a project root.
+2. **Analyze intent and rank them** — an LLM first expands the user's target,
+   requested range, required evidence, and exclusions. Jev then asks every 目次
+   whether it has concrete evidence for that scoped intent, one page
+   at a time in `WIKI_JEV_TOC_CHUNK_TOKENS` chunks: Jev refuses an over-budget input
+   and never truncates, so one oversized 目次 must not sit in the same batch as the
+   pages scored beside it. The top 10% are kept, plus everything tied with them up to
+   the material budget (5 × 12,000 chars), because a wiki whose scores are all `0.00`
+   has no 10% to speak of.
+3. **Summarise the winners** — `TOC_NOTE_GROUPS` LLM calls (5), balanced by page size
+   so a huge 目次 gets its own call and small ones share, each checking whether the
+   document has the requested evidence rather than merely sharing the topic.
+4. **Rewrite** — one call combines the original question, the initial intent, and
+   those notes into a page-target question whose breadth follows the user's actual
+   range. Each document-index card is judged only against that scoped requery, so
+   topic-only pages are rejected.
 
-Each summary is printed and streamed as it lands (`JEV 目次 digest: 24 目次 …`, then
-`JEV に投げる質問…`), so you can read the whole-wiki picture before the run finishes.
-The gate question asks whether a page **contains the answer**, never whether it
-is merely *related* — relatedness makes a single-domain corpus answer yes to
-everything, which is how a "list every function" question ends up with 950 seeds.
-Before a page is allowed to cost a body-score call it must also share keywords
-with the rewritten question, so the sweep spends its model calls on plausible
-pages only.
-Crawling and classification are pipelined: one thread enumerates documents,
-cards and pages and publishes full-read targets on a bounded queue while
-`WIKI_JEV_WORKERS` threads fetch and classify, so GROWI traversal and page reads
-overlap classification instead of running before it.
+Each stage is printed as it lands (`Jev 目次 digest: 24 文書 …`, then `Jev query
+(rewritten from 24 目次 entries): …`), and a stage that fails says why instead of
+quietly sweeping with the raw question.
+The gate asks whether each document-index entry indicates a page useful for the
+question. One thread scores cards while `WIKI_JEV_WORKERS` threads fetch accepted
+pages for the lead and subagents. Page bodies are not sent to Jev in this sweep.
 
 Confirmed seeds then drive the research directly: they are grouped by document
 and sliced into at most `WIKI_JEV_SUBAGENT_GROUPS` groups of at most
 `WIKI_JEV_SUBAGENT_GROUP_SIZE` seeds, and each group gets its own subagent
 (running `WIKI_SUBAGENT_CONCURRENCY` at a time). A group only ever sees its own
 seeds; reading a page another group owns is refused by the `read` tool, so the
-groups follow genuinely new paths instead of overlapping. The merged reports plus
-the seed blocks become the lead agent's context.
+groups follow genuinely new paths instead of overlapping. Reports are folded in
+windows of 4 as they land. With eight or more explorer groups, each completed
+window is submitted immediately to an independent level-1 compiler pool; the
+level-2 merge waits only for those completed folds. With fewer than eight groups,
+raw reports go directly to the level-2/final compiler. Inputs are partitioned only
+when they exceed the configured model context; every slice is sent in full and no
+source text is discarded. Each fold streams `reports_folded` (`reports`, `chars`).
+
+A lead-agent call that still fails (proxy reset, model crash) no longer throws the run
+away: after `WIKI_LLM_MAX_RETRIES` connection retries it emits `lead_failed` and answers
+straight from the seed evidence and the compiled report, with the sweep's page ids as
+citations, instead of ending in `agent run failed`.
 
 Jev is **disabled by default**; when disabled, unavailable, or failing, the
 existing ES → index map → router path runs unchanged (a `jev_unavailable` SSE
@@ -276,12 +291,23 @@ WIKI_JEV_API_KEY=secret-if-required
 | `WIKI_JEV_DTYPE` | local runtime weights: `bfloat16` (default), `float16`, `float32`. |
 | `WIKI_JEV_MODEL_REVISION` | Optional Hugging Face commit pin for the runtime and model snapshot. |
 | `WIKI_JEV_MAX_BATCH_REQUESTS` | Engine request cap (default `64`). |
+| `WIKI_JEV_LLM2JEV_CONCURRENCY` | concurrent single-state `/v1/systemone` calls for the `llm2jev` backend (default `20`). |
 | `WIKI_JEV_RECORD` / `WIKI_JEV_RECORD_MAX` | Optional JSONL path and maximum requests to record for parity checks (default `300`). |
 | `WIKI_JEV_CHUNK_TOKENS` / `WIKI_JEV_CHUNK_OVERLAP` | body chunking (defaults `25600` / `10000`). |
+| `WIKI_JEV_TOC_CHUNK_TOKENS` | 目次 chunking for the rewrite stage's ranking (default `15000`), comfortably inside the model's 25,600-token input ceiling so the question head also fits. |
 | `WIKI_JEV_WORKERS` | concurrent fetch+classify threads in the sweep pipeline (default `4`). The shared `jev/` engine owns model access on one worker while callers prepare requests. |
 | `WIKI_JEV_SUBAGENT_GROUP_SIZE` / `WIKI_JEV_SUBAGENT_GROUPS` | seeds per seed-group subagent / max such subagents per question (defaults `5` / `8`). Size `WIKI_JEV_SUBAGENT_GROUPS × WIKI_JEV_SUBAGENT_GROUP_SIZE` pages into `WIKI_MAX_PAGE_FETCHES_PER_RUN` or the groups starve. |
 | `WIKI_JEV_PREFILTER_MIN_OVERLAP` | keyword units a page must share with the rewritten question before it gets an expensive body score (default `2`, `0` = off). Dropped pages are counted in `jev_complete.prefiltered`: if that number climbs and seeds collapse, even the rewrite missed the corpus's vocabulary — lower this to `1`, then `0`. |
 | `WIKI_JEV_MAX_PAGE_READS` / `WIKI_JEV_MAX_LIST_CALLS` | independent sweep safety valves; `0` = unlimited. The sweep is exhaustive and can cost many GROWI reads. |
+
+The rewrite stage streams its own events before the sweep starts, so it is never a
+silent wait: `jev_toc_scan` (`documents` found, one activity line), then one
+`jev_progress` with `stage: "toc"` per ranked page (`done` / `total` / `percent` /
+`document` / `probability` / `yes`), `jev_toc_chunk` when a 目次 chunk still cannot be
+scored, `jev_toc` per summary call, `jev_toc_digest` (`scanned` / `kept` / `groups` /
+`chars`), `jev_toc_failed` when the stage gives up and the raw question is used, and
+finally `jev_query`. The progress bar relabels itself `00-目次 スキャン` while
+`stage` is `toc`, so the two stages of one question are readable apart.
 
 Sweep reads use their own budget (never the per-run `WIKI_MAX_PAGE_FETCHES_PER_RUN`)
 and warm the shared page cache. The sweep streams `jev_progress`

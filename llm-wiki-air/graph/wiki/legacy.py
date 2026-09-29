@@ -15,6 +15,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+from graph.common.images import find_images
+
 # region Config and Models
 
 
@@ -390,14 +392,22 @@ def chunk_source_lines_preserving_tables(
             in_f = not in_f
         fence_state.append(in_f)
 
-    img_state = []
+    img_state = [False] * n
     in_i = False
-    for line in lines:
-        if "<image-unit>" in line:
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if re.search(r"<image-unit\b", lowered):
             in_i = True
-        if "</image-unit>" in line:
+        img_state[index] = in_i
+        if "</image-unit>" in lowered:
             in_i = False
-        img_state.append(in_i)
+            img_state[index] = False
+    source = "\n".join(lines)
+    for image in find_images(source):
+        first = image.source_start - 1
+        last = image.source_end - 1
+        for index in range(first, last):
+            img_state[index] = True
 
     while start < n:
         end = min(start + target_size, n)
@@ -818,15 +828,17 @@ def basic_cut_is_inside_image_unit(
     if split_line <= 1:
         return False
 
+    source = "\n".join(source_lines)
+    cut = sum(len(line) + 1 for line in source_lines[: split_line - 1])
+    if any(image.start < cut < image.end for image in find_images(source)):
+        return True
     in_image_unit = False
-
     for line in source_lines[: split_line - 1]:
-        if "<image-unit>" in line:
+        lowered = line.lower()
+        if re.search(r"<image-unit\b", lowered):
             in_image_unit = True
-
-        if "</image-unit>" in line:
+        if "</image-unit>" in lowered:
             in_image_unit = False
-
     return in_image_unit
 
 
@@ -962,7 +974,7 @@ def make_llm(
     model: str,
     base_url: str,
     api_key: str,
-    temperature: float = 0.0,
+    temperature: float = TEMPERATURE,
     timeout: int = 300,
 ) -> ChatOpenAI:
     return ChatOpenAI(
@@ -981,6 +993,8 @@ async def structured_ainvoke(
     schema_cls: type[BaseModel],
     messages: list[Any],
     max_output_tokens: int | None = None,
+    *,
+    temperature: float | None = None,
 ) -> BaseModel:
     request_timeout = getattr(llm, "request_timeout", None)
     try:
@@ -994,12 +1008,23 @@ async def structured_ainvoke(
             return await operation
         return await asyncio.wait_for(operation, timeout=hard_timeout)
 
-    call_llm = (
-        llm.bind(max_tokens=max_output_tokens) if max_output_tokens is not None else llm
-    )
+    bind_kwargs: dict[str, Any] = {}
+    if max_output_tokens is not None:
+        bind_kwargs["max_tokens"] = max_output_tokens
+    if temperature is not None:
+        bind_kwargs["temperature"] = temperature
+    call_llm = llm.bind(**bind_kwargs) if bind_kwargs else llm
 
     try:
-        structured = call_llm.with_structured_output(schema_cls)
+        structured_kwargs = {
+            key: value
+            for key, value in (
+                ("max_tokens", max_output_tokens),
+                ("temperature", temperature),
+            )
+            if value is not None
+        }
+        structured = llm.with_structured_output(schema_cls, **structured_kwargs)
         result = await invoke(structured, messages)
 
         if isinstance(result, schema_cls):
@@ -1237,16 +1262,7 @@ def cut_is_inside_image_unit(source_lines: list[str], split_line: int) -> bool:
     if split_line <= 1:
         return False
 
-    in_image_unit = False
-
-    for line in source_lines[: split_line - 1]:
-        if "<image-unit>" in line:
-            in_image_unit = True
-
-        if "</image-unit>" in line:
-            in_image_unit = False
-
-    return in_image_unit
+    return basic_cut_is_inside_image_unit(source_lines, split_line)
 
 
 def cut_is_inside_table(source_lines: list[str], split_line: int) -> bool:
@@ -1842,6 +1858,7 @@ async def split_window_until_valid(
                 ConceptSplitResult,
                 messages,
                 max_output_tokens=max_output_tokens,
+                temperature=TEMPERATURE if attempt > 1 else None,
             )
 
             result = ConceptSplitResult.model_validate(raw_result)

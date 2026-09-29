@@ -22,9 +22,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from graph.growi.client import GrowiClient, GrowiPage, assert_publish_path, growi_path
+from graph.growi.client import GrowiClient, GrowiPage, assert_publish_path, growi_path, growi_segment
 from graph.wiki.storage import read_json, write_text_atomic
-from graph.workspace.project import Project, open_project, team_of
+from graph.workspace.project import Project, open_project
 from publisher.ledger import Ledger, load_ledger
 from publisher.pipeline import _connection, _folders, _lock, _publisher
 
@@ -110,17 +110,15 @@ def _related_documents(settings: Any, folders: dict[str, Path], summaries: dict[
     tokens = {doc: {str(x).casefold() for x in summary["keywords"] + summary["entities"] if str(x).strip()}
               for doc, summary in summaries.items()}
     ranked: dict[str, list[tuple[float, str]]] = {doc: [] for doc in folders}
-    teams: dict[str, list[str]] = {}
-    for doc in sorted(folders):
-        teams.setdefault(team_of(doc), []).append(doc)
-    # ponytail: all pairs inside one team; add a keyword index if a team outgrows a few thousand documents.
-    for docs in teams.values():
-        for i, a in enumerate(docs):
-            for b in docs[i + 1:]:
-                union = tokens[a] | tokens[b]
-                score = len(tokens[a] & tokens[b]) / len(union) if union else 0
-                if score >= .15:
-                    ranked[a].append((score, b)); ranked[b].append((score, a))
+    # Each configured target is one project/team, so every document in this
+    # project participates regardless of its mount subfolder.
+    docs = sorted(folders)
+    for i, a in enumerate(docs):
+        for b in docs[i + 1:]:
+            union = tokens[a] | tokens[b]
+            score = len(tokens[a] & tokens[b]) / len(union) if union else 0
+            if score >= .15:
+                ranked[a].append((score, b)); ranked[b].append((score, a))
     pairs = {tuple(sorted((doc, other))) for doc, found in ranked.items()
              for _score, other in sorted(found, key=lambda pair: (-pair[0], pair[1]))[:10]}
     cards = {}
@@ -136,8 +134,8 @@ def _related_documents(settings: Any, folders: dict[str, Path], summaries: dict[
             pending.append((key, text_a, text_b))
     if pending:
         try:
-            from jev import get_engine
-            engine = get_engine()
+            from jev import get_engine_for
+            engine = get_engine_for(settings)
             from graph.linker.jev_judge import related_documents
             accepted = asyncio.run(related_documents(engine, pending, settings))
             decisions.update({key: key in accepted for key, _a, _b in pending})
@@ -268,25 +266,72 @@ async def _delete_if_index(client: GrowiClient, path: str) -> bool:
     return True
 
 
+async def _delete_stale_indexes(
+    client: GrowiClient,
+    root_path: str,
+    expected_paths: set[str],
+) -> list[str]:
+    """Delete publisher-owned index pages below ``root_path`` that are not expected."""
+
+    doomed: dict[str, str] = {}
+    deleted_paths: list[str] = []
+    index_segment = growi_segment(INDEX_NAME)
+    boundary = growi_path(root_path)
+    for listed in await client.list_all_pages(root_path):
+        path = str(listed.path or "")
+        if not (
+            boundary == "/"
+            or path == boundary
+            or path.startswith(boundary.rstrip("/") + "/")
+        ):
+            continue
+        if path in expected_paths or path.rstrip("/").rsplit("/", 1)[-1] != index_segment:
+            continue
+        full = await client.get_page(page_id=listed.page_id)
+        if full is None or 'data-llm-wiki-index="' not in full.body:
+            continue
+        doomed[full.page_id] = full.revision_id
+        deleted_paths.append(full.path)
+    if doomed:
+        await client.delete_pages(doomed)
+    return sorted(deleted_paths)
+
+
 def _index_link(connection: Any | None, rel: str, name: str = INDEX_NAME) -> str:
     if connection:
         return growi_path(connection.write_path, rel, name)
     return growi_path(rel, name)
 
 
+def _delete_local_index(path: Path, index_root: Path) -> bool:
+    """Delete one derived local index and prune only its now-empty parents."""
+
+    path = Path(path)
+    if not path.exists():
+        return False
+    path.unlink()
+    root = Path(index_root).resolve(strict=False)
+    current = path.parent.resolve(strict=False)
+    while current != root and root in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+    return True
+
+
 def _folder_cards(folder: str, tree: dict[str, FolderNode], summaries: dict[str, dict[str, Any]],
                   connection: Any | None, *, root: bool = False) -> list[str]:
     node = tree[folder]
     blocks: list[str] = []
-    teams = {team_of(document) for document in summaries if team_of(document) != "general"} if root else set()
     for child in sorted(node.folders):
         # A source document can also be a parent folder. Its child folders live in
         # the document index's サブフォルダ section instead of another index page.
         if child in summaries:
             continue
         summary = folder_summary(child, tree, summaries)
-        blocks.append(render_folder_card(summary, _index_link(connection, child),
-                                         name_only=root and Path(child).name in teams))
+        blocks.append(render_folder_card(summary, _index_link(connection, child), name_only=False))
     for document in sorted(node.documents, key=str):
         blocks.append(render_document_card(summaries[document], _index_link(connection, document)))
     return blocks
@@ -310,6 +355,16 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     project lock, linking against the page IDs that sweep has just published.
     """
     project = open_project(settings)
+    if not locked:
+        with _lock(project):
+            return build_index(
+                settings,
+                only=only,
+                publish=publish,
+                on_progress=on_progress,
+                locked=True,
+                ledger=ledger,
+            )
     connection = _connection(settings)
     publisher = _publisher(settings) if publish else None
     if publish and publisher is None:
@@ -320,9 +375,21 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     folders = _folders(project)
     paths = list(folders)
     tree = folder_tree(paths)
+    if connection is not None:
+        remote_owners: dict[str, str] = {}
+        for rel in set(paths) | set(tree):
+            remote_path = _index_link(connection, rel)
+            previous = remote_owners.get(remote_path)
+            if previous is not None and previous != rel:
+                raise ValueError(
+                    f"index locations resolve to the same GROWI path {remote_path!r}: "
+                    f"{previous!r}, {rel!r}"
+                )
+            remote_owners[remote_path] = rel
     cards_by_document = {doc: document_cards(path) for doc, path in folders.items()}
     summaries = {doc: document_summary(doc, cards_by_document[doc]) for doc in folders}
     related = _related_documents(settings, folders, summaries, connection)
+    index_root = project.metadata / "index"
     scoped = set(paths) if only is None else {
         project.wiki_dir(rel.strip().lstrip("/")).relative_to(project.wiki).as_posix() for rel in only
     }
@@ -330,7 +397,9 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     for document in scoped:
         parts = Path(document).parts
         affected.update("/".join(parts[:i]) for i in range(1, len(parts)))
-    affected.update(scoped & set(tree))
+    # Include the scoped leaf even when it no longer exists. That is what lets a
+    # delete or move remove its old document index, not only refresh its parents.
+    affected.update(scoped)
     # Keep a collision document fresh when its child-folder listing changes.
     doc_scope = scoped | (set(summaries) & affected)
     if getattr(settings, "wiki_linker_judge", "llm") == "jev" and getattr(settings, "wiki_index_related_docs", False):
@@ -367,9 +436,9 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
             if on_progress:
                 on_progress({"stage": "index", "step": "document", "current": indexed, "total": total, "document": document})
         for folder in sorted(affected - set(summaries), key=str):
-            index_path = project.metadata / "index" / (folder if folder else "") / "index.md"
+            index_path = index_root / (folder if folder else "") / "index.md"
             if folder not in tree:
-                index_path.unlink(missing_ok=True)
+                _delete_local_index(index_path, index_root)
                 status = "deleted"
                 if publisher is not None:
                     try:
@@ -380,7 +449,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                 done.append({"folder": folder, "status": status})
                 continue
             if folder and not tree[folder].documents and not tree[folder].folders:
-                index_path.unlink(missing_ok=True)
+                _delete_local_index(index_path, index_root)
                 status = "deleted"
                 if publisher is not None:
                     try:
@@ -407,6 +476,32 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
             indexed += 1
             if on_progress:
                 on_progress({"stage": "index", "step": "folder", "current": indexed, "total": total, "folder": folder})
+        if only is None:
+            expected_rels = set(summaries) | set(tree)
+            expected_local = {
+                (index_root / (rel if rel else "") / "index.md").resolve(strict=False)
+                for rel in expected_rels
+            }
+            removed_local = []
+            for stale in sorted(index_root.rglob("index.md")) if index_root.exists() else ():
+                if stale.resolve(strict=False) in expected_local:
+                    continue
+                if _delete_local_index(stale, index_root):
+                    removed_local.append(stale.relative_to(index_root).as_posix())
+            if removed_local:
+                done.append({"stale_local_indexes": removed_local, "status": "deleted"})
+            if publisher is not None and hasattr(publisher.client, "list_all_pages"):
+                expected_remote = {_index_link(connection, rel) for rel in expected_rels}
+                try:
+                    removed_remote = asyncio.run(_delete_stale_indexes(
+                        publisher.client,
+                        growi_path(connection.write_path),
+                        expected_remote,
+                    ))
+                    if removed_remote:
+                        done.append({"stale_growi_indexes": removed_remote, "status": "deleted"})
+                except Exception as exc:
+                    failures.append(f"stale indexes: {type(exc).__name__}: {exc}")
     return {"run_id": run_id, "done": done, "failures": failures}
 
 
@@ -417,13 +512,20 @@ def delete_index_pages(settings: Any) -> dict[str, Any]:
     publisher = _publisher(settings)
     if publisher is None:
         raise RuntimeError("GROWI_URL is required")
-    documents = list(_folders(project))
-    tree = folder_tree(documents)
-    paths = [growi_path(connection.write_path, document, INDEX_NAME) for document in documents]
-    paths.extend(growi_path(connection.write_path, folder, INDEX_NAME)
-                 for folder in tree if folder and folder not in documents)
-    paths.append(growi_path(connection.write_path, INDEX_NAME))
-    deleted = [path for path in paths if asyncio.run(_delete_if_index(publisher.client, path))]
+    if hasattr(publisher.client, "list_all_pages"):
+        deleted = asyncio.run(_delete_stale_indexes(
+            publisher.client,
+            growi_path(connection.write_path),
+            set(),
+        ))
+    else:  # compatibility for small test/fake clients
+        documents = list(_folders(project))
+        tree = folder_tree(documents)
+        paths = [growi_path(connection.write_path, document, INDEX_NAME) for document in documents]
+        paths.extend(growi_path(connection.write_path, folder, INDEX_NAME)
+                     for folder in tree if folder and folder not in documents)
+        paths.append(growi_path(connection.write_path, INDEX_NAME))
+        deleted = [path for path in paths if asyncio.run(_delete_if_index(publisher.client, path))]
     return {"run_id": "idx-del-" + uuid.uuid4().hex[:16], "done": [{"deleted": deleted}], "failures": []}
 
 

@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .config import SEED_PLAN_VERSION, WikiConfig
+from .config import SEED_PLAN_COMPILE_VERSION, SEED_PLAN_VERSION, WikiConfig
 from .markdown_blocks import BlockIndex, build_block_index
 from .page import split_sections
 from .prompts import (
@@ -24,7 +24,7 @@ from .prompts import (
     semantic_plan_prompt,
 )
 from .schemas import CompiledSeedPlan, ObservationSet, RegionalReport, WindowReport
-from .storage import hash_of, read_json, write_json_atomic, write_text_atomic
+from .storage import clean_workdir, hash_of, read_json, write_json_atomic, write_text_atomic
 from .wire import RegionalPage, RegionalPlan, SeedPlan, SeedRange, SemanticPlan
 
 StopCheck = Callable[[], bool] | None
@@ -35,6 +35,34 @@ class SeedPlanningError(RuntimeError):
 
 
 MIN_SEED_LINES = 1
+
+
+def _merge_seed_ranges(pages: Sequence[SeedRange]) -> SeedRange:
+    """Collapse ranges that cannot be separated without cutting an atomic block."""
+
+    def distinct(values: Sequence[str], separator: str) -> str:
+        return separator.join(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+    title = distinct([page.title for page in pages], "・")
+    paths = [page.path for page in pages if page.path]
+    common_path: list[str] = []
+    if paths:
+        for values in zip(*paths):
+            if len(set(values)) != 1:
+                break
+            common_path.append(values[0])
+    if common_path and common_path[-1] not in title:
+        common_path.append(title)
+    elif not common_path and paths:
+        common_path = [title]
+    return SeedRange(
+        title=title,
+        summary=distinct([page.summary for page in pages], " "),
+        chapter=distinct([page.chapter for page in pages], " / "),
+        source_start=pages[0].source_start,
+        source_end=pages[-1].source_end,
+        path=common_path,
+    )
 
 
 def _window_reports_text(reports: Sequence[WindowReport]) -> str:
@@ -188,10 +216,26 @@ def validate_seed_plan(
             if lower <= candidate <= upper and block_index.cut_is_safe(candidate)
         ]
         if not choices:
-            return None, (
-                f"page boundaries around {cut} place an entire page inside "
-                f"{block.kind} {block.start}-{block.end}; merge or move those "
-                "semantic pages and return the complete plan again"
+            overlapping = [
+                position
+                for position, page in enumerate(cleaned, start=1)
+                if page.source_start <= block.end and page.source_end >= block.start
+            ]
+            first = overlapping[0]
+            last = overlapping[-1]
+            merged_start = cleaned[first - 1].source_start
+            merged_end = cleaned[last - 1].source_end
+            merged = _merge_seed_ranges(cleaned[first - 1:last])
+            assert merged.source_start == merged_start and merged.source_end == merged_end
+            return validate_seed_plan(
+                SeedPlan(
+                    summary=plan.summary,
+                    pages=[*cleaned[:first - 1], merged, *cleaned[last:]],
+                ),
+                source_line_count=source_line_count,
+                block_index=block_index,
+                lines=lines,
+                page_target_lines=page_target_lines,
             )
         snapped[index] = min(choices, key=lambda candidate: (abs(candidate - cut), candidate))
 
@@ -256,7 +300,7 @@ def _boundary_repairs(
 ) -> list[dict[str, int | str]]:
     repairs: list[dict[str, int | str]] = []
     if len(original.pages) != len(checked.pages):
-        return [{"title": "*", "note": f"{len(original.pages)} planned pages split into {len(checked.pages)}"}]
+        return [{"title": "*", "note": f"{len(original.pages)} planned pages compiled into {len(checked.pages)}"}]
     for before, after in zip(original.pages, checked.pages):
         if (
             before.source_start == after.source_start
@@ -397,6 +441,7 @@ async def _build_regions(
                         RegionalPlan,
                         prompt.messages(),
                         max_output_tokens=config.map_max_output_tokens,
+                        temperature=config.retry_temperature if last_error else config.temperature,
                     )
                     candidate = raw if isinstance(raw, RegionalPlan) else RegionalPlan.model_validate(raw)
                     if task_root:
@@ -506,6 +551,7 @@ async def _build_semantic_plan(
                 SemanticPlan,
                 prompt.messages(),
                 max_output_tokens=config.map_max_output_tokens,
+                temperature=config.retry_temperature if last_error else config.temperature,
             )
             result = raw if isinstance(raw, SemanticPlan) else SemanticPlan.model_validate(raw)
             if task_root:
@@ -550,7 +596,7 @@ async def _compile_seed_plan(
     key = hash_of(
         {
             "observation_prompt_version": config.prompt_version,
-            "seed_plan_version": SEED_PLAN_VERSION,
+            "seed_plan_compile_version": SEED_PLAN_COMPILE_VERSION,
             "semantic": semantic.model_dump(mode="json"),
             "regions": [item.model_dump(mode="json") for item in regions],
             "source_line_count": source_line_count,
@@ -582,56 +628,15 @@ async def _compile_seed_plan(
         except (OSError, TypeError, ValueError):
             pass
     if task_root:
-        task_root.mkdir(parents=True, exist_ok=True)
+        # A failed compile is one resumable stage, not a conversation to continue
+        # across process runs. Keep earlier planning stages, but start this stage at 1.
+        clean_workdir(task_root)
 
     last_error = ""
     previous_plan = ""
+    repeated_invalid = 0
     attempt = 0
-    if config.resume and task_root:
-        responses = sorted(task_root.glob("attempt-*-response.json"))
-        for response_file in reversed(responses):
-            try:
-                candidate = SeedPlan.model_validate(read_json(response_file))
-                checked, error = validate_seed_plan(
-                    candidate,
-                    source_line_count=source_line_count,
-                    block_index=block_index,
-                    lines=lines,
-                    page_target_lines=config.page_target_lines,
-                )
-                if error is None and checked is not None:
-                    repairs = _boundary_repairs(candidate, checked)
-                    write_json_atomic(result_path, checked)
-                    if repairs:
-                        write_json_atomic(task_root / "boundary-repairs.json", repairs)
-                    if on_progress:
-                        recovered_attempt = response_file.name.split("-")[1]
-                        on_progress(
-                            {
-                                "stage": "plan",
-                                "step": "compile_done",
-                                "cached": True,
-                                "recovered": True,
-                                "attempt": int(recovered_attempt),
-                                "pages": len(checked.pages),
-                                "repairs": len(repairs),
-                                "response": str(response_file),
-                            }
-                        )
-                    return checked
-                if not previous_plan:
-                    previous_plan = json.dumps(
-                        candidate.model_dump(mode="json"), indent=2, ensure_ascii=False
-                    )
-                    last_error = error or "invalid seed plan"
-            except (OSError, TypeError, ValueError):
-                continue
-        if responses:
-            try:
-                attempt = max(int(path.name.split("-")[1]) for path in responses)
-            except (IndexError, ValueError):
-                attempt = 0
-    # A fresh budget per run: resumed attempt numbers only name files.
+    # Each invocation gets a fresh, short repair conversation for this stage.
     for _ in range(max(1, config.map_attempts)):
         attempt += 1
         if stop_check and stop_check():
@@ -656,12 +661,14 @@ async def _compile_seed_plan(
                 SeedPlan,
                 prompt.messages(),
                 max_output_tokens=config.map_max_output_tokens,
-                temperature=config.retry_temperature if last_error else None,
+                temperature=config.retry_temperature if last_error else config.temperature,
             )
             candidate = raw if isinstance(raw, SeedPlan) else SeedPlan.model_validate(raw)
-            previous_plan = json.dumps(
+            candidate_plan = json.dumps(
                 candidate.model_dump(mode="json"), indent=2, ensure_ascii=False
             )
+            repeated = candidate_plan == previous_plan
+            previous_plan = candidate_plan
             if task_root:
                 response_file = task_root / f"attempt-{attempt:04d}-response.json"
                 write_json_atomic(response_file, candidate)
@@ -693,6 +700,15 @@ async def _compile_seed_plan(
                     )
                 return checked
             last_error = error or "invalid seed plan"
+            if repeated:
+                repeated_invalid += 1
+                last_error += (
+                    f" The exact same invalid plan has now been repeated "
+                    f"{repeated_invalid} time(s). Do not return it again; apply the exact "
+                    "range and page-count correction above."
+                )
+            else:
+                repeated_invalid = 0
         except Exception as exc:  # noqa: BLE001 - retry feedback is the recovery path
             last_error = f"{type(exc).__name__}: {exc}"[:1500]
         if task_root:

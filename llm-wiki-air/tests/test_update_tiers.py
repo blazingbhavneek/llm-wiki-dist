@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import random
 import tempfile
@@ -53,6 +54,67 @@ def resumable(run: Path, new_text: str) -> bool:
 
 
 class IncrementalDecisionTest(unittest.TestCase):
+    def test_image_spellings_share_byte_identity_and_wrapper_only_diff_is_tier_zero(self) -> None:
+        from graph.common.images import canonicalize_images
+        from graph.wiki.images import (
+            count_equivalent_units,
+            extract_image_units,
+            image_identity_counts,
+        )
+
+        payload = base64.b64encode(b"same image bytes").decode("ascii")
+        old_image = f'<embed src="data:image/png;base64,{payload}" style="width:1in" />'
+        new_image = (
+            '<image-unit>\n'
+            f'  <image-media><img alt="changed metadata" src="data:image/png;base64,{payload}"></image-media>\n'
+            '  <image-description>generated wording is not image identity</image-description>\n'
+            '</image-unit>'
+        )
+        old = f"# Page\n\n<td>{old_image}</td>\n\ntail"
+        new = f"# Page\n\n<td>{new_image}</td>\n\ntail"
+
+        self.assertEqual(
+            [line for line in canonicalize_images(old).splitlines() if line],
+            [line for line in canonicalize_images(new).splitlines() if line],
+        )
+        old_unit = extract_image_units(old.splitlines())[0]
+        new_unit = extract_image_units(new.splitlines())[0]
+        self.assertEqual(old_unit.unit_sha256, new_unit.unit_sha256)
+        self.assertEqual(count_equivalent_units(new, old_unit), 1)
+        self.assertEqual(count_equivalent_units(new + "\n" + old_image, old_unit), 2)
+        self.assertEqual(image_identity_counts(new + "\n" + old_image)[old_unit.unit_sha256], 2)
+        legacy_ref = '<embed src="media/media/image10.png" style="width:1in" />'
+        wrapped_ref = (
+            '<image-unit><image-media><img src="./media/media/image10.png" alt="x">'
+            '</image-media><image-description>y</image-description></image-unit>'
+        )
+        self.assertEqual(
+            extract_image_units([legacy_ref])[0].unit_sha256,
+            extract_image_units([wrapped_ref])[0].unit_sha256,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run = make_run(Path(tmp), old, [(1, len(inc.source_lines(old)))])
+            decision = inc.decide_update(run, old, new, kind="docx")
+            self.assertEqual((decision.tier, decision.reason), (0, "image-representation"))
+            self.assertTrue(decision.hunks)  # retained solely to remap physical lines
+            inc.apply_update(run, decision, new)
+            plan = read_json(run / "state" / "plan.json")
+            self.assertEqual(plan["source_line_count"], len(inc.source_lines(new)))
+            self.assertEqual(plan["pages"][0]["owner_ranges"], [[1, len(inc.source_lines(new))]])
+            self.assertTrue(resumable(run, new))
+
+    def test_changed_image_bytes_remain_a_real_change(self) -> None:
+        first = base64.b64encode(b"first image").decode("ascii")
+        second = base64.b64encode(b"second image").decode("ascii")
+        old = f'# Page\n\n<img src="data:image/png;base64,{first}">\n\ntail'
+        new = f'# Page\n\n<image-unit><image-media><img src="data:image/png;base64,{second}"></image-media></image-unit>\n\ntail'
+        with tempfile.TemporaryDirectory() as tmp:
+            run = make_run(Path(tmp), old, [(1, len(inc.source_lines(old)))])
+            decision = inc.decide_update(run, old, new, kind="docx")
+        self.assertNotEqual(decision.reason, "unchanged")
+        self.assertNotEqual(decision.reason, "image-representation")
+
     def test_line_hunks_matches_difflib_on_small_inputs(self) -> None:
         cases = [
             (["a", "b", "c"], ["a", "x", "b", "c"]),
@@ -436,6 +498,131 @@ class WriterTierTest(unittest.TestCase):
                 result = writer.write_wiki_pages(project, rel, mode="wiki", settings=SETTINGS, llm=model, embedder=None)
             self.assertEqual((result.tier, result.reason, result.rebuild), (3, "resume-failed", "full"))
             self.assertEqual([call.get("resume") for call in calls], [True, False])
+
+    def test_interrupted_initial_build_keeps_checkpoints_when_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = Project(root / "project", root / "mount").ensure()
+            rel = "test_docx.md"
+            self._write_raw(project, rel, OLD_SOURCE)
+            state = project.state_dir(rel)
+            (state / "source").mkdir(parents=True)
+            (state / "source" / "original.md").write_text(OLD_SOURCE, encoding="utf-8")
+            checkpoint = state / "work" / "observations" / "checkpoints" / "window" / "result.json"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text('{"kept": true}\n', encoding="utf-8")
+            calls = []
+
+            def resume_build(**kwargs):
+                calls.append(kwargs)
+                self.assertTrue(kwargs["resume"])
+                self.assertTrue(checkpoint.exists())
+                docs = Path(kwargs["out_dir"]) / "docs"
+                docs.mkdir(parents=True)
+                (docs / "001.md").write_text("# resumed\n", encoding="utf-8")
+                return SimpleNamespace(out_dir=Path(kwargs["out_dir"]))
+
+            with patch.object(writer, "build_wiki_output", side_effect=resume_build):
+                result = writer.write_wiki_pages(
+                    project, rel, mode="wiki", settings=SETTINGS,
+                    llm=None, embedder=None, resume=True,
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual((result.tier, result.reason, result.rebuild), (3, "no-previous-state", "full"))
+            self.assertTrue(checkpoint.exists())
+            self.assertEqual((project.wiki_dir(rel) / "001.md").read_text(encoding="utf-8"), "# resumed\n")
+
+    def test_unchanged_incomplete_run_resumes_stored_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, rel, state = make_project(
+                tmp, [(1, COUNT, "# P1\n\n" + "\n".join(BODY))], OLD_SOURCE,
+            )
+            self._write_raw(project, rel, OLD_SOURCE)
+            plan = state / "state" / "plan.json"
+            checkpoint = state / "work" / "planning" / "result.json"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text('{"kept": true}\n', encoding="utf-8")
+            (state / "wiki" / "001.md").unlink()
+
+            def resume_build(**kwargs):
+                self.assertTrue(kwargs["resume"])
+                self.assertTrue(plan.exists())
+                self.assertTrue(checkpoint.exists())
+                docs = Path(kwargs["out_dir"]) / "docs"
+                docs.mkdir(parents=True)
+                (docs / "001.md").write_text("# resumed\n", encoding="utf-8")
+                return SimpleNamespace(out_dir=Path(kwargs["out_dir"]))
+
+            with patch.object(writer, "build_wiki_output", side_effect=resume_build):
+                result = writer.write_wiki_pages(
+                    project, rel, mode="wiki", settings=SETTINGS,
+                    llm=None, embedder=None, resume=True,
+                )
+
+            self.assertEqual(
+                (result.tier, result.reason, result.rebuild),
+                (3, "interrupted-initial-build", "full"),
+            )
+            self.assertTrue(plan.exists())
+            self.assertTrue(checkpoint.exists())
+
+    def test_changed_source_with_incomplete_run_rebuilds_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, rel, state = make_project(
+                tmp, [(1, COUNT, "# P1\n\n" + "\n".join(BODY))], OLD_SOURCE,
+            )
+            self._write_raw(project, rel, OLD_SOURCE.replace("line 5", "line 5 changed"))
+            checkpoint = state / "work" / "planning" / "result.json"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text('{"stale": true}\n', encoding="utf-8")
+            (state / "wiki" / "001.md").unlink()
+
+            def fresh_build(**kwargs):
+                self.assertFalse(kwargs["resume"])
+                self.assertFalse(checkpoint.exists())
+                docs = Path(kwargs["out_dir"]) / "docs"
+                docs.mkdir(parents=True)
+                (docs / "001.md").write_text("# rebuilt\n", encoding="utf-8")
+                return SimpleNamespace(out_dir=Path(kwargs["out_dir"]))
+
+            with patch.object(writer, "build_wiki_output", side_effect=fresh_build):
+                result = writer.write_wiki_pages(
+                    project, rel, mode="wiki", settings=SETTINGS,
+                    llm=None, embedder=None, resume=True,
+                )
+
+            self.assertEqual(
+                (result.tier, result.reason, result.rebuild),
+                (3, "incomplete-previous-state", "full"),
+            )
+
+    def test_initial_build_does_not_resume_checkpoints_for_different_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = Project(root / "project", root / "mount").ensure()
+            rel = "test_docx.md"
+            self._write_raw(project, rel, OLD_SOURCE)
+            state = project.state_dir(rel)
+            (state / "source").mkdir(parents=True)
+            (state / "source" / "original.md").write_text("different source\n", encoding="utf-8")
+            checkpoint = state / "work" / "observations" / "checkpoints" / "stale.json"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text('{}\n', encoding="utf-8")
+
+            def fresh_build(**kwargs):
+                self.assertFalse(kwargs["resume"])
+                self.assertFalse(checkpoint.exists())
+                docs = Path(kwargs["out_dir"]) / "docs"
+                docs.mkdir(parents=True)
+                (docs / "001.md").write_text("# fresh\n", encoding="utf-8")
+                return SimpleNamespace(out_dir=Path(kwargs["out_dir"]))
+
+            with patch.object(writer, "build_wiki_output", side_effect=fresh_build):
+                writer.write_wiki_pages(
+                    project, rel, mode="wiki", settings=SETTINGS,
+                    llm=None, embedder=None, resume=True,
+                )
 
     def test_human_edited_page_is_reported_when_regenerated(self) -> None:
         page_one, page_two = "# P1\n\n" + "\n".join(BODY[:50]), "# P2\n\n" + "\n".join(BODY[50:])

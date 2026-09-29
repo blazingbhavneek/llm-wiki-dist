@@ -79,7 +79,11 @@ class Settings(BaseModel):
     # Sent explicitly so a server-side default cannot cut a long report short; with
     # reasoning on it covers thinking plus answer. 0 leaves it to the server.
     llm_max_output_tokens: int = 32768
+    llm_context_tokens: int = 131072
     llm_timeout: int = 900
+    # Agents cannot retry a half-finished turn themselves, so the SDK retries the
+    # connection: one proxy reset must not throw away a finished sweep and its reports.
+    llm_max_retries: int = 2
 
     # Reranker (optional; ES order preserved when unavailable)
     rerank_base_url: str = ""
@@ -94,11 +98,11 @@ class Settings(BaseModel):
 
     # Jev relevance gate (optional; ES/router path is used when disabled)
     jev_enabled: bool = False
-    jev_backend: str = "auto"          # auto | local | hosted
+    jev_backend: str = "auto"          # auto | local | hosted | llm2jev (sglang/vllm via llm2jev)
     jev_local_path: str = ""           # directory containing jev_style_decision.py
     jev_device: str = "auto"           # auto | cuda | mps | cpu for the local runtime
     jev_dtype: str = "bfloat16"        # float32 | bfloat16 | float16 (bf16 falls back to fp16)
-    jev_base_url: str = ""             # hosted Jev-compatible /score endpoint
+    jev_base_url: str = ""             # hosted /score endpoint, or llm2jev /v1/systemone (sglang/vllm)
     jev_api_key: str = ""
     jev_model: str = "chaoliangUNSW/Jev-Style-0.8B-Decision-v3"
     jev_timeout: int = 60
@@ -106,6 +110,7 @@ class Settings(BaseModel):
     jev_seed_threshold: float = 0.80
     jev_chunk_tokens: int = 25600
     jev_chunk_overlap: int = 10000
+    jev_toc_chunk_tokens: int = 15000  # 目次 pages are ranked in their own, smaller chunks
     jev_max_page_reads: int = 0        # 0 = unlimited; independent of RunBudget
     jev_max_list_calls: int = 0        # 0 = unlimited
     jev_workers: int = 4               # concurrent fetch+classify threads in the sweep pipeline
@@ -116,8 +121,12 @@ class Settings(BaseModel):
     jev_toc_gate_threshold: float = 0.2
     jev_deterministic: bool = False
     jev_verdict_cache: bool = False
-    lead_after_reports: str = "agent"
+    lead_after_reports: str = "synthesis"
     agent_tool_concurrency: int = 1
+    # Compiler budgets are independent from the ordinary lead-agent budget.
+    report_fold_tokens: int = 32768       # level-1 report compiler
+    final_compiler_tokens: int = 65536    # final answer compiler
+    compiler_concurrency: int = 4        # level-1 compilers running beside explorers
     jev_mode: str = "exhaustive"
     cascade_max_docs: int = 40
     cascade_section_threshold: float = 0.3
@@ -171,6 +180,8 @@ class Settings(BaseModel):
     subagent_count: int = 2
     subagent_concurrency: int = 2
     subagent_max_steps: int = 20
+    # Give explorers room for detailed reports; compiler inputs are chunked separately.
+    subagent_report_tokens: int = 16384
     subagent_min_reads: int = 1
     subagent_max_reads: int = 4
 
@@ -219,7 +230,9 @@ class Settings(BaseModel):
             chat_model=(env("WIKI_CHAT_MODEL") or env("WIKI_MODEL") or "gemma-4-31B"),
             chat_temperature=float(env("WIKI_CHAT_TEMPERATURE") or 0.2),
             llm_max_output_tokens=max(0, int(env("WIKI_LLM_MAX_OUTPUT_TOKENS") or 32768)),
+            llm_context_tokens=max(4096, int(env("WIKI_LLM_CONTEXT_TOKENS") or 131072)),
             llm_timeout=max(1, int(env("WIKI_REQUEST_TIMEOUT") or 900)),
+            llm_max_retries=_clamp(int(env("WIKI_LLM_MAX_RETRIES") or 2), 0, 5),
             rerank_base_url=(env("WIKI_RERANK_BASE_URL") or "").rstrip("/"),
             rerank_api_key=env("WIKI_RERANK_API_KEY") or "",
             rerank_model=env("WIKI_RERANK_MODEL") or "",
@@ -232,7 +245,7 @@ class Settings(BaseModel):
             jev_local_path=(env("WIKI_JEV_LOCAL_PATH") or "").strip(),
             jev_device=(env("WIKI_JEV_DEVICE") or "auto").strip().lower(),
             jev_dtype=(env("WIKI_JEV_DTYPE") or "bfloat16").strip().lower(),
-    jev_base_url=(env("WIKI_JEV_BASE_URL") or "").rstrip("/"),
+            jev_base_url=(env("WIKI_JEV_BASE_URL") or "").rstrip("/"),
             jev_api_key=(env("WIKI_JEV_API_KEY") or "").strip(),
             jev_model=env("WIKI_JEV_MODEL") or "chaoliangUNSW/Jev-Style-0.8B-Decision-v3",
             jev_timeout=int(env("WIKI_JEV_TIMEOUT") or 60),
@@ -240,6 +253,7 @@ class Settings(BaseModel):
             jev_seed_threshold=_clamp_float(float(env("WIKI_JEV_SEED_THRESHOLD") or 0.8), 0.0, 1.0),
             jev_chunk_tokens=int(env("WIKI_JEV_CHUNK_TOKENS") or 25600),
             jev_chunk_overlap=int(env("WIKI_JEV_CHUNK_OVERLAP") or 10000),
+            jev_toc_chunk_tokens=int(env("WIKI_JEV_TOC_CHUNK_TOKENS") or 15000),
             jev_max_page_reads=int(env("WIKI_JEV_MAX_PAGE_READS") or 0),
             jev_max_list_calls=int(env("WIKI_JEV_MAX_LIST_CALLS") or 0),
             jev_workers=max(1, int(env("WIKI_JEV_WORKERS") or 4)),
@@ -250,8 +264,11 @@ class Settings(BaseModel):
             jev_toc_gate_threshold=_clamp_float(float(env("WIKI_JEV_TOC_GATE_THRESHOLD") or 0.2), 0.0, 1.0),
             jev_deterministic=_bool(env("WIKI_JEV_DETERMINISTIC")),
             jev_verdict_cache=_bool(env("WIKI_JEV_VERDICT_CACHE")),
-            lead_after_reports=(env("WIKI_LEAD_AFTER_REPORTS") or "agent").strip().lower(),
+            lead_after_reports=(env("WIKI_LEAD_AFTER_REPORTS") or "synthesis").strip().lower(),
             agent_tool_concurrency=_clamp(int(env("WIKI_AGENT_TOOL_CONCURRENCY") or 1), 1, 256),
+            report_fold_tokens=_clamp(int(env("WIKI_REPORT_FOLD_TOKENS") or 32768), 256, 131072),
+            final_compiler_tokens=_clamp(int(env("WIKI_FINAL_COMPILER_TOKENS") or 65536), 256, 131072),
+            compiler_concurrency=_clamp(int(env("WIKI_COMPILER_CONCURRENCY") or 4), 1, 256),
             jev_mode=(env("WIKI_JEV_MODE") or "exhaustive").strip().lower(),
             cascade_max_docs=max(1, int(env("WIKI_CASCADE_MAX_DOCS") or 40)),
             cascade_section_threshold=_clamp_float(float(env("WIKI_CASCADE_SECTION_THRESHOLD") or 0.3), 0.0, 1.0),
@@ -298,6 +315,7 @@ class Settings(BaseModel):
                 _clamp(int(env("WIKI_SEARCH_LLM_MAX_CONCURRENCY") or 4), 1, 256),
             ),
             subagent_max_steps=_clamp(int(env("WIKI_SUBAGENT_MAX_STEPS") or 20), 4, 100),
+            subagent_report_tokens=_clamp(int(env("WIKI_SUBAGENT_REPORT_TOKENS") or 16384), 256, 16384),
             subagent_min_reads=_clamp(int(env("WIKI_SUBAGENT_MIN_READS") or 1), 0, 10),
             subagent_max_reads=_clamp(int(env("WIKI_SUBAGENT_MAX_READS") or 4), 1, 20),
             enable_mermaid=(
@@ -317,17 +335,25 @@ class Settings(BaseModel):
             raise ValueError("GROWI_URL is required")
         if not self.growi_token:
             raise ValueError("GROWI_TOKEN is required")
+        if self.llm_context_tokens <= 2048:
+            raise ValueError("WIKI_LLM_CONTEXT_TOKENS must exceed 2048 tokens")
         if self.jev_seed_threshold < self.jev_threshold:
             raise ValueError("WIKI_JEV_SEED_THRESHOLD must be >= WIKI_JEV_THRESHOLD")
         # The chunker reserves 512 tokens for the prompt/metadata.
         if self.jev_chunk_tokens <= 512:
             raise ValueError("WIKI_JEV_CHUNK_TOKENS must be > 512")
+        if self.jev_toc_chunk_tokens <= 512:
+            raise ValueError("WIKI_JEV_TOC_CHUNK_TOKENS must be > 512")
         if not 0 <= self.jev_chunk_overlap < self.jev_chunk_tokens - 512:
             raise ValueError("WIKI_JEV_CHUNK_OVERLAP must fit the body token budget")
         if self.jev_max_page_reads < 0 or self.jev_max_list_calls < 0:
             raise ValueError("Jev budgets must be >= 0 (0 = unlimited)")
         if self.jev_workers < 1:
             raise ValueError("WIKI_JEV_WORKERS must be >= 1")
+        if self.report_fold_tokens < 256 or self.final_compiler_tokens < 256:
+            raise ValueError("Compiler output budgets must be >= 256 tokens")
+        if self.compiler_concurrency < 1:
+            raise ValueError("WIKI_COMPILER_CONCURRENCY must be >= 1")
         if self.jev_subagent_group_size < 1 or self.jev_subagent_groups < 1:
             raise ValueError("Jev seed-group size and count must be >= 1")
         if self.jev_prefilter_min_overlap < 0:

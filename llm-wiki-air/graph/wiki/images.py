@@ -1,12 +1,12 @@
 """Images are immutable evidence (plan section 10).
 
-An ``<image-unit>`` belongs to its owning source chunk; it is never optional
-decoration.  Two representations exist and they are deliberately different
-types so sanitized text cannot be mistaken for wiki source:
+An image belongs to its owning source chunk; it is never optional decoration.
+``<image-unit>``, ``<img>``, ``<embed>``, and Markdown image spellings share a
+content identity, while two internal types keep source and prompt text apart:
 
 ``ImageUnit.raw``
-    Exact ``<image-unit>`` bytes, including the base64 media payload.  Only
-    deterministic code (the materializer and the substitution step) reads it.
+    Exact source markup, including any base64 media payload.  Deterministic
+    restoration uses it, while integrity comparisons use decoded-media hashes.
 
 ``SanitizedSource`` / ``ImageUnit.prompt_marker``
     Stable ID, mime, alt text and description with the payload omitted.  Only
@@ -20,26 +20,35 @@ from dataclasses import dataclass
 from html import unescape
 from typing import Callable, Iterable, Sequence
 
+from graph.common.images import (
+    IMAGE_UNIT_RE,
+    ImageMarkup,
+    find_images,
+    image_source_identity,
+    replace_images_preserving_lines,
+)
+
 from .ids import image_id
-from .markdown_blocks import IMAGE_UNIT_CLOSE, IMAGE_UNIT_OPEN, build_block_index
+from .markdown_blocks import build_block_index
 from .schemas import ImageRecord
 from .storage import sha256_text, slice_text
 
 _MEDIA_RE = re.compile(
-    r"""src=["']data:(?P<mime>[\w.+-]+/[\w.+-]+);base64,(?P<data>[A-Za-z0-9+/=]*)["']""",
+    r"""src\s*=\s*["']data:(?P<mime>[\w.+-]+/[\w.+-]+);base64,(?P<data>[A-Za-z0-9+/=\s]*)["']""",
     re.IGNORECASE,
 )
 _ALT_RE = re.compile(r"""alt=["'](?P<alt>[^"']*)["']""", re.IGNORECASE)
 _DESC_RE = re.compile(
-    r"<image-description>(?P<desc>.*?)</image-description>", re.IGNORECASE | re.DOTALL
+    r"<image-description\b[^>]*>(?P<desc>.*?)</image-description>",
+    re.IGNORECASE | re.DOTALL,
 )
-_UNIT_RE = re.compile(r"<image-unit\b[^>]*>.*?</image-unit>", re.IGNORECASE | re.DOTALL)
+_UNIT_RE = IMAGE_UNIT_RE
 _BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
 
 
 @dataclass(frozen=True)
 class ImageUnit:
-    """Raw form of one image block. ``raw`` is byte-authoritative."""
+    """Raw form of one image block plus representation-independent identity."""
 
     image_id: str
     source_start: int
@@ -80,47 +89,63 @@ class SanitizedSource:
         return f"SanitizedSource({self.line_count} lines, base64 removed)"
 
 
-def _build_unit(lines: Sequence[str], start: int, end: int) -> ImageUnit:
-    raw = slice_text(lines, start, end)
-    media = _MEDIA_RE.search(raw)
-    payload = media.group("data") if media else ""
-    unit_hash = sha256_text(raw)
-    alt = _ALT_RE.search(raw)
-    description = _DESC_RE.search(raw)
+def _build_unit(
+    raw: str,
+    start: int,
+    end: int,
+    *,
+    identity: str = "",
+    media_sha256: str = "",
+    mime: str = "",
+    alt_text: str = "",
+    description_text: str = "",
+    occurrence: int = 0,
+) -> ImageUnit:
+    # ``unit_sha256`` is intentionally representation-independent.  It is used
+    # by incremental integrity checks, where an <embed>, <img>, Markdown image,
+    # and <image-unit> containing the same source must be interchangeable.
+    unit_hash = sha256_text(identity or raw)
     return ImageUnit(
-        image_id=image_id(unit_hash, f"{start}-{end}"),
+        # Occurrence, rather than physical line range, keeps the placeholder ID
+        # stable when a parser changes only the number of wrapper lines.
+        image_id=image_id(unit_hash, str(occurrence)),
         source_start=start,
         source_end=end,
         raw=raw,
-        mime=media.group("mime") if media else "",
-        alt=alt.group("alt") if alt else "",
-        description=" ".join(description.group("desc").split()) if description else "",
+        mime=mime,
+        alt=alt_text,
+        description=" ".join(description_text.split()),
         unit_sha256=unit_hash,
-        media_sha256=sha256_text(payload) if payload else "",
+        media_sha256=media_sha256,
     )
 
 
 def extract_image_units(lines: Sequence[str]) -> list[ImageUnit]:
-    """Find every complete ``<image-unit>`` block with its exact bytes."""
+    """Find all supported image spellings with exact source bytes and ranges."""
+
+    text = "\n".join(lines)
+    # Preserve the old hard failure for malformed rich units.  Plain <img> and
+    # <embed> tags are self-contained and need no corresponding close marker.
+    opened = len(re.findall(r"<image-unit\b", text, re.IGNORECASE))
+    closed = len(re.findall(r"</image-unit>", text, re.IGNORECASE))
+    if opened != closed:
+        raise ValueError("unclosed or unmatched <image-unit> block")
 
     units: list[ImageUnit] = []
-    open_line: int | None = None
-
-    for number, line in enumerate(lines, start=1):
-        if open_line is None and IMAGE_UNIT_OPEN in line:
-            if IMAGE_UNIT_CLOSE in line.split(IMAGE_UNIT_OPEN, 1)[1]:
-                units.append(_build_unit(lines, number, number))
-                open_line = None
-            else:
-                open_line = number
-            continue
-        if open_line is not None and IMAGE_UNIT_CLOSE in line:
-            units.append(_build_unit(lines, open_line, number))
-            open_line = None
-
-    if open_line is not None:
-        raise ValueError(f"unclosed <image-unit> opened at line {open_line}")
-
+    for occurrence, image in enumerate(find_images(text), start=1):
+        units.append(
+            _build_unit(
+                image.raw,
+                image.source_start,
+                image.source_end,
+                identity=image.identity,
+                media_sha256=image.media_sha256,
+                mime=image.mime,
+                alt_text=image.alt,
+                description_text=image.description,
+                occurrence=occurrence,
+            )
+        )
     return units
 
 
@@ -134,13 +159,9 @@ def reuse_image_descriptions(
     """Reuse descriptions by media hash and describe only unseen image bytes."""
 
     cached: dict[str, str] = {}
-    for match in _UNIT_RE.finditer(previous):
-        media = _MEDIA_RE.search(match.group(0))
-        description = _DESC_RE.search(match.group(0))
-        if media and description:
-            cached.setdefault(
-                sha256_text(media.group("data")), description.group("desc")
-            )
+    for image in find_images(previous):
+        if image.media_sha256 and image.description:
+            cached.setdefault(image.media_sha256, image.description)
 
     generated: dict[str, str] = {}
     emitted: set[str] = set()
@@ -151,7 +172,11 @@ def reuse_image_descriptions(
         description = _DESC_RE.search(block)
         if not media or not description:
             return block
-        key = sha256_text(media.group("data"))
+        _identity, key, _mime = image_source_identity(
+            f'data:{media.group("mime")};base64,{media.group("data")}'
+        )
+        if not key:
+            return block
         if not repeat_descriptions:
             if key in emitted:
                 start = description.start("desc")
@@ -234,12 +259,17 @@ def image_records(units: Iterable[ImageUnit]) -> list[ImageRecord]:
 def sanitize_lines(lines: Sequence[str], units: Sequence[ImageUnit]) -> list[str]:
     """Replace image media with a stable marker, keeping line numbering intact."""
 
-    sanitized = list(lines)
-    for unit in units:
-        sanitized[unit.source_start - 1] = unit.prompt_marker
-        for number in range(unit.source_start + 1, unit.source_end + 1):
-            sanitized[number - 1] = f"<media payload omitted: {unit.image_id}>"
-    return sanitized
+    text = "\n".join(lines)
+    parsed = find_images(text)
+    by_start = {
+        image.start: unit for image, unit in zip(parsed, units) if image.raw == unit.raw
+    }
+
+    def marker(image: ImageMarkup) -> str:
+        unit = by_start.get(image.start)
+        return unit.prompt_marker if unit is not None else "[IMAGE]"
+
+    return replace_images_preserving_lines(text, marker).split("\n")
 
 
 def sanitized_source(
@@ -306,20 +336,42 @@ def missing_image_ids(markdown: str, units: Sequence[ImageUnit]) -> list[str]:
 
     missing = []
     for unit in units:
-        if unit.placeholder in markdown or unit.raw in markdown:
+        if unit.placeholder in markdown or unit_intact(markdown, unit):
             continue
         missing.append(unit.image_id)
     return missing
 
 
 def unit_intact(markdown: str, unit: ImageUnit) -> bool:
-    """The raw unit appears byte-identically, and it appears exactly once."""
+    """At least one equivalent image occurs, regardless of wrapper spelling."""
 
-    return (markdown or "").count(unit.raw) == 1
+    return count_equivalent_units(markdown, unit) >= 1
+
+
+def count_equivalent_units(markdown: str, unit: ImageUnit) -> int:
+    """Count images with the same byte/reference identity as ``unit``."""
+
+    if not unit.unit_sha256:
+        return (markdown or "").count(unit.raw)
+    return sum(
+        1
+        for image in find_images(markdown or "")
+        if sha256_text(image.identity or image.raw) == unit.unit_sha256
+    )
+
+
+def image_identity_counts(markdown: str) -> dict[str, int]:
+    """Count image occurrences by the same identity used by ``ImageUnit``."""
+
+    counts: dict[str, int] = {}
+    for image in find_images(markdown or ""):
+        key = sha256_text(image.identity or image.raw)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def count_units(markdown: str, units: Sequence[ImageUnit]) -> dict[str, int]:
-    return {unit.image_id: (markdown or "").count(unit.raw) for unit in units}
+    return {unit.image_id: count_equivalent_units(markdown, unit) for unit in units}
 
 
 def scrub_base64(text: str) -> str:

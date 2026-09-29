@@ -253,9 +253,12 @@ documents directly at the root; folder summaries never combine content from
 different teams. Deleted documents and now-empty folder indexes are removed.
 (`001-…` stays the first real page.) A failed index page is logged, never rolled
 back over, so a table of contents can never undo a published document.
-`sync` additionally reconciles the whole wiki tree afterwards, so a project whose wiki
-predates the index catches up on the next run; pages GROWI already has byte-for-byte are
-read, not rewritten.
+Each promoted `watch`/`queue work` batch also rematerializes the affected local
+`metadata/index/**/index.md` files from live state. Pure moves refresh both the old and
+new document paths and both ancestor trees. `sync` additionally reconciles the whole
+wiki tree afterwards, removing stale publisher-owned local/GROWI index pages, so a
+project whose wiki predates the index catches up on the next run; pages GROWI already
+has byte-for-byte are read, not rewritten.
 Run the command yourself only to repair or inspect them:
 
 ```bash

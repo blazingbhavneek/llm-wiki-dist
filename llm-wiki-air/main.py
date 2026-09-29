@@ -1,6 +1,6 @@
 """One entry point for the publisher. `python main.py -h`.
 
-check                       ping chat/embed/parser/GROWI endpoints
+check                       ping chat/embed/parser/GROWI endpoints + the local Jev backend
 convert                     external mount -> raw Markdown only
 build wiki [<raw-rel>...]   raw/ -> wiki pages only
 build link [<raw-rel>...]   link pending wiki pages only
@@ -85,6 +85,56 @@ def _report(result: dict[str, Any]) -> int:
     return 1 if result["failures"] else 0
 
 
+def _jev_check(settings: Settings) -> tuple[str, int]:
+    """Resolve the project's Jev backend and, for gguf, start the local runtime once.
+
+    The linker and the index builder only log a warning when the Jev engine fails to
+    start and then fall back to the LLM, so a broken GGUF path would surface as slow,
+    differently-scored links instead of an error. This proves the configured snapshot
+    and jev-score binary answer one decision, without any sync, and it never downloads:
+    a missing snapshot is reported rather than fetched.
+    """
+
+    from jev import JevConfig, JevQuestion, get_engine_for, reset_engine
+
+    try:
+        config = JevConfig.from_settings(settings)
+    except Exception as exc:
+        return f"jev     DOWN config ({type(exc).__name__}: {exc})", 1
+    wanted = (str(getattr(settings, "wiki_linker_judge", "llm")) == "jev"
+              or bool(getattr(settings, "wiki_index_related_docs", False)))
+    if not wanted:
+        return f"jev     skipped (judge={settings.wiki_linker_judge}, related-docs off)", 0
+    if config.backend != "gguf":
+        return f"jev     {config.backend} backend (local start not checked)", 0
+    if not config.gguf_local_path:
+        return "jev     DOWN wiki_jev_gguf_local_path is empty", 1
+    folder = Path(config.gguf_local_path).expanduser()
+    files = ("jev_style_decision_gguf.py", "readout_config.json", "tokenizer/tokenizer.json",
+             f"Jev-Style-0.8B-Decision-v3-{config.gguf_quant}.gguf")
+    missing = [name for name in files if not (folder / name).is_file()]
+    binary = Path(config.gguf_binary).expanduser() if config.gguf_binary else folder / "build" / "jev-score"
+    if not binary.is_file():
+        missing.append(str(binary))
+    elif not os.access(binary, os.X_OK):
+        return f"jev     DOWN {binary} is not executable", 1
+    if missing:
+        return f"jev     DOWN missing from {folder}: {', '.join(missing)}", 1
+    try:
+        engine = get_engine_for(settings)
+        result = engine.decide(
+            {"section": {"page": "check", "heading": "接続手順",
+                         "text": "本節ではシステムAからシステムBへの接続手順を説明する。"}},
+            JevQuestion("この節は接続手順を説明しているか？"),
+        )
+    except Exception as exc:
+        return f"jev     DOWN {type(exc).__name__}: {exc}", 1
+    finally:
+        reset_engine()
+    return (f"jev     gguf {config.gguf_quant}/{config.gguf_many_mode} "
+            f"p_yes={float(result.p_yes):.3f} {binary}"), 0
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     import requests
 
@@ -108,6 +158,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"{name:7} DOWN {url} ({type(exc).__name__})")
             bad += 1
+    jev_line, jev_bad = _jev_check(settings)
+    print(jev_line)
+    bad += jev_bad
     project = open_project(settings)
     print(f"data    {project.root.resolve()}  mount={project.mount} ingest={settings.ingest_mode} linker={'off' if not settings.wiki_linker_enabled else settings.wiki_linker_mode}")
     return 1 if bad else 0
@@ -122,6 +175,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     with worker_lock(project):
         retry_failed(project)
         first = True
+        resume = bool(getattr(args, "continue_run", False))
         while True:
             scan(
                 settings,
@@ -131,7 +185,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 verify_content=True,
             )
             first = False
-            result = work_once(settings, on_event=_progress if args.verbose else None)
+            result = work_once(settings, on_event=_progress if args.verbose else None, continue_run=resume)
+            # Only the first batch can resume a kept worktree; later batches
+            # in the same process are always fresh.
+            resume = False
             if result is None:
                 break
             combined["done"].extend(result.get("done", []))
@@ -165,6 +222,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             growi_interval=args.growi_interval,
             force=args.force,
             on_event=_progress if args.verbose else None,
+            continue_run=bool(getattr(args, "continue_run", False)),
         )
     except KeyboardInterrupt:
         return 0
@@ -172,7 +230,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 def cmd_queue(args: argparse.Namespace) -> int:
     from publisher.pipeline import _lock
-    from publisher.queue import recover, retry_failed, scan, status, work_once, worker_lock
+    from publisher.queue import recover, resumable_operation_id, retry_failed, scan, status, work_once, worker_lock
 
     settings = _settings(args)
     project = open_project(settings)
@@ -186,15 +244,20 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if args.queue_command == "retry":
         print(json.dumps({"retried": retry_failed(project)}))
         return 0
+    resume = bool(getattr(args, "continue_run", False))
     with worker_lock(project):
         with _lock(project):
-            recover(project, settings)
+            preserved = resumable_operation_id(project, adopt_orphan=True) if resume else None
+            recover(project, settings, preserve_operation_id=preserved)
         while True:
-            result = work_once(settings)
+            result = work_once(settings, continue_run=resume)
+            # Only the first batch can resume a kept worktree.
+            resume = False
             if result is not None:
                 print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
             if args.once:
-                return 1 if result and result.get("failures") else 0
+                index_failures = (result or {}).get("index", {}).get("failures", [])
+                return 1 if result and (result.get("failures") or index_failures) else 0
             if result is None:
                 time.sleep(0.5)
 
@@ -293,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--project", default=argparse.SUPPRESS, help="config name from configs/ or absolute INI path")
         p.add_argument("--data-root", default=argparse.SUPPRESS, help="override selected INI data_root (may also go before the command)")
 
-    check = sub.add_parser("check", help="ping chat/embed/parser/GROWI endpoints"); project_flags(check); check.set_defaults(fn=cmd_check)
+    check = sub.add_parser("check", help="ping chat/embed/parser/GROWI endpoints and the local Jev backend"); project_flags(check); check.set_defaults(fn=cmd_check)
 
     def pipeline_flags(p: argparse.ArgumentParser) -> None:
         project_flags(p)
@@ -306,10 +369,14 @@ def build_parser() -> argparse.ArgumentParser:
     sync.description = "Drain the queue, then reconcile index pages for the whole wiki tree."
     sync.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
     sync.add_argument("--force", action="store_true", help="regenerate selected sources even when unchanged")
+    sync.add_argument("--continue", dest="continue_run", action="store_true",
+                      help="resume the previous run's kept candidate worktree instead of discarding it")
     sync.set_defaults(fn=cmd_sync)
     watch = sub.add_parser("watch", help="run the metadata scanner and persistent queue worker"); pipeline_flags(watch)
     watch.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
     watch.add_argument("--force", action="store_true", help="queue selected sources once at startup even when unchanged")
+    watch.add_argument("--continue", dest="continue_run", action="store_true",
+                       help="resume the previous run's kept candidate worktree instead of discarding it")
     watch.add_argument("--interval", type=float, default=float(os.environ.get("PUBLISHER_INTERVAL_SECONDS", "10")))
     watch.add_argument("--growi-interval", type=float, default=float(os.environ.get("GROWI_WATCH_INTERVAL_SECONDS", "300")), help="seconds between low-priority GROWI revision checks; 0 disables")
     watch.set_defaults(fn=cmd_watch)
@@ -324,6 +391,8 @@ def build_parser() -> argparse.ArgumentParser:
     queue_work = queue_sub.add_parser("work", help="process queued work, fast deletes before slow batches")
     project_flags(queue_work)
     queue_work.add_argument("--once", action="store_true", help="process at most one queue batch and exit")
+    queue_work.add_argument("--continue", dest="continue_run", action="store_true",
+                            help="resume the previous run's kept candidate worktree instead of discarding it")
     queue_status = queue_sub.add_parser("status", help="list pending, active, and failed work"); project_flags(queue_status)
     queue_retry = queue_sub.add_parser("retry", help="requeue failed work"); project_flags(queue_retry)
     queue.set_defaults(fn=cmd_queue)

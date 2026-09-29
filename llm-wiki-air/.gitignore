@@ -30,3 +30,4 @@ doc-parser/tests/*
 zip.py
 growi-llm-wiki.zip
 growi-search/chaoliangUNSW
+jev/models

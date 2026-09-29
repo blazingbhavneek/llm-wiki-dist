@@ -105,6 +105,241 @@ class DiffDocxFixtureTest(unittest.TestCase):
 
 
 class DiffPipelineSafetyTest(unittest.TestCase):
+    def test_mount_raw_path_collision_fails_instead_of_overwriting_a_document(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = Path(tmp)
+            (mount / "same.docx").write_bytes(b"docx")
+            (mount / "same_docx.md").write_text("markdown", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "same_docx.md"):
+                queue._snapshot(mount)
+
+    def test_whole_folder_move_is_coalesced_into_identity_preserving_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mount = base / "mount"
+            (mount / "team/sub").mkdir(parents=True)
+            (mount / "team/a.md").write_text("A", encoding="utf-8")
+            (mount / "team/sub/b.md").write_text("B", encoding="utf-8")
+            settings = SimpleNamespace(
+                data_root=str(base / "data"), target_name="test", mount_path=str(mount)
+            )
+            project = open_project(settings)
+            queue.scan(settings, settle_seconds=0)
+            queue.finish(project, queue.claim(project, "slow"))
+            with queue._connect(project) as conn:
+                observed = {str(row["rel"]): dict(row) for row in conn.execute("SELECT * FROM sources")}
+            save_ledger(project.metadata / "pipeline.json", Ledger({
+                rel: {
+                    "source_id": row["source_id"], "raw_rel": row["raw_rel"],
+                    "source_sha256": row["source_sha256"],
+                    "source_blob_oid": row["blob_oid"],
+                }
+                for rel, row in observed.items()
+            }, {}))
+
+            (mount / "team").rename(mount / "archive")
+            result = queue.scan(settings, settle_seconds=0)
+
+            self.assertEqual(result["moved"], [
+                {"from": "team/a.md", "to": "archive/a.md"},
+                {"from": "team/sub/b.md", "to": "archive/sub/b.md"},
+            ])
+            rows = queue.status(project)
+            self.assertEqual({row["operation"] for row in rows}, {"move"})
+            self.assertEqual(
+                {row["source_id"] for row in rows},
+                {row["source_id"] for row in observed.values()},
+            )
+
+    def test_unchanged_source_resume_reuses_parsed_markdown(self) -> None:
+        from publisher.pipeline import _can_resume_parsed_source, _source_row
+        from publisher.scanner import SourceFile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "document_doc.md"
+            raw.write_text("already parsed\n", encoding="utf-8")
+            item = SourceFile("document.doc", "same-hash", 10, 1, "doc")
+            previous = {"source_sha256": "same-hash"}
+
+            failed = _source_row(item, "document_doc.md", "previous wiki failure")
+            self.assertEqual(failed["source_sha256"], "same-hash")
+            self.assertEqual(failed["last_error"], "previous wiki failure")
+
+            self.assertTrue(
+                _can_resume_parsed_source(
+                    previous, item, raw,
+                    requested_resume=True, classification="none",
+                )
+            )
+            self.assertTrue(
+                _can_resume_parsed_source(
+                    {"source_sha256": "", "source_blob_oid": "blob-1"}, item, raw,
+                    requested_resume=True, classification="none",
+                    known_source_sha256="same-hash",
+                    known_source_blob_oid="blob-1",
+                )
+            )
+            self.assertFalse(
+                _can_resume_parsed_source(
+                    previous, item, raw,
+                    requested_resume=False, classification="none",
+                )
+            )
+            self.assertFalse(
+                _can_resume_parsed_source(
+                    previous, item, raw,
+                    requested_resume=True, classification="forced",
+                )
+            )
+
+    def test_rename_plus_edit_keeps_old_digest_until_the_new_blob_is_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mount = base / "mount"
+            new_rel = "new/renamed.docx"
+            (mount / "new").mkdir(parents=True)
+            (mount / new_rel).write_bytes(b"new source bytes")
+            settings = SimpleNamespace(
+                data_root=str(base / "data"), target_name="test", mount_path=str(mount),
+                wiki_linker_enabled=False,
+            )
+            project = open_project(settings)
+            old_rel = "old/original.docx"
+            old_raw = "old/original_docx.md"
+            old_digest = hashlib.sha256(b"old source bytes").hexdigest()
+            new_digest = hashlib.sha256(b"new source bytes").hexdigest()
+            raw = project.raw_file(old_raw)
+            raw.parent.mkdir(parents=True)
+            raw.write_text("# Parsed old content\n", encoding="utf-8")
+            wiki = project.wiki_dir(old_raw)
+            (wiki / "_planning").mkdir(parents=True)
+            (wiki / "001.md").write_text("# Old\n", encoding="utf-8")
+            (wiki / "_planning" / "source.json").write_text(
+                json.dumps({"raw": old_raw, "id_seed": "stable-seed"}), encoding="utf-8"
+            )
+            (wiki / "_planning" / "linker.json").write_text(
+                '{"status":"disabled"}', encoding="utf-8"
+            )
+            save_ledger(project.metadata / "pipeline.json", Ledger({
+                old_rel: {
+                    "source_id": "source-1", "id_seed": "stable-seed",
+                    "raw_rel": old_raw, "source_sha256": old_digest,
+                    "source_blob_oid": "old-blob",
+                },
+            }, {}))
+
+            job = SimpleNamespace(
+                rel=new_rel, from_rel=old_rel,
+                raw_rel="new/renamed_docx.md",
+                target_sha256=new_digest, target_blob_oid="new-blob",
+            )
+
+            class Publisher:
+                def move_document(self, *_args, **_kwargs):
+                    return {}
+
+                def page_marker_id(self, *_args):
+                    return "marker"
+
+            with (
+                patch.object(pipeline, "_publisher", return_value=Publisher()),
+                patch("publisher.index.build_index", return_value={"done": [], "failures": []}),
+            ):
+                result = pipeline.move_sources(settings, [job])
+
+            self.assertEqual(result["failures"], [])
+            moved = load_ledger(project.metadata / "pipeline.json").sources[new_rel]
+            self.assertEqual(moved["source_sha256"], old_digest)
+            self.assertEqual(moved["source_blob_oid"], "old-blob")
+            self.assertNotEqual(moved["source_sha256"], new_digest)
+            self.assertEqual(result["index_paths"], sorted([old_raw, "new/renamed_docx.md"]))
+            self.assertFalse((project.raw / "old").exists())
+            self.assertFalse((project.wiki / "old").exists())
+
+    def test_queue_work_materializes_indexes_from_promoted_live_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mount = base / "mount"
+            mount.mkdir()
+            settings = SimpleNamespace(
+                data_root=str(base / "data"), target_name="test", mount_path=str(mount)
+            )
+            expected = {
+                "done": [{"path": "a.md", "status": "added"}],
+                "failures": [], "cancelled": False,
+                "index_paths": ["a_md.md"],
+            }
+            with (
+                patch.object(queue, "_work_once_locked", return_value=dict(expected)),
+                patch.object(pipeline, "_lock", return_value=contextlib.nullcontext()),
+                patch("publisher.index.build_index", return_value={
+                    "done": [{"document": "a.md", "status": "written"}], "failures": [],
+                }) as build,
+            ):
+                result = queue.work_once(settings)
+
+            build.assert_called_once_with(
+                settings, only=["a_md.md"], on_progress=None, locked=True
+            )
+            self.assertEqual(result["index"], {"updated": 1, "failures": []})
+
+    def test_incremental_linker_refreshes_only_changed_page_metadata(self) -> None:
+        from graph.linker.service import link_document
+        from publisher.history import checkpoint_live
+
+        class Model:
+            def __init__(self) -> None:
+                self.meta_calls = 0
+
+            async def text(self, _messages, **_kwargs):
+                self.meta_calls += 1
+                return '{"summary":"fresh"}'
+
+            async def structured(self, schema, _messages, **_kwargs):
+                return schema()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Project(Path(tmp), Path(tmp) / "mount").ensure()
+            ensure_repository(project)
+            document = project.wiki_dir("doc_md.md")
+            pages = document / "_planning" / "pages"
+            pages.mkdir(parents=True)
+            first = pages / "001-a.md"
+            first.write_text("# A\n\nalpha unique text\n", encoding="utf-8")
+            (pages / "002-b.md").write_text("# B\n\nbeta separate text\n", encoding="utf-8")
+            (document / "_planning" / "source.json").write_text(
+                '{"raw":"doc_md.md","id_seed":"doc"}', encoding="utf-8"
+            )
+            (document / "_planning" / "linker.json").write_text(
+                '{"status":"pending","mode":"legacy"}', encoding="utf-8"
+            )
+            settings = SimpleNamespace(
+                wiki_linker_mode="legacy", wiki_linker_judge="llm",
+                wiki_output_language="Japanese", wiki_linker_concurrency=1,
+                wiki_rewrite_concurrency=1, concurrency=1,
+            )
+            asyncio.run(link_document(
+                project, "doc_md.md", model=Model(), embedder=None, settings=settings,
+            ))
+            checkpoint_live(project, "linked baseline")
+
+            with candidate(project, "incremental-link") as staged:
+                staged_first = staged.wiki_dir("doc_md.md") / "_planning" / "pages" / first.name
+                staged_first.write_text("# A\n\nalpha changed text\n", encoding="utf-8")
+                (staged.wiki_dir("doc_md.md") / "_planning" / "linker.json").write_text(
+                    '{"status":"pending","mode":"legacy","resume":true}', encoding="utf-8"
+                )
+                model = Model()
+                result = asyncio.run(link_document(
+                    staged, "doc_md.md", model=model, embedder=None, settings=settings,
+                    changed_pages={"doc.md/001-a.md"},
+                ))
+
+            self.assertEqual(model.meta_calls, 1)
+            self.assertEqual(result.meta_calls, 1)
+            self.assertEqual(result.affected_pages, ["doc.md/001-a.md"])
+
     def test_one_source_edit_can_update_repeated_generated_facts(self) -> None:
         from graph.wiki.wire import IncrementalPageEditResult
         from graph.workspace.writer import _apply_model_patches
@@ -130,6 +365,43 @@ class DiffPipelineSafetyTest(unittest.TestCase):
         self.assertEqual(result["kind"], "small")
         self.assertEqual(result["hunks"], 100)
         self.assertEqual(result["reason"], "below-threshold")
+
+    def test_continue_adopts_dirty_same_base_candidate_after_failed_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mount = root / "mount"
+            mount.mkdir()
+            source = mount / "a.md"
+            source.write_text("source\n", encoding="utf-8")
+            project = Project(root / "project", mount).ensure()
+            base = ensure_repository(project)
+            blob = stage_blob(project, source)
+
+            with candidate(project, "lost-transaction", keep=True) as staged:
+                checkpoint = staged.state_dir("a_md.md") / "work" / "checkpoint.json"
+                checkpoint.parent.mkdir(parents=True)
+                checkpoint.write_text('{"kept": true}\n', encoding="utf-8")
+
+            with queue._connect(project) as conn:
+                queue._enqueue(
+                    conn, "a.md", "a_md.md", "add", 0, 0,
+                    target_blob_oid=blob.oid, target_sha256=blob.sha256,
+                    base_commit=base,
+                )
+                conn.execute("UPDATE jobs SET status='failed',error='model failed' WHERE rel='a.md'")
+
+            adopted = queue._adopt_resumable_orphan(project)
+            self.assertEqual(adopted, "lost-transaction")
+            self.assertEqual(queue.resumable_operation_id(project), "lost-transaction")
+            recovered = queue.recover(
+                project,
+                SimpleNamespace(wiki_linker_enabled=False),
+                preserve_operation_id="lost-transaction",
+            )
+
+            self.assertEqual(recovered, 1)
+            self.assertEqual(queue.status(project)[0]["status"], "queued")
+            self.assertTrue(checkpoint.exists())
 
     def test_sync_command_rescans_until_the_queue_is_drained(self) -> None:
         import main

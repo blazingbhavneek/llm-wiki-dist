@@ -266,10 +266,12 @@ def _prompt_safe(text: str, units: Sequence[ImageUnit]) -> str:
 
 
 def _image_neighbors(lines: Sequence[str], unit: ImageUnit) -> tuple[str, str]:
+    from graph.common.images import find_images
+
     def nearest(numbers) -> str:
         for number in numbers:
             text = lines[number - 1].strip()
-            if text and not text.startswith(("<image-", "</image-", "<img ")):
+            if text and not find_images(text) and not text.startswith(("<image-", "</image-")):
                 return text
         return ""
 
@@ -411,6 +413,9 @@ async def _structured_with_artifacts(
     attempts: int,
     max_output_tokens: int,
     stop_check: StopCheck,
+    prompt_factory: Callable[[str | None], Any] | None = None,
+    validator: Callable[[Any], str | None] | None = None,
+    retry_temperature: float | None = None,
 ) -> tuple[Any | None, int, str]:
     """Run one small structured task and retain every prompt and result."""
 
@@ -418,17 +423,29 @@ async def _structured_with_artifacts(
     for attempt in range(1, max(1, attempts) + 1):
         if stop_check and stop_check():
             raise asyncio.CancelledError("reference research cancelled")
+        current_prompt = (
+            prompt_factory(last_error or None) if prompt_factory is not None else prompt
+        )
         write_text_atomic(
             output_dir / f"{stem}-attempt-{attempt:02d}-prompt.md",
-            prompt.render(),
+            current_prompt.render(),
         )
         try:
             raw = await model.structured(
                 schema,
-                prompt.messages(),
+                current_prompt.messages(),
                 max_output_tokens=max_output_tokens,
+                temperature=retry_temperature,
             )
             result = raw if isinstance(raw, schema) else schema.model_validate(raw)
+            validation_error = validator(result) if validator is not None else None
+            if validation_error:
+                last_error = validation_error[:1000]
+                write_text_atomic(
+                    output_dir / f"{stem}-attempt-{attempt:02d}-error.txt",
+                    last_error + "\n",
+                )
+                continue
             write_json_atomic(output_dir / f"{stem}.json", result)
             return result, attempt, ""
         except Exception as exc:  # noqa: BLE001 - bounded retry with evidence
@@ -463,6 +480,41 @@ def _valid_reference_facts(
             fact.target_line = 0
         valid.append(fact)
     return valid
+
+
+def _reference_validation_error(
+    result: ReferenceResearchResult,
+    references: Sequence[SeedPage],
+) -> str | None:
+    """Return actionable feedback before invalid cross-page facts are discarded."""
+
+    allowed = [
+        f"{page.title}: {_ranges_text(page.owner_ranges)}行"
+        for page in references
+    ]
+    errors: list[str] = []
+    if not result.useful_facts and not result.no_useful_information_reason.strip():
+        errors.append("useful_factsが空の場合はno_useful_information_reasonを具体的に書くこと")
+    for index, fact in enumerate(result.useful_facts, start=1):
+        if not fact.description.strip():
+            errors.append(f"useful_facts[{index}]にdescriptionがない")
+        if not any(
+            owner_start <= fact.source_start <= fact.source_end <= owner_end
+            for page in references
+            for owner_start, owner_end in page.owner_ranges
+        ):
+            errors.append(
+                f"useful_facts[{index}]の出典範囲 {fact.source_start}-{fact.source_end} が参照ページ内にない"
+            )
+    if not errors:
+        return None
+    return (
+        "参照ページの範囲外の事実や空の事実を返してはならない。"
+        "修正したuseful_facts全体を返すこと。許可された参照範囲: "
+        + ", ".join(allowed)
+        + "\n- "
+        + "\n- ".join(errors[:8])
+    )
 
 
 def _render_reference_research(
@@ -581,19 +633,20 @@ async def _research_references(
         and "no_useful_information_reason" in cached
     ):
         result = ReferenceResearchResult.model_validate(cached)
-        reason = result.no_useful_information_reason.strip()
-        evidence = [
-            _ReferenceEvidence(
-                page=candidate,
-                facts=_valid_reference_facts(result.useful_facts, candidate, page),
-                no_useful_information_reason=reason,
-            )
-            for candidate in selected
-        ]
-        research = _render_reference_research(page, evidence, seed_root=seed_root)
-        write_text_atomic(research_dir / "reference-research.md", research)
-        _emit(on_progress, "research", "resumed", page=page.title)
-        return evidence, research
+        if _reference_validation_error(result, selected) is None:
+            reason = result.no_useful_information_reason.strip()
+            evidence = [
+                _ReferenceEvidence(
+                    page=candidate,
+                    facts=_valid_reference_facts(result.useful_facts, candidate, page),
+                    no_useful_information_reason=reason,
+                )
+                for candidate in selected
+            ]
+            research = _render_reference_research(page, evidence, seed_root=seed_root)
+            write_text_atomic(research_dir / "reference-research.md", research)
+            _emit(on_progress, "research", "resumed", page=page.title)
+            return evidence, research
 
     research_dir = clean_workdir(research_dir)
     target_summary = page.summary.strip() or page.title
@@ -632,6 +685,17 @@ async def _research_references(
         attempts=config.reference_attempts,
         max_output_tokens=config.reference_max_output_tokens,
         stop_check=stop_check,
+        prompt_factory=lambda feedback: reference_research_prompt(
+            target_number=page.number,
+            target_title=page.title,
+            target_ranges=_ranges_text(page.owner_ranges),
+            target_summary=target_summary,
+            references=references,
+            output_language=config.output_language,
+            last_error=feedback,
+        ),
+        validator=lambda candidate: _reference_validation_error(candidate, selected),
+        retry_temperature=getattr(config, "retry_temperature", 0.7),
     )
     reason = (
         result.no_useful_information_reason.strip()
@@ -1001,6 +1065,7 @@ async def _write_section(
             attempts=config.judge_attempts,
             max_output_tokens=config.judge_max_output_tokens,
             stop_check=stop_check,
+            retry_temperature=getattr(config, "retry_temperature", 0.7),
         )
         if judgment is None:
             candidates.append(_SectionCandidate(draft, attempt, errors=[]))

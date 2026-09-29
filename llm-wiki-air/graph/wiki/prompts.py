@@ -17,6 +17,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from .config import (
     PROMPT_VERSION,
     REWRITE_PROMPT_VERSION,
+    SEED_PLAN_COMPILE_VERSION,
     SEED_PLAN_VERSION,
 )
 from .images import SanitizedSource
@@ -227,13 +228,15 @@ def seed_plan_compile_prompt(
         correction = (
             "\n\n前回の構造化結果は無効だった。以下の検証結果を読み、全ページを再提出すること。\n"
             "検証エラーの修正は意味計画より優先する。意味計画の範囲が重複・欠落していても"
-            "そのまま写さず、上の絶対条件を満たすよう境界を直すこと。同じ結果を繰り返さないこと。\n"
+            "そのまま写さず、上の絶対条件を満たすよう境界を直すこと。検証エラーがページの"
+            "結合を要求した場合は、意味計画のページ数を維持せず、指定範囲をちょうど1ページに"
+            "結合すること。同じ結果を繰り返さないこと。\n"
             f"検証エラー: {last_error}\n"
             f"前回の結果:\n{previous_plan or '（取得できず）'}\n"
         )
     return Prompt(
         kind="seed_plan_compile",
-        version=SEED_PLAN_VERSION,
+        version=SEED_PLAN_COMPILE_VERSION,
         system=(
             "意味計画を、単純で厳密な連続シード範囲表へ変換する専用作業者である。"
             "新しい意味方針を考え直さず、構造と境界の整合性に集中する。\n"
@@ -249,7 +252,7 @@ def seed_plan_compile_prompt(
             "- 次ページのsource_startは直前ページのsource_end+1。\n"
             f"- 最終ページはsource_end={source_line_count}。\n"
             "- したがって全行をちょうど1回だけ所有し、漏れ・重複・飛び越しを一切作らない。\n"
-            "- fenced code、Markdown表、<image-unit>、一つの具体的エンティティの途中を境界にしない。\n"
+            "- fenced code、Markdown表、画像ブロック（<image-unit>/<img>/<embed>/Markdown画像）、一つの具体的エンティティの途中を境界にしない。\n"
             "- 意味計画で独立指定された列挙エンティティを勝手に分断しない。\n"
             "- 空行、見出しだけ、導入文だけ、前後ページの断片だけを1ページにしない。見出しは"
             "通常、その直後の本文と同じページに入れる。\n"
@@ -271,11 +274,18 @@ def reference_research_prompt(
     target_summary: str,
     references: str,
     output_language: str,
+    last_error: str | None = None,
 ) -> Prompt:
     """Compare compact summaries of related seed pages."""
 
     from .wire import ReferenceResearchResult
 
+    correction = (
+        "\n\n前回の構造化結果は検証に失敗した。以下を修正し、useful_facts全体を返すこと。\n"
+        f"検証エラー: {last_error}\n"
+        if last_error
+        else ""
+    )
     return Prompt(
         kind="reference_research",
         version=REWRITE_PROMPT_VERSION,
@@ -307,7 +317,7 @@ def reference_research_prompt(
             "- 有用な事実がなければuseful_factsを空にし、"
             "no_useful_information_reasonへ具体的な理由を書く。捏造して水増ししない。\n\n"
             f"--- 対象ページ要約 ---\n{target_summary}\n\n"
-            f"{references}"
+            f"{references}{correction}"
         ),
     )
 

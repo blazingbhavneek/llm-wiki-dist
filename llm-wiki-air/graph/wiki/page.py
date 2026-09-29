@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import re
 from typing import Sequence
+import unicodedata
 
 from .markdown_blocks import atomic_windows, build_block_index
 from .wire import ReferenceFact
+from graph.common.markdown import strip_image_media
 
 HEADING_RE = re.compile(r"^#{1,4} \S")
-CODE_TOKEN_RE = re.compile(r"0[xX][0-9A-Fa-f]+|[A-Za-z_][A-Za-z0-9_]{2,}")
+# The third alternative covers the short letter+digit constants (``T1``, ``P0``, ``30Wh``)
+# that the >=3-char and must-start-with-a-letter rules above both skip; they are exactly
+# the kind of tuned value a small edit changes.  Requiring one letter and one digit keeps
+# ordinary words and bare numbers out, which the existing filter already rejects anyway.
+CODE_TOKEN_RE = re.compile(
+    r"0[xX][0-9A-Fa-f]+|[A-Za-z_][A-Za-z0-9_]{2,}"
+    r"|(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{2,}"
+)
 WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}|[ァ-ヶー]{3,}|[一-龯]{2,}")
 REFERENCE_MARKER_RE = re.compile(r"（参照元:\s*原文\s*(\d+)\s*(?:[-–—]\s*(\d+)\s*)?行）")
 READER_REFERENCE_RE = re.compile(
@@ -24,6 +33,11 @@ MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]\n]*\]\([^\n]*?\)")
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 PLACEHOLDER_RE = re.compile(r"\[\[NEO-IMAGE:[A-Za-z0-9_-]+\]\]")
+# Model-visible scaffolding that names an image id.  ``sanitized()`` swaps an image
+# line for ``<media payload omitted: img-…>`` and prompts carry ``[IMAGE img-…]``
+# markers; a wiki page holds the restored unit instead, so either one left in the
+# text makes ``code_tokens`` demand an identifier the page can never contain.
+IMAGE_MARKER_RE = re.compile(r"<media payload omitted:[^>]*>|\[IMAGE [^\]]*\]")
 # doc-parser output backslash-escapes CommonMark punctuation in prose (e.g.
 # ``mpi\_aware``). A faithful rewrite naturally drops that escape, which used
 # to make code_tokens() see "_aware" as a token the draft "lost". Strip the
@@ -94,13 +108,31 @@ def split_sections(
     return result
 
 
+def opaque_free(text: str) -> str:
+    """Source text with payloads a rewrite cannot reproduce reduced to nothing.
+
+    ``[[NEO-IMAGE:...]]`` tokens and every supported inline image spelling
+    (``<image-unit>``, ``<img>``, ``<embed>``, or Markdown image) have to go
+    before tokenizing, or ``code_tokens`` invents "identifiers" out of base64
+    alphabet and the lossless check becomes unsatisfiable. ``strip_image_media``
+    keeps ``<image-description>`` prose, so only the media stops producing tokens.
+    """
+
+    cleaned = strip_image_media(text or "")
+    cleaned = IMAGE_MARKER_RE.sub(" ", PLACEHOLDER_RE.sub(" ", cleaned))
+    # The parser writes constants in full-width (``Ｔ１分``, ``３０Ｗｈ``) and a rewrite
+    # may emit either width, so compare one canonical form.  Without this the
+    # identifier check is blind to every full-width constant, which is most of what
+    # a Japanese source document actually changes.  NFKC leaves plain ASCII alone.
+    return unicodedata.normalize("NFKC", MD_ESCAPE_RE.sub(r"\1", cleaned))
+
+
 def code_tokens(text: str) -> set[str]:
     """Identifier-like tokens that a lossless rewrite must keep verbatim."""
 
     # ponytail: bare numbers are too noisy; add units-aware numeric checks if needed.
     found: set[str] = set()
-    cleaned = MD_ESCAPE_RE.sub(r"\1", PLACEHOLDER_RE.sub(" ", text or ""))
-    cleaned = PLURAL_ACRONYM_RE.sub(r"\1", cleaned)
+    cleaned = PLURAL_ACRONYM_RE.sub(r"\1", opaque_free(text))
     for token in CODE_TOKEN_RE.findall(cleaned):
         if (
             token[:2].lower() == "0x"
@@ -118,7 +150,7 @@ def code_tokens(text: str) -> set[str]:
 def word_tokens(text: str) -> set[str]:
     """Coarse vocabulary used only to rank reference candidates."""
 
-    cleaned = MD_ESCAPE_RE.sub(r"\1", PLACEHOLDER_RE.sub(" ", text or ""))
+    cleaned = opaque_free(text)
     return set(WORD_RE.findall(cleaned))
 
 

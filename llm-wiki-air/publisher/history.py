@@ -257,8 +257,14 @@ def reopen_candidate(project: Project, operation_id: str, commit: str) -> Projec
 
 
 @contextmanager
-def candidate(project: Project, operation_id: str) -> Iterator[Project]:
-    """Yield a detached worktree rooted at last-good and always remove it."""
+def candidate(project: Project, operation_id: str, *, keep: bool = False) -> Iterator[Project]:
+    """Yield a detached worktree rooted at last-good.
+
+    When ``keep`` is false (default, historical behavior) the worktree is
+    always removed on exit.  The queue worker passes ``keep=True`` to defer
+    deletion to the next startup: a later run with ``--continue`` reuses the
+    kept worktree, while a run without the flag discards leftovers up front.
+    """
     ensure_repository(project)
     staged = candidate_project(project, operation_id)
     root = staged.root
@@ -276,6 +282,12 @@ def candidate(project: Project, operation_id: str) -> Iterator[Project]:
                 source.backup(target)
         yield staged
     finally:
+        if keep:
+            try:
+                _git(project, "worktree", "prune")
+            except subprocess.CalledProcessError:
+                pass
+            return
         subprocess.run(
             ["git", "-C", str(project.root), "worktree", "remove", "--force", str(root)],
             check=False,
@@ -283,6 +295,73 @@ def candidate(project: Project, operation_id: str) -> Iterator[Project]:
         )
         shutil.rmtree(root.parent, ignore_errors=True)
         _git(project, "worktree", "prune")
+
+
+def remove_candidate(project: Project, operation_id: str) -> None:
+    """Remove one candidate worktree; a missing worktree is ignored."""
+    staged = candidate_project(project, operation_id)
+    root = staged.root
+    subprocess.run(
+        ["git", "-C", str(project.root), "worktree", "remove", "--force", str(root)],
+        check=False,
+        capture_output=True,
+    )
+    shutil.rmtree(root.parent, ignore_errors=True)
+    try:
+        _git(project, "worktree", "prune")
+    except subprocess.CalledProcessError:
+        pass
+
+
+def list_candidate_ids(project: Project) -> list[str]:
+    """Return operation ids that still have a candidate directory on disk."""
+    try:
+        base = _candidate_base(project).resolve()
+    except OSError:
+        return []
+    if not base.is_dir():
+        return []
+    try:
+        expected = project.root.name
+    except Exception:
+        return []
+    try:
+        children = list(base.iterdir())
+    except OSError:
+        return []
+    ids: list[str] = []
+    for child in children:
+        try:
+            if child.is_dir() and (child / expected).is_dir():
+                ids.append(child.name)
+        except OSError:
+            continue
+    return sorted(ids)
+
+
+@contextmanager
+def resumed_candidate(project: Project, operation_id: str, commit: str) -> Iterator[Project]:
+    """Yield a kept candidate worktree, recreating it from ``commit`` if pruned.
+
+    Unlike :func:`candidate` this never creates a fresh worktree from
+    last-good and never deletes the directory on exit, so LLM checkpoints in
+    ``metadata/state`` survive across restarts.  Deletion stays deferred to
+    the next startup without ``--continue``.
+    """
+    staged = reopen_candidate(project, operation_id, commit)
+    if project.linker_database.exists() and not staged.linker_database.exists():
+        staged.linker_database.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(project.linker_database)) as source, closing(
+            sqlite3.connect(staged.linker_database)
+        ) as target:
+            source.backup(target)
+    try:
+        yield staged
+    finally:
+        try:
+            _git(project, "worktree", "prune")
+        except subprocess.CalledProcessError:
+            pass
 
 
 def commit_candidate(candidate_project: Project, message: str, metadata: dict[str, Any]) -> str:
@@ -342,6 +421,24 @@ def _stage_durable(project: Project) -> None:
         _git(project, "add", "-A", "--", *selected)
 
 
+def _prune_empty_generated_dirs(project: Project) -> None:
+    """Git does not track directories; remove empty remnants after a tree switch."""
+
+    for root in (project.raw, project.wiki, project.metadata / "state"):
+        if not root.is_dir():
+            continue
+        directories = sorted(
+            (path for path in root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
+        for directory in directories:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+
+
 def promote(project: Project, candidate_project: Project, commit: str) -> None:
     _git(project, "cat-file", "-e", f"{commit}^{{commit}}")
     previous = last_good(project)
@@ -351,6 +448,7 @@ def promote(project: Project, candidate_project: Project, commit: str) -> None:
     except BaseException:
         _git(project, "update-ref", LAST_GOOD_REF, previous, commit)
         raise
+    _prune_empty_generated_dirs(project)
     source_db = candidate_project.linker_database
     if source_db.exists():
         project.linker_database.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +463,7 @@ def promote(project: Project, candidate_project: Project, commit: str) -> None:
 
 def restore_last_good(project: Project) -> None:
     _git(project, "reset", "--hard", last_good(project))
+    _prune_empty_generated_dirs(project)
 
 
 def prune_candidates(project: Project) -> None:
@@ -378,6 +477,6 @@ def prune_candidates(project: Project) -> None:
 
 __all__ = [
     "Blob", "LAST_GOOD_REF", "amend_candidate", "candidate", "candidate_is_clean", "candidate_project", "checkpoint_live", "commit_candidate",
-    "ensure_repository", "last_good", "promote", "prune_candidates", "read_blob",
-    "reopen_candidate", "restore_last_good", "stage_blob",
+    "ensure_repository", "last_good", "list_candidate_ids", "promote", "prune_candidates", "read_blob",
+    "remove_candidate", "reopen_candidate", "restore_last_good", "resumed_candidate", "stage_blob",
 ]

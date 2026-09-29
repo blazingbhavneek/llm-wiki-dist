@@ -8,6 +8,7 @@ from graph.config import app_concurrency
 
 PROMPT_VERSION = "wiki-overlap-plan-ja-6"
 SEED_PLAN_VERSION = "wiki-seed-plan-ja-11"
+SEED_PLAN_COMPILE_VERSION = "wiki-seed-compile-ja-12"
 REWRITE_PROMPT_VERSION = "wiki-sections-ja-4"
 
 class WikiConfig(BaseModel):
@@ -17,8 +18,8 @@ class WikiConfig(BaseModel):
     planner_concurrency: int = Field(default_factory=app_concurrency)
     planner_attempts: int = 5
     regional_window_count: int = 10
-    # Final range compiler tries per run; the document fails after this many.
-    map_attempts: int = 100
+    # Short in-stage repair budget. A failed document is checkpointed and retried later.
+    map_attempts: int = 5
     planner_max_output_tokens: int = 4000
     # Plans are small JSON; the cap only bounds reasoning loops (one ran 10 min on a 15-line file).
     map_max_output_tokens: int = 16000
@@ -44,9 +45,9 @@ class WikiConfig(BaseModel):
     chat_base_url: str = "http://10.160.144.101:51029/v1"
     chat_api_key: str = "local"
     chat_model: str = "gemma-4-31B"
-    temperature: float = 0.0
-    # Retries after a rejected answer sample hotter so the model does not repeat it.
-    retry_temperature: float = 1.0
+    temperature: float = 0.7
+    # Keep repairs at the same non-zero sampling temperature.
+    retry_temperature: float = 0.7
     request_timeout: int = 300
     # Reasoning on plain-text rewrite/intro calls (structured calls keep the
     # server default). Python's lossless checks gate the output either way.

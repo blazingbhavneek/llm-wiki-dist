@@ -128,6 +128,76 @@ class IndexClient(FakeClient):
         ]
 
 
+class ProjectRootsClient(IndexClient):
+    """/00-目次 is missing; /Moove/00-目次 exists, /user has none."""
+
+    def __init__(self, children=None):
+        super().__init__()
+        self._roots = (children if children is not None
+                       else [page_of("507f1f77bcf86cd799439031", "/Moove"),
+                             page_of("507f1f77bcf86cd799439032", "/user")])
+
+    def get_page(self, *, page_id=None, path=None):
+        if (page_id or path) == "/00-目次":
+            self.page_calls.append(page_id or path)
+            return None
+        return super().get_page(page_id=page_id, path=path)
+
+    def list_children(self, *, page_id=None, path=None):
+        self.page_calls.append(page_id or path)
+        if (page_id or path) == "/":
+            return list(self._roots)
+        return []
+
+
+class TwoProjectRootsClient(FakeClient):
+    """/00-目次 missing; two project roots, each with one document."""
+
+    def __init__(self):
+        super().__init__()
+        self.index_pages = {
+            "/P1/00-目次": page_of(
+                "507f1f77bcf86cd799439041", "/P1/00-目次",
+                '<span hidden data-llm-wiki-index="root"></span>\n'
+                "- [D1](/P1/D1/00-目次) — scope one\n"
+                "  - 種別: 文書\n"
+                "  - ページ数: 1\n",
+            ),
+            "/P2/00-目次": page_of(
+                "507f1f77bcf86cd799439042", "/P2/00-目次",
+                '<span hidden data-llm-wiki-index="root"></span>\n'
+                "- [D2](/P2/D2/00-目次) — scope two\n"
+                "  - 種別: 文書\n"
+                "  - ページ数: 1\n",
+            ),
+            "/P1/D1/00-目次": page_of(
+                "507f1f77bcf86cd799439043", "/P1/D1/00-目次",
+                '<span hidden data-llm-wiki-index="document"></span>\n'
+                "- [Alpha1](/P1/alpha1) — alpha one\n"
+                "  - キーワード: alpha\n",
+            ),
+            "/P2/D2/00-目次": page_of(
+                "507f1f77bcf86cd799439044", "/P2/D2/00-目次",
+                '<span hidden data-llm-wiki-index="document"></span>\n'
+                "- [Alpha2](/P2/alpha2) — alpha two\n"
+                "  - キーワード: alpha\n",
+            ),
+        }
+
+    def get_page(self, *, page_id=None, path=None):
+        self.page_calls.append(page_id or path)
+        if (page_id or path) == "/00-目次":
+            return None
+        return self.index_pages.get(page_id or path)
+
+    def list_children(self, *, page_id=None, path=None):
+        self.page_calls.append(page_id or path)
+        if (page_id or path) == "/":
+            return [page_of("507f1f77bcf86cd799439045", "/P1"),
+                    page_of("507f1f77bcf86cd799439046", "/P2")]
+        return []
+
+
 class FakeReranker:
     """Prefers documents containing ``prefer``; reverses order otherwise."""
 
@@ -161,6 +231,25 @@ class IndexMapTests(unittest.TestCase):
         self.assertEqual(len(client.page_calls), 3)
         index.rank("alpha", 2)
         self.assertEqual(len(client.page_calls), 3)
+
+    def test_missing_root_index_falls_back_to_project_roots(self):
+        client = ProjectRootsClient()
+        settings = Settings(growi_url="http://growi.test", growi_token="t", growi_root_path="/")
+        state = R.IndexMap(client, settings, None, None).snapshot()
+        self.assertTrue(state.cards)
+        self.assertEqual({c.title for c in state.cards}, {"Alpha", "Beta"})
+
+    def test_missing_root_index_with_no_project_roots_stays_empty(self):
+        client = ProjectRootsClient(children=[])
+        settings = Settings(growi_url="http://growi.test", growi_token="t", growi_root_path="/")
+        state = R.IndexMap(client, settings, None, None).snapshot()
+        self.assertEqual(state.cards, [])
+
+    def test_missing_root_index_walks_every_project_root(self):
+        client = TwoProjectRootsClient()
+        settings = Settings(growi_url="http://growi.test", growi_token="t", growi_root_path="/")
+        state = R.IndexMap(client, settings, None, None).snapshot()
+        self.assertEqual({c.title for c in state.cards}, {"Alpha1", "Alpha2"})
 
     def test_fast_search_merges_map_and_hides_index_pages(self):
         client, settings, index = self.make_index()
@@ -250,14 +339,15 @@ class AnswerVerificationTests(unittest.TestCase):
         self.assertIn("概要本文", payload)
         self.assertIn("詳細本文", payload)
 
-    def test_cited_pages_are_checked_first_and_a_large_page_cannot_crowd_them_out(self):
+    def test_oversized_source_does_not_trigger_partial_verification(self):
         llm = FakeLLM(answer="ok\n\n引用:\n" + ID1)
         draft = self.draft([ID4, ID1]).model_copy(update={"answer": "下書き\n\n引用:\n" + ID1 + " : 概要"})
-        with mock.patch.object(R, "VERIFY_SOURCE_CHARS", 1000):
-            self.session(llm)._verified("q", draft, lambda _e: None)
-        payload = llm.complete_calls[0][1]
-        self.assertIn("概要本文", payload)
-        self.assertNotIn("长篇内容", payload)
+        session = self.session(llm)
+        session.settings = session.settings.model_copy(update={"llm_context_tokens": 35000})
+        out = session._verified("q", draft, lambda _e: None)
+        self.assertEqual(llm.complete_calls, [])
+        self.assertIn("最終照合は省略", out.answer)
+        self.assertEqual(out.cited_node_ids, draft.cited_node_ids)
 
     def test_no_source_pages_means_no_answer(self):
         llm = FakeLLM()
@@ -911,6 +1001,29 @@ class ExhaustiveTuningTests(unittest.TestCase):
         self.assertNotIn(ID3, answer.answer)
         self.assertTrue(any(event["type"] == "answer_delta" for event in events))
 
+    def test_lead_answer_from_seed_reports_keeps_sources_for_verification(self):
+        from types import SimpleNamespace
+
+        session = make_session(
+            settings=jev_settings(chat_base_url="http://llm.test/v1", chat_model="m"),
+            llm=FakeLLM(answer=f"Checked answer\n\n引用:\n{ID1} : 概要"),
+        )
+        session._seed_ids = [ID1]
+        session._seed_context = "report about the source page"
+
+        class Agent:
+            def invoke(self, *_args, **_kwargs):
+                return {"messages": [SimpleNamespace(content="Draft answer from report")]}
+
+        with mock.patch.object(R, "_compile_agent", return_value=Agent()):
+            draft = session._run_lead("question", lambda _event: None, None)
+        self.assertEqual(draft.cited_node_ids, [ID1])
+        events = []
+        checked = session._verified("question", draft, events.append)
+        self.assertEqual(checked.answer.splitlines()[0], "Checked answer")
+        self.assertEqual(next(event["pages"] for event in events if event["type"] == "verify"), 1)
+        self.assertIn("概要本文", session.llm.complete_calls[0][1])
+
     def test_agent_tool_concurrency_reaches_both_graph_invocations(self):
         settings = Settings(growi_url="http://growi.test", growi_token="t", growi_root_path="/Moove",
                             agent_tool_concurrency=3)
@@ -1130,7 +1243,8 @@ class RecordingJev(FakeJev):
         self.questions: list[str] = []
 
     def score_many(self, state, questions):
-        self.questions.extend(question.text for question in questions)
+        # the 目次 ranking happens before any rewrite exists, so it is asked the raw question
+        self.questions.extend(q.text for q in questions if not q.key.startswith("toc:"))
         return super().score_many(state, questions)
 
 
@@ -1774,6 +1888,122 @@ class JevSweepTests(unittest.TestCase):
         names = {name for name, _text in blocks}
         self.assertIn("/Moove/A", names)
         self.assertNotIn("/Moove/A/sub", names)
+
+    def test_toc_probs_batch_groups_sized_engine_calls(self):
+        from types import SimpleNamespace
+
+        class BatchJev:
+            def __init__(self): self.calls = []
+            def decide_batch(self, requests, return_exceptions=False):
+                self.calls.append(len(requests))
+                return [SimpleNamespace(p_yes=0.9) for _request in requests]
+
+        jev = BatchJev()
+        _client, session = self.make(jev=jev)
+        events = []
+        blocks = [(f"/Moove/D{i:02d}", f"page {i} body") for i in range(45)]
+        probs = session._jev_toc_probs("query", blocks, None, events.append, batch=True, batch_size=20)
+        self.assertEqual(jev.calls, [20, 20, 5])  # shared calls, not one per page
+        self.assertEqual(probs, [0.9] * 45)
+        done = [e["done"] for e in events
+                if e.get("type") == "jev_progress" and e.get("stage") == "toc"]
+        self.assertEqual(done, [0] + list(range(1, 46)) + [45])  # 0/total first, then once per page
+
+    def test_toc_probs_batch_keeps_per_chunk_isolation(self):
+        class FailJev(FakeJev):
+            def score_many(self, state, questions):
+                if "FAIL" in state["toc"]:
+                    raise RuntimeError("unreadable")
+                return [self.high if "概説" in state["toc"] else self.low for _q in questions]
+
+        _client, session = self.make(jev=FailJev(["概説"]))
+        events = []
+        blocks = [("/Moove/ok", "概説 関数一覧"), ("/Moove/bad", "FAIL")]
+        probs = session._jev_toc_probs("query", blocks, None, events.append, batch=True, batch_size=20)
+        self.assertEqual(probs, [0.95, 0.0])  # the failed chunk costs only its page
+        chunks = [e for e in events if e.get("type") == "jev_toc_chunk"]
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["document"], "/Moove/bad")
+
+    def test_oversized_toc_pages_are_chunked_and_note_calls_stay_bounded(self):
+        # Jev refuses an over-budget state and never truncates, so one huge 目次 used to
+        # fail every page ranked in the same batch and leave the sweep with the raw question.
+        class BudgetJev(FakeJev):
+            def count_tokens(self, text):
+                return len(text)
+
+            def score_many(self, state, questions):
+                if len(state["toc"]) > 15000:  # the jev_toc_chunk_tokens the session is configured with
+                    raise RuntimeError("Jev input exceeds runtime budget")
+                return [self.high if "概説" in state["toc"] else self.low for _question in questions]
+
+        jev = BudgetJev(["概説"])
+        _client, session = self.make(jev=jev, chat_base_url="http://llm.test/v1", chat_model="m")
+        session.llm = RewritingLLM()
+        blocks = [(f"/Moove/huge{i}", "概説 " * 9000) for i in range(2)] + \
+                 [(f"/Moove/{name}", "概説 関数一覧") for name in "abcdefgh"]
+        probs = session._jev_toc_probs("give me all functions", blocks, None, lambda _event: None)
+        self.assertEqual(len(probs), len(blocks))
+        self.assertTrue(all(probability > 0.5 for probability in probs))  # chunks scored, not skipped
+        notes = session._jev_toc_notes("give me all functions", blocks, lambda _event: None)
+        self.assertEqual(len(notes), R.TOC_NOTE_GROUPS)  # a few grouped calls, not one per page
+        self.assertEqual(len(session.llm.complete_calls), R.TOC_NOTE_GROUPS)
+        self.assertTrue(all(line.startswith("[/Moove/") for line in notes))
+        self.assertIn("huge0", "\n".join(notes))  # the biggest page still reaches the rewriter
+
+    def test_seed_group_reports_fold_in_windows_as_they_land(self):
+        # All reports at once is what overflowed the compiler: 6 subagents in one
+        # document cost 2 async L1 folds (4 then the remaining 2) plus 1 sync L2
+        # fold over the batch outputs. Same-document groups stay in one L1 batch.
+        confirmed = [{"node": page_of(f"g{i}", f"/Moove/G/{i}"), "score": 0.9 - i * 0.01,
+                      "document": "/Moove/G", "why": [], "evidence": []} for i in range(6)]
+        _client, session = self.make(chat_base_url="http://llm.test/v1", chat_model="m")
+        session.llm = FakeLLM(answer="統合結果")
+        groups = R._seed_groups(confirmed, group_size=1, max_groups=6)
+        self.assertEqual(len(groups), 6)
+        events = []
+
+        def fake(_session, run, _question, _prompt, _emit, _stop):
+            return {"start": run.start_id, "answer": f"報告 {run.start_id}", "cited": [ID1]}
+
+        with mock.patch.object(R, "_run_subagent", side_effect=fake):
+            text, cited = session._run_seed_groups(groups, confirmed, "質問", events.append, None)
+        folds = [call for call in session.llm.complete_calls if call[0] == R.REPORT_FOLD_PROMPT]
+        self.assertEqual(len(folds), 3)
+        l1 = sorted((fold for fold in folds if "中間報告バッチ" not in fold[1]),
+                    key=lambda fold: fold[1].count("### サブエージェント"))
+        l2 = next(fold for fold in folds if "中間報告バッチ" in fold[1])
+        self.assertEqual([fold[1].count("### サブエージェント") for fold in l1], [2, 4])
+        for index in range(6):
+            self.assertIn(f"報告 g{index}", l1[0][1] + l1[1][1])  # no report dropped
+        self.assertIn("中間報告バッチ1", l2[1])
+        self.assertIn("中間報告バッチ2", l2[1])
+        self.assertEqual(text, "統合結果")
+        self.assertEqual(cited, [ID1])
+        self.assertEqual(sorted(e["reports"] for e in events if e["type"] == "reports_folded"),
+                         [2, 2, 4])
+
+    def test_subagent_reports_are_capped_but_the_lead_answer_is_not(self):
+        settings = jev_settings(subagent_report_tokens=4096, llm_max_output_tokens=32768)
+        self.assertEqual(R._model(settings, settings.subagent_report_tokens).max_tokens, 4096)
+        self.assertEqual(R._model(settings).max_tokens, 32768)
+        self.assertEqual(R._model(settings).max_retries, settings.llm_max_retries)
+
+    def test_failed_lead_still_answers_from_the_reports(self):
+        # A proxy reset on the last call must not throw away a finished sweep.
+        session = make_session(settings=jev_settings(chat_base_url="http://llm.test/v1", chat_model="m"),
+                               llm=FakeLLM(answer=f"統合回答\n\n引用:\n\n{ID1} : 概要"))
+        session._seed_pieces = ("seed block", "報告: 関数一覧")
+        session._seed_ids = [ID1]
+        answer = session._degraded_answer("質問", lambda _event: None)
+        self.assertIn("統合回答", answer.answer)
+        self.assertEqual(answer.cited_node_ids, [ID1])
+        session.llm = FakeLLM(answer="引用なし")  # synthesis unusable: the raw reports are the answer
+        raw = session._degraded_answer("質問", lambda _event: None)
+        self.assertIn("報告: 関数一覧", raw.answer)
+        self.assertEqual(raw.cited_node_ids, [ID1])
+        session._seed_pieces = ("", "")
+        self.assertIsNone(session._degraded_answer("質問", lambda _event: None))
 
 
 if __name__ == "__main__":

@@ -93,6 +93,10 @@ class Mirror:
         while not self._stop.is_set():
             try:
                 self.sync_once()
+            except GrowiAPIError as exc:
+                # GROWI timeouts are transient and the next poll retries. Avoid
+                # printing a full traceback every poll while an answer is running.
+                log.warning("mirror sync deferred: %s", exc)
             except Exception:  # noqa: BLE001 - the next poll retries transient failures
                 log.exception("mirror sync failed")
             self._stop.wait(max(1, getattr(self.settings, "mirror_poll_seconds", 10)))

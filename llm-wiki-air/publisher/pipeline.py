@@ -20,9 +20,15 @@ from typing import Any, Callable
 
 from graph.clients.embeddings import Embedder
 from graph.common.markdown import strip_big_tables, strip_image_media
-from graph.growi import GrowiClient, GrowiPublisher
+from graph.growi import GrowiClient, GrowiPublisher, growi_path
 from graph.workspace.parser_client import UnsupportedDocument, parse_document
-from graph.workspace.project import Project, open_project, raw_name_for, wiki_folder_name
+from graph.workspace.project import (
+    Project,
+    assert_unique_generated_paths,
+    open_project,
+    raw_name_for,
+    wiki_folder_name,
+)
 from graph.workspace.writer import links_up_to_date, run_linkers, wiki_config, wiki_up_to_date, write_wiki_pages
 from graph.wiki.model import ChatModelPort
 from graph.wiki.storage import read_json, write_json_atomic
@@ -84,7 +90,11 @@ def _source_row(
         "source_id": source_id,
         "id_seed": str(previous.get("id_seed") or details.get("id_seed") or (legacy_seed if previous else source_id)),
         "mount_rel": item.rel,
-        "source_sha256": item.source_sha256 if not error else "",
+        # A failed wiki/generate stage does not mean that the source bytes are
+        # unknown.  Keep the digest so a later retry can reuse the parsed
+        # Markdown when the source is unchanged; ``last_error`` already marks
+        # the row as incomplete and is what makes the queue retry it.
+        "source_sha256": item.source_sha256,
         "source_blob_oid": str(details.get("source_blob_oid") or previous.get("source_blob_oid") or ""),
         "size": item.size,
         "mtime_ns": item.mtime_ns,
@@ -146,6 +156,34 @@ def _document_raw_rel(document: str) -> str:
     return (path.parent / raw_name_for(path.name)).as_posix()
 
 
+def _assert_unique_growi_locations(
+    project: Project,
+    documents: set[str],
+    publisher: GrowiPublisher,
+) -> None:
+    """Reject document/folder names that GROWI normalizes onto one location."""
+
+    logical_paths = set(documents)
+    for document in documents:
+        parts = Path(document).parts
+        logical_paths.update("/".join(parts[:index]) for index in range(1, len(parts)))
+    remote_owners: dict[str, str] = {}
+    for logical_path in logical_paths:
+        connection = getattr(publisher, "connection", None)
+        remote_path = (
+            growi_path(connection.write_path, logical_path)
+            if connection is not None
+            else publisher.doc_path(project, _document_raw_rel(logical_path))
+        )
+        previous = remote_owners.get(remote_path)
+        if previous is not None and previous != logical_path:
+            raise ValueError(
+                f"wiki locations resolve to the same GROWI path {remote_path!r}: "
+                f"{previous!r}, {logical_path!r}"
+            )
+        remote_owners[remote_path] = logical_path
+
+
 def _folders(project: Project) -> dict[str, Path]:
     result: dict[str, Path] = {}
     for marker in project.wiki.rglob("_planning/linker.json") if project.wiki.exists() else ():
@@ -170,6 +208,19 @@ def _write_raw(path: Path, text: str) -> None:
     except BaseException:
         Path(name).unlink(missing_ok=True)
         raise
+
+
+def _prune_empty_parents(path: Path, root: Path) -> None:
+    """Remove empty generated directories below ``root`` and keep the root itself."""
+
+    root = Path(root).resolve(strict=False)
+    current = Path(path).resolve(strict=False)
+    while current != root and root in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
 
 
 def _assert_source_unchanged(item: SourceFile, path: Path) -> None:
@@ -288,6 +339,8 @@ def _publish_sweep(
 
     failures: list[str] = []
     folders = _folders(project)
+    if publisher is not None:
+        _assert_unique_growi_locations(project, set(folders), publisher)
     scoped_documents = (
         {project.wiki_dir(rel).relative_to(project.wiki).as_posix() for rel in only}
         if only is not None
@@ -448,6 +501,9 @@ def _remove_sources(project: Project, ledger: Ledger, sources: dict[str, str]) -
             shutil.rmtree(project.wiki_dir(raw_rel), ignore_errors=True)
             shutil.rmtree(project.state_dir(raw_rel), ignore_errors=True)
             project.raw_file(raw_rel).unlink(missing_ok=True)
+            _prune_empty_parents(project.wiki_dir(raw_rel).parent, project.wiki)
+            _prune_empty_parents(project.state_dir(raw_rel).parent, project.metadata / "state")
+            _prune_empty_parents(project.raw_file(raw_rel).parent, project.raw)
             ledger.sources.pop(rel, None)
             source_id = str(source.get("source_id") or "")
             if source_id:
@@ -461,10 +517,48 @@ def _remove_sources(project: Project, ledger: Ledger, sources: dict[str, str]) -
                     "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
                 _save_identities(project, identities)
-            done.append({"path": rel, "status": "deleted", "touched": touched, "rebuild": "full"})
+            done.append({
+                "path": rel,
+                "raw_rel": raw_rel,
+                "status": "deleted",
+                "touched": touched,
+                "rebuild": "full",
+            })
         except Exception as exc:
             failures.append(f"{rel}: {type(exc).__name__}: {exc}")
     return done, touched_raw, failures
+
+
+def _can_resume_parsed_source(
+    previous_source: dict[str, Any],
+    item: SourceFile,
+    raw_path: Path,
+    *,
+    requested_resume: bool,
+    classification: str,
+    known_source_sha256: str = "",
+    known_source_blob_oid: str = "",
+) -> bool:
+    """Reuse parsed Markdown when retrying stages for an unchanged source binary."""
+
+    previous_sha256 = str(previous_source.get("source_sha256") or "")
+    expected_sha256 = previous_sha256
+    # Older failed rows intentionally erased source_sha256.  The queue still
+    # carries the staged blob identity; only trust its hash when that identity
+    # is the same one recorded with the raw Markdown.
+    if (
+        not expected_sha256
+        and known_source_sha256
+        and known_source_blob_oid
+        and str(previous_source.get("source_blob_oid") or "") == known_source_blob_oid
+    ):
+        expected_sha256 = known_source_sha256
+    return bool(
+        requested_resume
+        and classification != "forced"
+        and expected_sha256 == item.source_sha256
+        and raw_path.exists()
+    )
 
 
 def sync_once(
@@ -497,6 +591,7 @@ def sync_once(
                 raise RuntimeError("cannot sync from a dirty last-good working tree")
         ledger = load_ledger(ledger_path)
         scan = scan_mount(project.mount, ledger.sources)
+        assert_unique_generated_paths(scan.files)
         publisher = _publisher(settings)
         if publisher is None:
             raise RuntimeError("GROWI_URL is required for sync/watch; use build for local-only output")
@@ -556,6 +651,9 @@ def sync_once(
             details = source_details.get(rel, {})
             previous_source = dict(ledger.sources.get(rel) or {})
             classification = str(details.get("classification") or "none")
+            requested_resume = not force if resume is None else resume
+            if classification == "forced":
+                requested_resume = False
             started = time.monotonic()
             try:
                 log.info("run=%s path=%s stage=parse start", run_id, rel)
@@ -568,17 +666,33 @@ def sync_once(
                         "bytes": item.size,
                     })
                 with _progress_heartbeat(on_progress, stage="parse", file=rel):
+                    raw_path = project.raw_file(raw_rel)
                     previous_markdown = (
-                        project.raw_file(raw_rel).read_text(encoding="utf-8")
-                        if previous_source and project.raw_file(raw_rel).exists()
+                        raw_path.read_text(encoding="utf-8")
+                        if (previous_source or details.get("source_sha256")) and raw_path.exists()
                         else None
                     )
-                    parse_args = (
-                        {"previous_markdown": previous_markdown}
-                        if previous_markdown is not None
-                        else {}
-                    )
-                    markdown = _parse(item, project.mount / rel, settings, **parse_args)
+                    if _can_resume_parsed_source(
+                        previous_source,
+                        item,
+                        raw_path,
+                        requested_resume=requested_resume,
+                        classification=classification,
+                        known_source_sha256=str(details.get("source_sha256") or ""),
+                        known_source_blob_oid=str(details.get("source_blob_oid") or ""),
+                    ):
+                        assert previous_markdown is not None
+                        markdown = previous_markdown
+                        log.info("run=%s path=%s stage=parse resumed", run_id, rel)
+                        if on_progress:
+                            on_progress({"stage": "parse", "step": "resumed", "file": rel})
+                    else:
+                        parse_args = (
+                            {"previous_markdown": previous_markdown}
+                            if previous_markdown is not None
+                            else {}
+                        )
+                        markdown = _parse(item, project.mount / rel, settings, **parse_args)
                 _assert_source_unchanged(item, project.mount / rel)
                 if previous_markdown is not None and classification != "forced":
                     _check_parse_size(rel, previous_markdown, markdown)
@@ -595,9 +709,6 @@ def sync_once(
                 if on_progress:
                     on_progress({"stage": "wiki", "step": "start", "file": raw_rel})
                 with _progress_heartbeat(on_progress, stage="wiki", file=raw_rel):
-                    requested_resume = not force if resume is None else resume
-                    if classification == "forced":
-                        requested_resume = False
                     result = write_wiki_pages(
                         project, raw_rel, mode=str(settings.ingest_mode), settings=settings,
                         llm=model, embedder=embedder, on_progress=on_progress,
@@ -648,7 +759,8 @@ def sync_once(
                     changed.append(rel)
                     log.warning("run=%s path=%s stage=generate retry_later error=%s: %s", run_id, rel, type(exc).__name__, exc)
                     continue
-                # Second failure: skip until the next sync (the error row has no hash).
+                # Second failure: skip until the next sync.  Keep the source
+                # digest in the error row so an unchanged retry can skip parse.
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 ledger.sources[rel] = _source_row(item, raw_rel, error, details=details, previous=previous_source)
                 save_ledger(ledger_path, ledger)
@@ -713,7 +825,15 @@ def sync_once(
             from .history import checkpoint_live
 
             checkpoint_live(project, f"sync {run_id}")
-    return {"run_id": run_id, "scan": scan, "done": done, "failures": failures, "cancelled": cancelled}
+    index_paths = None if publish_only is None else sorted(publish_only)
+    return {
+        "run_id": run_id,
+        "scan": scan,
+        "done": done,
+        "failures": failures,
+        "cancelled": cancelled,
+        "index_paths": index_paths,
+    }
 
 
 def delete_sources(
@@ -757,7 +877,13 @@ def delete_sources(
                 **({"begin_publish": begin_publish} if begin_publish is not None else {}),
             ))
         save_ledger(ledger_path, ledger)
-    return {"run_id": run_id, "done": done, "failures": failures, "cancelled": cancelled}
+    return {
+        "run_id": run_id,
+        "done": done,
+        "failures": failures,
+        "cancelled": cancelled,
+        "index_paths": sorted(set(sources.values()) | touched),
+    }
 
 
 def _replace_metadata_paths(value: Any, replacements: dict[str, str]) -> Any:
@@ -804,6 +930,7 @@ def move_sources(
         ledger = load_ledger(ledger_path)
         identities = _identities(project)
         moves: list[tuple[Any, str, str, str, dict[str, dict[str, Any]]]] = []
+        index_paths: set[str] = set()
         try:
             for job in jobs:
                 if should_continue is not None and not should_continue():
@@ -817,6 +944,10 @@ def move_sources(
                 new_raw = (Path(new_rel).parent / raw_name_for(Path(new_rel).name)).as_posix()
                 old_document = project.wiki_dir(old_raw).relative_to(project.wiki).as_posix()
                 new_document = project.wiki_dir(new_raw).relative_to(project.wiki).as_posix()
+                content_changed = bool(
+                    job.target_sha256
+                    and job.target_sha256 != str(source.get("source_sha256") or "")
+                )
                 for old_path, new_path in (
                     (project.raw_file(old_raw), project.raw_file(new_raw)),
                     (project.wiki_dir(old_raw), project.wiki_dir(new_raw)),
@@ -827,6 +958,12 @@ def move_sources(
                             raise FileExistsError(f"move target already exists: {new_path}")
                         new_path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(old_path), str(new_path))
+                        stop = (
+                            project.raw if old_path == project.raw_file(old_raw)
+                            else project.wiki if old_path == project.wiki_dir(old_raw)
+                            else project.metadata / "state"
+                        )
+                        _prune_empty_parents(old_path.parent, stop)
                 replacements = {old_raw: new_raw, old_document: new_document, old_rel: new_rel}
                 planning = project.wiki_dir(new_raw) / "_planning"
                 for path in planning.glob("*.json") if planning.is_dir() else ():
@@ -840,9 +977,15 @@ def move_sources(
                     "mount_rel": new_rel,
                     "raw_rel": new_raw,
                     "wiki_rel": new_rel,
-                    "source_sha256": str(job.target_sha256 or source.get("source_sha256") or ""),
-                    "source_blob_oid": str(job.target_blob_oid or source.get("source_blob_oid") or ""),
                 })
+                # A rename plus an edit still has to parse the new immutable blob.
+                # Leaving the previous digest here makes sync_once see the content
+                # change and prevents its resume gate from reusing the old raw text.
+                if not content_changed:
+                    source.update({
+                        "source_sha256": str(job.target_sha256 or source.get("source_sha256") or ""),
+                        "source_blob_oid": str(job.target_blob_oid or source.get("source_blob_oid") or ""),
+                    })
                 if (project.mount / new_rel).is_file():
                     stat = (project.mount / new_rel).stat()
                     source.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
@@ -860,8 +1003,10 @@ def move_sources(
                         moved_pages[new_document + local_path[len(old_document):]] = ledger.published_pages.pop(local_path)
                 ledger.published_pages.update(moved_pages)
                 moves.append((job, old_raw, new_raw, new_document, moved_pages))
+                index_paths.update((old_raw, new_raw))
             if failures:
                 return {"run_id": run_id, "done": done, "failures": failures, "cancelled": False}
+            _assert_unique_growi_locations(project, set(_folders(project)), publisher)
             _save_identities(project, identities)
             if getattr(settings, "wiki_linker_enabled", True) and moves:
                 from graph.linker.catalog import Catalog
@@ -899,15 +1044,40 @@ def move_sources(
                 save_ledger(ledger_path, ledger)
                 done.append({"path": str(job.rel), "from": str(job.from_rel), "status": "moved", "rebuild": "move"})
             if touched_raw:
+                index_paths.update(touched_raw)
                 failures.extend(_publish_sweep(
                     project, ledger, publisher, run_id, only=touched_raw, on_progress=on_progress,
                     settings=settings,
                     **({"begin_publish": begin_publish} if begin_publish is not None else {}),
                 ))
+            if moves and not failures:
+                # A pure move does not need a document publish sweep, but its old/new
+                # document indexes and both ancestor trees still have to move. Indexes
+                # are derived output, so keep their failures non-transactional just as
+                # _publish_sweep does for add/update/delete.
+                from .index import build_index
+
+                try:
+                    for problem in build_index(
+                        settings,
+                        only=sorted(index_paths),
+                        locked=True,
+                        ledger=ledger,
+                        on_progress=on_progress,
+                    )["failures"]:
+                        log.warning("run=%s stage=index error=%s", run_id, problem)
+                except Exception as exc:
+                    log.warning("run=%s stage=index error=%s: %s", run_id, type(exc).__name__, exc)
             save_ledger(ledger_path, ledger)
         except Exception as exc:
             failures.append(f"move: {type(exc).__name__}: {exc}")
-    return {"run_id": run_id, "done": done, "failures": failures, "cancelled": False}
+    return {
+        "run_id": run_id,
+        "done": done,
+        "failures": failures,
+        "cancelled": False,
+        "index_paths": sorted(index_paths),
+    }
 
 
 def _sources_by_id(ledger: Ledger) -> dict[str, tuple[str, dict[str, Any]]]:

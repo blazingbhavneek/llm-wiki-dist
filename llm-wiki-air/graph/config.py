@@ -162,16 +162,31 @@ class Settings(BaseModel):
     wiki_linker_mode: Literal["legacy", "neo"] = "neo"
     wiki_linker_concurrency: int = 0
     wiki_linker_judge: Literal["llm", "jev"] = "jev"
+    # Project-level JEV selection overrides the process/.env backend.  Keeping
+    # the GGUF paths here lets one project use local inference while another
+    # continues to use a hosted or llm2jev service.
+    wiki_jev_backend: Literal["torch", "gguf", "hosted", "llm2jev"] = "torch"
+    wiki_jev_gguf_local_path: str = ""
+    wiki_jev_gguf_quant: str = "F16"
+    wiki_jev_gguf_many_mode: Literal["exact", "batched"] = "exact"
+    wiki_jev_score_bin: str = ""
     wiki_linker_role_threshold: float = Field(default=0.5, ge=0, le=1)
     wiki_linker_alias_threshold: float = Field(default=0.8, ge=0, le=1)
-    wiki_linker_screen_candidates: int = Field(default=50, ge=1)
+    wiki_linker_screen_candidates: int = Field(default=80, ge=1)
     wiki_linker_screen_threshold: float = Field(default=0.4, ge=0, le=1)
-    wiki_linker_verify_top: int = Field(default=5, ge=1)
+    wiki_linker_verify_top: int = Field(default=20, ge=1)
     wiki_linker_verify_threshold: float = Field(default=0.7, ge=0, le=1)
     # Jev verify scores in [floor, verify_threshold) get a yes/no LLM second opinion; 0 turns it off.
     wiki_linker_tiebreak_floor: float = Field(default=0.4, ge=0, le=1)
-    wiki_linker_curate_keep: int = Field(default=8, ge=1)
-    wiki_linker_hop_caps: str = "40,40,20"
+    wiki_linker_curate_keep: int = Field(default=12, ge=1)
+    wiki_linker_hop_caps: str = "60,50,25"
+    # Visible-link budgets: what the curator may keep and the renderer may print.
+    wiki_linker_footer_max: int = Field(default=20, ge=1)
+    wiki_linker_inline_max: int = Field(default=8, ge=0)
+    wiki_linker_inline_max_big: int = Field(default=12, ge=0)
+    wiki_linker_inline_max_neo: int = Field(default=3, ge=0)
+    wiki_linker_edge_candidates: int = Field(default=12, ge=1)
+    wiki_linker_edges_per_target: int = Field(default=3, ge=1)
     wiki_index_related_docs: bool = False
     # Kept as an explicit fail-fast compatibility flag for old engine callers.
     engine_semantic_edges: bool = False
@@ -345,6 +360,11 @@ class Settings(BaseModel):
             ).lower() in ("1", "true", "yes", "on"),
             wiki_linker_mode=env("WIKI_LINKER_MODE", cls.wiki_linker_mode),
             wiki_linker_judge=env("WIKI_LINKER_JUDGE", cls.wiki_linker_judge),
+            wiki_jev_backend=env("WIKI_JEV_BACKEND", cls.wiki_jev_backend),
+            wiki_jev_gguf_local_path=env("WIKI_JEV_GGUF_LOCAL_PATH", cls.wiki_jev_gguf_local_path),
+            wiki_jev_gguf_quant=env("WIKI_JEV_GGUF_QUANT", cls.wiki_jev_gguf_quant),
+            wiki_jev_gguf_many_mode=env("WIKI_JEV_GGUF_MANY_MODE", cls.wiki_jev_gguf_many_mode),
+            wiki_jev_score_bin=env("WIKI_JEV_SCORE_BIN", cls.wiki_jev_score_bin),
             wiki_linker_role_threshold=float(env("WIKI_LINKER_ROLE_THRESHOLD", cls.wiki_linker_role_threshold)),
             wiki_linker_alias_threshold=float(env("WIKI_LINKER_ALIAS_THRESHOLD", cls.wiki_linker_alias_threshold)),
             wiki_linker_screen_candidates=int(env("WIKI_LINKER_SCREEN_CANDIDATES", cls.wiki_linker_screen_candidates)),
@@ -354,6 +374,12 @@ class Settings(BaseModel):
             wiki_linker_tiebreak_floor=float(env("WIKI_LINKER_TIEBREAK_FLOOR", cls.wiki_linker_tiebreak_floor)),
             wiki_linker_curate_keep=int(env("WIKI_LINKER_CURATE_KEEP", cls.wiki_linker_curate_keep)),
             wiki_linker_hop_caps=env("WIKI_LINKER_HOP_CAPS", cls.wiki_linker_hop_caps),
+            wiki_linker_footer_max=int(env("WIKI_LINKER_FOOTER_MAX", cls.wiki_linker_footer_max)),
+            wiki_linker_inline_max=int(env("WIKI_LINKER_INLINE_MAX", cls.wiki_linker_inline_max)),
+            wiki_linker_inline_max_big=int(env("WIKI_LINKER_INLINE_MAX_BIG", cls.wiki_linker_inline_max_big)),
+            wiki_linker_inline_max_neo=int(env("WIKI_LINKER_INLINE_MAX_NEO", cls.wiki_linker_inline_max_neo)),
+            wiki_linker_edge_candidates=int(env("WIKI_LINKER_EDGE_CANDIDATES", cls.wiki_linker_edge_candidates)),
+            wiki_linker_edges_per_target=int(env("WIKI_LINKER_EDGES_PER_TARGET", cls.wiki_linker_edges_per_target)),
             wiki_index_related_docs=env("WIKI_INDEX_RELATED_DOCS", "1" if cls.wiki_index_related_docs else "0").lower() in ("1", "true", "yes", "on"),
             wiki_linker_concurrency=int(
                 env("WIKI_LINKER_CONCURRENCY", concurrency)
@@ -1534,35 +1560,11 @@ def format_lead_candidate(result: dict[str, Any]) -> str:
     return lines
 
 
-_IMAGE_UNIT_RE = re.compile(
-    r"<image-unit\b[^>]*>(?P<body>.*?)</image-unit>",
-    re.IGNORECASE | re.DOTALL,
-)
-
-_IMAGE_DESCRIPTION_RE = re.compile(
-    r"<image-description\b[^>]*>(?P<description>.*?)</image-description>",
-    re.IGNORECASE | re.DOTALL,
-)
-
-_IMAGE_MEDIA_RE = re.compile(
-    r"<image-media\b[^>]*>.*?</image-media>",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
 def strip_image_media(text: str) -> str:
     """Remove embedded image media payloads and keep image descriptions."""
-    if not text:
-        return text
+    from graph.common.images import strip_images
 
-    def replace_image_unit(match: re.Match[str]) -> str:
-        body = match.group("body")
-        description = _IMAGE_DESCRIPTION_RE.search(body)
-        if description:
-            return description.group("description").strip()
-        return _IMAGE_MEDIA_RE.sub("", body).strip()
-
-    return _IMAGE_UNIT_RE.sub(replace_image_unit, text).strip()
+    return strip_images(text, keep_descriptions=True).strip()
 
 
 _BIG_TABLE_RE = re.compile(r"<table>.*?</table>", re.DOTALL)

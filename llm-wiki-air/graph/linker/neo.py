@@ -80,7 +80,8 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None, setting
     entity_names = {normalize_name(item.name) for item in chunk.entities}
     caps = [HOP1_MAX, HOP2_MAX, HOP3_MAX]
     if judge and settings is not None:
-        try: caps = [int(value) for value in settings.wiki_linker_hop_caps.split(",")]
+        # Fewer values than hops means fewer hops: "40,30" disables the 3-hop expansion.
+        try: caps = ([int(value) for value in settings.wiki_linker_hop_caps.split(",")] + [0, 0, 0])[:3]
         except (AttributeError, TypeError, ValueError): pass
     obvious = set() if judge else set(_similar_ids(catalog, chunk, team))
     for cid, _score in catalog.behaviour_chunks(team, entity_names, exclude_page=chunk.page_rel)[:caps[0]]:
@@ -103,7 +104,7 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None, setting
                 break
         if len(hop2) >= caps[1]:
             break
-    selected.extend(hop2)
+    selected.extend(hop2[:caps[1]])
     hop3: list[Candidate] = []
     for e1 in entity_names:
         for first in catalog.behaviour_links(team, e1):
@@ -126,7 +127,7 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None, setting
                 break
         if len(hop3) >= caps[2]:
             break
-    selected.extend(hop3)
+    selected.extend(hop3[:caps[2]])
     if judge:
         text = f"{chunk.title} {chunk.heading} {chunk.summary} {' '.join(chunk.keywords)}"
         limit = getattr(settings, "wiki_linker_screen_candidates", 50)

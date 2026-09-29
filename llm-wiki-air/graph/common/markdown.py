@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .images import strip_images
+
 LINKS_FOOTER_START = "<!-- llm-wiki-links:start -->"
 LINKS_FOOTER_END = "<!-- llm-wiki-links:end -->"
 
@@ -68,18 +70,10 @@ def is_tableish_line(line: str) -> bool:
     return stripped.startswith("|") and stripped.endswith("|") or bool(re.match(r"^\s*[-|: ]+\s*$", line))
 
 
-_IMAGE_UNIT_RE = re.compile(r"<image-unit\b[^>]*>.*?</image-unit>", re.I | re.S)
-_IMAGE_DESCRIPTION_RE = re.compile(r"<image-description\b[^>]*>(.*?)</image-description>", re.I | re.S)
-_IMAGE_MEDIA_RE = re.compile(r"<image-media\b[^>]*>.*?</image-media>", re.I | re.S)
-_DATA_IMAGE_URI_RE = re.compile(r"data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+", re.I)
-
-
 def strip_image_media(text: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        description = _IMAGE_DESCRIPTION_RE.search(match.group(0))
-        return description.group(1).strip() if description else ""
+    """Remove any supported image representation while retaining descriptions."""
 
-    return _DATA_IMAGE_URI_RE.sub("[embedded image omitted]", _IMAGE_MEDIA_RE.sub("", _IMAGE_UNIT_RE.sub(replace, text)))
+    return strip_images(text, keep_descriptions=True)
 
 
 def strip_big_tables(text: str, *, max_rows: int = 40) -> str:

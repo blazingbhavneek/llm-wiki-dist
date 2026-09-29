@@ -52,10 +52,13 @@ from walker import Walker
 from prompts import (
     ANSWER_VERIFY_PROMPT,
     FOLLOWUP_ANSWER_PROMPT,
+    JEV_CANDIDATE_COVERAGE_PROMPT,
+    JEV_INTENT_PROMPT,
     JEV_QUERY_REWRITE_PROMPT,
     JEV_TOC_SUMMARY_PROMPT,
     MAIN_AGENT_SYSTEM_PROMPT,
     PACKED_SUBAGENT_PROMPT,
+    REPORT_FOLD_PROMPT,
     ROUTER_PROMPT,
     SHALLOW_ANSWER_PROMPT,
     SUBAGENT_SYSTEM_PROMPT,
@@ -69,6 +72,8 @@ IMAGE_DESC_RE = re.compile(
     r"<image-description\b[^>]*>(.*?)</image-description>", re.I | re.S
 )
 IMAGE_MEDIA_RE = re.compile(r"<image-media\b[^>]*>.*?</image-media>", re.I | re.S)
+HTML_IMAGE_RE = re.compile(r"<(?:img|embed)\b[^>]*>", re.I | re.S)
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\([^\n)]*\)", re.I)
 DATA_IMAGE_RE = re.compile(
     r"data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+", re.I
 )
@@ -90,6 +95,8 @@ def sanitize_text(value: Any) -> str:
 
     text = IMAGE_UNIT_RE.sub(_unit, text)
     text = IMAGE_MEDIA_RE.sub("", text)
+    text = HTML_IMAGE_RE.sub("[image omitted]", text)
+    text = MARKDOWN_IMAGE_RE.sub("[image omitted]", text)
     text = DATA_IMAGE_RE.sub("[image omitted]", text)
     return text
 
@@ -243,15 +250,42 @@ class IndexMap:
     def _ref(target: str) -> str:
         return (target or "").strip().strip("/")
 
+    def _project_root_seeds(self, root: str) -> list[tuple[WikiPage, str, md.IndexCard | None, int]]:
+        """First-level <child>/00-目次 pages under root; children without one are skipped."""
+        name = self.settings.index_page_name
+        try:
+            if self.mirror is not None and self.mirror.ready:
+                children = self.mirror.children_of(root or "/")
+            else:
+                children = self.client.list_children(path=root or "/")
+        except GrowiAPIError as exc:
+            log.info("index project roots unreadable (%s): %s", root or "/", exc)
+            return []
+        seeds = []
+        for child in children:
+            if not child.path:
+                continue
+            target = f"{child.path.rstrip('/')}/{name}"
+            sub = self._read(target)
+            if sub is None or not md.is_index_page(sub.body):
+                continue
+            seeds.append((sub, self._ref(sub.path or target), None, 0))
+        return seeds
+
     def _build(self) -> _MapState:
         """Fetch + parse + embed into a fresh state. Touches no shared fields except the vector cache."""
         mirror_version = self.mirror.version if self.mirror is not None and self.mirror.ready else -1
         root = self.settings.growi_root_path.rstrip("/")
-        index_path = f"{root}/{self.settings.index_page_name}"
-        page = (self.mirror.get(path=index_path) if self.mirror is not None and self.mirror.ready
-                else self.client.get_page(path=index_path))
-        if page is None or not md.is_index_page(page.body):
-            return _MapState(mirror_version=mirror_version)
+        if root:
+            index_path = f"{root}/{self.settings.index_page_name}"
+            page = self._read(index_path)
+            pending = ([(page, self._ref(page.path or index_path), None, 0)]
+                       if page is not None and md.is_index_page(page.body)
+                       else [])
+        else:
+            # GROWI / is a container of projects, not itself a project index.
+            pending = self._project_root_seeds("/")
+        root_refs = {ref for _page, ref, _document, _depth in pending}
         docs: list[md.IndexCard] = []
         cards: list[md.IndexCard] = []
         entity_definers: dict[str, list[md.IndexCard]] = {}
@@ -259,8 +293,6 @@ class IndexMap:
         folders: list[md.IndexCard] = []
         parent: dict[str, str] = {}
         children: dict[str, list[md.IndexCard]] = {}
-        root_ref = self._ref(page.path or f"{root}/{self.settings.index_page_name}")
-        pending = [(page, root_ref, None, 0)]
         visited: set[str] = set()
         with ThreadPoolExecutor(max_workers=max(1, self.settings.growi_concurrency), thread_name_prefix="index-map") as pool:
             while pending:
@@ -273,7 +305,7 @@ class IndexMap:
                     kind = md.index_kind(current.body)
                     listed = md.parse_index(current.body)
                     children[current_ref] = listed
-                    if kind == "document" or (kind == "1" and current_ref != root_ref):
+                    if kind == "document" or (kind == "1" and current_ref not in root_refs):
                         doc_ref = self._ref(document.target) if document else current_ref
                         title = document.title if document else current.title
                         doc_cards: list[md.IndexCard] = []
@@ -460,6 +492,17 @@ class RouteDecision(BaseModel):
     reason: str = ""
 
 
+class JevIntent(BaseModel):
+    """Machine-readable scope used by the document shortlist and coverage gate."""
+
+    target: str = ""
+    scope: str = ""
+    broad: bool = False
+    required_evidence: list[str] = Field(default_factory=list)
+    must_include_terms: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+
+
 @dataclass
 class Subrun:
     start_id: str
@@ -591,6 +634,13 @@ class _SweepWork:
 
 
 _JEV_YES_LOOKING = 0.5  # a p(はい) above this counts as a verdict leaning yes
+_JEV_NARROW_DOC_LIMIT = 3  # narrow question + this many TOC yes docs or fewer: skip rewrite + card scoring
+TOC_NOTE_GROUPS = 5        # LLM calls the 目次 rewrite stage makes, however many pages it ranks
+TOC_NOTE_GROUP_CHARS = 12000  # 目次 text one of those calls summarises
+REPORT_WINDOW = 4          # L1 batch size: subagent reports per compiler call (see _run_seed_groups)
+JEV_TOC_RETRIEVAL_K = 20   # scoped document 目次 shortlist before page-card scoring
+JEV_FAST_SEED_LIMIT = 9    # fewer than ten readable seeds: direct compiler path
+JEV_ONE_STAGE_SEED_LIMIT = 32  # through 32 seeds: explorers, then final compiler
 
 
 def _yes_means(units: dict[str, Any]) -> dict[str, float]:
@@ -667,7 +717,7 @@ def _base_url(value: str) -> str:
 # --- agent compilation ------------------------------------------------------
 
 
-def _model(settings: Settings) -> Any:
+def _model(settings: Settings, max_tokens: int = 0) -> Any:
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(
@@ -677,9 +727,9 @@ def _model(settings: Settings) -> Any:
         temperature=settings.chat_temperature,
         timeout=httpx.Timeout(settings.llm_timeout, pool=None),
         http_client=llm_http_client(settings.llm_max_concurrency),
-        max_retries=0,
+        max_retries=settings.llm_max_retries,
         stream_usage=True,
-        max_tokens=settings.llm_max_output_tokens or None,
+        max_tokens=max_tokens or settings.llm_max_output_tokens or None,
     )
 
 
@@ -689,7 +739,8 @@ def _llm_client(settings: Settings, temperature: float) -> LlmClient:
                      max_tokens=settings.llm_max_output_tokens, max_concurrency=settings.llm_max_concurrency)
 
 
-def _compile_agent(settings: Settings, tools: list[StructuredTool], prompt: str, stop_event: Event | None):
+def _compile_agent(settings: Settings, tools: list[StructuredTool], prompt: str, stop_event: Event | None,
+                   max_tokens: int = 0):
     safe_prompt = sanitize_text(prompt or "")
 
     def before_model(state: dict[str, Any]) -> dict[str, Any]:
@@ -700,7 +751,7 @@ def _compile_agent(settings: Settings, tools: list[StructuredTool], prompt: str,
         return {"llm_input_messages": sanitize_messages(messages)}
 
     return create_react_agent(
-        _model(settings), tools=tools, prompt=safe_prompt, pre_model_hook=before_model, version="v2"
+        _model(settings, max_tokens), tools=tools, prompt=safe_prompt, pre_model_hook=before_model, version="v2"
     )
 
 
@@ -730,9 +781,11 @@ def _count_steps(state: Any) -> int:
     return max(1, len(messages))
 
 
-# ponytail: source text for the answer check is capped by characters; page-level
-# selection would be needed only if answers start citing very large pages.
-VERIFY_SOURCE_CHARS = 80000
+def _llm_output_capped(llm: Any, max_tokens: int) -> bool:
+    reason = str(getattr(llm, "last_finish_reason", "") or "").lower()
+    usage = getattr(llm, "last_usage", None) or {}
+    return reason in {"length", "max_tokens"} or bool(
+        max_tokens and (usage.get("output_tokens") or 0) >= max_tokens)
 
 
 def _clean_ids(ids: list[Any] | None) -> list[str]:
@@ -790,6 +843,8 @@ def _seed_groups(confirmed: list[dict[str, Any]], group_size: int, max_groups: i
     ``confirmed`` arrives confidence-sorted, so documents line up by their best
     seed and a document with more seeds just costs more subagents. Each group is
     one subagent's whole world: it sees its own seeds and never another's.
+    ``max_groups`` remains an API/configuration compatibility argument; executor
+    concurrency, rather than truncation, limits how many run simultaneously.
     """
     size = max(1, group_size)
     by_document: dict[str, list[dict[str, Any]]] = {}
@@ -800,7 +855,11 @@ def _seed_groups(confirmed: list[dict[str, Any]], group_size: int, max_groups: i
     for results in by_document.values():
         for start in range(0, len(results), size):
             groups.append(results[start:start + size])
-    return sorted(groups, key=lambda group: -group[0]["score"])[:max(1, max_groups)]
+    # ``max_groups`` is retained for configuration compatibility, but accepted
+    # seeds must never disappear merely because many documents produced small
+    # groups.  The executor limits concurrent calls; extra groups wait in its
+    # queue.
+    return sorted(groups, key=lambda group: -group[0]["score"])
 
 
 def _seed_refs(results: list[dict[str, Any]]) -> set[str]:
@@ -876,7 +935,13 @@ class ResearchSession:
         self._page_grams: OrderedDict[tuple[str, str], set[str]] = OrderedDict()
         self._query_grams: dict[str, set[str]] = {}
         self._seed_context = ""
+        self._seed_pieces: tuple[str, str] = ("", "")
         self._seed_ids: list[str] = []
+        self._seed_raw_reports: list[dict[str, Any]] = []
+        self._jev_scope_query = ""
+        self._jev_intent_structured: dict[str, Any] = {}
+        self._jev_early_doc_keys: set[str] = set()
+        self._jev_early_mode = False
 
     def apply_overrides(self, overrides: dict[str, Any] | None) -> None:
         clean = _sanitize_overrides(overrides or {}, self.settings)
@@ -1370,7 +1435,7 @@ class ResearchSession:
         emit({
             "type": "jev_gate", "stage": stage, "status": status, "node": ref,
             "document": document, "probability": round(float(probability), 4),
-            "threshold": self.settings.jev_threshold if stage == "card" else self.settings.jev_seed_threshold,
+            "threshold": self.settings.jev_seed_threshold if stage == "full" else self.settings.jev_threshold,
             "chunk_count": chunk_count,
         })
 
@@ -1403,7 +1468,8 @@ class ResearchSession:
 
     def _jev_walk(self, root: WikiPage, budget: JevSweepBudget,
                   stop_event: Event | None,
-                  skip_index_pages: bool = True) -> Iterator[WikiPage]:
+                  skip_index_pages: bool = True,
+                  live_list: bool = False) -> Iterator[WikiPage]:
         """Sweep-only recursive child walk; cycles stop on visited IDs/paths.
 
         Yields while it crawls so classification starts before enumeration ends.
@@ -1423,7 +1489,7 @@ class ResearchSession:
             if from_listing and node.descendant_count == 0:
                 continue
             try:
-                children = self._mirror_children(node.path)
+                children = None if live_list else self._mirror_children(node.path)
                 if children is None:
                     if not budget.try_list():
                         continue
@@ -1442,61 +1508,20 @@ class ResearchSession:
 
     def _jev_documents(self, state: "_MapState", budget: JevSweepBudget,
                        stop_event: Event | None) -> list[dict]:
-        """Every visible document: valid-index docs first, then no-index roots.
-
-        A document whose index fetch failed is never silently omitted; it falls
-        back to recursive page enumeration.
-        """
+        """Documents reachable through the root index, with readable page cards."""
         docs: list[dict] = []
-        keys: set[str] = set()
         for doc in state.docs:
+            _check_stop(stop_event)
             page = self._fetch_ref(doc.target, sweep_budget=budget)
             cards = state.cards_by_document.get(doc.doc_ref, [])
             root_path = page.path.rsplit("/", 1)[0] if page is not None and page.path else ""
             if page is not None and md.is_index_page(page.body) and cards and root_path:
-                keys.add(root_path.rstrip("/"))
                 docs.append({"key": root_path, "indexed": True, "title": doc.title,
                              "cards": cards, "root": page})
-            else:
-                root = None
-                if page is not None and page.path:
-                    root_path = page.path
-                    if root_path.rstrip("/").rsplit("/", 1)[-1] == self.settings.index_page_name:
-                        root_path = root_path.rsplit("/", 1)[0]  # document dir, not the index page
-                    root = WikiPage(id="", path=root_path)
-                elif doc.target.startswith("/"):
-                    root = WikiPage(id="", path=doc.target)
-                key = ((root.path if root is not None else "") or doc.target).rstrip("/")
-                if key and key not in keys:
-                    keys.add(key)
-                    docs.append({"key": key, "indexed": False, "title": doc.title,
-                                 "cards": [], "root": root or WikiPage(id="", path="")})
-        # No-index fallback: every first-level child of the visible root that is
-        # not already an indexed document is its own document root.
-        children = self._mirror_children(self.settings.growi_root_path)
-        if children is None and budget.try_list():
-            _check_stop(stop_event)
-            try:
-                self.timer.count("growi_list")
-                children = self.client.list_children(path=self.settings.growi_root_path)
-            except GrowiAPIError as exc:
-                log.info("jev root listing failed: %s", exc)
-                children = []
-        if children is not None:
-            indexed_refs = {
-                card.target.rstrip("/") for card in state.folders
-                if card.target.strip("/") in state.children
-            }
-            for child in children:
-                key = child.path.rstrip("/")
-                if not key or key in keys or key in indexed_refs:
-                    continue
-                keys.add(key)
-                docs.append({"key": key, "indexed": False, "title": child.title,
-                             "cards": [], "root": child})
         return docs
 
-    def _jev_probs(self, items: list[tuple[dict, JevQuestion]]) -> list[float]:
+    def _jev_probs(self, items: list[tuple[dict, JevQuestion]], *,
+                   return_exceptions: bool = False) -> list:
         """Score states together when the engine supports batching; retain fake compatibility."""
         if not items:
             return []
@@ -1506,32 +1531,49 @@ class ResearchSession:
             self.timer.count("jev_calls")
             self.timer.count("jev_questions", len(requests))
             try:
-                results = self.jev.decide_batch(requests)
+                if return_exceptions:
+                    results = self.jev.decide_batch(requests, return_exceptions=True)
+                else:
+                    results = self.jev.decide_batch(requests)
             except Exception as exc:  # the sweep falls back to ES on RuntimeError, like score_many
                 raise RuntimeError(f"Jev scoring failed: {exc}") from exc
+            if return_exceptions:
+                return [float(result.p_yes) if not isinstance(result, BaseException) else result
+                        for result in results]
             return [float(result.p_yes) for result in results]
         probabilities = []
         for state, question in items:
             self.timer.count("jev_calls")
             self.timer.count("jev_questions")
-            result = self.jev.score_many(state, [question])
+            try:
+                result = self.jev.score_many(state, [question])
+            except Exception as exc:
+                if not return_exceptions:
+                    raise
+                probabilities.append(exc)
+                continue
             if len(result) != 1:
                 raise RuntimeError("jev adapter returned misaligned probabilities")
             probabilities.append(float(result[0]))
         return probabilities
 
     def _jev_score_cards(self, query: str, doc: dict, emit: Callable,
-                         stop_event: Event | None, work: "_SweepWork") -> list[md.IndexCard]:
+                         stop_event: Event | None, work: "_SweepWork") -> list[tuple[md.IndexCard, float]]:
         """Score one lightweight state per card, batching the document once."""
         st = self.settings
-        candidates: list[md.IndexCard] = []
+        candidates: list[tuple[md.IndexCard, float]] = []
         cards = doc["cards"]
         items = []
         for card in cards:
             state = self._jev_state(doc["key"], cards=[card])
             question = JevQuestion(
                 key=card.target,
-                text=jev_question_text(query, subject=f"{card.title} ({card.target})"),
+                text=("これは第2段階の厳密なページ候補判定です。この文書の00-目次にある1件の項目"
+                      "（タイトル・概要・キーワード）だけを見て、リンク先ページ本文が検索意図に必要な"
+                      "証拠そのものを含む可能性がある場合だけ「はい」と答えてください。"
+                      "単に同じ製品・分野、対象名の一度だけの言及、別対象の説明、リンク集や概要だけなら「いいえ」です。\n"
+                      f"項目: {card.title} ({card.target})\n質問: {query}\n"
+                      "選択肢: はい / いいえ"),
             )
             items.append((state, question))
         considered = 0
@@ -1547,12 +1589,13 @@ class ResearchSession:
             if prob > st.jev_threshold:
                 found += 1
                 self._jev_gate(emit, "card", "candidate", node, prob, doc["key"])
-                candidates.append(card)
+                candidates.append((card, prob))
             else:
                 self._jev_gate(emit, "card", "pruned", node, prob, doc["key"])
         with work.lock:
             work.stats["cards_considered"] += considered
             work.stats["candidates"] += found
+            work.max_probability = max(work.max_probability, *probs) if probs else work.max_probability
         return candidates
 
     def _jev_score_body(self, query: str, document: str, page: WikiPage,
@@ -1607,54 +1650,301 @@ class ResearchSession:
         """Pages that describe what a document contains: the rewriter's best clue."""
         return any(marker in (title or "") for marker in ("目次", "一覧", "index", "Index", "INDEX"))
 
-    def _jev_toc_blocks(self, state: "_MapState", budget: JevSweepBudget,
-                        stop_event: Event | None) -> list[tuple[str, str]]:
-        """(name, full text) for every 00-目次 / 一覧 page in the wiki, at any depth.
+    def _jev_project_roots(self, budget: JevSweepBudget,
+                           stop_event: Event | None) -> list[WikiPage]:
+        """Configured project, or first-level projects with their own root 00-目次."""
+        configured = self.settings.growi_root_path.rstrip("/")
+        index_name = self.settings.index_page_name
+        if configured:
+            index = self._fetch_ref(f"{configured}/{index_name}", sweep_budget=budget)
+            return ([WikiPage(id="", path=configured, title=configured.rsplit("/", 1)[-1])]
+                    if index is not None and md.is_index_page(index.body) else [])
+        if not budget.try_list():
+            return []
+        _check_stop(stop_event)
+        try:
+            self.timer.count("growi_list")
+            children = self.client.list_children(path="/")
+        except GrowiAPIError as exc:
+            log.info("jev project root listing failed: %s", exc)
+            return []
+        roots = []
+        for child in children:
+            _check_stop(stop_event)
+            if not child.path:
+                continue
+            index = self._fetch_ref(
+                f"{child.path.rstrip('/')}/{index_name}", sweep_budget=budget)
+            if index is not None and md.is_index_page(index.body):
+                roots.append(child)
+        return roots
 
-        Recursive on purpose: subdirectories carry their own 00-目次, so a first-level
-        scan describes one chapter and reports the rest of the wiki as 関連なし. Each
-        index page goes to its summariser whole, and the reads pay from the sweep's
-        budget and warm its cache, so a page the sweep scores later is not fetched twice.
-        """
+    def _jev_toc_blocks(self, state: "_MapState", budget: JevSweepBudget,
+                        stop_event: Event | None,
+                        roots: list[WikiPage] | None = None) -> list[tuple[str, str]]:
+        """Every document 00-目次 below each project root, including nested ones."""
         blocks: list[tuple[str, str]] = []
         seen: set[str] = set()
-        try:
-            roots = self._mirror_children(self.settings.growi_root_path)
-            if roots is None:
-                self.timer.count("growi_list")
-                roots = self.client.list_children(path=self.settings.growi_root_path)
-        except GrowiAPIError as exc:
-            log.info("jev rewrite inventory failed (root listing): %s", exc)
-            return []
-        for root in roots:  # each top-level subtree, walked to every depth
-            if not root.id and not root.path:
+        if roots is None:
+            roots = self._jev_project_roots(budget, stop_event)
+        root_indexes = {
+            f"{root.path.rstrip('/')}/{self.settings.index_page_name}" for root in roots if root.path
+        }
+        for root in roots:
+            if not root.path:
                 continue
-            for page in self._jev_walk(root, budget, stop_event, skip_index_pages=False):
-                if not self._is_toc_page(page.title):
+            for page in self._jev_walk(root, budget, stop_event,
+                                       skip_index_pages=False, live_list=True):
+                _check_stop(stop_event)
+                path = page.path.rstrip("/")
+                if (not path or path in root_indexes or
+                        path.rsplit("/", 1)[-1] != self.settings.index_page_name):
                     continue
                 reference = page.id or page.path
                 key = reference.strip("/")
                 if not key or key in seen:
                     continue
-                seen.add(key)
                 body = page.body or ""
-                if not body.strip():  # listings carry no body; the 目次 itself must be read
+                if not body.strip():
                     found = self._fetch_ref(reference, sweep_budget=budget)
                     body = found.body if found is not None else ""
-                if md.index_kind(body) in {"folder", "root"}:
+                if (not md.is_index_page(body) or
+                        md.index_kind(body) in {"root", "folder"}):
                     continue
-                name = page.path.rsplit("/", 1)[0] or page.title or page.path
-                blocks.append((name, sanitize_text(body)))
+                seen.add(key)
+                blocks.append((path.rsplit("/", 1)[0] or page.title,
+                               sanitize_text(body)))
         return blocks
 
-    def _jev_toc_note(self, query: str, document: str, text: str) -> str:
+    def _jev_retrieve_tocs(self, query: str, blocks: list[tuple[str, str]],
+                           limit: int = JEV_TOC_RETRIEVAL_K) -> list[tuple[str, str]]:
+        """BM25 + vector + configured reranker shortlist over document 目次 pages."""
+        if len(blocks) <= limit:
+            return blocks
+        texts = [f"{document}\n{text}" for document, text in blocks]
+
+        def terms(text: str) -> list[str]:
+            normalized = unicodedata.normalize("NFKC", text or "").lower()
+            out = re.findall(r"[a-z0-9]{2,}", normalized)
+            runs = re.sub(r"[a-z0-9\s\W]+", " ", normalized)
+            for chunk in runs.split():
+                out.extend(chunk[i:i + 2] for i in range(len(chunk) - 1))
+                if len(chunk) == 1:
+                    out.append(chunk)
+            return out
+
+        tokenized = [terms(text) for text in texts]
+        document_frequency: Counter = Counter()
+        for tokens in tokenized:
+            document_frequency.update(set(tokens))
+        query_terms = terms(query)
+        query_counts = Counter(query_terms)
+        document_count = max(1, len(tokenized))
+        average_length = sum(len(tokens) for tokens in tokenized) / document_count or 1.0
+        bm25: list[float] = []
+        for tokens in tokenized:
+            counts = Counter(tokens)
+            length = len(tokens)
+            score = 0.0
+            for term, query_frequency in query_counts.items():
+                frequency = counts.get(term, 0)
+                df = document_frequency.get(term, 0)
+                if not frequency or not df:
+                    continue
+                idf = math.log(1 + (document_count - df + 0.5) / (df + 0.5))
+                denominator = frequency + 1.2 * (0.25 + 0.75 * length / average_length)
+                score += idf * ((frequency * 2.2) / denominator) * query_frequency
+            bm25.append(score)
+
+        fused: dict[int, float] = {}
+
+        def add_ranked(order: list[int], include: Callable[[int], bool] | None = None) -> None:
+            for rank, index in enumerate(order):
+                if include is not None and not include(index):
+                    continue
+                fused[index] = fused.get(index, 0.0) + 1.0 / (60 + rank)
+
+        add_ranked(sorted(range(len(blocks)), key=lambda i: bm25[i], reverse=True),
+                   lambda index: bm25[index] > 0)
+        embedder = getattr(self.index_map, "embedder", None) if self.index_map is not None else None
+        if embedder is not None:
+            try:
+                query_vector = embedder.embed_query(query)
+                vectors = embedder.embed_documents(texts)
+                similarities = [cosine(query_vector, vector) for vector in vectors]
+                add_ranked(sorted(range(len(blocks)), key=lambda i: similarities[i], reverse=True))
+            except Exception as exc:  # noqa: BLE001 - keyword ranking is still useful
+                log.info("document 目次 vector retrieval failed: %s", exc)
+        if self.reranker is not None:
+            try:
+                reranked = normalize_scores(self.reranker.score(query, texts))
+                add_ranked(sorted(range(len(blocks)), key=lambda i: reranked[i], reverse=True))
+            except Exception as exc:  # noqa: BLE001 - retrieval remains usable without reranking
+                log.info("document 目次 rerank failed: %s", exc)
+
+        # Without any retrieval signal, do not treat the first twenty documents
+        # as relevant; the caller will fall back to all reachable documents.
+        if not fused:
+            return []
+        order = sorted(fused, key=fused.get, reverse=True)
+        return [blocks[index] for index in order[:limit]]
+
+    def _jev_toc_probs(self, query: str, blocks: list[tuple[str, str]],
+                       stop_event: Event | None, emit: Callable, *,
+                       batch: bool = False, batch_size: int = 20) -> list[float]:
+        """Rank the 目次 pages one page at a time, in <=jev_toc_chunk_tokens chunks.
+
+        Jev refuses an over-budget input and never truncates, so the inventory must not
+        ride in one batch: a single oversized 目次 fails every page scored with it. Each
+        page is chunked and scored on its own, a page is the best of its chunks, and a
+        chunk that still fails costs only that chunk. Progress streams as it goes: this
+        is the slowest stage of a question and the one that decides every answer after it.
+
+        With batch=True the chunks of every page ride shared engine calls of at most
+        batch_size items instead of one call per page; verdicts, failure isolation
+        and per-page progress are unchanged.
+        """
+        st = self.settings
+        count = getattr(self.jev, "count_tokens", _jev_est_tokens)
+        overlap = min(st.jev_chunk_overlap, st.jev_toc_chunk_tokens // 2)
+        question = jev_toc_question(query)
+        emit({"type": "jev_toc_scan", "documents": len(blocks)})
+        if batch:
+            return self._jev_toc_probs_batched(query, blocks, stop_event, emit, question,
+                                               count, overlap, batch_size)
+        probabilities: list[float] = []
+        yeses, sum_yes = 0, 0.0
+        # The bar ticks once per page, not per chunk: a page is the unit the user reads.
+        for done, (document, text) in enumerate(blocks, start=1):
+            _check_stop(stop_event)
+            best = 0.0
+            chunks = _jev_chunks(sanitize_text(text), st.jev_toc_chunk_tokens, overlap,
+                                 prefix=document, count=count)
+            for part, chunk in enumerate(chunks):
+                try:
+                    probs = self._jev_probs([({"document": document, "toc": chunk},
+                                              JevQuestion(key=f"toc:{document}:{part}", text=question))])
+                except Exception as exc:  # noqa: BLE001 - one unreadable page must not stop the rest
+                    print(f"[growi-search] Jev 目次 score failed ({document} #{part + 1}): {exc}", flush=True)
+                    emit({"type": "jev_toc_chunk", "document": document, "part": part + 1,
+                          "chunks": len(chunks), "reason": str(exc)[:200]})
+                    continue
+                if probs:
+                    best = max(best, max(probs))
+            if best > _JEV_YES_LOOKING:
+                yeses += 1
+                sum_yes += best
+            probabilities.append(best)
+            emit({"type": "jev_progress", "stage": "toc", "done": done, "total": len(blocks),
+                  "percent": round(100.0 * done / len(blocks), 1), "document": document,
+                  "probability": round(best, 4), "yes": yeses,
+                  "mean_yes_probability": round(sum_yes / yeses, 4) if yeses else 0.0})
+        emit({"type": "jev_progress", "stage": "toc", "done": len(blocks), "total": len(blocks),
+              "percent": 100.0, "yes": yeses,
+              "mean_yes_probability": round(sum_yes / yeses, 4) if yeses else 0.0})
+        return probabilities
+
+    def _jev_toc_probs_batched(self, query: str, blocks: list[tuple[str, str]],
+                               stop_event: Event | None, emit: Callable, question: str,
+                               count: Callable, overlap: int, batch_size: int) -> list[float]:
+        """Shared engine calls of at most batch_size chunks for the whole 目次 scan."""
+        size = max(1, int(batch_size or 0))
+        per_doc: list[list[tuple[dict, JevQuestion]]] = []
+        for document, text in blocks:
+            chunks = _jev_chunks(sanitize_text(text), self.settings.jev_toc_chunk_tokens, overlap,
+                                 prefix=document, count=count)
+            per_doc.append([({"document": document, "toc": chunk},
+                             JevQuestion(key=f"toc:{document}:{part}", text=question))
+                            for part, chunk in enumerate(chunks)])
+        flat = [item for items in per_doc for item in items]
+        batches = (len(flat) + size - 1) // size if flat else 0
+        emit({"type": "jev_progress", "stage": "toc", "done": 0, "total": len(blocks),
+              "percent": 0.0, "batches": batches, "yes": 0, "mean_yes_probability": 0.0})
+        scored: list = []
+        for start in range(0, len(flat), size):
+            _check_stop(stop_event)
+            scored.extend(self._jev_probs(flat[start:start + size], return_exceptions=True))
+        probabilities: list[float] = []
+        yeses, sum_yes = 0, 0.0
+        # The bar still ticks once per page: a page is the unit the user reads.
+        offset = 0
+        for done, ((document, _text), items) in enumerate(zip(blocks, per_doc), start=1):
+            _check_stop(stop_event)
+            best = 0.0
+            for part in range(len(items)):
+                result = scored[offset + part]
+                if isinstance(result, BaseException):
+                    print(f"[growi-search] Jev 目次 score failed ({document} #{part + 1}): {result}", flush=True)
+                    emit({"type": "jev_toc_chunk", "document": document, "part": part + 1,
+                          "chunks": len(items), "reason": str(result)[:200]})
+                    continue
+                best = max(best, result)
+            offset += len(items)
+            if best > _JEV_YES_LOOKING:
+                yeses += 1
+                sum_yes += best
+            probabilities.append(best)
+            emit({"type": "jev_progress", "stage": "toc", "done": done, "total": len(blocks),
+                  "percent": round(100.0 * done / len(blocks), 1), "document": document,
+                  "probability": round(best, 4), "yes": yeses,
+                  "mean_yes_probability": round(sum_yes / yeses, 4) if yeses else 0.0})
+        emit({"type": "jev_progress", "stage": "toc", "done": len(blocks), "total": len(blocks),
+              "percent": 100.0, "yes": yeses,
+              "mean_yes_probability": round(sum_yes / yeses, 4) if yeses else 0.0})
+        return probabilities
+
+    def _jev_toc_note(self, query: str, document: str, text: str, intent: str = "") -> str:
         """What one document holds relative to the question, in the corpus's own words."""
-        payload = json.dumps({"質問": query, "文書": document, "この文書の目次": text},
+        payload = json.dumps({"質問": query, "初期検索意図": intent or query,
+                              "文書": document, "この文書の目次": text},
                              ensure_ascii=False)
         llm = self.deterministic_llm or self.llm
         note = llm.complete(JEV_TOC_SUMMARY_PROMPT, sanitize_text(payload))
         self._record_usage(llm)
-        return sanitize_text(note).replace("\n", " ").strip()[:500]
+        return sanitize_text(note).replace("\n", " ").strip()
+
+    def _jev_toc_notes(self, query: str, winners: list[tuple[str, str]], emit: Callable,
+                       intent: str = "") -> list[str]:
+        """Summarise the winning 目次 pages in a few size-balanced calls, not one per page.
+
+        The rewriter's prompt wants `[文書名] 要約` lines, so whole 目次 pages cannot go to
+        it: the top 10% of a wiki this size is ~450k chars. Large pages end up on their
+        own, small ones share a call, and the stage costs TOC_NOTE_GROUPS calls however
+        many pages the ranking kept.
+        """
+        bins = min(TOC_NOTE_GROUPS, len(winners))
+        groups: list[list[tuple[int, str, str]]] = [[] for _ in range(bins)]
+        sizes = [0] * bins
+        for rank, (document, text) in enumerate(winners):  # biggest page into the emptiest group
+            slot = min(range(bins), key=lambda index: sizes[index])
+            groups[slot].append((rank, document, text))
+            sizes[slot] += len(text)
+        notes: list[str] = [""] * bins
+        titles: list[str] = [""] * bins
+        emit_guard = Lock()
+
+        def summarize(slot: int, group: list[tuple[int, str, str]]) -> None:
+            group.sort()
+            document = " / ".join(name for _rank, name, _text in group)
+            text = "\n\n".join(f"[{name}]\n{body}" for _rank, name, body in group)
+            titles[slot] = document
+            try:
+                notes[slot] = self._jev_toc_note(query, document, text, intent)
+            except AgentStopped:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one unread group must not blind the rewrite
+                print(f"[growi-search] Jev 目次 note failed ({document}): {exc}", flush=True)
+                notes[slot] = text[:400].replace("\n", " ")
+            with emit_guard:
+                emit({"type": "jev_toc", "document": document, "note": notes[slot]})
+
+        with self.timer.stage("toc_notes"):
+            with ThreadPoolExecutor(max_workers=bins, thread_name_prefix="jev-toc") as pool:
+                futures = [pool.submit(summarize, slot, group)
+                           for slot, group in enumerate(groups) if group]
+                for future in futures:
+                    future.result()
+        return [f"[{title}] {note}" for title, note in zip(titles, notes) if note]
 
     def _jev_toc_digest(self, query: str, state: "_MapState", budget: JevSweepBudget,
                         stop_event: Event | None, emit: Callable) -> tuple[str, int]:
@@ -1721,18 +2011,42 @@ class ResearchSession:
                           for index, (document, _text) in enumerate(blocks)
                           if (note := notes[index]) != "関連なし"), len(blocks))
 
-    def _jev_target_query(self, query: str, material: str) -> str:
-        """Rewrite the question into a page-target question, in the corpus's vocabulary.
+    def _jev_intent_query(self, query: str) -> str:
+        """Expand the user's request into a strict, evidence-oriented search intent."""
+        if self.llm is None or not self.settings.llm_ready:
+            return ""
+        payload = json.dumps({"ユーザーの質問": query}, ensure_ascii=False)
+        llm = self.deterministic_llm or self.llm
+        try:
+            intent = llm.complete_structured(JEV_INTENT_PROMPT, sanitize_text(payload), JevIntent)
+            self._record_usage(llm)
+            self._jev_intent_structured = intent.model_dump()
+            parts = [f"対象: {intent.target}", f"範囲: {intent.scope}",
+                     f"広さ: {'広い' if intent.broad else '限定的'}"]
+            if intent.required_evidence:
+                parts.append(f"必要な証拠: {'、'.join(intent.required_evidence)}")
+            if intent.must_include_terms:
+                parts.append(f"必須語: {'、'.join(intent.must_include_terms)}")
+            if intent.exclusions:
+                parts.append(f"除外: {'、'.join(intent.exclusions)}")
+            return "。".join(part for part in parts if part).strip()
+        except Exception as exc:  # noqa: BLE001 - intent expansion must not disable the sweep
+            log.info("structured jev intent failed; using text intent: %s", exc)
+            try:
+                text = llm.complete(JEV_INTENT_PROMPT, sanitize_text(payload))
+                self._record_usage(llm)
+                return sanitize_text(text).replace("\n", " ").strip()
+            except Exception as fallback_exc:  # noqa: BLE001 - raw query remains safe
+                log.info("jev intent expansion failed; using raw question: %s", fallback_exc)
+                return ""
 
-        The sweep asks every page the same question, so that wording decides what
-        the classifier is even able to say yes to: the raw question is normally in
-        the wrong shape (English against a Japanese manual, a whole-answer lookup
-        phrased for an enumeration). Empty string means "no rewrite", and then the
-        raw question is used.
-        """
+    def _jev_target_query(self, query: str, material: str, intent: str = "") -> str:
+        """Rewrite the scoped intent into a page-target question using selected TOCs."""
         if self.llm is None or not self.settings.llm_ready or not material:
             return ""
-        payload = json.dumps({"質問": query, "この Wiki に存在するページ（目次）": material},
+        payload = json.dumps({"元の質問": query, "初期検索意図": intent or query,
+                              "構造化された初期検索意図": self._jev_intent_structured,
+                              "第1段階で選別された文書の目次要約": material},
                              ensure_ascii=False)
         try:
             llm = self.deterministic_llm or self.llm
@@ -1741,7 +2055,56 @@ class ResearchSession:
         except Exception as exc:  # noqa: BLE001 - a missing rewrite must not fail the sweep
             log.info("jev query rewrite failed; using the question as-is: %s", exc)
             return ""
-        return sanitize_text(text).replace("\n", " ").strip()[:400]
+        return sanitize_text(text).replace("\n", " ").strip()
+
+    def _jev_refine_from_seeds(self, query: str, results: list[dict[str, Any]]) -> str:
+        """Make the second-pass question from the evidence found by a broad scan."""
+        if not results:
+            return ""
+        material = "\n\n".join(
+            f"[{result['node'].title}] {result['node'].summary}\n{result['node'].path}"
+            for result in results
+        )
+        return self._jev_target_query(query, material, self._jev_scope_query or query)
+
+    def _jev_candidates_enough(self, query: str, intent: str,
+                               candidates: list[tuple[str, str]]) -> bool:
+        """Ask the LLM whether the scoped shortlist can safely stand for the corpus."""
+        if not candidates or self.llm is None or not self.settings.llm_ready:
+            return False
+        material = "\n\n".join(f"[{document}]\n{text}" for document, text in candidates)
+        structured = self._jev_intent_structured
+        if not structured or structured.get("broad"):
+            return False
+        required = [term.casefold() for term in self._jev_required_terms()]
+        normalized_material = unicodedata.normalize("NFKC", material).casefold()
+        if required and any(term not in normalized_material for term in required):
+            return False
+        payload = json.dumps({"元の質問": query, "検索意図": intent,
+                              "構造化された意図": structured,
+                              "候補文書の目次": material}, ensure_ascii=False)
+        try:
+            llm = self.deterministic_llm or self.llm
+            verdict = sanitize_text(llm.complete(
+                JEV_CANDIDATE_COVERAGE_PROMPT, payload)).strip()
+            self._record_usage(llm)
+        except Exception as exc:  # noqa: BLE001 - uncertainty must scan all documents
+            log.info("jev candidate coverage check failed: %s", exc)
+            return False
+        return verdict.startswith("十分") and "不足" not in verdict
+
+    def _jev_required_terms(self) -> list[str]:
+        """Exact anchors a narrow structured intent requires in a readable page."""
+        structured = self._jev_intent_structured
+        if not structured or structured.get("broad"):
+            return []
+        terms = [str(term).strip() for term in structured.get("must_include_terms", [])
+                 if str(term).strip() and " " not in str(term) and "　" not in str(term)]
+        if not terms and structured.get("target"):
+            target = str(structured["target"]).strip()
+            if " " not in target and "　" not in target:
+                terms = [target]
+        return terms
 
     def _jev_prefiltered(self, query: str, page: WikiPage) -> bool:
         """Cheap gate in front of the expensive body pass.
@@ -1848,19 +2211,59 @@ class ResearchSession:
             work.frontier.append((page, source_card))
         self._jev_gate(emit, "full", "confirmed", page, prob, document, chunk_count)
 
-    def _run_jev_sweep(self, query: str, emit: Callable, stop_event: Event | None) -> list[dict[str, Any]]:
-        """Exhaustive per-question relevance sweep; returns confirmed seeds.
+    def _jev_accept_card(self, card: md.IndexCard, document: str, probability: float,
+                         budget: JevSweepBudget, stop_event: Event | None,
+                         emit: Callable, work: "_SweepWork") -> None:
+        """Hydrate a yes card, applying exact-term body validation for narrow intents."""
+        _check_stop(stop_event)
+        key = card.target.strip("/")
+        with work.lock:
+            if key in work.visited:
+                return
+            work.visited.add(key)
+        page = self._fetch_ref(card.target, sweep_budget=budget)
+        if page is None:
+            self._jev_gate(emit, "read", "unread", IndexMap.card_page(card), probability, document, 0)
+            return
+        required_terms = self._jev_required_terms()
+        if required_terms:
+            searchable = unicodedata.normalize(
+                "NFKC", f"{page.title}\n{page.path}\n{page.body or ''}"
+            ).casefold()
+            if any(term.casefold() not in searchable for term in required_terms):
+                with work.lock:
+                    work.stats["pages_considered"] += 1
+                self._jev_gate(emit, "read", "pruned", page, probability, document, 0)
+                return
+        with work.lock:
+            if page.id in work.visited and page.id != key:
+                return
+            work.visited.add(page.id)
+            work.stats["pages_considered"] += 1
+            work.stats["confirmed"] += 1
+            work.results.append({
+                "node": page, "score": probability, "why": [], "document": document,
+                "evidence": [Evidence(
+                    page_id=page.id, field="jev",
+                    text=f"Jev p(はい)={probability:.2f}; stage=card; document index={document}",
+                    source_rank=0, score=probability).model_dump()],
+            })
+        self._jev_gate(emit, "read", "confirmed", page, probability, document, 0)
 
-        Crawl and classification are pipelined: one thread enumerates documents,
-        cards and pages and publishes full-read targets on a bounded queue while
-        `jev_workers` threads fetch and classify them, so GROWI traversal and page
-        reads overlap classification instead of running before it.
+    def _run_jev_sweep(self, query: str, emit: Callable, stop_event: Event | None,
+                       force_full: bool = False) -> list[dict[str, Any]]:
+        """Score reachable document-index cards and hydrate the yes pages as seeds.
+
+        One thread scores document cards while worker threads fetch the accepted
+        pages. The body is read for exploration, not classified by Jev.
 
         Never an answer generator: an empty list (or any failure) leaves the
         existing ES -> index map -> router -> lead path completely intact.
         """
         started = time.monotonic()
         st = self.settings
+        self._jev_early_mode = False
+        self._jev_early_doc_keys = set()
         workers = max(1, st.jev_workers)
         budget = JevSweepBudget(st.jev_max_page_reads, st.jev_max_list_calls)
         work = _SweepWork(stats={"documents": 0, "pages_considered": 0, "cards_considered": 0,
@@ -1868,8 +2271,8 @@ class ResearchSession:
                                  "prefiltered": 0})
         status = "ok"
         print(f"[growi-search] Jev sweep: start backend={st.jev_backend} workers={workers}", flush=True)
-        # tqdm-style live progress: one unit per classification gate. The total
-        # grows as the crawl discovers cards/pages, so the percentage is clamped
+        # tqdm-style live progress: one unit per card verdict or accepted page read.
+        # The total grows as the index reveals cards, so the percentage is clamped
         # to never recede and is forced to 100 when the sweep ends.
         progress_lock = Lock()
         units = {"total": 0, "done": 0, "pct": 0.0, "scored_full": 0, "scored_card": 0,
@@ -1917,30 +2320,44 @@ class ResearchSession:
                          probability=event.get("probability") if verdict else None)
             emit(event)
 
-        # The queue bound is the pipeline's backpressure: the crawl never runs
-        # further ahead than the classifiers can consume.
+        # The queue bound keeps the card scorer from outrunning page hydration.
         targets: Queue = Queue(maxsize=workers * 4)
         drained = object()
 
         def produce(state: "_MapState") -> None:
             try:
                 docs = self._jev_documents(state, budget, stop_event)
+                preferred = docs
+                remainder: list[dict] = []
+                if self._jev_early_doc_keys and not force_full:
+                    wanted = {key.strip("/") for key in self._jev_early_doc_keys}
+                    preferred = [doc for doc in docs if doc["key"].strip("/") in wanted]
+                    remainder = [doc for doc in docs if doc["key"].strip("/") not in wanted]
                 with work.lock:
-                    work.stats["documents"] = len(docs)
-                progress(add_total=sum(len(d["cards"]) for d in docs if d["indexed"]), step=0)
-                for doc in docs:
-                    _check_stop(stop_event)
-                    if work.errors:
-                        return
-                    if doc["indexed"]:
+                    work.stats["documents"] = len(preferred)
+
+                def scan(scan_docs: list[dict]) -> int:
+                    found = 0
+                    progress(add_total=sum(len(d["cards"]) for d in scan_docs), step=0)
+                    for doc in scan_docs:
+                        _check_stop(stop_event)
+                        if work.errors:
+                            return found
                         candidates = self._jev_score_cards(jev_query, doc, gated, stop_event, work)
-                        progress(add_total=len(candidates), step=0)  # each candidate costs a full read
-                        for card in candidates:
-                            targets.put((card.target, doc["key"], card))
-                    else:
-                        for page in self._jev_walk(doc["root"], budget, stop_event):
-                            progress(add_total=1, step=0)  # the crawl just found one more page
-                            targets.put((page.id or page.path, doc["key"], None))
+                        found += len(candidates)
+                        progress(add_total=len(candidates), step=0)
+                        for card, probability in candidates:
+                            targets.put((card, doc["key"], probability))
+                    return found
+
+                found = scan(preferred)
+                # Keep this inside the same producer/sweep. A shortlist with no
+                # page-level yes simply falls through to the remaining documents;
+                # it does not create another SSE/Jev stage.
+                if not found and remainder and not work.errors:
+                    with work.lock:
+                        work.stats["documents"] = len(docs)
+                    scan(remainder)
             except BaseException as exc:  # noqa: BLE001 - re-raised on the sweep thread
                 with work.lock:
                     work.errors.insert(0, exc)  # the first failure decides the fallback
@@ -1955,77 +2372,170 @@ class ResearchSession:
                     return
                 if work.errors:
                     continue  # drain only: never block the producer while the run unwinds
-                reference, document, card = item
+                card, document, probability = item
                 try:
-                    self._jev_confirm(jev_query, reference, document, state, card,
-                                      budget, stop_event, gated, work)
+                    self._jev_accept_card(card, document, probability, budget,
+                                          stop_event, emit, work)
                 except BaseException as exc:  # noqa: BLE001 - re-raised on the sweep thread
                     with work.lock:
                         work.errors.append(exc)
+                finally:
+                    progress(step=1, stage="read")
 
         try:
             state = self.index_map.snapshot() if self.index_map is not None else _MapState()
-            # What Jev is actually asked: the question rewritten against the real
-            # inventory of this wiki's 00-目次 pages. The rewritten text also feeds
-            # the keyword prefilter, which is how an English question can still match
-            # a Japanese manual.
-            try:
-                material, entries = self._jev_toc_digest(query, state, budget, stop_event, emit)
-            except AgentStopped:
-                raise
-            except Exception as exc:  # noqa: BLE001 - a broken inventory must not fail the question
-                log.info("jev 目次 digest failed; asking the raw question: %s", exc)
-                material, entries = "", 0
+            # Rewrite against document 00-目次 pages reached from project indexes.
+            # First expand the user's scope, use that intent to rank document TOCs,
+            # then requery the selected TOCs into a precise page-level question.
+            material, entries = "", 0
+            intent = query
+            requery = ""
+            shortlist_enough = False
+            narrow_early = False
+            narrow_toc_seeds: list[tuple[str, float]] | None = None
+            blocks: list[tuple[str, str]] = []
             with self.timer.stage("rewrite"):
-                jev_query = self._jev_target_query(query, material) or query
+                try:
+                    blocks = self._jev_toc_blocks(state, budget, stop_event)
+                    if blocks and self.jev is not None and self.settings.llm_ready:
+                        intent = self._jev_intent_query(query) or query
+                        emit({"type": "jev_intent", "text": intent,
+                              "structured": self._jev_intent_structured})
+                        print(f"[growi-search] Jev intent: {intent}", flush=True)
+                        # Preserve the original scope pass: Jev evaluates every
+                        # reachable document 目次 before the LLM creates the precise
+                        # page-level requery.
+                        # batch=True groups the scan into shared engine calls of at most
+                        # batch_size items; the backend sends one state per HTTP call,
+                        # up to llm2jev_concurrency in flight.
+                        probs = self._jev_toc_probs(intent, blocks, stop_event, emit,
+                                                          batch=True, batch_size=20)
+                        ranked = sorted(zip(blocks, probs), key=lambda pair: pair[1], reverse=True)
+                        yes_docs = [(document, probability)
+                                    for (document, _text), probability in ranked
+                                    if probability > _JEV_YES_LOOKING]
+                        structured = self._jev_intent_structured or {}
+                        is_narrow = isinstance(structured, dict) and structured.get("broad") is False
+                        if (not force_full and is_narrow
+                                and 1 <= len(yes_docs) <= _JEV_NARROW_DOC_LIMIT):
+                            # Narrow question with a few TOC yes: skip notes +
+                            # rewrite + card scoring. The yes documents become the
+                            # seed scope directly.
+                            winners = [(document, text) for (document, text), _p in ranked
+                                       if any(d == document for d, _ in yes_docs)]
+                            entries = len(winners)
+                            material, requery = "", ""
+                            jev_query = intent
+                            narrow_early = True
+                            narrow_toc_seeds = yes_docs
+                            self._jev_early_mode = True
+                            self._jev_early_doc_keys = {document for document, _ in yes_docs}
+                            shortlist_enough = True
+                            print(f"[growi-search] Jev narrow early exit: "
+                                  f"{len(yes_docs)} TOC yes, skipping rewrite + card scoring",
+                                  flush=True)
+                        else:
+                            selected = ranked
+                            keep = max(1, math.ceil(0.1 * len(selected)))
+                            cutoff = selected[keep - 1][1]
+                            material_budget = TOC_NOTE_GROUPS * TOC_NOTE_GROUP_CHARS
+                            winners, used = [], 0
+                            for (document, text), probability in selected:  # ties at the cutoff stay in
+                                if probability < cutoff or (winners and used + len(text) > material_budget):
+                                    break
+                                winners.append((document, text))
+                                used += len(text)
+                            material = "\n".join(self._jev_toc_notes(intent, winners, emit, intent))
+                            entries = len(winners)
+                            requery = self._jev_target_query(query, material, intent) or ""
+                            jev_query = requery or intent
+                            if not force_full:
+                                shortlist = self._jev_retrieve_tocs(
+                                    jev_query, blocks, JEV_TOC_RETRIEVAL_K)
+                                enough = self._jev_candidates_enough(query, jev_query, shortlist)
+                                shortlist_enough = bool(shortlist and enough)
+                                if shortlist and enough:
+                                    self._jev_early_mode = True
+                                    self._jev_early_doc_keys = {document for document, _ in shortlist}
+                                print(f"[growi-search] Jev 目次 shortlist: {len(shortlist)} candidates; "
+                                      f"coverage={'enough' if enough else 'all-doc scan'}", flush=True)
+                except AgentStopped:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - rank/rewrite failure falls back to raw
+                    print(f"[growi-search] Jev top-10% requery failed; using raw question: {exc}", flush=True)
+                    emit({"type": "jev_toc_failed", "reason": str(exc)[:200]})
+                    material, entries, requery = "", 0, ""
+                # Always reported: "0 文書" used to be a silent console line, which is how a
+                # dead stage looked like an empty wiki.
+                emit({"type": "jev_toc_digest", "scanned": len(blocks), "kept": entries,
+                      "retrieved": (len(self._jev_early_doc_keys)
+                                    if self._jev_early_mode else len(blocks)),
+                      "early": self._jev_early_mode,
+                      "narrow": narrow_early,
+                      "shortlist_enough": shortlist_enough,
+                      "groups": min(TOC_NOTE_GROUPS, entries), "chars": len(material)})
+                # The second-stage question is the scoped requery. Keeping the raw
+                # broad question alongside it would make Jev accept topic-only pages.
+                jev_query = requery or intent
+                self._jev_scope_query = jev_query
             emit({"type": "jev_query", "text": jev_query, "rewritten": jev_query != query,
                   "toc_entries": entries})
             print(f"[growi-search] Jev 目次 digest: {entries} 文書 / {len(material)} chars "
                   f"under {st.growi_root_path}", flush=True)
             origin = (f"rewritten from {entries} 目次 entries" if jev_query != query
-                      else "raw question — no 目次 inventory to rewrite from")
+                      else "raw question — no usable 目次 rewrite")
             print(f"[growi-search] Jev query ({origin}): {jev_query}", flush=True)
-            with self.timer.stage("sweep"):
-                crawler = Thread(target=produce, args=(state,), name="jev-crawl", daemon=True)
-                crawler.start()
-                pool = [Thread(target=consume, args=(state,), name=f"jev-score-{i}", daemon=True)
-                        for i in range(workers)]
-                for worker in pool:
-                    worker.start()
-                for worker in pool:
-                    worker.join()
-                crawler.join()
+            if narrow_toc_seeds is not None:
+                # Narrow early exit: TOC yes docs -> page seeds without card scoring.
+                # Cards are still hydrated + required-terms checked, so no unchecked seed.
+                with self.timer.stage("sweep"):
+                    docs = self._jev_documents(state, budget, stop_event)
+                    by_key = {doc["key"].strip("/"): doc for doc in docs}
+                    with work.lock:
+                        work.stats["documents"] = len(narrow_toc_seeds)
+                        work.max_probability = max(
+                            (prob for _, prob in narrow_toc_seeds), default=work.max_probability)
+                    total_cards = sum(len(by_key.get(doc.strip("/"), {}).get("cards", []))
+                                      for doc, _ in narrow_toc_seeds)
+                    progress(add_total=total_cards, step=0)
+                    with work.lock:
+                        work.stats["cards_considered"] += total_cards
+                    for document, toc_prob in narrow_toc_seeds:
+                        _check_stop(stop_event)
+                        if work.errors:
+                            break
+                        entry = by_key.get(document.strip("/"))
+                        if entry is None:
+                            continue
+                        for card in entry["cards"]:
+                            _check_stop(stop_event)
+                            if work.errors:
+                                break
+                            try:
+                                self._jev_accept_card(card, entry["key"], toc_prob, budget,
+                                                      stop_event, emit, work)
+                            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                                with work.lock:
+                                    work.errors.append(exc)
+                            finally:
+                                progress(step=1, stage="read")
+                    with work.lock:
+                        work.stats["candidates"] += work.stats["confirmed"]
+            else:
+                with self.timer.stage("sweep"):
+                    crawler = Thread(target=produce, args=(state,), name="jev-crawl", daemon=True)
+                    crawler.start()
+                    pool = [Thread(target=consume, args=(state,), name=f"jev-score-{i}", daemon=True)
+                            for i in range(workers)]
+                    for worker in pool:
+                        worker.start()
+                    for worker in pool:
+                        worker.join()
+                    crawler.join()
             with work.lock:
                 failure = work.errors[0] if work.errors else None
             if failure is not None:
                 raise failure
-            # Phase B: entity-defining edges across document boundaries.
-            with self.timer.stage("frontier"):
-                while work.frontier:
-                    _check_stop(stop_event)
-                    level = []
-                    while work.frontier:
-                        level.append(work.frontier.popleft())
-                    targets = {}
-                    if self.index_map is not None:
-                        for page, card in level:
-                            entities = card.entities if card is not None else self._page_entities(state, page)
-                            for entity in entities:
-                                for definer in self.index_map.definers_for(entity):
-                                    with work.lock:
-                                        work.stats["entity_edges_followed"] += 1
-                                    target = definer.target.strip("/")
-                                    if target in work.visited or target in targets:
-                                        continue
-                                    targets[target] = (definer.target, definer.document, definer)
-                                    progress(add_total=1, step=0)  # edge target just discovered
-                    if targets:
-                        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jev-frontier") as pool:
-                            futures = [pool.submit(self._jev_confirm, jev_query, reference, document,
-                                                   state, card, budget, stop_event, gated, work)
-                                       for reference, document, card in targets.values()]
-                            for future in as_completed(futures):
-                                future.result()
         except AgentStopped:
             raise
         except (RuntimeError, GrowiAPIError) as exc:
@@ -2058,8 +2568,7 @@ class ResearchSession:
         print(
             f"[growi-search] Jev sweep: {status} documents={stats['documents']} "
             f"cards={stats['cards_considered']} pages={stats['pages_considered']} "
-            f"skipped={stats['prefiltered']} "
-            f"confirmed={stats['confirmed']} yes={units['yes_full']} "
+            f"confirmed={stats['confirmed']} yes={units['yes_card']} "
             f"avg_p={_yes_means(units)['mean_yes_probability']:.2f} "
             f"max_p={max_probability:.2f} elapsed_ms={elapsed_ms}",
             flush=True,
@@ -2105,10 +2614,23 @@ class ResearchSession:
             answer = self._try_route(question, emit, stop_event, question)
         if answer is None:
             with self.timer.stage("lead"):
-                answer = self._run_lead(question, emit, stop_event)
+                try:
+                    answer = self._run_lead(question, emit, stop_event)
+                    if not answer.answer.strip() or answer.answer.strip() == STEP_LIMIT_TEXT:
+                        emit({"type": "lead_failed", "reason": "lead returned no completed answer"})
+                        answer = self._degraded_answer(question, emit) or answer
+                except AgentStopped:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a reset connection must not erase the research
+                    log.info("lead agent failed: %s", exc)
+                    emit({"type": "lead_failed", "reason": str(exc)[:200]})
+                    answer = self._degraded_answer(question, emit)
+                    if answer is None:
+                        raise
         if not reused:  # a reused prior answer was checked when it was first given
             with self.timer.stage("verify"):
                 answer = self._verified(question, answer, emit)
+        answer = self._retain_raw_reports(answer)
         answer.cited_nodes = [self._cite(node_id) for node_id in answer.cited_node_ids]
         usages = [*self._usage_cb.usage_metadata.values(), *self._extra_usage]
         _log_usage(question, answer.answer, answer.steps, usages, self.settings)
@@ -2126,34 +2648,43 @@ class ResearchSession:
         """
         sources: list[str] = []
         titles: dict[str, str] = {}
-        size = 0
-        # Pages the draft itself cites carry its claims, so they go first; a page that does
-        # not fit is skipped rather than ending the list, so one large sheet dump cannot
-        # crowd out the small page a claim came from.
+        # Keep every readable cited page together. If the full verification prompt
+        # exceeds the model context, preserve the draft instead of checking a subset.
         ids = sorted(dedupe(answer.cited_node_ids), key=lambda node_id: node_id not in answer.answer)
         for node_id in ids:
-            page = self._fetch_page(page_id=node_id)
+            # Cited ids are sometimes paths (card targets): resolve either form,
+            # so a path citation is checked, not silently skipped.
+            page = self._fetch_ref(node_id)
             if page is None or not (page.body or "").strip():
-                continue
-            if sources and size + len(page.body) > VERIFY_SOURCE_CHARS:
                 continue
             titles[page.id] = page.title
             sources.append(f"--- {page.id} : {page.title} ---\n{page.body}")
-            size += len(page.body)
         emit({"type": "verify", "pages": len(sources)})
         if not sources:
-            return AgentAnswer(question=question, answer="Wiki内で、この質問に答える記述は見つかりませんでした。",
-                               cited_node_ids=[], steps=answer.steps)
+            if self._seed_raw_reports:
+                return answer.model_copy(update={"answer": "", "cited_node_ids": self._seed_ids[:]})
+            # A completed cascade/lead answer must not be erased merely because
+            # its cited pages are temporarily unreadable during verification.
+            return answer
         if self.llm is None or not self.settings.llm_ready:
             return answer
+        payload = json.dumps({"question": question, "draft_answer": answer.answer,
+                              "source_pages": "\n\n".join(sources)}, ensure_ascii=False)
+        if self._llm_tokens(ANSWER_VERIFY_PROMPT + payload) > self._llm_input_budget():
+            return answer.model_copy(update={
+                "answer": answer.answer + "\n\n※原文全体がモデルの入力枠を超えるため、最終照合は省略しました。"})
         try:
-            text = self.llm.complete(ANSWER_VERIFY_PROMPT, json.dumps(
-                {"question": question, "draft_answer": answer.answer, "source_pages": "\n\n".join(sources)},
-                ensure_ascii=False)).strip()
+            text = self.llm.complete(
+                ANSWER_VERIFY_PROMPT,
+                payload,
+                max_tokens=self.settings.final_compiler_tokens,
+            ).strip()
             self._record_usage()
         except Exception as exc:  # noqa: BLE001 - say so rather than pass it off as checked
             log.info("answer verification failed: %s", exc)
             return answer.model_copy(update={"answer": answer.answer + "\n\n※この回答は原文との照合ができませんでした。"})
+        if _llm_output_capped(self.llm, self.settings.final_compiler_tokens):
+            return answer.model_copy(update={"answer": answer.answer + "\n\n※原文照合の出力が上限に達したため、照合前の回答を保持しました。"})
         if not text:
             return answer
         cited = [node_id for node_id in titles if node_id in text] or list(titles)
@@ -2180,9 +2711,53 @@ class ResearchSession:
             self.timer.count("llm_output_tokens", usage.get("output_tokens", 0))
             self._extra_usage.append(usage)
 
+    def _llm_tokens(self, content: str) -> int:
+        counter = getattr(getattr(self.llm, "llm", None), "get_num_tokens", None)
+        if counter is not None:
+            try:
+                return int(counter(content))
+            except Exception:  # noqa: BLE001 - the server may use an unknown tokenizer
+                pass
+        # One UTF-8 byte per token is a conservative fallback, never a slice of text.
+        return len(content.encode("utf-8"))
+
+    def _llm_input_budget(self) -> int:
+        # Output budgets are generation limits only. Do not turn them into a
+        # character/token cap on the evidence sent to a compiler.
+        return self.settings.llm_context_tokens
+
+    def _llm_chunks(self, material: str, system: str, payload: Callable[[str], str]) -> list[str]:
+        """Partition complete input only when it exceeds the configured context; discard nothing."""
+        budget = self._llm_input_budget()
+        if self._llm_tokens(system + payload("")) >= budget:
+            raise ValueError("LLM prompt alone exceeds the configured context budget")
+        chunks: list[str] = []
+        start = 0
+        while start < len(material):
+            low, high, end = start + 1, len(material), start
+            while low <= high:
+                middle = (low + high) // 2
+                cost = self._llm_tokens(system + payload(material[start:middle]))
+                if cost <= budget:
+                    end = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if end == start:
+                raise ValueError("one character exceeds the configured LLM context budget")
+            chunks.append(material[start:end])
+            start = end
+        return chunks
+
     def _try_route(self, question: str, emit: Callable, stop_event: Event | None, _q: str) -> AgentAnswer | None:
         self._seed_context = ""
+        self._seed_pieces = ("", "")
         self._seed_ids = []
+        self._seed_raw_reports = []
+        self._jev_scope_query = ""
+        self._jev_intent_structured = {}
+        self._jev_early_doc_keys = set()
+        self._jev_early_mode = False
         _check_stop(stop_event)
         if self.jev is not None:
             if self.settings.jev_mode == "cascade":
@@ -2197,27 +2772,63 @@ class ResearchSession:
             confirmed = ([] if self.settings.jev_mode == "cascade" else
                          self._run_jev_sweep(question, emit, stop_event))
             if confirmed:
+                seed_count = len(confirmed)
+                if seed_count <= JEV_FAST_SEED_LIMIT:
+                    explored = confirmed
+                    seeds = "\n\n".join(format_lead_candidate(result) for result in explored)
+                    raw_pages = self._direct_seed_material(explored)
+                    self._seed_ids = dedupe([result["node"].id or result["node"].path
+                                             for result in explored])
+                    self._seed_context = f"{seeds}\n\n{raw_pages}"
+                    self._seed_pieces = (seeds, raw_pages)
+                    self._seed_raw_reports = []
+                    emit({"type": "candidates", "count": seed_count,
+                          "nodes": [node_ref(result["node"]) for result in explored]})
+                    emit({"type": "compiling", "mode": "direct"})
+                    return self._synthesize_reports(
+                        question, "", raw_pages, set(self._seed_ids), emit)
+                large_path = seed_count > JEV_ONE_STAGE_SEED_LIMIT
+                if large_path:
+                    refined = self._jev_refine_from_seeds(question, confirmed)
+                    if refined:
+                        emit({"type": "jev_adaptive", "mode": "refined",
+                              "reason": "broad seed set requires a second Jev pass",
+                              "seeds": seed_count})
+                        first = confirmed
+                        second = self._run_jev_sweep(refined, emit, stop_event, force_full=True)
+                        by_ref = {result["node"].id or result["node"].path: result
+                                  for result in first}
+                        for result in second:
+                            by_ref.setdefault(result["node"].id or result["node"].path, result)
+                        confirmed = sorted(by_ref.values(), key=lambda result: -result["score"])
+                        seed_count = len(confirmed)
                 groups = _seed_groups(confirmed, self.settings.jev_subagent_group_size,
                                       self.settings.jev_subagent_groups)
                 explored = [result for group in groups for result in group]
                 emit({"type": "candidates", "count": len(explored),
                       "nodes": [node_ref(result["node"]) for result in explored]})
                 seeds = "\n\n".join(format_lead_candidate(result) for result in explored)
-                if len(explored) > 1:
-                    # One subagent per document slice; the merged reports are what the
-                    # lead answers from, so the sweep's findings drive the answer.
-                    with self.timer.stage("seed_groups"):
-                        reports, cited = self._run_seed_groups(groups, confirmed, question, emit, stop_event)
-                    self._seed_context = f"{seeds}\n\n{reports}"
-                    self._seed_ids = dedupe([result["node"].id for result in explored] + cited)
-                    if self.settings.lead_after_reports == "synthesis":
-                        answer = self._synthesize_reports(question, seeds, reports,
-                                                           set(self._seed_ids), emit)
-                        if answer is not None:
-                            return answer
-                else:
-                    self._seed_context = seeds
-                    self._seed_ids = [result["node"].id for result in explored]
+                # One subagent per document slice; the merged reports are what the
+                # final compiler answers from, including the one-explorer case.
+                scoped_question = self._jev_scope_query or question
+                with self.timer.stage("seed_groups"):
+                    reports, cited = self._run_seed_groups(
+                        groups, confirmed, scoped_question, emit, stop_event,
+                        levelwise=large_path)
+                self._seed_context = f"{seeds}\n\n{reports}"
+                self._seed_pieces = (seeds, reports)
+                self._seed_ids = dedupe([result["node"].id for result in explored] + cited)
+                # Exploration and both compiler levels are already complete.
+                # Always run the final report synthesizer now; sending this back
+                # through the tool-using lead can repeat research or stop without
+                # calling finish, and an environment override must not re-enable it.
+                emit({"type": "compiling",
+                      "mode": "two_stage" if large_path else "one_stage",
+                      "seed_count": seed_count})
+                answer = self._synthesize_reports(question, seeds, reports,
+                                                   set(self._seed_ids), emit)
+                if answer is not None:
+                    return answer
                 return None  # force the deep lead path on the sweep's own findings
         if self.budget.pages_exhausted:
             emit({"type": "budget", "pages_used": self.budget.pages_used, "message": "ページ取得上限到達"})
@@ -2290,36 +2901,117 @@ class ResearchSession:
             return None
         return AgentAnswer(question=question, answer=sanitize_text(text), cited_node_ids=[r["node"].id for r in top], steps=1)
 
+    def _degraded_answer(self, question: str, emit: Callable) -> AgentAnswer | None:
+        """Keep answering when the lead fails or its full context cannot fit.
+
+        Answer from the seed evidence and the compiled reports instead of throwing the
+        whole run away. With no evidence at all there is nothing to degrade to, and the
+        caller re-raises so the failure stays visible.
+        """
+        seeds, reports = self._seed_pieces
+        if not (seeds or reports):
+            return None
+        answer = self._synthesize_reports(question, seeds, reports, set(self._seed_ids), emit)
+        if answer is not None:
+            return answer.model_copy(update={
+                "answer": answer.answer + "\n\n※調査結果から直接回答を作成しました。"})
+        body = (reports or seeds).strip()
+        return AgentAnswer(question=question,
+                           answer=f"（回答の統合が完了しなかったため、調査結果をそのまま返します）\n\n{body}",
+                           cited_node_ids=list(self._seed_ids), steps=0)
+
+    def _retain_raw_reports(self, answer: AgentAnswer) -> AgentAnswer:
+        """Use raw explorer reports only to rescue an actually empty final answer."""
+        if answer.answer.strip() or not self._seed_raw_reports:
+            return answer
+        reports = self._seed_pieces[1].strip() or _reports_text(self._seed_raw_reports)
+        cited = dedupe([*answer.cited_node_ids,
+                        *(page_id for report in self._seed_raw_reports
+                          for page_id in report.get("cited", []))])
+        footer = "\n\n引用:\n\n" + "\n\n".join(
+            f"{page_id} : {self._cite(page_id)['title']}" for page_id in cited) if cited else ""
+        return answer.model_copy(update={
+            "answer": f"{reports}{footer}",
+            "cited_node_ids": cited,
+        })
+
+    @staticmethod
+    def _direct_seed_material(results: list[dict[str, Any]]) -> str:
+        """Keep every small-path seed body available to the single compiler call."""
+        parts = ["必読ページ原文（以下の全ページを確認して回答してください）:"]
+        for result in results:
+            page: WikiPage = result["node"]
+            parts.append(
+                f"\n--- {page.id or page.path} : {page.title} ---\n"
+                f"path: {page.path}\n{page.body or page.summary or ''}"
+            )
+        return sanitize_text("\n".join(parts))
+
     def _synthesize_reports(self, question: str, seeds: str, reports: str,
                             allowed_ids: set[str], emit: Callable) -> AgentAnswer | None:
-        """Answer directly from seed evidence and reports; malformed output falls back to the lead."""
-        payload = json.dumps({"question": question, "seeds": seeds, "reports": reports}, ensure_ascii=False)
+        """Answer from every compiled slice without sending an oversized model input."""
+        # The explorers -> L1 -> L2 hierarchy exists so the final compiler does not
+        # receive dozens of raw reports or every Jev candidate. When L2 exists it is
+        # the complete final-compiler input; seeds are only the no-report fallback.
+        material = reports.strip() or seeds.strip()
+        if not material:
+            return None
+        payload_for = lambda chunk: json.dumps({"question": question, "reports": chunk}, ensure_ascii=False)
+        output_tokens = self.settings.final_compiler_tokens
         try:
-            text = self.llm.stream(SYNTHESIS_PROMPT, payload,
-                                   lambda piece: emit({"type": "answer_delta", "text": piece})).strip()
-            self._record_usage()
-        except Exception as exc:  # noqa: BLE001 - the normal lead remains the fallback
-            log.info("report synthesis failed; using lead agent: %s", exc)
+            chunks = self._llm_chunks(material, SYNTHESIS_PROMPT, payload_for)
+        except ValueError:
             return None
-        body, marker, citations = text.partition("引用:")
-        if not marker:
-            return None
-        cited = []
-        for line in citations.splitlines():
-            match = re.match(r"^\s*([0-9a-fA-F]{24})\s*:\s*.+?\s*$", line)
-            if match and match.group(1) in allowed_ids and match.group(1) not in cited:
-                cited.append(match.group(1))
+        bodies: list[str] = []
+        cited: list[str] = []
+        for index, chunk in enumerate(chunks, start=1):
+            payload = payload_for(chunk)
+            try:
+                text = self.llm.stream(
+                    SYNTHESIS_PROMPT, payload,
+                    lambda piece: emit({"type": "answer_delta", "text": piece}),
+                    max_tokens=output_tokens,
+                ).strip()
+                self._record_usage()
+                if _llm_output_capped(self.llm, output_tokens):
+                    text = ""
+            except Exception as exc:  # noqa: BLE001 - keep the complete compiled slice
+                log.info("report synthesis slice %s failed: %s", index, exc)
+                text = ""
+            body, marker, citations = text.partition("引用:")
+            matched = []
+            if marker:
+                for line in citations.splitlines():
+                    match = re.match(r"^\s*(?:[-*]\s*)?([0-9a-fA-F]{24})\s*:\s*.+?\s*$", line)
+                    if match and match.group(1) in allowed_ids:
+                        matched.append(match.group(1))
+            # Citation formatting is not a validity test for the answer body. Falling
+            # back to `chunk` here used to expose the complete internal seed prompt.
+            bodies.append((body.strip() if text else chunk.strip()))
+            cited.extend(matched)
+        report_ids = dedupe(re.findall(r"(?<![0-9a-fA-F])[0-9a-fA-F]{24}(?![0-9a-fA-F])", reports))
+        cited = dedupe(cited) or [page_id for page_id in report_ids if page_id in allowed_ids]
+        cited = cited or [page_id for page_id in self._seed_ids if page_id in allowed_ids]
         if not cited:
+            body_text = "\n\n".join(bodies).strip()
+            if body_text:
+                return AgentAnswer(question=question, answer=sanitize_text(body_text),
+                                   cited_node_ids=[], steps=1)
             return None
         canonical = "\n\n".join(f"{page_id} : {self._cite(page_id)['title']}" for page_id in cited)
-        answer = f"{body.rstrip()}\n\n引用:\n\n{canonical}"
+        body_text = "\n\n".join(bodies)
+        answer = f"{body_text}\n\n引用:\n\n{canonical}"
         return AgentAnswer(question=question, answer=sanitize_text(answer), cited_node_ids=cited, steps=1)
 
     def _run_lead(self, question: str, emit: Callable, stop_event: Event | None) -> AgentAnswer:
         ctx = _LeadContext(self, question, emit, stop_event)
+        content = _seeded(self.settings, question, self._seed_context, self._seed_ids)
+        if (self._seed_raw_reports
+                and self._llm_tokens(MAIN_AGENT_SYSTEM_PROMPT + content) > self._llm_input_budget()):
+            emit({"type": "lead_failed", "reason": "compiled reports exceed the lead input budget"})
+            return self._degraded_answer(question, emit)
         agent = _compile_agent(self.settings, _lead_tools(ctx), MAIN_AGENT_SYSTEM_PROMPT, stop_event)
         emit({"type": "route", "mode": "deep", "reason": "lead agent started"})
-        content = _seeded(self.settings, question, self._seed_context, self._seed_ids)
         state = agent.invoke(
             {"messages": [{"role": "user", "content": sanitize_text(content)}]},
             config={
@@ -2330,8 +3022,26 @@ class ResearchSession:
         )
         self.timer.count("agent_messages", _count_steps(state))
         finished = ctx.finished
-        answer_text = finished.get("answer") or _last_text(state)
+        state_text = _last_text(state).strip()
+        if not finished.get("answer") and self._seed_raw_reports:
+            if state_text and state_text != STEP_LIMIT_TEXT:
+                # Some OpenAI-compatible servers return a complete final message
+                # instead of the requested finish tool call. That is still a usable
+                # answer and must not discard the completed explorer/compiler work.
+                finished["answer"] = state_text
+            else:
+                emit({"type": "lead_failed", "reason": "lead returned no answer"})
+                degraded = self._degraded_answer(question, emit)
+                if degraded is not None:
+                    return degraded
+        answer_text = finished.get("answer") or state_text
         cited = dedupe([*finished.get("cited_node_ids", []), *ctx.evidence])
+        if not cited and self._seed_ids:
+            # The lead may answer directly from the pre-explored Jev reports without
+            # calling explore or passing cited_node_ids to finish. Keep those source
+            # IDs so verification does not mistake a missing citation for no evidence.
+            cited = self._seed_ids[:]
+            print(f"[growi-search] Lead omitted citations; verifying against {len(cited)} seed/report pages", flush=True)
         return AgentAnswer(question=question, answer=sanitize_text(answer_text), cited_node_ids=cited, steps=_count_steps(state))
 
     def _run_subagents(self, raw_ids: list[Any], question: str, evidence: list[str], emit: Callable, stop_event: Event | None) -> str:
@@ -2399,7 +3109,8 @@ class ResearchSession:
 
 
     def _run_seed_groups(self, groups: list[list[dict[str, Any]]], confirmed: list[dict[str, Any]], question: str,
-                         emit: Callable, stop_event: Event | None) -> tuple[str, list[str]]:
+                         emit: Callable, stop_event: Event | None,
+                         levelwise: bool | None = None) -> tuple[str, list[str]]:
         """Explore every Jev seed group in parallel with disjoint seed sets.
 
         Returns the merged report text plus every page id the groups cited, so the
@@ -2420,30 +3131,135 @@ class ResearchSession:
                 emit(event)
 
         max_workers = min(len(groups), max(1, self.settings.subagent_concurrency))
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="seed-group") as executor:
-            futures = {}
-            for pos, group in enumerate(groups):
-                blocked = everyone - owned[pos]  # another group owns those pages
-                document = group[0].get("document") or ""
-                extra = [result["node"].id for result in confirmed
-                         if (result.get("document") or "") == document and id(result) not in kept]
-                futures[executor.submit(self._run_group_subagent, pos + 1, group, blocked, extra,
-                                        question, safe_emit, stop_event)] = pos
-            for future in as_completed(futures):
-                pos = futures[future]
-                try:
-                    reports[pos] = future.result()
-                except AgentStopped:
-                    for pending in futures:
-                        pending.cancel()
-                    raise
-                except Exception as exc:  # noqa: BLE001 - partial failure is OK
-                    log.info("seed group %s failed: %s", pos + 1, exc)
-                    reports[pos] = {"start": groups[pos][0]["node"].id,
-                                    "answer": f"(グループ調査失敗: {exc})", "cited": []}
+        # The adaptive route explicitly selects the compiler depth from the
+        # number of accepted seeds. Keep the old group-count fallback for other
+        # callers of this helper.
+        levelwise = len(groups) >= 16 if levelwise is None else levelwise
+        by_doc: dict[str, list[int]] = {}
+        for pos, group in enumerate(groups):
+            by_doc.setdefault(group[0].get("document") or "", []).append(pos)
+        batches: list[list[int]] = []
+        if levelwise:
+            # L1 batches are fixed up front: same-document groups fold together, at
+            # most REPORT_WINDOW per batch. Each batch is submitted to its own
+            # compiler pool as soon as all of its explorers finish.
+            for positions in by_doc.values():
+                batches.extend(positions[i:i + REPORT_WINDOW] for i in range(0, len(positions), REPORT_WINDOW))
+        l1: list[str | None] = [None] * len(batches)
+        l1_futures: dict[Any, int] = {}
+        compiler_executor = (
+            ThreadPoolExecutor(
+                max_workers=min(len(batches), max(1, self.settings.compiler_concurrency)),
+                thread_name_prefix="report-compiler",
+            )
+            if batches else None
+        )
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="seed-group") as executor:
+                futures = {}
+                for pos, group in enumerate(groups):
+                    blocked = everyone - owned[pos]  # another group owns those pages
+                    document = group[0].get("document") or ""
+                    extra = [result["node"].id for result in confirmed
+                             if (result.get("document") or "") == document and id(result) not in kept]
+                    futures[executor.submit(self._run_group_subagent, pos + 1, group, blocked, extra,
+                                            question, safe_emit, stop_event)] = pos
+                for future in as_completed(futures):
+                    pos = futures[future]
+                    try:
+                        reports[pos] = future.result()
+                    except AgentStopped:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - partial failure is OK
+                        log.info("seed group %s failed: %s", pos + 1, exc)
+                        reports[pos] = {"start": groups[pos][0]["node"].id,
+                                        "answer": f"(グループ調査失敗: {exc})", "cited": []}
+                    if not levelwise:
+                        continue
+                    for b, batch in enumerate(batches):
+                        if l1[b] is not None or not all(reports[i] for i in batch):
+                            continue
+                        if len(batch) == 1:
+                            l1[b] = _reports_text([reports[batch[0]]])
+                        elif compiler_executor is not None:
+                            # The compiler pool is independent from the explorer
+                            # pool, so a slow fold cannot hold up other explorers or
+                            # prevent a newly completed batch from being folded.
+                            l1[b] = ""  # submitted sentinel
+                            l1_futures[compiler_executor.submit(
+                                self._fold_reports,
+                                question, "", [reports[i] for i in batch], safe_emit,
+                                self.settings.report_fold_tokens,
+                            )] = b
+
+            if compiler_executor is not None:
+                for future in as_completed(l1_futures):
+                    b = l1_futures[future]
+                    try:
+                        l1[b] = future.result()
+                    except Exception as exc:  # noqa: BLE001 - preserve the exact batch on fold failure
+                        log.info("level-1 report compiler %s failed: %s", b + 1, exc)
+                        l1[b] = _reports_text([reports[i] for i in batches[b] if reports[i]])
+        finally:
+            if compiler_executor is not None:
+                compiler_executor.shutdown(wait=True, cancel_futures=True)
         final = [report for report in reports if report]
+        self._seed_raw_reports = [dict(report) for report in final]
         cited = dedupe([cited_id for report in final for cited_id in report.get("cited", [])])
-        return _reports_text(final), cited
+        if not levelwise:
+            return _reports_text(final), cited
+        parts = [text for text in l1 if text]
+        if len(parts) == 1:
+            return parts[0] or _reports_text(final), cited
+        # L2 receives every completed L1 batch. Its larger budget keeps the merged
+        # report intact before the separate final answer compiler runs.
+        merged = self._fold_reports(question, "", [
+            {"start": f"中間報告バッチ{b + 1}", "answer": text, "cited": []}
+            for b, text in enumerate(l1) if text], safe_emit,
+            self.settings.final_compiler_tokens) if parts else ""
+        return (merged or _reports_text(final)), cited
+
+    def _fold_reports(self, question: str, draft: str, reports: list[dict[str, Any]],
+                      emit: Callable, max_output_tokens: int | None = None) -> str:
+        """Fold reports into one merged report: one L1 batch, or the L2 final pass.
+
+        Every input character reaches one compiler call. Failed, empty, or capped
+        calls keep their exact input slice so a compiler response can never discard
+        source details merely because generation ended early.
+        """
+        raw = _reports_text(reports)
+        combined = "\n\n".join(part for part in (draft, raw) if part)
+        if self.llm is None or not self.settings.llm_ready:
+            return combined
+        payload_for = lambda chunk: json.dumps(
+            {"質問": question, "これまでの統合報告": "", "新規報告": chunk}, ensure_ascii=False)
+        output_tokens = max_output_tokens or self.settings.report_fold_tokens
+        try:
+            chunks = self._llm_chunks(combined, REPORT_FOLD_PROMPT, payload_for)
+        except ValueError:
+            return combined
+        folded: list[str] = []
+        for chunk in chunks:
+            payload = payload_for(chunk)
+            try:
+                part = sanitize_text(
+                    self.llm.complete(REPORT_FOLD_PROMPT, payload, max_tokens=output_tokens)
+                ).strip()
+                self._record_usage()
+                if _llm_output_capped(self.llm, output_tokens):
+                    part = ""  # A cut-off summary cannot replace its complete input.
+            except Exception as exc:  # noqa: BLE001 - never lose reports to a failed fold
+                log.info("report fold failed; keeping the raw chunk: %s", exc)
+                part = ""
+            folded.append(part or chunk)
+        merged = "\n\n".join(folded)
+        print(f"[growi-search] Report fold: {len(reports)} reports, {len(chunks)} calls, "
+              f"{len(combined)} input chars, {len(merged)} output chars", flush=True)
+        emit({"type": "reports_folded", "reports": len(reports), "chars": len(merged)})
+        return merged
 
     def _run_group_subagent(self, index: int, group: list[dict[str, Any]], offlimits: set[str],
                             extra: list[str],
@@ -2467,7 +3283,10 @@ class ResearchSession:
             f"{backlog}"
             "他のグループが担当するページは読み取りがブロックされています（重複調査を防ぐため）。"
             "担当シードを読み直すのではなく、シードの発リンクや子ページなど、まだ誰も読んでいないパスを追い、"
-            "このドキュメントが質問について何を述べているかを報告してください。"
+            "このドキュメントが検索意図について何を述べているかを報告してください。"
+            "質問の対象・範囲に合わない一般論や、名前が出るだけの記述は回答に数えないでください。"
+            "一覧や複数項目を求める場合は、各項目が対象ライブラリに属する根拠を確認してください。"
+            "特定の項目を求める場合は、指定された対象と必要な詳細を定義する本文だけを根拠にしてください。"
             "質問が一覧・列挙を求める場合、報告には見つけた項目を省略せず全部書いてください。"
         )
         return _run_subagent(self, run, question, prompt, emit, stop_event)
@@ -2542,7 +3361,11 @@ def _lead_explore(ctx: _LeadContext, node_ids: list[str]) -> str:
     cleaned = _clean_ids(node_ids)
     if not cleaned:
         return "有効なIDがありません。最初に検索してください。"
-    return ctx.session._run_subagents(cleaned, ctx.question, ctx.evidence, ctx.emit, ctx.stop_event)
+    # TEMPORARILY DISABLED: Elasticsearch/lead-driven subagents.
+    # Keep the implementation below intact so this can be restored after the
+    # Jev-scoped subagent path is validated.
+    return "Elasticsearchから起動するサブエージェントは一時的に無効です。検索結果だけで finish してください。"
+    # return ctx.session._run_subagents(cleaned, ctx.question, ctx.evidence, ctx.emit, ctx.stop_event)
 
 
 def _lead_finish(ctx: _LeadContext, answer: str, cited_node_ids: list[str] | None = None) -> str:
@@ -2558,10 +3381,11 @@ def _lead_tools(ctx: _LeadContext) -> list[StructuredTool]:
             lambda text: _lead_search(ctx, text), name="search",
             description="GROWI をキーワード検索して候補ページを返します。", args_schema=LeadSearchArgs
         ),
-        StructuredTool.from_function(
-            lambda node_ids: _lead_explore(ctx, node_ids), name="explore",
-            description="指定ページID群をサブエージェントで並列深掘りします。", args_schema=LeadExploreArgs
-        ),
+        # TEMPORARILY DISABLED: Elasticsearch-driven explorer creation.
+        # StructuredTool.from_function(
+        #     lambda node_ids: _lead_explore(ctx, node_ids), name="explore",
+        #     description="指定ページID群をサブエージェントで並列深掘りします。", args_schema=LeadExploreArgs
+        # ),
         StructuredTool.from_function(
             lambda answer, cited_node_ids=None: _lead_finish(ctx, answer, cited_node_ids),
             name="finish",
@@ -2695,15 +3519,15 @@ def _sub_find(ctx: _SubContext, description: str) -> str:
 def _sub_finish(ctx: _SubContext, answer: str, cited_node_ids: list[str] | None = None) -> str:
     _check_stop(ctx.stop_event)
     run = ctx.run
-    minimum = 0 if run.cascade else ctx.session.settings.subagent_min_reads
-    # Pushed back once only: a small document may not have that many pages, and refusing
-    # forever runs the agent out of steps with no report at all.
-    if len(run.read_ids) < minimum and not ctx.finished.get("pushed_back"):
-        ctx.finished["pushed_back"] = True
-        return (
-            f"読んだページは {len(run.read_ids)} 件です。少なくとも "
-            f"{minimum} 件読んでから finish してください。"
-        )
+    # TEMPORARILY DISABLED: minimum-read enforcement. Keep this block for
+    # restoration after the Jev-scoped explorer path is validated.
+    # minimum = 0 if run.cascade else ctx.session.settings.subagent_min_reads
+    # if len(run.read_ids) < minimum and not ctx.finished.get("pushed_back"):
+    #     ctx.finished["pushed_back"] = True
+    #     return (
+    #         f"読んだページは {len(run.read_ids)} 件です。少なくとも "
+    #         f"{minimum} 件読んでから finish してください。"
+    #     )
     ctx.finished["answer"] = sanitize_text(str(answer or "")).strip()
     ctx.finished["cited_node_ids"] = _clean_ids(cited_node_ids)
     return "finished; do not call tools anymore"
@@ -2725,7 +3549,8 @@ def _sub_tools(ctx: _SubContext) -> list[StructuredTool]:
 def _run_subagent(session: ResearchSession, run: Subrun, question: str, prompt: str, emit: Callable, stop_event: Event | None) -> dict:
     ctx = _SubContext(session=session, run=run, emit=emit, stop_event=stop_event)
     agent = _compile_agent(session.settings, _sub_tools(ctx),
-                           PACKED_SUBAGENT_PROMPT if run.cascade else SUBAGENT_SYSTEM_PROMPT, stop_event)
+                           PACKED_SUBAGENT_PROMPT if run.cascade else SUBAGENT_SYSTEM_PROMPT, stop_event,
+                           max_tokens=session.settings.subagent_report_tokens)
     state = agent.invoke(
         {"messages": [{"role": "user", "content": sanitize_text(prompt)}]},
         config={

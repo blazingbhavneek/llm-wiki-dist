@@ -156,6 +156,7 @@ class Catalog:
     def sync_from_planning(self, project: Any, *, skip_document: str | None = None) -> None:
         plans = sorted(Path(project.wiki).rglob("_planning/chunks.json"))
         pending_edges: list[dict[str, Any]] = []
+        project_team = Path(project.root).name
         for path in plans:
             data = read_json(path, default={})
             document = str(data.get("document") or self._document_for(path, Path(project.wiki)))
@@ -168,7 +169,7 @@ class Catalog:
             for page in sorted(pages_dir.glob("*.md")):
                 page_data = next((p for p in data.get("pages", []) if p.get("filename") == page.name), {})
                 by_hash = {item.get("text_sha256"): item for item in page_data.get("chunks", [])}
-                for item in make_chunks(document, str(data.get("team") or document.split("/", 1)[0]), page.name, page.read_text(encoding="utf-8"), id_seed=str(data.get("id_seed") or document)):
+                for item in make_chunks(document, project_team, page.name, page.read_text(encoding="utf-8"), id_seed=str(data.get("id_seed") or document)):
                     cached = by_hash.get(item.text_sha256)
                     if cached:
                         from .chunks import _meta_from_json
@@ -177,7 +178,7 @@ class Catalog:
             self.reconcile(
                 document,
                 chunks,
-                team=str(data.get("team") or document.split("/", 1)[0]),
+                team=project_team,
                 raw_rel=str(data.get("raw_rel") or ""),
                 page_hashes={p.get("filename", ""): p.get("original_sha256", "") for p in data.get("pages", [])},
             )

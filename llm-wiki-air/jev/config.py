@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,13 +28,16 @@ class JevConfig:
     share_state_max_forks: int = 8
     stats_seconds: int = 60
     compile: bool = False
+    llm2jev_concurrency: int = 20
 
     @classmethod
     def from_env(cls, env=os.environ):
         get = env.get
         backend = (get("WIKI_JEV_BACKEND") or "torch").strip().lower()
         base, local = get("WIKI_JEV_BASE_URL", ""), get("WIKI_JEV_LOCAL_PATH", "")
-        if backend == "local":
+        if backend in {"llm2jev", "systemone", "sglang", "vllm", "jpt"}:
+            backend = "llm2jev"
+        elif backend == "local":
             backend = "torch"
         elif backend == "auto":
             backend = "hosted" if base and not local else "torch"
@@ -56,21 +59,40 @@ class JevConfig:
             share_state_max_forks=_int(get, "WIKI_JEV_SHARE_STATE_MAX_FORKS", 8),
             stats_seconds=_int(get, "WIKI_JEV_STATS_SECONDS", 60),
             compile=_bool(get("WIKI_JEV_COMPILE", "0")),
+            llm2jev_concurrency=_int(get, "WIKI_JEV_LLM2JEV_CONCURRENCY", 20),
         )
-        if backend not in {"torch", "gguf", "hosted"}:
-            raise ValueError("WIKI_JEV_BACKEND must be torch, gguf or hosted")
+        if backend not in {"torch", "gguf", "hosted", "llm2jev"}:
+            raise ValueError("WIKI_JEV_BACKEND must be torch, gguf, hosted or llm2jev")
         if fields["device"] not in {"auto", "cuda", "mps", "cpu"}:
             raise ValueError("WIKI_JEV_DEVICE must be auto, cuda, mps or cpu")
         if fields["dtype"] not in {"float32", "bfloat16", "float16"}:
             raise ValueError("WIKI_JEV_DTYPE must be float32, bfloat16 or float16")
         if fields["gguf_many_mode"] not in {"exact", "batched"}:
             raise ValueError("WIKI_JEV_GGUF_MANY_MODE must be exact or batched")
-        for key in ("timeout", "max_batch_requests", "record_max", "max_batch_tokens", "token_cache_mb", "share_state_max_forks"):
+        for key in ("timeout", "max_batch_requests", "record_max", "max_batch_tokens", "token_cache_mb", "share_state_max_forks", "llm2jev_concurrency"):
             if fields[key] <= 0:
                 raise ValueError(f"WIKI_JEV_{key.upper()} must be positive")
         if fields["batch_wait_ms"] < 0 or fields["stats_seconds"] < 0:
             raise ValueError("WIKI_JEV_BATCH_WAIT_MS and WIKI_JEV_STATS_SECONDS must be non-negative")
         return cls(**fields)
+
+    @classmethod
+    def from_settings(cls, settings):
+        """Apply project settings after environment defaults."""
+
+        config = cls.from_env()
+        return replace(
+            config,
+            backend=str(getattr(settings, "wiki_jev_backend", config.backend)),
+            gguf_local_path=str(getattr(
+                settings, "wiki_jev_gguf_local_path", config.gguf_local_path,
+            )),
+            gguf_quant=str(getattr(settings, "wiki_jev_gguf_quant", config.gguf_quant)),
+            gguf_many_mode=str(getattr(
+                settings, "wiki_jev_gguf_many_mode", config.gguf_many_mode,
+            )),
+            gguf_binary=str(getattr(settings, "wiki_jev_score_bin", config.gguf_binary)),
+        )
 
 
 def _int(get, name, default):

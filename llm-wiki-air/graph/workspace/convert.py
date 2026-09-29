@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .parser_client import UnsupportedDocument, parse_document
-from .project import Project, raw_name_for
+from .project import Project, assert_unique_generated_paths, raw_name_for
 
 SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
@@ -16,9 +16,13 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
     log_path = project.convert_log_path
     seen = json.loads(log_path.read_text(encoding="utf-8")) if log_path.exists() else {}
     present: set[str] = set(); converted: list[str] = []; removed: list[str] = []; unsupported: list[str] = []; failed: list[str] = []
-    for path in sorted(project.mount.rglob("*")):
-        if not path.is_file() or path.is_symlink() or path.name in SKIP_NAMES or path.name.startswith("~$"):
-            continue
+    paths = [
+        path for path in sorted(project.mount.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+        and path.name not in SKIP_NAMES and not path.name.startswith("~$")
+    ]
+    assert_unique_generated_paths(path.relative_to(project.mount).as_posix() for path in paths)
+    for path in paths:
         rel = path.relative_to(project.mount).as_posix(); present.add(rel); stat = path.stat()
         key = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
         if seen.get(rel, {}).get("mtime_ns") == key["mtime_ns"] and seen.get(rel, {}).get("size") == key["size"]:

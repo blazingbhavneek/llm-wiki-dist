@@ -79,7 +79,7 @@ class ChatModelPort:
 
         return await structured_ainvoke(
             self.llm, schema, list(messages), max_output_tokens=max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS,
-            temperature=temperature,
+            temperature=self.config.temperature if temperature is None else temperature,
         )
 
     async def text(
@@ -92,8 +92,7 @@ class ChatModelPort:
         """One bounded plain-text completion; the caller validates the content."""
 
         kwargs: dict[str, Any] = {"max_tokens": max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
+        kwargs["temperature"] = self.config.temperature if temperature is None else temperature
         kwargs["extra_body"] = {
             "chat_template_kwargs": {"enable_thinking": self.config.text_thinking}
         }

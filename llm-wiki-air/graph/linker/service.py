@@ -21,15 +21,14 @@ from .catalog import Catalog, LinkerModeMismatch
 from .legacy import Candidate
 from .prompts import CHUNK_META_VERSION, EDGE_VERSION_JEV, EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
 from .render import (
-    BIG_DOCUMENT_LINES, INTERNAL_SUMMARY_TERMS, MAX_BIG_INLINE_ENTRIES,
-    MAX_FOOTER_ENTRIES, MAX_INLINE_ENTRIES, USEFUL_LABELS, RenderEdge,
-    MAX_NEO_BEHAVIOUR_INLINE_ENTRIES, footer_edges, render_page, write_if_changed,
+    BIG_DOCUMENT_LINES, INTERNAL_SUMMARY_TERMS, MAX_FOOTER_ENTRIES, USEFUL_LABELS,
+    RenderEdge, footer_edges, render_limits, render_page, write_if_changed,
 )
 
 Progress = Callable[[dict[str, Any]], None] | None
 StopCheck = Callable[[], bool] | None
-MAX_EDGE_CANDIDATES = 8
-MAX_EDGES_PER_TARGET = 2
+MAX_EDGE_CANDIDATES = 12
+MAX_EDGES_PER_TARGET = 3
 MAX_PAGE_CANDIDATES = 40
 log = logging.getLogger(__name__)
 
@@ -69,8 +68,10 @@ def _document(project: Any, rel: str) -> str:
     return Path(project.wiki_dir(rel)).relative_to(project.wiki).as_posix()
 
 
-def _team(document: str) -> str:
-    return document.split("/", 1)[0] if "/" in document else "general"
+def _team(project: Any) -> str:
+    """One linker namespace per configured project, regardless of mount folders."""
+
+    return Path(project.root).name
 
 
 def _row_meta(row: Any) -> Any:
@@ -140,7 +141,8 @@ def _navigation(project: Any, document: str) -> dict[str, Any]:
     return read_json(_navigation_path(project, document), default={"schema_version": 1, "pages": {}})
 
 
-def _valid_choices(current: list[dict[str, Any]], edges: list[RenderEdge], *, inline_limit: int) -> list[dict[str, Any]]:
+def _valid_choices(current: list[dict[str, Any]], edges: list[RenderEdge], *, inline_limit: int,
+                   footer_limit: int = MAX_FOOTER_ENTRIES) -> list[dict[str, Any]]:
     by_id = {edge.edge_id: edge for edge in edges}
     seen_ids: set[str] = set()
     seen_pages: set[str] = set()
@@ -152,7 +154,7 @@ def _valid_choices(current: list[dict[str, Any]], edges: list[RenderEdge], *, in
         if edge is None or edge_id in seen_ids or edge.peer_page_rel in seen_pages:
             continue
         placement = "inline" if raw.get("placement") == "inline" and inline < inline_limit else "footer"
-        if placement == "footer" and footer >= MAX_FOOTER_ENTRIES:
+        if placement == "footer" and footer >= footer_limit:
             continue
         inline += placement == "inline"
         footer += placement == "footer"
@@ -186,8 +188,8 @@ async def _curate_page(
             candidates = [edge for edge in candidates if edge.source in {"use", "define"} or edge.edge_id in selected]
         except Exception as exc:
             log.warning("Jev page curation failed for %s: %s", page_rel, exc)
-    inline_limit = MAX_NEO_BEHAVIOUR_INLINE_ENTRIES if mode == "neo" else MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES
-    current = _valid_choices(current, candidates, inline_limit=inline_limit)
+    inline_limit, footer_limit = render_limits(mode, big_document, settings)
+    current = _valid_choices(current, candidates, inline_limit=inline_limit, footer_limit=footer_limit)
     current_ids = {choice["edge_id"] for choice in current}
     # Always show the existing choices, then the strongest remaining candidates.
     by_id = {edge.edge_id: edge for edge in candidates}
@@ -214,7 +216,7 @@ async def _curate_page(
         })
     messages = reference_plan_messages(
         page={"path": page_rel, "content": original[:12000]}, current=current_payload,
-        candidates=candidate_payload, inline_limit=inline_limit, footer_limit=MAX_FOOTER_ENTRIES,
+        candidates=candidate_payload, inline_limit=inline_limit, footer_limit=footer_limit,
         output_language=str(getattr(settings, "wiki_output_language", "Japanese (日本語)")),
         behaviour_only=mode == "neo",
     )
@@ -229,7 +231,7 @@ async def _curate_page(
             if item.get("placement") == "inline" and str(item.get("anchor", "")).strip() not in original:
                 item["placement"] = "footer"
                 item["anchor"] = ""
-        return _valid_choices(proposed, pool, inline_limit=inline_limit), candidate_ids
+        return _valid_choices(proposed, pool, inline_limit=inline_limit, footer_limit=footer_limit), candidate_ids
     except Exception:
         # A transient curator failure must not erase good links already visible to readers.
         return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary or edge.peer_summary} for edge in pool[:3]]), candidate_ids
@@ -245,8 +247,8 @@ async def render_pages(
     jev_engine = None
     if str(getattr(settings, "wiki_linker_judge", "llm")) == "jev":
         try:
-            from jev import get_engine
-            jev_engine = get_engine()
+            from jev import get_engine_for
+            jev_engine = get_engine_for(settings)
         except Exception as exc:
             log.warning("Jev linker engine unavailable for page curation: %s", exc)
     semaphore = asyncio.Semaphore(concurrency)
@@ -284,7 +286,7 @@ async def render_pages(
     for job, (choices, candidate_ids) in zip(jobs, results):
         page_rel, doc, original_path, original, edges, _state, big = job
         navigation_by_doc[doc].setdefault("pages", {})[original_path.name] = {"version": REFERENCE_PLAN_VERSION, "candidate_ids": candidate_ids, "references": choices}
-        rendered = render_page(original, page_rel=page_rel, edges=edges, mode=mode, big_document=big, choices=choices)
+        rendered = render_page(original, page_rel=page_rel, edges=edges, mode=mode, big_document=big, choices=choices, settings=settings)
         if write_if_changed(Path(project.wiki) / page_rel, rendered):
             touched.add(doc)
     for doc, navigation in navigation_by_doc.items():
@@ -293,18 +295,20 @@ async def render_pages(
     return touched
 
 
-async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_: list[Candidate], mode: str, version: str, artifact_dir: Path | None, stop_check: StopCheck, output_language: str = "", strict: bool = False) -> tuple[list[dict[str, Any]], int]:
+async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_: list[Candidate], mode: str, version: str, artifact_dir: Path | None, stop_check: StopCheck, output_language: str = "", strict: bool = False, settings: Any = None) -> tuple[list[dict[str, Any]], int]:
     from .legacy import EDGE_GROUP_SIZE
     from .prompts import legacy_edge_messages, neo_edge_messages
     from .wire import EdgeSuggestions, NeoEdgeSuggestions
 
     accepted: list[dict[str, Any]] = []
     calls = 0
-    selected = candidates_[:MAX_EDGE_CANDIDATES]
+    edge_candidates = int(getattr(settings, "wiki_linker_edge_candidates", MAX_EDGE_CANDIDATES))
+    edges_per_target = int(getattr(settings, "wiki_linker_edges_per_target", MAX_EDGES_PER_TARGET))
+    selected = candidates_[:edge_candidates]
     if mode == "neo":
         entity_candidates = [candidate for candidate in candidates_ if candidate.source in {"use", "define"}]
         behaviour_candidates = [candidate for candidate in candidates_ if candidate.source not in {"use", "define"}]
-        selected = entity_candidates + behaviour_candidates[:MAX_EDGE_CANDIDATES]
+        selected = entity_candidates + behaviour_candidates[:edge_candidates]
     for offset in range(0, len(selected), EDGE_GROUP_SIZE):
         if stop_check and stop_check():
             raise LinkerCancelled("cancelled during edge filtering")
@@ -362,8 +366,8 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
     if mode == "neo":
         entity_edges = [edge for edge in accepted if edge["source"] in {"use", "define"}]
         behaviour_edges = [edge for edge in accepted if edge["source"] not in {"use", "define"}]
-        return entity_edges + behaviour_edges[:MAX_EDGES_PER_TARGET], calls
-    return accepted[:MAX_EDGES_PER_TARGET], calls
+        return entity_edges + behaviour_edges[:edges_per_target], calls
+    return accepted[:edges_per_target], calls
 
 
 async def _filter_target(catalog, model, target, candidates_, *, mode, version, artifact_dir,
@@ -374,11 +378,13 @@ async def _filter_target(catalog, model, target, candidates_, *, mode, version, 
             return (await judge_edges(catalog, jev_engine, target, candidates_, settings, model=model)), len(candidates_), 0
         except Exception as exc:
             log.warning("Jev edge judge failed for %s: %s", target.chunk_id, exc)
-            accepted, calls = await _filter_groups(catalog, model, target, candidates_, mode, version,
-                                                   artifact_dir, stop_check, output_language, strict=False)
+            accepted, calls = await _filter_groups(
+                catalog, model, target, candidates_, mode, version,
+                artifact_dir, stop_check, output_language, strict=strict, settings=settings,
+            )
             return accepted, calls, 1
     accepted, calls = await _filter_groups(catalog, model, target, candidates_, mode, version,
-                                           artifact_dir, stop_check, output_language, strict=strict)
+                                           artifact_dir, stop_check, output_language, strict=strict, settings=settings)
     return accepted, calls, 0
 
 
@@ -405,7 +411,7 @@ async def link_document(
         for page in (regenerated_pages or ())
         if page.startswith(document + "/") or "/" not in page
     }
-    team = _team(document)
+    team = _team(project)
     mode = str(getattr(settings, "wiki_linker_mode", "legacy"))
     judge = str(getattr(settings, "wiki_linker_judge", "llm"))
     if judge not in {"llm", "jev"}:
@@ -436,8 +442,8 @@ async def link_document(
         edge_version = EDGE_VERSION_JEV if judge == "jev" else EDGE_VERSION_NEO if mode == "neo" else EDGE_VERSION_LEGACY
         if judge == "jev":
             try:
-                from jev import get_engine
-                jev_engine = get_engine()
+                from jev import get_engine_for
+                jev_engine = get_engine_for(settings)
             except Exception as exc:
                 log.warning("Jev linker engine unavailable; using LLM: %s", exc)
                 jev_fallbacks += 1
@@ -489,12 +495,24 @@ async def link_document(
                 stale_ids.intersection_update(
                     item.chunk_id for item in all_chunks if item.page_rel in changed_page_rels
                 )
+            # Regenerated chunks need global candidate rediscovery. Patched chunks
+            # refresh metadata and embeddings below, but keep the incremental
+            # contract of rechecking their existing visible edges only.
             fresh_ids = (
-                {item.chunk_id for item in all_chunks if item.page_rel in regenerated_page_rels and item.chunk_id in stale_ids}
+                {
+                    item.chunk_id for item in all_chunks
+                    if item.page_rel in regenerated_page_rels and item.chunk_id in stale_ids
+                }
                 if incremental_scope else set()
             )
             if incremental_scope:
-                to_describe = [item for item in all_chunks if item.chunk_id in fresh_ids and item.text_sha256 not in previous_cache]
+                # Patched pages need fresh metadata just as regenerated pages do.
+                # Reusing the old row after the chunk text changed leaves summaries,
+                # entities, edge candidates, and embeddings stale.
+                to_describe = [
+                    item for item in all_chunks
+                    if item.chunk_id in stale_ids and item.text_sha256 not in previous_cache
+                ]
             else:
                 to_describe = [item for item in all_chunks if refresh_metadata or not previously_complete or item.chunk_id in stale_ids]
             reported_chunks = len(stale_ids) if incremental_scope else len(to_describe)
@@ -553,8 +571,8 @@ async def link_document(
             diff["edges_removed"] = int(diff.get("edges_removed", 0)) + metadata_edges_removed
             if not incremental_scope:
                 catalog.embed_pending(embedder, team=team)
-            elif fresh_ids:
-                catalog.embed_pending(embedder, team=team, chunk_ids=fresh_ids)
+            elif stale_ids:
+                catalog.embed_pending(embedder, team=team, chunk_ids=stale_ids)
             changed_ids = stale_ids | revised_ids
             affected_ids = changed_ids | set(diff["removed"])
             relevant_edges = [
@@ -877,7 +895,7 @@ async def link_documents(
     return aggregate
 
 
-def remove_document(project: Any, rel: str) -> list[str]:
+def remove_document(project: Any, rel: str, *, settings: Any = None) -> list[str]:
     """Drop a document's chunks/edges and re-render every peer it was linked to."""
     document = _document(project, rel)
     if not Path(project.linker_database).exists():
@@ -896,9 +914,11 @@ def remove_document(project: Any, rel: str) -> list[str]:
                     page_rel = f"{peer}/{original.name}"
                     edges = [_edge_from_row(row, page_rel) for row in catalog.edges_for_page(page_rel)]
                     page_state = navigation.setdefault("pages", {}).get(original.name, {})
-                    choices = _valid_choices(list(page_state.get("references", [])), footer_edges(edges, page_rel=page_rel, limit=None), inline_limit=MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES)
+                    page_mode = catalog.meta("mode") or "legacy"
+                    inline_limit, footer_limit = render_limits(page_mode, big_document, settings)
+                    choices = _valid_choices(list(page_state.get("references", [])), footer_edges(edges, page_rel=page_rel, limit=None), inline_limit=inline_limit, footer_limit=footer_limit)
                     navigation.setdefault("pages", {})[original.name] = {"candidate_ids": [], "references": choices}
-                    rendered = render_page(original.read_text(encoding="utf-8"), page_rel=page_rel, edges=edges, mode=catalog.meta("mode") or "legacy", big_document=big_document, choices=choices)
+                    rendered = render_page(original.read_text(encoding="utf-8"), page_rel=page_rel, edges=edges, mode=page_mode, big_document=big_document, choices=choices, settings=settings)
                     if write_if_changed(folder / original.name, rendered):
                         touched.add(_raw_rel(catalog, peer))
                 write_json_atomic(_navigation_path(project, peer), navigation)

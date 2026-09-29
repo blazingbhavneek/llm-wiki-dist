@@ -13,9 +13,11 @@ Line numbers are 1-based inclusive, matching the rest of the pipeline.  A
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
+from graph.common.images import find_images
 from graph.common.markdown import is_tableish_line, scan_markdown_fences
 
 IMAGE_UNIT_OPEN = "<image-unit>"
@@ -131,21 +133,32 @@ def _scan_image_unit_blocks(lines: list[str]) -> list[AtomicBlock]:
     open_line: int | None = None
 
     for number, line in enumerate(lines, start=1):
+        lowered = line.lower()
         if open_line is None:
-            if IMAGE_UNIT_OPEN in line:
-                tail = line.split(IMAGE_UNIT_OPEN, 1)[1]
+            opened = re.search(r"<image-unit\b", lowered)
+            if opened:
+                tail = lowered[opened.end():]
                 if IMAGE_UNIT_CLOSE in tail:
                     blocks.append(AtomicBlock("image-unit", number, number))
                 else:
                     open_line = number
             continue
 
-        if IMAGE_UNIT_CLOSE in line:
+        if IMAGE_UNIT_CLOSE in lowered:
             blocks.append(AtomicBlock("image-unit", open_line, number))
             open_line = None
 
     if open_line is not None:
         raise MalformedBlockError(f"unclosed <image-unit> opened at line {open_line}")
+    # Plain <img>/<embed> and Markdown image forms are normally one line, but
+    # an HTML tag may legally span lines and must be just as indivisible as a
+    # rich image unit.
+    text = "\n".join(lines)
+    existing = {(block.start, block.end) for block in blocks}
+    for image in find_images(text):
+        start, end = image.source_start, image.source_end
+        if (start, end) not in existing:
+            blocks.append(AtomicBlock("image-unit", start, end))
     return blocks
 
 
