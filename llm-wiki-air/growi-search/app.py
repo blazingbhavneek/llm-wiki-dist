@@ -1,7 +1,8 @@
 """FastAPI app: read-only GROWI search + page views + streaming researcher.
 
-No database, no writes, no graph. Routes mirror the plan (§13); the frontend is
-served from ./frontend/dist behind an optional WIKI_PREFIX.
+Never writes to GROWI. Search runs on a local Qdrant index that the background sync
+builds from the 目次 data blocks (docs/new-growi-search.md). The frontend is served from
+./frontend/dist behind an optional WIKI_PREFIX.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -29,6 +31,24 @@ from growi_client import GrowiAPIError, GrowiSearchClient
 from researcher import AgentStopped, Researcher
 
 log = logging.getLogger("growi_search")
+
+
+def _setup_logging() -> None:
+    """Show this service's INFO lines (sync progress, question summaries, JEV stats) without
+    turning on every library's INFO logging. WIKI_LOG_LEVEL=DEBUG shows more."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[growi-search] %(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+    level = (os.environ.get("WIKI_LOG_LEVEL") or "INFO").upper()
+    for name in ("growi_search", "growi_search_gateway", "growi_search_store", "growi_search_sync",
+                 "growi_search_researcher", "jev"):
+        logger = logging.getLogger(name)
+        if not logger.handlers:
+            logger.addHandler(handler)
+            logger.setLevel(level)
+            logger.propagate = False
+
+
+_setup_logging()
 
 HERE = Path(__file__).resolve().parent
 FRONTEND_DIST = HERE / "frontend" / "dist"
@@ -101,7 +121,7 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
             max_concurrency=settings.growi_concurrency,
             transport=transport,
         )
-        # A test transport means offline mode: skip the live reranker probe.
+        # A test transport means offline mode: skip the live model probes and the sync.
         reranker = None if transport is not None else Reranker.build(settings)
         embedder = None if transport is not None else Embedder.build(settings)
         app.state.settings = settings
@@ -111,10 +131,7 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
         app.state.researcher = researcher or Researcher(client, settings, reranker, embedder)
         app.state.runs = {}
         try:
-            if transport is None:  # warm the 00-目次 index map in the background (offline tests skip it)
-                mirror = getattr(app.state.researcher, "mirror", None)
-                if mirror is not None:
-                    mirror.start()
+            if transport is None:
                 jev = getattr(app.state.researcher, "jev", None)
                 status = (
                     "disabled (set WIKI_JEV_ENABLED=1)"
@@ -126,7 +143,13 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
                 print(f"[growi-search] Jev: {status}", flush=True)
                 if settings.jev_enabled and jev is None:
                     raise RuntimeError("Jev is enabled but its local model or hosted endpoint is unavailable")
-                threading.Thread(target=app.state.researcher.index_map.snapshot, name="index-map-warmup", daemon=True).start()
+                if settings.embed_base_url and settings.embed_model and embedder is None:
+                    # Starting without it would rebuild the whole index BM25-only, then again later.
+                    raise RuntimeError("the embedder is configured but unreachable "
+                                       "(unset WIKI_EMBED_BASE_URL to run BM25-only)")
+                print(f"[growi-search] embedder: {embedder.identity if embedder else 'none (BM25 only)'}; "
+                      f"reranker: {'on' if reranker else 'off'}", flush=True)
+                app.state.researcher.start()  # the 目次 hash-tree sync into the local index
             try:
                 app.state.growi_ok = bool(await asyncio.to_thread(client.health))
             except Exception as exc:  # noqa: BLE001 - startup probe is informational
@@ -141,9 +164,9 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
             )
             yield
         finally:
-            mirror = getattr(app.state.researcher, "mirror", None)
-            if mirror is not None:
-                mirror.stop()
+            close = getattr(app.state.researcher, "close", None)
+            if close is not None:
+                close()
             client.close()
 
     app = FastAPI(title="growi-search", lifespan=lifespan)
@@ -162,8 +185,7 @@ def create_app(settings: Settings | None = None, transport: Any = None, research
                 "reranker": app.state.reranker is not None,
                 "embedder": app.state.embedder is not None,
                 "jev": getattr(app.state.researcher, "jev", None) is not None,
-                "mirror": bool(getattr(app.state.researcher, "mirror", None) and
-                               app.state.researcher.mirror.ready),
+                "index": app.state.researcher.sync.status() if hasattr(app.state.researcher, "sync") else {},
                 "root_path": st.growi_root_path,
             }
         )

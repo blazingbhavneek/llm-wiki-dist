@@ -27,6 +27,10 @@ class ChunkMeta(BaseModel):
     entities: list[ChunkEntity] = Field(default_factory=list)
     behaviours: list[ChunkBehaviour] = Field(default_factory=list)
     role_judge: str = ""
+    # Search-only fields: they ride in the 目次 data block and the linker never reads them.
+    kind: str = ""
+    points: list[str] = Field(default_factory=list)
+    search_terms: list[str] = Field(default_factory=list)
 
 
 class EdgeSuggestion(BaseModel):

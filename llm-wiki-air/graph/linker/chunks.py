@@ -22,7 +22,7 @@ from .wire import ChunkBehaviour, ChunkEntity, ChunkMeta
 
 # Bounds for one chunk-metadata call: temperature 0 loops on long lists, and without a
 # token cap one call could generate until the request timeout. The cap includes thinking.
-META_MAX_TOKENS = 6000
+META_MAX_TOKENS = 16384  # output only: the search fields (search_terms, claims) have no count cap
 META_TEMPERATURE = 0.7
 
 
@@ -131,12 +131,22 @@ def split_page(text: str) -> list[RawChunk]:
     return chunks
 
 
-def model_text(chunk: RawChunk | Chunk | str) -> str:
-    text = chunk if isinstance(chunk, str) else chunk.text
+def _without_nav(text: str) -> str:
     marker = text.rfind("\n---\n")
     if marker >= 0 and ("前のページ" in text[marker:] or "次のページ" in text[marker:]):
         text = text[:marker]
-    return strip_big_tables(strip_image_media(text))[:12000]
+    return text
+
+
+def model_text(chunk: RawChunk | Chunk | str) -> str:
+    text = chunk if isinstance(chunk, str) else chunk.text
+    return strip_big_tables(strip_image_media(_without_nav(text)))[:12000]
+
+
+def meta_text(chunk: RawChunk | Chunk | str) -> str:
+    """The whole section for chunk_meta: search terms often live in big parameter tables."""
+    text = chunk if isinstance(chunk, str) else chunk.text
+    return strip_image_media(_without_nav(text))
 
 
 def chunk_id(id_seed: str, filename: str, ordinal: int) -> str:
@@ -169,15 +179,7 @@ def validate_meta(meta: ChunkMeta, text: str) -> ChunkMeta:
             seen.add(key); keywords.append(value)
         if len(keywords) == 12:
             break
-    claims: list[str] = []
-    seen.clear()
-    for value in meta.claims:
-        value = collapse(value, 1000)
-        key = value.casefold()
-        if value and key not in seen:
-            seen.add(key); claims.append(value)
-        if len(claims) == 20:
-            break
+    claims = _unique(collapse(value, 1000) for value in meta.claims)
     entities: list[ChunkEntity] = []
     seen_names: set[str] = set()
     for item in meta.entities:
@@ -214,8 +216,21 @@ def validate_meta(meta: ChunkMeta, text: str) -> ChunkMeta:
     return ChunkMeta(
         summary=collapse(meta.summary, 1000), keywords=keywords, entity=collapse(meta.entity, 1000),
         claims=claims, bridge_probe=collapse(meta.bridge_probe, 1000), entities=entities,
-        behaviours=behaviours, role_judge=meta.role_judge,
+        behaviours=behaviours, role_judge=meta.role_judge, kind=collapse(meta.kind, 1000),
+        points=_unique(collapse(value, 1000) for value in meta.points),
+        search_terms=_unique(collapse(value, 200) for value in meta.search_terms),
     )
+
+
+def _unique(values: Any) -> list[str]:
+    """Non-empty values, first spelling kept, no count cap (the search fields are uncapped)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.casefold()
+        if value and key not in seen:
+            seen.add(key); out.append(value)
+    return out
 
 
 def _meta_from_json(value: dict[str, Any]) -> ChunkMeta:
@@ -311,7 +326,7 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
             if stop_check and stop_check():
                 raise RuntimeError("linker cancelled")
             prompt = chunk_meta_prompt(page_title=item.title, heading=item.heading, document=item.document,
-                                       text=item.model_text, output_language=output_language, known_entities=[])
+                                       text=meta_text(item), output_language=output_language, known_entities=[])
             if artifact_dir:
                 artifact_dir.mkdir(parents=True, exist_ok=True)
                 write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.prompt.md", prompt.render())
@@ -352,7 +367,7 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
                 raise RuntimeError("linker cancelled")
             prompt = chunk_meta_prompt(
                 page_title=item.title, heading=item.heading, document=item.document,
-                text=item.model_text, output_language=output_language,
+                text=meta_text(item), output_language=output_language,
                 known_entities=[{"name": entity.name, "kind": entity.kind} for entity in registry.values()],
             )
             if artifact_dir:
@@ -379,4 +394,4 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
     return calls, fallbacks
 
 
-__all__ = ["Chunk", "RawChunk", "cache_by_hash", "chunk_id", "describe_all", "make_chunks", "model_text", "normalize_name", "snapshot_originals", "split_page", "to_json", "validate_meta"]
+__all__ = ["Chunk", "RawChunk", "cache_by_hash", "chunk_id", "describe_all", "make_chunks", "meta_text", "model_text", "normalize_name", "snapshot_originals", "split_page", "to_json", "validate_meta"]

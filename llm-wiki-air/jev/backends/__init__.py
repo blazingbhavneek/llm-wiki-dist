@@ -17,10 +17,10 @@ def make_backend(config):
     if config.backend == "gguf":
         from .gguf import GGUFBackend
         return GGUFBackend.from_config(config)
-    if config.backend == "hosted":
-        from .hosted import HostedBackend
+    if config.backend in {"hosted", "systemone", "sglang", "vllm", "jpt"}:
+        from .hosted import HostedBackend  # vanilla /v1/systemone
         return HostedBackend(config)
-    if config.backend in {"llm2jev", "systemone", "sglang", "vllm", "jpt"}:
-        from .llm2jev import Llm2JevBackend
+    if config.backend == "llm2jev":
+        from .llm2jev import Llm2JevBackend  # custom batched /score
         return Llm2JevBackend(config)
     raise ValueError(f"unknown Jev backend: {config.backend}")

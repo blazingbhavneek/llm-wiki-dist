@@ -107,7 +107,7 @@ class Readiness(unittest.TestCase):
         with TestClient(application) as client:
             data = client.get("/api/ready").json()
             self.assertEqual(
-                set(data), {"ready", "growi", "search", "llm", "reranker", "embedder", "jev", "mirror", "root_path"}
+                set(data), {"ready", "growi", "search", "llm", "reranker", "embedder", "jev", "index", "root_path"}
             )
             self.assertTrue(data["growi"])
             self.assertFalse(data["llm"])  # no chat_base_url in test settings
@@ -331,18 +331,19 @@ class NewReadOnlyRoutes(unittest.TestCase):
             for secret in ("growi_token", "chat_api_key", "rerank_api_key"):
                 self.assertNotIn(secret, data)
 
-    def test_mirror_not_started_offline(self):
-        settings = Settings(growi_url="http://growi.test", growi_token=TOKEN, mirror_dir="/tmp/mirror")
+    def test_sync_not_started_offline(self):
+        settings = Settings(growi_url="http://growi.test", growi_token=TOKEN)
         researcher = FakeResearcher()
-        researcher.mirror = mock.Mock()
+        researcher.start = mock.Mock()
         application, _ = make_app(settings=settings, researcher=researcher, transport=mock_transport())
         with TestClient(application):
-            researcher.mirror.start.assert_not_called()
+            researcher.start.assert_not_called()
 
-    def test_failed_jev_startup_stops_mirror_and_client(self):
+    def test_failed_jev_startup_closes_researcher_and_client(self):
         settings = Settings(growi_url="http://growi.test", growi_token=TOKEN, jev_enabled=True)
         researcher = FakeResearcher()
-        researcher.mirror = mock.Mock()
+        researcher.start = mock.Mock()
+        researcher.close = mock.Mock()
         researcher.jev = None
         client = mock.Mock()
         application = appmod.create_app(settings, researcher=researcher)
@@ -353,8 +354,8 @@ class NewReadOnlyRoutes(unittest.TestCase):
                         pass
 
                 asyncio.run(enter_lifespan())
-        researcher.mirror.start.assert_called_once()
-        researcher.mirror.stop.assert_called_once()
+        researcher.start.assert_not_called()
+        researcher.close.assert_called_once()
         client.close.assert_called_once()
 
     def test_attachment_proxy_and_validation(self):

@@ -10,7 +10,7 @@ from graph.wiki.prompts import COMMON_RULES, Prompt, _language_rule
 
 from .wire import ChunkMeta, NeoEdgeSuggestions
 
-CHUNK_META_VERSION = "wiki-chunk-meta-7"
+CHUNK_META_VERSION = "wiki-chunk-meta-8"
 EDGE_VERSION_LEGACY = "wiki-link-edge-legacy-4"
 EDGE_VERSION_NEO = "wiki-link-edge-neo-4"
 EDGE_VERSION_JEV = "wiki-link-edge-jev-5"
@@ -74,16 +74,29 @@ def chunk_meta_prompt(
         "- name は本文に書かれている表記をそのまま写す。\n"
         "- この文書を離れても同じ対象を指す名前だけを選ぶ。文書の中でしか指す先が決まらない"
         "呼び方や、どの文書にも現れる一般的な語は、照合すると無関係な文書を結び付けるので含めない。\n"
+        "- kind は名前の種類（関数、パラメータ、エラーコード、製品、組織、手順、概念など）を短く必ず書く。\n"
         "- role は、この節がその名前を定義・仕様説明していて、その名前を調べる読者が読むべき節なら "
         "defines、単に使用・言及しているだけなら uses。\n"
         f"{registry}\n# behaviours\n"
         "この節で「誰が／何が、何をしているか」のうち重要なものを最大10個列挙する。subject と object は entities の"
         "name と一致させる。object が無い場合は空文字。action は短い動詞句。\n\n"
+        "以下の4項目は検索専用である。リンク判定には使わない。\n\n"
+        "# kind（節全体）\nこの節が「どんな種類の情報」を含むかを1文で書く。対象名だけでなく、含まれる情報の種類を並べる。"
+        "例: 「mpf_mfs_open」ではなく「mpf_mfs_open の API リファレンス、引数一覧、戻り値、使用例」。\n\n"
+        "# points\nこの節が扱う内容を箇条書きで漏れなく列挙する。値や細部ではなく「何が書かれているか」を一般的な言葉で書く"
+        "（例: 「オープンモードの種類」「エラー時の戻り値」）。本文が少し改訂されても正しいままの書き方にする。\n\n"
+        "# search_terms\n検索用の語句を上限なしで漏れなく列挙する。本文に出てくる関数名・API名・パラメータ名・引数名・"
+        "定数・マクロ・エラーコード・設定項目・コマンド・ファイル名・画面名・製品名・値を、表や箇条書きの中のものも含めて"
+        "本文の表記のまま全て入れる。さらに、読者がこの節を探すときに入力しそうな言い換え・同義語・日本語と英語の両方の"
+        "呼び方も加える。重複は入れない。\n\n"
+        "# claims\n本文が直接裏付ける短い事実を1文1事実で漏れなく列挙する。値・条件・例外・手順・対象・結果・順序を含め、"
+        "本文に無い推論は書かない。\n\n"
+        "# bridge_probe\nこの節が関係しうる、より広い分野・概念・仕組み（例: 排他制御、資源の競合、初期化順序）を1〜2文で書く。"
+        "本文の言い換えではなく、つながる文脈を書く。確信が無ければ本文の主題を短く書く。\n\n"
         f"--- 本文 ---\n{text}"
     )
     schema = ChunkMeta.model_json_schema()
-    for unused in ("role_judge", "claims", "bridge_probe"):
-        schema["properties"].pop(unused, None)
+    schema["properties"].pop("role_judge", None)
     return Prompt(
         kind="chunk_meta",
         version=CHUNK_META_VERSION,

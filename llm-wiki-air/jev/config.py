@@ -28,15 +28,17 @@ class JevConfig:
     share_state_max_forks: int = 8
     stats_seconds: int = 60
     compile: bool = False
-    llm2jev_concurrency: int = 20
+    http_concurrency: int = 20  # hosted / llm2jev: states scored at the same time
 
     @classmethod
     def from_env(cls, env=os.environ):
         get = env.get
         backend = (get("WIKI_JEV_BACKEND") or "torch").strip().lower()
         base, local = get("WIKI_JEV_BASE_URL", ""), get("WIKI_JEV_LOCAL_PATH", "")
-        if backend in {"llm2jev", "systemone", "sglang", "vllm", "jpt"}:
-            backend = "llm2jev"
+        # hosted = the vanilla /v1/systemone API (stock llm2jev over sglang/vllm);
+        # llm2jev = the custom batched /score scorer.
+        if backend in {"systemone", "sglang", "vllm", "jpt"}:
+            backend = "hosted"
         elif backend == "local":
             backend = "torch"
         elif backend == "auto":
@@ -59,7 +61,8 @@ class JevConfig:
             share_state_max_forks=_int(get, "WIKI_JEV_SHARE_STATE_MAX_FORKS", 8),
             stats_seconds=_int(get, "WIKI_JEV_STATS_SECONDS", 60),
             compile=_bool(get("WIKI_JEV_COMPILE", "0")),
-            llm2jev_concurrency=_int(get, "WIKI_JEV_LLM2JEV_CONCURRENCY", 20),
+            http_concurrency=_int(get, "WIKI_JEV_HTTP_CONCURRENCY" if get("WIKI_JEV_HTTP_CONCURRENCY")
+                                  else "WIKI_JEV_LLM2JEV_CONCURRENCY", 20),
         )
         if backend not in {"torch", "gguf", "hosted", "llm2jev"}:
             raise ValueError("WIKI_JEV_BACKEND must be torch, gguf, hosted or llm2jev")
@@ -69,7 +72,7 @@ class JevConfig:
             raise ValueError("WIKI_JEV_DTYPE must be float32, bfloat16 or float16")
         if fields["gguf_many_mode"] not in {"exact", "batched"}:
             raise ValueError("WIKI_JEV_GGUF_MANY_MODE must be exact or batched")
-        for key in ("timeout", "max_batch_requests", "record_max", "max_batch_tokens", "token_cache_mb", "share_state_max_forks", "llm2jev_concurrency"):
+        for key in ("timeout", "max_batch_requests", "record_max", "max_batch_tokens", "token_cache_mb", "share_state_max_forks", "http_concurrency"):
             if fields[key] <= 0:
                 raise ValueError(f"WIKI_JEV_{key.upper()} must be positive")
         if fields["batch_wait_ms"] < 0 or fields["stats_seconds"] < 0:

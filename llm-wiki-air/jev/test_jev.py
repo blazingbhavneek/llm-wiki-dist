@@ -287,57 +287,6 @@ class ParityTests(unittest.TestCase):
 
 
 class HostedBackendTests(unittest.TestCase):
-    def test_wire_contract_and_keyed_results(self):
-        seen = {}
-        def handler(request):
-            seen.update(path=request.url.path, auth=request.headers.get("authorization"), body=json.loads(request.content))
-            return httpx.Response(200, json={"results": [
-                {"key": "b", "probabilities": {"はい": .2}},
-                {"key": "a", "probabilities": {"はい": .9}},
-            ]})
-        config = JevConfig(backend="hosted", model="model", base_url="http://jev.test", api_key="secret")
-        backend = HostedBackend(config, transport=httpx.MockTransport(handler))
-        batch = [backend.prepare(JevRequest({}, JevQuestion("q", key=k), "same")) for k in ("a", "b")]
-        try:
-            values = backend.run(batch)
-            self.assertEqual([v.p_yes for v in values], [.9, .2])
-            self.assertEqual(seen["path"], "/score"); self.assertEqual(seen["auth"], "Bearer secret")
-            self.assertEqual(seen["body"]["many_mode"], "batched")
-            self.assertEqual(seen["body"]["options"], {"yes": "はい", "no": "いいえ"})
-        finally: backend.close()
-
-    def test_no_auth_without_key(self):
-        auth = []
-        backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
-            lambda request: (auth.append(request.headers.get("authorization")), httpx.Response(200, json={"probabilities": [.5]}))[1]))
-        try: backend.run([backend.prepare(JevRequest({}, JevQuestion("q"), "s"))])
-        finally: backend.close()
-        self.assertEqual(auth, [None])
-
-    def test_rejects_bad_shapes_and_probabilities(self):
-        cases = ([{"probabilities": []}], [{"probabilities": [1.2]}],
-                 [{"results": [{"key": "x", "probabilities": {"yes": .5}}, {"key": "x", "probabilities": {"yes": .4}}]}],
-                 [{"unexpected": True}])
-        for body in cases:
-            backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
-                lambda request, b=body[0]: httpx.Response(200, json=b)))
-            try:
-                with self.assertRaises(JevUnavailable): backend.run([backend.prepare(JevRequest({}, JevQuestion("q", key="a"), "s"))])
-            finally: backend.close()
-
-    def test_retry_only_transport_and_server_errors(self):
-        for status, expected in ((400, 1), (503, 2)):
-            calls = []
-            backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
-                lambda request, s=status: (calls.append(1), httpx.Response(s))[1]))
-            batch = [backend.prepare(JevRequest({}, JevQuestion("q"), "s"))]
-            try:
-                with self.assertRaises(JevUnavailable): backend.run(batch)
-                self.assertEqual(len(calls), expected)
-            finally: backend.close()
-
-
-class Llm2JevBackendTests(unittest.TestCase):
     def test_wire_contract_state_passthrough_and_order(self):
         seen = {}
         def handler(request):
@@ -345,8 +294,8 @@ class Llm2JevBackendTests(unittest.TestCase):
             return httpx.Response(200, json={"answers": {
                 "q0": {"type": "noul", "noul": .9}, "q1": {"type": "noul", "noul": .2}},
                 "usage": {"input_tokens": 100, "output_tokens": 2}})
-        config = JevConfig(backend="llm2jev", base_url="http://jev.test", api_key="secret")
-        backend = Llm2JevBackend(config, transport=httpx.MockTransport(handler))
+        config = JevConfig(backend="hosted", base_url="http://jev.test", api_key="secret")
+        backend = HostedBackend(config, transport=httpx.MockTransport(handler))
         batch = [backend.prepare(JevRequest({"doc": "s"}, JevQuestion("q", key=k), "same")) for k in ("a", "b")]
         try:
             values = backend.run(batch)
@@ -365,7 +314,7 @@ class Llm2JevBackendTests(unittest.TestCase):
         for base, expected in (("http://jev.test", "http://jev.test/v1/systemone"),
                                ("http://jev.test/v1/systemone", "http://jev.test/v1/systemone"),
                                ("http://jev.test/", "http://jev.test/v1/systemone")):
-            backend = Llm2JevBackend(JevConfig(base_url=base))
+            backend = HostedBackend(JevConfig(base_url=base))
             try: self.assertEqual(backend.url, expected)
             finally: backend.close()
 
@@ -375,7 +324,7 @@ class Llm2JevBackendTests(unittest.TestCase):
                 "q0": {"type": "choice", "choice": "b", "probabilities": {"a": .25, "b": .75}, "confidence": .4},
                 "q1": {"type": "score", "score": 1.7, "probabilities": {"0": .1, "1": .2, "2": .7},
                        "legend": {"0": "low", "1": "mid", "2": "high"}, "confidence": .5}}})
-        backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(handler))
+        backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(handler))
         batch = [backend.prepare(JevRequest("s", JevQuestion("pick", "choice", {"a": "A", "b": "B"}, key="c"), "s")),
                  backend.prepare(JevRequest("s", JevQuestion("level", "score", ["low", "mid", "high"], key="v"), "s"))]
         try:
@@ -391,7 +340,7 @@ class Llm2JevBackendTests(unittest.TestCase):
             calls.append(len(body["questions"]))
             n = len(body["questions"])
             return httpx.Response(200, json={"answers": {f"q{i}": {"type": "noul", "noul": .9} for i in range(n)}})
-        backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(handler))
+        backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(handler))
         batch = [backend.prepare(JevRequest("s", JevQuestion("q", key=str(i)), "same")) for i in range(70)]
         try:
             values = backend.run(batch)
@@ -405,7 +354,7 @@ class Llm2JevBackendTests(unittest.TestCase):
                  [{"answers": {}}],
                  [{"unexpected": True}])
         for body in cases:
-            backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
+            backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
                 lambda request, b=body[0]: httpx.Response(200, json=b)))
             try:
                 with self.assertRaises(JevUnavailable): backend.run([backend.prepare(JevRequest({}, JevQuestion("q", key="a"), "s"))])
@@ -414,7 +363,7 @@ class Llm2JevBackendTests(unittest.TestCase):
     def test_retry_only_transport_and_server_errors(self):
         for status, expected in ((400, 1), (422, 1), (503, 2)):
             calls = []
-            backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
+            backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
                 lambda request, s=status: (calls.append(1), httpx.Response(s))[1]))
             batch = [backend.prepare(JevRequest({}, JevQuestion("q"), "s"))]
             try:
@@ -423,19 +372,23 @@ class Llm2JevBackendTests(unittest.TestCase):
             finally: backend.close()
 
     def test_prepare_rejects_unknown_kind(self):
-        backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"))
+        backend = HostedBackend(JevConfig(base_url="http://jev.test"))
         try:
             with self.assertRaises(NotImplementedError):
                 backend.prepare(JevRequest("s", JevQuestion("q", "rank", None)))
         finally: backend.close()
 
-    def test_aliases_resolve_to_llm2jev(self):
+    def test_aliases_resolve_to_hosted(self):
         from jev.backends import make_backend
-        for name in ("llm2jev", "systemone", "sglang", "vllm", "jpt"):
-            self.assertEqual(JevConfig.from_env({"WIKI_JEV_BACKEND": name}).backend, "llm2jev")
+        for name in ("hosted", "systemone", "sglang", "vllm", "jpt"):
+            self.assertEqual(JevConfig.from_env({"WIKI_JEV_BACKEND": name}).backend, "hosted")
             backend = make_backend(JevConfig(backend=name, base_url="http://jev.test"))
-            try: self.assertIsInstance(backend, Llm2JevBackend)
+            try: self.assertIsInstance(backend, HostedBackend)
             finally: backend.close()
+        self.assertEqual(JevConfig.from_env({"WIKI_JEV_BACKEND": "llm2jev"}).backend, "llm2jev")
+        backend = make_backend(JevConfig(backend="llm2jev", base_url="http://jev.test"))
+        try: self.assertIsInstance(backend, Llm2JevBackend)
+        finally: backend.close()
 
     def test_singles_fly_concurrently_in_input_order(self):
         import threading, time
@@ -454,7 +407,7 @@ class Llm2JevBackendTests(unittest.TestCase):
                     f"q{j}": {"type": "noul", "noul": .9} for j in range(n)}})
             finally:
                 with lock: active -= 1
-        backend = Llm2JevBackend(JevConfig(base_url="http://jev.test", llm2jev_concurrency=20),
+        backend = HostedBackend(JevConfig(base_url="http://jev.test", http_concurrency=20),
                                  transport=httpx.MockTransport(handler))
         batch = [backend.prepare(JevRequest(f"state-{i}", JevQuestion("q", key=f"k{i}"), f"s{i}")) for i in range(35)]
         try:
@@ -464,8 +417,9 @@ class Llm2JevBackendTests(unittest.TestCase):
         finally: backend.close()
 
     def test_concurrency_validation_names_variable(self):
-        with self.assertRaisesRegex(ValueError, "WIKI_JEV_LLM2JEV_CONCURRENCY"):
-            JevConfig.from_env({"WIKI_JEV_LLM2JEV_CONCURRENCY": "0"})
+        with self.assertRaisesRegex(ValueError, "WIKI_JEV_HTTP_CONCURRENCY"):
+            JevConfig.from_env({"WIKI_JEV_HTTP_CONCURRENCY": "0"})
+        self.assertEqual(JevConfig.from_env({"WIKI_JEV_LLM2JEV_CONCURRENCY": "7"}).http_concurrency, 7)  # old name
 
     def test_singles_keep_input_order(self):
         calls = []
@@ -475,7 +429,7 @@ class Llm2JevBackendTests(unittest.TestCase):
             assert "requests" not in body  # plain /v1/systemone: one state per call
             return httpx.Response(200, json={"answers": {
                 k: {"type": "noul", "noul": .5} for k in body["questions"]}})
-        backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(handler))
+        backend = HostedBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(handler))
         batch = [backend.prepare(JevRequest(f"s{i}", JevQuestion("q", key=f"k{i}"), f"s{i}")) for i in range(5)]
         try:
             values = backend.run(batch)
@@ -483,6 +437,57 @@ class Llm2JevBackendTests(unittest.TestCase):
             self.assertTrue(all(set(c) == {"state", "questions"} for c in calls))
             self.assertEqual([v.key for v in values], [f"k{i}" for i in range(5)])
         finally: backend.close()
+
+
+class Llm2JevBackendTests(unittest.TestCase):
+    def test_wire_contract_and_keyed_results(self):
+        seen = {}
+        def handler(request):
+            seen.update(path=request.url.path, auth=request.headers.get("authorization"), body=json.loads(request.content))
+            return httpx.Response(200, json={"results": [
+                {"key": "b", "probabilities": {"はい": .2}},
+                {"key": "a", "probabilities": {"はい": .9}},
+            ]})
+        config = JevConfig(backend="llm2jev", model="model", base_url="http://jev.test", api_key="secret")
+        backend = Llm2JevBackend(config, transport=httpx.MockTransport(handler))
+        batch = [backend.prepare(JevRequest({}, JevQuestion("q", key=k), "same")) for k in ("a", "b")]
+        try:
+            values = backend.run(batch)
+            self.assertEqual([v.p_yes for v in values], [.9, .2])
+            self.assertEqual(seen["path"], "/score"); self.assertEqual(seen["auth"], "Bearer secret")
+            self.assertEqual(seen["body"]["many_mode"], "batched")
+            self.assertEqual(seen["body"]["options"], {"yes": "はい", "no": "いいえ"})
+        finally: backend.close()
+
+    def test_no_auth_without_key(self):
+        auth = []
+        backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
+            lambda request: (auth.append(request.headers.get("authorization")), httpx.Response(200, json={"probabilities": [.5]}))[1]))
+        try: backend.run([backend.prepare(JevRequest({}, JevQuestion("q"), "s"))])
+        finally: backend.close()
+        self.assertEqual(auth, [None])
+
+    def test_rejects_bad_shapes_and_probabilities(self):
+        cases = ([{"probabilities": []}], [{"probabilities": [1.2]}],
+                 [{"results": [{"key": "x", "probabilities": {"yes": .5}}, {"key": "x", "probabilities": {"yes": .4}}]}],
+                 [{"unexpected": True}])
+        for body in cases:
+            backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
+                lambda request, b=body[0]: httpx.Response(200, json=b)))
+            try:
+                with self.assertRaises(JevUnavailable): backend.run([backend.prepare(JevRequest({}, JevQuestion("q", key="a"), "s"))])
+            finally: backend.close()
+
+    def test_retry_only_transport_and_server_errors(self):
+        for status, expected in ((400, 1), (503, 2)):
+            calls = []
+            backend = Llm2JevBackend(JevConfig(base_url="http://jev.test"), transport=httpx.MockTransport(
+                lambda request, s=status: (calls.append(1), httpx.Response(s))[1]))
+            batch = [backend.prepare(JevRequest({}, JevQuestion("q"), "s"))]
+            try:
+                with self.assertRaises(JevUnavailable): backend.run(batch)
+                self.assertEqual(len(calls), expected)
+            finally: backend.close()
 
 
 class TorchBackendTests(unittest.TestCase):

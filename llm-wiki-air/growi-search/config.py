@@ -1,11 +1,10 @@
-"""Search-service settings: GROWI, LLM, reranker, limits. No DB/ingest settings."""
+"""Search-service settings: GROWI, LLM, embedder/reranker, JEV, local index, research limits."""
 
 from __future__ import annotations
 
 import configparser
 import logging
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,7 +14,7 @@ from pydantic import BaseModel
 
 log = logging.getLogger("growi_search_config")
 
-# growi-search runs from its own directory; the shared Jev package is adjacent.
+# growi-search runs from its own directory; the shared jev and graph packages are adjacent.
 _AIR_ROOT = str(Path(__file__).resolve().parent.parent)
 if _AIR_ROOT not in sys.path:
     sys.path.append(_AIR_ROOT)
@@ -25,10 +24,6 @@ def _load_env_files() -> None:
     # load_dotenv does not overwrite already-set variables, so service-local wins.
     service_dir = Path(__file__).resolve().parent
     load_dotenv(service_dir / ".env", override=False)
-    # Keep optional retrieval channels off even when the shared builder .env
-    # configures endpoints. Explicit process/service values still take priority.
-    os.environ.setdefault("WIKI_EMBED_BASE_URL", "")
-    os.environ.setdefault("WIKI_RERANK_BASE_URL", "")
     load_dotenv(service_dir.parent / ".env", override=False)
 
 
@@ -55,8 +50,8 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-def _clamp_float(value: float, low: float, high: float) -> float:
-    return max(low, min(value, high))
+def _unit(value: str | None, default: float) -> float:
+    return max(0.0, min(float(value or default), 1.0))
 
 
 def _bool(value: str | None) -> bool:
@@ -70,147 +65,100 @@ class Settings(BaseModel):
     growi_attachment_token: str = ""
     growi_root_path: str = "/"
     growi_timeout: float = 30.0
+    growi_concurrency: int = 6
 
-    # Chat LLM
+    # Chat LLM (shared server: llm_max_concurrency is the number of slots this service uses)
     chat_base_url: str = ""
     chat_api_key: str = "local"
     chat_model: str = "gemma-4-31B"
     chat_temperature: float = 0.2
-    # Sent explicitly so a server-side default cannot cut a long report short; with
-    # reasoning on it covers thinking plus answer. 0 leaves it to the server.
     llm_max_output_tokens: int = 32768
     llm_context_tokens: int = 131072
     llm_timeout: int = 900
-    # Agents cannot retry a half-finished turn themselves, so the SDK retries the
-    # connection: one proxy reset must not throw away a finished sweep and its reports.
     llm_max_retries: int = 2
+    llm_max_concurrency: int = 4
 
-    # Reranker (optional; ES order preserved when unavailable)
-    rerank_base_url: str = ""
-    rerank_api_key: str = ""
-    rerank_model: str = ""
-    rerank_timeout: int = 15
-
-    # Embeddings for the index map (optional; keyword overlap is used when absent)
+    # Embeddings and reranker (both optional: without them search is BM25-only / RRF order)
     embed_base_url: str = ""
     embed_model: str = ""
     embed_api_key: str = "local"
+    embed_query_prefix: str = ""
+    embed_doc_prefix: str = ""
+    rerank_base_url: str = ""
+    rerank_api_key: str = ""
+    rerank_model: str = ""
+    rerank_timeout: int = 30
 
-    # Jev relevance gate (optional; ES/router path is used when disabled)
+    # JEV yes/no classifier (the finder's judge)
     jev_enabled: bool = False
-    jev_backend: str = "auto"          # auto | local | hosted | llm2jev (sglang/vllm via llm2jev)
-    jev_local_path: str = ""           # directory containing jev_style_decision.py
-    jev_device: str = "auto"           # auto | cuda | mps | cpu for the local runtime
-    jev_dtype: str = "bfloat16"        # float32 | bfloat16 | float16 (bf16 falls back to fp16)
-    jev_base_url: str = ""             # hosted /score endpoint, or llm2jev /v1/systemone (sglang/vllm)
+    jev_backend: str = "auto"          # auto | local | hosted (vanilla /v1/systemone) | llm2jev (custom batched /score)
+    jev_local_path: str = ""
+    jev_device: str = "auto"
+    jev_dtype: str = "bfloat16"
+    jev_base_url: str = ""
     jev_api_key: str = ""
     jev_model: str = "chaoliangUNSW/Jev-Style-0.8B-Decision-v3"
     jev_timeout: int = 60
-    jev_threshold: float = 0.50
-    jev_seed_threshold: float = 0.80
-    jev_chunk_tokens: int = 25600
-    jev_chunk_overlap: int = 10000
-    jev_toc_chunk_tokens: int = 15000  # 目次 pages are ranked in their own, smaller chunks
-    jev_max_page_reads: int = 0        # 0 = unlimited; independent of RunBudget
-    jev_max_list_calls: int = 0        # 0 = unlimited
-    jev_workers: int = 4               # concurrent fetch+classify threads in the sweep pipeline
-    jev_subagent_group_size: int = 5   # max seeds one seed-group subagent explores
-    jev_subagent_groups: int = 8       # max seed-group subagents per question
-    jev_prefilter_min_overlap: int = 2  # shared keyword grams needed before an expensive body score; 0 = off
-    jev_toc_gate: bool = False
-    jev_toc_gate_threshold: float = 0.2
-    jev_deterministic: bool = False
-    jev_verdict_cache: bool = False
-    lead_after_reports: str = "synthesis"
-    agent_tool_concurrency: int = 1
-    # Compiler budgets are independent from the ordinary lead-agent budget.
-    report_fold_tokens: int = 32768       # level-1 report compiler
-    final_compiler_tokens: int = 65536    # final answer compiler
-    compiler_concurrency: int = 4        # level-1 compilers running beside explorers
-    jev_mode: str = "exhaustive"
-    cascade_max_docs: int = 40
-    cascade_section_threshold: float = 0.3
-    cascade_subagents: int = 15
-    cascade_context_tokens: int = 48000
-    cascade_subagent_steps: int = 4
-    cascade_early_stop: float = 0.9
-    answer_cache: bool = False
+    jev_help_threshold: float = 0.5    # question B: "does this section help answer it?"
+    jev_direct_threshold: float = 0.8  # question A: "does this section answer it directly?"
 
-    # Jev walker (folder/document/page tree descent)
-    walker_threshold: float = 0.50
-    walker_route_threshold: float = 0.15
-    walker_min_children: int = 2
-    walker_k: int = 3
-    walker_max_items: int = 150
-    walker_es_rescue: bool = False
-
-    # Index pages published by `main.py index`
+    # Local index built from the 目次 data blocks
     index_page_name: str = "00-目次"
-    index_cache_ttl: int = 600
-    index_map_top_k: int = 20
-    index_map_embed_k: int = 60
+    store_dir: str = ""
+    sync_seconds: int = 30
+    revision_sweep_seconds: int = 300
 
-    # Retrieval limits
-    search_candidates: int = 30
-    rerank_top_k: int = 8
-    shallow_page_reads: int = 2
-    evidence_per_page: int = 2
-    link_expand_limit: int = 12
-    max_page_fetches_per_run: int = 12
-    max_search_calls_per_run: int = 6
-    growi_concurrency: int = 6
-    llm_max_concurrency: int = 4
+    # Finder
+    search_pool: int = 300             # sections pulled from Qdrant before rerank + JEV
+    rerank_pool: int = 200
+    wave_size: int = 100
+    max_waves: int = 4
+
+    # Research and compiler (16k/32k/64k cap OUTPUT only; inputs are never cut)
+    quick_max_pages: int = 3
+    max_threads: int = 12
+    max_rounds: int = 3
+    max_gaps: int = 6
+    run_seconds: int = 1200            # soft: no new research round starts after it
+    subagent_concurrency: int = 4      # researchers at once, never above llm_max_concurrency
+    subagent_max_steps: int = 20
+    subagent_report_tokens: int = 16384
+    lead_check_tokens: int = 16384
+    report_fold_tokens: int = 32768
+    final_compiler_tokens: int = 65536
+    service_max_agents: int = 4        # questions researched at the same time
+
+    # Page cache for page views and researcher reads
     page_cache_ttl: int = 120
     page_cache_max: int = 256
-
-    # Optional local GROWI mirror. Disabled for Settings() fixtures; enabled by from_env().
-    mirror_dir: str = ""
-    mirror_poll_seconds: int = 10
-    mirror_relist_seconds: int = 1800
-    mirror_changes: str = "auto"
-    mirror_warm_concurrency: int = 8
-    mirror_list_limit: int = 500
     page_cache_mb: int = 64
 
-    # Service concurrency / agents
-    service_max_reads: int = 16
-    service_max_agents: int = 4
-    agent_max_steps: int = 40
-    agent_patience: int = 20
-    subagent_count: int = 2
-    subagent_concurrency: int = 2
-    subagent_max_steps: int = 20
-    # Give explorers room for detailed reports; compiler inputs are chunked separately.
-    subagent_report_tokens: int = 16384
-    subagent_min_reads: int = 1
-    subagent_max_reads: int = 4
-
     # Presentation / deployment
-    enable_mermaid: bool = False
     doc_parser_url: str = "/agent/doc-parser/"
     prefix: str = "/growi-search"
     allowed_llm_hosts: str = ""
     usage_log_path: str = ""
+    trace_dir: str = ""                # one JSON per question: every score and decision (for tuning)
 
     @classmethod
     def from_env(cls) -> "Settings":
         _load_env_files()
         env = os.environ.get
         project = _project_values()
-        if env("WIKI_JEV_BATCH_SIZE") is not None:
-            log.warning("WIKI_JEV_BATCH_SIZE is deprecated and ignored; JevEngine now batches requests")
 
         token = (project.get("growi_token") or env("GROWI_TOKEN") or "").strip()
-        # Tolerate a pasted "API Token: ..." value.
-        if token.lower().startswith("api token:"):
+        if token.lower().startswith("api token:"):  # tolerate a pasted "API Token: ..." value
             token = token.split(":", 1)[1].strip()
 
-        # ponytail: whole-instance access; set GROWI_ROOT_PATH to scope manually.
         root = (env("GROWI_ROOT_PATH") or "/").strip() or "/"
         if not root.startswith("/"):
             root = "/" + root
         if len(root) > 1:
             root = root.rstrip("/")
+
+        embed_model = env("WIKI_EMBED_MODEL") or ""
+        ruri = "ruri" in embed_model.lower()  # ruri-v3 is trained with these retrieval prefixes
+        llm_slots = _clamp(int(env("WIKI_SEARCH_LLM_MAX_CONCURRENCY") or 4), 1, 256)
 
         return cls(
             growi_url=(project.get("growi_url") or env("GROWI_URL") or "").rstrip("/"),
@@ -218,28 +166,26 @@ class Settings(BaseModel):
             growi_attachment_token=(env("GROWI_ATTACHMENT_TOKEN") or token).strip(),
             growi_root_path=root,
             growi_timeout=float(env("GROWI_TIMEOUT") or 30),
-            chat_base_url=(
-                env("WIKI_CHAT_BASE_URL")
-                or project.get("chat_base_url")
-                or env("OPENAI_BASE_URL")
-                or ""
-            ).rstrip("/"),
-            chat_api_key=(
-                env("WIKI_CHAT_API_KEY") or env("OPENAI_API_KEY") or "local"
-            ),
-            chat_model=(env("WIKI_CHAT_MODEL") or env("WIKI_MODEL") or "gemma-4-31B"),
+            growi_concurrency=_clamp(int(env("WIKI_GROWI_CONCURRENCY") or 6), 1, 32),
+            chat_base_url=(env("WIKI_CHAT_BASE_URL") or project.get("chat_base_url")
+                           or env("OPENAI_BASE_URL") or "").rstrip("/"),
+            chat_api_key=env("WIKI_CHAT_API_KEY") or env("OPENAI_API_KEY") or "local",
+            chat_model=env("WIKI_CHAT_MODEL") or env("WIKI_MODEL") or "gemma-4-31B",
             chat_temperature=float(env("WIKI_CHAT_TEMPERATURE") or 0.2),
             llm_max_output_tokens=max(0, int(env("WIKI_LLM_MAX_OUTPUT_TOKENS") or 32768)),
             llm_context_tokens=max(4096, int(env("WIKI_LLM_CONTEXT_TOKENS") or 131072)),
             llm_timeout=max(1, int(env("WIKI_REQUEST_TIMEOUT") or 900)),
             llm_max_retries=_clamp(int(env("WIKI_LLM_MAX_RETRIES") or 2), 0, 5),
+            llm_max_concurrency=llm_slots,
+            embed_base_url=(env("WIKI_EMBED_BASE_URL") or "").rstrip("/"),
+            embed_model=embed_model,
+            embed_api_key=env("WIKI_EMBED_API_KEY") or "local",
+            embed_query_prefix=env("WIKI_EMBED_QUERY_PREFIX", "検索クエリ: " if ruri else ""),
+            embed_doc_prefix=env("WIKI_EMBED_DOC_PREFIX", "検索文書: " if ruri else ""),
             rerank_base_url=(env("WIKI_RERANK_BASE_URL") or "").rstrip("/"),
             rerank_api_key=env("WIKI_RERANK_API_KEY") or "",
             rerank_model=env("WIKI_RERANK_MODEL") or "",
-            rerank_timeout=int(env("WIKI_RERANK_TIMEOUT") or 15),
-            embed_base_url=(env("WIKI_EMBED_BASE_URL") or "").rstrip("/"),
-            embed_model=env("WIKI_EMBED_MODEL") or "",
-            embed_api_key=env("WIKI_EMBED_API_KEY") or "local",
+            rerank_timeout=int(env("WIKI_RERANK_TIMEOUT") or 30),
             jev_enabled=_bool(env("WIKI_JEV_ENABLED")),
             jev_backend=(env("WIKI_JEV_BACKEND") or "auto").strip().lower(),
             jev_local_path=(env("WIKI_JEV_LOCAL_PATH") or "").strip(),
@@ -249,85 +195,37 @@ class Settings(BaseModel):
             jev_api_key=(env("WIKI_JEV_API_KEY") or "").strip(),
             jev_model=env("WIKI_JEV_MODEL") or "chaoliangUNSW/Jev-Style-0.8B-Decision-v3",
             jev_timeout=int(env("WIKI_JEV_TIMEOUT") or 60),
-            jev_threshold=_clamp_float(float(env("WIKI_JEV_THRESHOLD") or 0.5), 0.0, 1.0),
-            jev_seed_threshold=_clamp_float(float(env("WIKI_JEV_SEED_THRESHOLD") or 0.8), 0.0, 1.0),
-            jev_chunk_tokens=int(env("WIKI_JEV_CHUNK_TOKENS") or 25600),
-            jev_chunk_overlap=int(env("WIKI_JEV_CHUNK_OVERLAP") or 10000),
-            jev_toc_chunk_tokens=int(env("WIKI_JEV_TOC_CHUNK_TOKENS") or 15000),
-            jev_max_page_reads=int(env("WIKI_JEV_MAX_PAGE_READS") or 0),
-            jev_max_list_calls=int(env("WIKI_JEV_MAX_LIST_CALLS") or 0),
-            jev_workers=max(1, int(env("WIKI_JEV_WORKERS") or 4)),
-            jev_subagent_group_size=max(1, int(env("WIKI_JEV_SUBAGENT_GROUP_SIZE") or 5)),
-            jev_subagent_groups=max(1, int(env("WIKI_JEV_SUBAGENT_GROUPS") or 8)),
-            jev_prefilter_min_overlap=max(0, int(env("WIKI_JEV_PREFILTER_MIN_OVERLAP") or 2)),
-            jev_toc_gate=_bool(env("WIKI_JEV_TOC_GATE")),
-            jev_toc_gate_threshold=_clamp_float(float(env("WIKI_JEV_TOC_GATE_THRESHOLD") or 0.2), 0.0, 1.0),
-            jev_deterministic=_bool(env("WIKI_JEV_DETERMINISTIC")),
-            jev_verdict_cache=_bool(env("WIKI_JEV_VERDICT_CACHE")),
-            lead_after_reports=(env("WIKI_LEAD_AFTER_REPORTS") or "synthesis").strip().lower(),
-            agent_tool_concurrency=_clamp(int(env("WIKI_AGENT_TOOL_CONCURRENCY") or 1), 1, 256),
+            jev_help_threshold=_unit(env("WIKI_JEV_HELP_THRESHOLD") or env("WIKI_JEV_THRESHOLD"), 0.5),
+            jev_direct_threshold=_unit(env("WIKI_JEV_DIRECT_THRESHOLD") or env("WIKI_JEV_SEED_THRESHOLD"), 0.8),
+            index_page_name=env("WIKI_INDEX_PAGE_NAME") or "00-目次",
+            store_dir=(env("WIKI_SEARCH_STORE_DIR") or str(Path(_AIR_ROOT) / "data" / "growi-search-store")).strip(),
+            sync_seconds=max(5, int(env("WIKI_SEARCH_SYNC_SECONDS") or 30)),
+            revision_sweep_seconds=max(30, int(env("WIKI_SEARCH_REVISION_SWEEP_SECONDS") or 300)),
+            search_pool=_clamp(int(env("WIKI_SEARCH_POOL") or 300), 20, 5000),
+            rerank_pool=_clamp(int(env("WIKI_RERANK_POOL") or 200), 1, 2000),
+            wave_size=_clamp(int(env("WIKI_JEV_WAVE_SIZE") or 100), 10, 2000),
+            max_waves=_clamp(int(env("WIKI_JEV_MAX_WAVES") or 4), 1, 50),
+            quick_max_pages=_clamp(int(env("WIKI_QUICK_MAX_PAGES") or 3), 1, 20),
+            max_threads=_clamp(int(env("WIKI_MAX_THREADS") or 12), 1, 64),
+            max_rounds=_clamp(int(env("WIKI_MAX_ROUNDS") or 3), 1, 10),
+            max_gaps=_clamp(int(env("WIKI_MAX_GAPS") or 6), 1, 32),
+            run_seconds=max(60, int(env("WIKI_RUN_SECONDS") or 1200)),
+            subagent_concurrency=min(_clamp(int(env("WIKI_SUBAGENT_CONCURRENCY") or llm_slots), 1, 256), llm_slots),
+            subagent_max_steps=_clamp(int(env("WIKI_SUBAGENT_MAX_STEPS") or 20), 4, 100),
+            subagent_report_tokens=_clamp(int(env("WIKI_SUBAGENT_REPORT_TOKENS") or 16384), 256, 131072),
+            lead_check_tokens=_clamp(int(env("WIKI_LEAD_CHECK_TOKENS") or 16384), 256, 131072),
             report_fold_tokens=_clamp(int(env("WIKI_REPORT_FOLD_TOKENS") or 32768), 256, 131072),
             final_compiler_tokens=_clamp(int(env("WIKI_FINAL_COMPILER_TOKENS") or 65536), 256, 131072),
-            compiler_concurrency=_clamp(int(env("WIKI_COMPILER_CONCURRENCY") or 4), 1, 256),
-            jev_mode=(env("WIKI_JEV_MODE") or "exhaustive").strip().lower(),
-            cascade_max_docs=max(1, int(env("WIKI_CASCADE_MAX_DOCS") or 40)),
-            cascade_section_threshold=_clamp_float(float(env("WIKI_CASCADE_SECTION_THRESHOLD") or 0.3), 0.0, 1.0),
-            cascade_subagents=_clamp(int(env("WIKI_CASCADE_SUBAGENTS") or 15), 1, 32),
-            cascade_context_tokens=max(1, int(env("WIKI_CASCADE_CONTEXT_TOKENS") or 48000)),
-            cascade_subagent_steps=max(1, int(env("WIKI_CASCADE_SUBAGENT_STEPS") or 4)),
-            cascade_early_stop=_clamp_float(float(env("WIKI_CASCADE_EARLY_STOP") or 0.9), 0.0, 1.0),
-            answer_cache=_bool(env("WIKI_ANSWER_CACHE")),
-            walker_threshold=_clamp_float(float(env("WIKI_WALKER_THRESHOLD") or 0.5), 0.0, 1.0),
-            walker_route_threshold=_clamp_float(float(env("WIKI_WALKER_ROUTE_THRESHOLD") or 0.15), 0.0, 1.0),
-            walker_min_children=_clamp(int(env("WIKI_WALKER_MIN_CHILDREN") or 2), 0, 100),
-            walker_k=_clamp(int(env("WIKI_WALKER_K") or 3), 1, 100),
-            walker_max_items=_clamp(int(env("WIKI_WALKER_MAX_ITEMS") or 150), 1, 10000),
-            walker_es_rescue=_bool(env("WIKI_WALKER_ES_RESCUE")),
-            index_page_name=env("WIKI_INDEX_PAGE_NAME") or "00-目次",
-            index_cache_ttl=int(env("WIKI_INDEX_CACHE_TTL") or 600),
-            index_map_top_k=int(env("WIKI_INDEX_MAP_TOP_K") or 20),
-            index_map_embed_k=int(env("WIKI_INDEX_MAP_EMBED_K") or 60),
-            search_candidates=_clamp(int(env("WIKI_SEARCH_CANDIDATES") or 30), 1, 50),
-            rerank_top_k=_clamp(int(env("WIKI_RERANK_TOP_K") or 8), 1, 40),
-            shallow_page_reads=_clamp(int(env("WIKI_SHALLOW_PAGE_READS") or 2), 1, 3),
-            evidence_per_page=_clamp(int(env("WIKI_EVIDENCE_PER_PAGE") or 2), 1, 8),
-            link_expand_limit=_clamp(int(env("WIKI_LINK_EXPAND_LIMIT") or 12), 1, 50),
-            max_page_fetches_per_run=int(env("WIKI_MAX_PAGE_FETCHES_PER_RUN") or 12),
-            max_search_calls_per_run=int(env("WIKI_MAX_SEARCH_CALLS_PER_RUN") or 6),
-            growi_concurrency=_clamp(int(env("WIKI_GROWI_CONCURRENCY") or 6), 1, 32),
-            llm_max_concurrency=_clamp(int(env("WIKI_SEARCH_LLM_MAX_CONCURRENCY") or 4), 1, 256),
+            service_max_agents=_clamp(int(env("WIKI_SERVICE_MAX_AGENTS") or 4), 1, 32),
             page_cache_ttl=int(env("WIKI_PAGE_CACHE_TTL") or 120),
             page_cache_max=_clamp(int(env("WIKI_PAGE_CACHE_MAX") or 256), 1, 4096),
-            mirror_dir=env("WIKI_MIRROR_DIR", str(Path(_AIR_ROOT) / "data" / "growi-search-mirror")).strip(),
-            mirror_poll_seconds=int(env("WIKI_MIRROR_POLL_SECONDS") or 10),
-            mirror_relist_seconds=int(env("WIKI_MIRROR_RELIST_SECONDS") or 1800),
-            mirror_changes=(env("WIKI_MIRROR_CHANGES") or "auto").strip().lower(),
-            mirror_warm_concurrency=max(1, int(env("WIKI_MIRROR_WARM_CONCURRENCY") or 8)),
-            mirror_list_limit=max(1, int(env("WIKI_MIRROR_LIST_LIMIT") or 500)),
             page_cache_mb=max(1, int(env("WIKI_PAGE_CACHE_MB") or 64)),
-            service_max_reads=_clamp(int(env("WIKI_SERVICE_MAX_READS") or 16), 1, 128),
-            service_max_agents=_clamp(int(env("WIKI_SERVICE_MAX_AGENTS") or 4), 1, 32),
-            agent_max_steps=_clamp(int(env("WIKI_AGENT_MAX_STEPS") or 40), 5, 200),
-            agent_patience=_clamp(int(env("WIKI_AGENT_PATIENCE") or 20), 1, 100),
-            subagent_count=_clamp(int(env("WIKI_SUBAGENT_COUNT") or 2), 1, 8),
-            subagent_concurrency=min(
-                _clamp(int(env("WIKI_SUBAGENT_CONCURRENCY") or 2), 1, 64),
-                _clamp(int(env("WIKI_SEARCH_LLM_MAX_CONCURRENCY") or 4), 1, 256),
-            ),
-            subagent_max_steps=_clamp(int(env("WIKI_SUBAGENT_MAX_STEPS") or 20), 4, 100),
-            subagent_report_tokens=_clamp(int(env("WIKI_SUBAGENT_REPORT_TOKENS") or 16384), 256, 16384),
-            subagent_min_reads=_clamp(int(env("WIKI_SUBAGENT_MIN_READS") or 1), 0, 10),
-            subagent_max_reads=_clamp(int(env("WIKI_SUBAGENT_MAX_READS") or 4), 1, 20),
-            enable_mermaid=(
-                env("WIKI_ENABLE_MERMAID") or ("1" if shutil.which("mmdc") else "")
-            ).lower() in {"1", "true", "yes", "on"},
             doc_parser_url=env("WIKI_DOC_PARSER_URL") or "/agent/doc-parser/",
             prefix=(env("WIKI_PREFIX") or "/growi-search").strip().rstrip("/"),
             allowed_llm_hosts=env("WIKI_ALLOWED_LLM_HOSTS") or "",
             usage_log_path=env("WIKI_USAGE_LOG_PATH") or "",
+            trace_dir=(env("WIKI_SEARCH_TRACE_DIR") or "").strip(),
         )
-
-    # --- validation ---------------------------------------------------------
 
     def validate_strict(self) -> None:
         """Startup validation. Raises ValueError on unusable configuration."""
@@ -335,39 +233,10 @@ class Settings(BaseModel):
             raise ValueError("GROWI_URL is required")
         if not self.growi_token:
             raise ValueError("GROWI_TOKEN is required")
-        if self.llm_context_tokens <= 2048:
-            raise ValueError("WIKI_LLM_CONTEXT_TOKENS must exceed 2048 tokens")
-        if self.jev_seed_threshold < self.jev_threshold:
-            raise ValueError("WIKI_JEV_SEED_THRESHOLD must be >= WIKI_JEV_THRESHOLD")
-        # The chunker reserves 512 tokens for the prompt/metadata.
-        if self.jev_chunk_tokens <= 512:
-            raise ValueError("WIKI_JEV_CHUNK_TOKENS must be > 512")
-        if self.jev_toc_chunk_tokens <= 512:
-            raise ValueError("WIKI_JEV_TOC_CHUNK_TOKENS must be > 512")
-        if not 0 <= self.jev_chunk_overlap < self.jev_chunk_tokens - 512:
-            raise ValueError("WIKI_JEV_CHUNK_OVERLAP must fit the body token budget")
-        if self.jev_max_page_reads < 0 or self.jev_max_list_calls < 0:
-            raise ValueError("Jev budgets must be >= 0 (0 = unlimited)")
-        if self.jev_workers < 1:
-            raise ValueError("WIKI_JEV_WORKERS must be >= 1")
-        if self.report_fold_tokens < 256 or self.final_compiler_tokens < 256:
-            raise ValueError("Compiler output budgets must be >= 256 tokens")
-        if self.compiler_concurrency < 1:
-            raise ValueError("WIKI_COMPILER_CONCURRENCY must be >= 1")
-        if self.jev_subagent_group_size < 1 or self.jev_subagent_groups < 1:
-            raise ValueError("Jev seed-group size and count must be >= 1")
-        if self.jev_prefilter_min_overlap < 0:
-            raise ValueError("WIKI_JEV_PREFILTER_MIN_OVERLAP must be >= 0 (0 = no prefilter)")
-        if self.lead_after_reports not in {"agent", "synthesis"}:
-            raise ValueError("WIKI_LEAD_AFTER_REPORTS must be agent or synthesis")
-        if self.jev_mode not in {"exhaustive", "cascade"}:
-            raise ValueError("WIKI_JEV_MODE must be exhaustive or cascade")
-        if not 1 <= self.subagent_concurrency <= self.llm_max_concurrency:
-            raise ValueError("WIKI_SUBAGENT_CONCURRENCY must be between 1 and WIKI_SEARCH_LLM_MAX_CONCURRENCY")
-        if self.mirror_poll_seconds < 1:
-            raise ValueError("WIKI_MIRROR_POLL_SECONDS must be >= 1")
-        if self.mirror_relist_seconds < 60:
-            raise ValueError("WIKI_MIRROR_RELIST_SECONDS must be >= 60")
+        if self.jev_direct_threshold < self.jev_help_threshold:
+            raise ValueError("WIKI_JEV_DIRECT_THRESHOLD must be >= WIKI_JEV_HELP_THRESHOLD")
+        if max(self.subagent_report_tokens, self.report_fold_tokens, self.final_compiler_tokens) * 2 > self.llm_context_tokens:
+            raise ValueError("an output budget must leave at least half of WIKI_LLM_CONTEXT_TOKENS for input")
 
     @property
     def llm_ready(self) -> bool:
@@ -388,4 +257,6 @@ class Settings(BaseModel):
         return hosts
 
     def public_dict(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"growi_token", "growi_attachment_token", "chat_api_key", "rerank_api_key", "embed_api_key", "usage_log_path", "jev_api_key", "jev_local_path"})
+        return self.model_dump(exclude={"growi_token", "growi_attachment_token", "chat_api_key", "rerank_api_key",
+                                        "embed_api_key", "usage_log_path", "jev_api_key", "jev_local_path", "store_dir",
+                                        "trace_dir"})

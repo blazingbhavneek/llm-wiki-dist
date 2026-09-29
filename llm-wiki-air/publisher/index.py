@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from graph.common import mokuji_data
 from graph.growi.client import GrowiClient, GrowiPage, assert_publish_path, growi_path, growi_segment
 from graph.wiki.storage import read_json, write_text_atomic
 from graph.workspace.project import Project, open_project
@@ -32,6 +33,8 @@ INDEX_NAME = "00-目次"  # sorts before 001-…; growi-search reads it (WIKI_IN
 MARKER = '<span hidden data-llm-wiki-index="{kind}"></span>'
 MAX_KEYWORDS_PER_PAGE = 12
 MAX_ENTITIES_PER_PAGE = 8
+MAX_KINDS_PER_PAGE = 5
+MAX_POINTS_PER_PAGE = 12
 MAX_DOCUMENT_CHAPTERS = 20
 MAX_DOCUMENT_KEYWORDS = 30
 MAX_DOCUMENT_ENTITIES = 20
@@ -81,8 +84,43 @@ def document_cards(folder: Path) -> list[dict[str, Any]]:
             "chapter": _one_line(cov.get("header", ""), 120),
             "keywords": [k for c in page_chunks for k in c.get("keywords", [])],
             "entities": [e["name"] for c in page_chunks for e in c.get("entities", []) if e.get("role") == "defines" and e.get("name")],
+            # A page is described by its sections: no extra LLM call, nothing capped here.
+            "kind": list(dict.fromkeys(c["kind"] for c in page_chunks if c.get("kind"))),
+            "points": list(dict.fromkeys(p for c in page_chunks for p in c.get("points", []) if p)),
+            "sections": page_chunks,
         })
     return cards
+
+
+def document_records(cards: list[dict[str, Any]], page_row: Callable[[str], dict[str, Any]]) -> list[dict[str, Any]]:
+    """Data block records of one document 目次: every page and every section, uncapped.
+
+    Built from the pre-link planning metadata, never from the rendered pages.
+    """
+    records: list[dict[str, Any]] = []
+    for card in cards:
+        row = page_row(card["filename"])
+        page_id = str(row.get("page_id") or "")
+        records.append({
+            "type": "page", "id": page_id, "revision": str(row.get("revision_id") or ""),
+            "path": str(row.get("growi_path") or ""), "file": card["filename"], "title": card["title"],
+            "summary": card["summary"], "chapter": card["chapter"], "kind": card["kind"], "points": card["points"],
+        })
+        for chunk in card["sections"]:
+            records.append({
+                "type": "section", "page": page_id, "file": card["filename"],
+                "ordinal": int(chunk.get("ordinal") or 0), "heading": str(chunk.get("heading") or ""),
+                "lines": [chunk.get("line_start"), chunk.get("line_end")], "hash": str(chunk.get("text_sha256") or ""),
+                "summary": str(chunk.get("summary") or ""), "kind": str(chunk.get("kind") or ""),
+                "points": list(chunk.get("points") or []), "keywords": list(chunk.get("keywords") or []),
+                "search_terms": list(chunk.get("search_terms") or []), "facts": list(chunk.get("claims") or []),
+                "entities": [{"name": e.get("name", ""), "kind": e.get("kind", ""), "role": e.get("role", "")}
+                             for e in chunk.get("entities") or [] if e.get("name")],
+                "behaviours": [{"subject": b.get("subject", ""), "action": b.get("action", ""), "object": b.get("object", "")}
+                               for b in chunk.get("behaviours") or []],
+                "bridge": str(chunk.get("bridge_probe") or ""),
+            })
+    return records
 
 
 def render_document_index(title: str, cards: list[dict[str, Any]], link_for: Callable[[str], str], related: list[tuple[str, str]] | None = None) -> str:
@@ -91,6 +129,10 @@ def render_document_index(title: str, cards: list[dict[str, Any]], link_for: Cal
         lines.append(f"- [{card['title']}]({link_for(card['filename'])}) — {card['summary'] or '要約なし'}")
         if card["chapter"]:
             lines.append(f"  - 章: {card['chapter']}")
+        if card.get("kind"):
+            lines.append(f"  - 情報の種類: {_join(card['kind'], MAX_KINDS_PER_PAGE)}")
+        if card.get("points"):
+            lines.append(f"  - 要点: {_join(card['points'], MAX_POINTS_PER_PAGE)}")
         if card["keywords"]:
             lines.append(f"  - キーワード: {_join(card['keywords'], MAX_KEYWORDS_PER_PAGE)}")
         if card["entities"]:
@@ -337,6 +379,41 @@ def _folder_cards(folder: str, tree: dict[str, FolderNode], summaries: dict[str,
     return blocks
 
 
+def data_blocks(tree: dict[str, FolderNode], summaries: dict[str, dict[str, Any]],
+                cards_by_document: dict[str, list[dict[str, Any]]], connection: Any | None,
+                page_row: Callable[[str, str], dict[str, Any]], root_name: str) -> dict[str, str]:
+    """The rendered data block of every index location ("" is the project root).
+
+    A child record carries the hash of the child's block, so any change below changes
+    every hash up to the root; growi-search polls the root and walks down where they differ.
+    """
+    records: dict[str, list[dict[str, Any]]] = {}
+
+    def child(kind: str, rel: str, summary: dict[str, Any]) -> dict[str, Any]:
+        return {"type": "child", "kind": kind, "name": summary["name"], "ref": _index_link(connection, rel),
+                "summary": summary["scope"], "pages": summary["pages"], "hash": mokuji_data.block_hash(block(rel))}
+
+    def block(rel: str) -> list[dict[str, Any]]:
+        if rel not in records:
+            own = (document_records(cards_by_document[rel], lambda filename: page_row(rel, filename))
+                   if rel in summaries else [])
+            below: list[dict[str, Any]] = []
+            if rel in tree:
+                node = tree[rel]
+                # Same listing as _folder_cards: a document that is also a folder is listed once, as a document.
+                below += [child("folder", sub, folder_summary(sub, tree, summaries))
+                          for sub in sorted(node.folders) if sub not in summaries]
+                below += [child("document", doc, summaries[doc]) for doc in sorted(node.documents, key=str)]
+            records[rel] = own + below
+        return records[rel]
+
+    out: dict[str, str] = {}
+    for rel in sorted(set(summaries) | set(tree), key=str):
+        level = "document" if rel in summaries else "root" if not rel else "folder"
+        out[rel] = mokuji_data.render(level, Path(rel).name if rel else root_name, block(rel))
+    return out
+
+
 def _subfolder_section(document: str, tree: dict[str, FolderNode], summaries: dict[str, dict[str, Any]],
                        connection: Any | None) -> str:
     if document not in tree:
@@ -409,6 +486,9 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     with contextlib.nullcontext() if locked else _lock(project):
         ledger = ledger if ledger is not None else load_ledger(project.metadata / "pipeline.json")
         target = str(settings.target_name).strip("/")
+        # Every block is computed (cheap, local files only) so unchanged siblings keep their hashes.
+        blocks = data_blocks(tree, summaries, cards_by_document, connection,
+                             lambda doc, filename: ledger.published_pages.get(f"{doc}/{filename}", {}), target)
         for document, folder in sorted(folders.items()):
             doc_path = growi_path(connection.write_path, document) if connection else f"/{document}"
             cards = cards_by_document[document]
@@ -421,6 +501,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
 
             body = render_document_index(Path(document).name, cards, link_for, related.get(document, []))
             body += _subfolder_section(document, tree, summaries, connection)
+            body += "\n" + blocks[document]
             write_text_atomic(project.metadata / "index" / document / "index.md", body)
             status = "written"
             if publisher is not None:
@@ -462,6 +543,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
             kind = "root" if not folder else "folder"
             body = render_folder_index(title, kind,
                                        _folder_cards(folder, tree, summaries, connection, root=not folder))
+            body += "\n" + blocks[folder]
             write_text_atomic(index_path, body)
             status = "written"
             try:
@@ -542,4 +624,4 @@ def delete_document_index(publisher: Any, document: str) -> None:
         log.warning("index page for %s: %s: %s", document, type(exc).__name__, exc)
 
 
-__all__ = ["FolderNode", "build_index", "delete_document_index", "delete_index_pages", "document_cards", "document_summary", "folder_summary", "folder_tree", "render_document_card", "render_document_index", "render_folder_card", "render_folder_index"]
+__all__ = ["FolderNode", "build_index", "data_blocks", "delete_document_index", "delete_index_pages", "document_cards", "document_records", "document_summary", "folder_summary", "folder_tree", "render_document_card", "render_document_index", "render_folder_card", "render_folder_index"]
