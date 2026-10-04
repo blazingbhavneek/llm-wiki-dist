@@ -22,7 +22,7 @@ from typing import Any
 
 import markdown as md
 from config import Settings
-from graph.common import mokuji_data
+from common import mokuji_data
 from growi_client import GrowiAPIError, GrowiSearchClient
 from models import WikiPage
 from store import Store, norm

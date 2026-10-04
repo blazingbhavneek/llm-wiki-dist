@@ -44,11 +44,26 @@ async def summarize_hierarchy(
     from langchain_core.messages import HumanMessage
 
     cached = read_json(checkpoint, default={}) if checkpoint.exists() else {}
+    fast = str(getattr(config, "policy", "standard")) == "fast"
+    if not fast and cached.get("policy"):
+        cached = {}  # fast context is deterministic; standard must not reuse it as model output
     groups: dict[tuple[str, ...], list[Any]] = {}
     for page in pages:
         groups.setdefault(tuple(page.path[:-1]), []).append(page)
     parents: dict[str, str] = dict(cached.get("parents", {}))
     summaries: dict[str, str] = dict(cached.get("pages", {}))
+    if fast:
+        # Fast context is derived from source ranges and existing seed
+        # summaries. It is deterministic and never spends a model call.
+        for chain, group in groups.items():
+            key = " › ".join(chain)
+            parents.setdefault(key, lead(lines, group[0].owner_ranges[0][0], group[-1].owner_ranges[-1][1], limit=400))
+            for page in group:
+                summaries.setdefault(str(page.number), page.summary or lead(lines, page.owner_ranges[0][0], page.owner_ranges[-1][1], limit=400))
+        write_json_atomic(checkpoint, {"parents": parents, "pages": summaries, "policy": "fast-v1"})
+        for page in pages:
+            page.summary = summaries.get(str(page.number), page.summary)
+        return parents
     for chain, group in groups.items():
         key = " › ".join(chain)
         if key in parents and all(str(page.number) in summaries for page in group):

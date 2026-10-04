@@ -17,13 +17,17 @@ from graph.common.markdown import strip_big_tables, strip_image_media
 from graph.wiki.page import fence_flags, strip_reader_references
 from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
 
-from .prompts import CHUNK_META_VERSION, chunk_meta_prompt
+from .prompts import CHUNK_META_VERSION, chunk_meta_batch_prompt, chunk_meta_prompt
 from .wire import ChunkBehaviour, ChunkEntity, ChunkMeta
 
 # Bounds for one chunk-metadata call: temperature 0 loops on long lists, and without a
 # token cap one call could generate until the request timeout. The cap includes thinking.
 META_MAX_TOKENS = 16384  # output only: the search fields (search_terms, claims) have no count cap
 META_TEMPERATURE = 0.7
+# Fast policy: sections per page call. ponytail: guesses until a GPU run; raise if the
+# answers stay complete, lower if pages fall back to per-section calls.
+META_BATCH_SECTIONS = 4
+META_BATCH_CHARS = 12000
 
 
 def _is_lead(item: "Chunk", sectioned: set[str]) -> bool:
@@ -240,9 +244,9 @@ def _meta_from_json(value: dict[str, Any]) -> ChunkMeta:
         return ChunkMeta()
 
 
-def cache_by_hash(path: Path) -> dict[str, ChunkMeta]:
+def cache_by_hash(path: Path, *, meta_version: str = CHUNK_META_VERSION) -> dict[str, ChunkMeta]:
     data = read_json(path, default={})
-    if data.get("meta_version") != CHUNK_META_VERSION:
+    if data.get("meta_version") != meta_version:
         return {}
     result: dict[str, ChunkMeta] = {}
     for page in data.get("pages", []):
@@ -252,7 +256,7 @@ def cache_by_hash(path: Path) -> dict[str, ChunkMeta]:
     return result
 
 
-def to_json(document: str, team: str, chunks: list[Chunk], *, id_seed: str | None = None) -> dict[str, Any]:
+def to_json(document: str, team: str, chunks: list[Chunk], *, id_seed: str | None = None, meta_version: str = CHUNK_META_VERSION) -> dict[str, Any]:
     pages: dict[str, dict[str, Any]] = {}
     for item in chunks:
         page = pages.setdefault(item.filename, {"filename": item.filename, "title": item.title, "original_sha256": "", "chunks": []})
@@ -261,7 +265,7 @@ def to_json(document: str, team: str, chunks: list[Chunk], *, id_seed: str | Non
             "line_start": item.line_start, "line_end": item.line_end, "text_sha256": item.text_sha256,
             **item.meta.model_dump(mode="json"),
         })
-    return {"schema_version": 1, "meta_version": CHUNK_META_VERSION, "document": document, "id_seed": id_seed or document, "team": team, "pages": list(pages.values())}
+    return {"schema_version": 1, "meta_version": meta_version, "document": document, "id_seed": id_seed or document, "team": team, "pages": list(pages.values())}
 
 
 def snapshot_originals(doc_dir: Path) -> dict[str, str]:
@@ -309,9 +313,76 @@ def _apply_entity_replacements(processed: list[Chunk], entities: list[ChunkEntit
     return changed
 
 
-async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str, concurrency: int, cache: dict[str, ChunkMeta] | None = None, artifact_dir: Path | None = None, stop_check: Callable[[], bool] | None = None, parallel: bool = False) -> tuple[int, int]:
+def _page_batches(items: list[Chunk]) -> list[list[Chunk]]:
+    batches: list[list[Chunk]] = []
+    size = 0
+    for item in items:
+        text = len(meta_text(item))
+        if not batches or batches[-1][0].page_rel != item.page_rel or len(batches[-1]) >= META_BATCH_SECTIONS or size + text > META_BATCH_CHARS:
+            batches.append([])
+            size = 0
+        batches[-1].append(item)
+        size += text
+    return batches
+
+
+async def _describe_pages(chunks: list[Chunk], *, model: Any, output_language: str, concurrency: int, cache: dict[str, ChunkMeta], artifact_dir: Path | None, stop_check: Callable[[], bool] | None) -> tuple[dict[str, ChunkMeta], int]:
+    """Fast policy: one metadata call per page, split when oversized.
+
+    Returns metadata by text hash. A section missing, invalid or empty in the answer is
+    left out, so describe_all retries it with its own call.
+    """
+    sectioned = {item.page_rel for item in chunks if item.heading}
+    batches = _page_batches([item for item in chunks if item.text_sha256 not in cache and not _is_lead(item, sectioned)])
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    found: dict[str, ChunkMeta] = {}
+
+    async def describe(number: int, group: list[Chunk]) -> None:
+        if stop_check and stop_check():
+            raise RuntimeError("linker cancelled")
+        prompt = chunk_meta_batch_prompt(
+            page_title=group[0].title, document=group[0].document, output_language=output_language,
+            sections=[(f"S{index}", item.heading, meta_text(item)) for index, item in enumerate(group, 1)],
+        )
+        stem = f"meta-batch-{number}-{Path(group[0].filename).stem}"
+        if artifact_dir:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(artifact_dir / f"{stem}.prompt.md", prompt.render())
+        async with semaphore:
+            try:
+                raw = await model.text(prompt.messages(), max_output_tokens=META_MAX_TOKENS * 2, temperature=META_TEMPERATURE)
+                answer = extract_json_from_text(raw)
+            except Exception as exc:  # noqa: BLE001 - every section falls back to its own call
+                if artifact_dir:
+                    write_text_atomic(artifact_dir / f"{stem}-error.txt", f"{type(exc).__name__}: {exc}")
+                return
+        if artifact_dir:
+            write_json_atomic(artifact_dir / f"{stem}.json", answer)
+        for value in answer.get("sections", []) if isinstance(answer, dict) else []:
+            if not isinstance(value, dict):
+                continue
+            key = str(value.pop("section", ""))
+            index = int(key[1:]) - 1 if key[:1] == "S" and key[1:].isdigit() else -1
+            if not 0 <= index < len(group):
+                continue
+            try:
+                meta = validate_meta(ChunkMeta.model_validate(value), group[index].text)
+            except Exception:  # noqa: BLE001 - invalid section: its own call retries it
+                continue
+            if meta.summary and (meta.keywords or meta.search_terms):
+                found[group[index].text_sha256] = meta
+
+    await asyncio.gather(*(describe(number, group) for number, group in enumerate(batches, 1)))
+    return found, len(batches)
+
+
+async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str, concurrency: int, cache: dict[str, ChunkMeta] | None = None, artifact_dir: Path | None = None, stop_check: Callable[[], bool] | None = None, parallel: bool = False, batch: bool = False) -> tuple[int, int]:
     cache = cache or {}
     calls = fallbacks = 0
+    if batch:
+        found, calls = await _describe_pages(chunks, model=model, output_language=output_language, concurrency=concurrency,
+                                             cache=cache, artifact_dir=artifact_dir, stop_check=stop_check)
+        cache = {**cache, **found}  # sections the page call missed fall through to their own call below
     if parallel:
         semaphore = asyncio.Semaphore(max(1, concurrency))
         pending = []

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from graph.common import mokuji_data
+from common import mokuji_data
 from graph.growi.client import GrowiClient, GrowiPage, assert_publish_path, growi_path, growi_segment
 from graph.wiki.storage import read_json, write_text_atomic
 from graph.workspace.project import Project, open_project

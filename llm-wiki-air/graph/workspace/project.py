@@ -8,33 +8,24 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from common.paths import generated_rels as _generated_rels
+from common.paths import raw_name_for as _raw_name_for
+from common.paths import wiki_folder_name as _wiki_folder_name
+
 VERBATIM = {".md", ".txt"}
 
 
 def wiki_folder_name(raw_name: str) -> str:
-    stem = PurePosixPath(raw_name).stem
-    base, sep, ext = stem.rpartition("_")
-    return f"{base}.{ext}" if sep and base and ext.isalnum() else stem
+    return _wiki_folder_name(raw_name)
 
 
 def raw_name_for(mount_name: str) -> str:
-    path = PurePosixPath(mount_name)
-    ext = path.suffix.lstrip(".").lower()
-    if not ext:
-        return path.stem
-    base, sep, tail = path.stem.rpartition("_")
-    if ext == "md" and sep and base and tail.isalnum():
-        return path.name  # already raw-style `<stem>_<srcent>.md`: don't double-suffix
-    return f"{path.stem}_{ext}.md"
+    return _raw_name_for(mount_name)
 
 
 def generated_rels(mount_rel: str) -> tuple[str, str]:
     """Return the raw-file and wiki/state-directory paths for one mount path."""
-
-    source = PurePosixPath(mount_rel)
-    raw = source.parent / raw_name_for(source.name)
-    wiki = raw.parent / wiki_folder_name(raw.name)
-    return raw.as_posix(), wiki.as_posix()
+    return _generated_rels(mount_rel)
 
 
 def assert_unique_generated_paths(mount_rels: Iterable[str]) -> None:
@@ -91,15 +82,21 @@ class Project:
 
     @property
     def raw(self) -> Path:
-        return self.root / "raw"
+        from common.paths import DataLayout
+
+        return DataLayout(self.root).raw
 
     @property
     def metadata(self) -> Path:
-        return self.root / "metadata"
+        from common.paths import DataLayout
+
+        return DataLayout(self.root).metadata
 
     @property
     def wiki(self) -> Path:
-        return self.root / "wiki"
+        from common.paths import DataLayout
+
+        return DataLayout(self.root).wiki
 
     @property
     def database(self) -> Path:
@@ -111,11 +108,15 @@ class Project:
 
     @property
     def linker_database(self) -> Path:
-        return self.metadata / "wiki-linker.sqlite"
+        from common.paths import DataLayout
+
+        return DataLayout(self.root).linker_database
 
     @property
     def queue_database(self) -> Path:
-        return self.metadata / "watch-queue.sqlite"
+        from common.paths import DataLayout
+
+        return DataLayout(self.root).queue_database
 
     @property
     def last_sha_path(self) -> Path:

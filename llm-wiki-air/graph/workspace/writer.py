@@ -286,16 +286,20 @@ class WriteResult:
     human_edits_overwritten: list[str] = field(default_factory=list)
 def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kind: str = "md", require_resume: bool = False):
     from graph.wiki.config import WikiConfig
+    from common.policy import resolve_policy
 
     concurrency = max(1, int(getattr(settings, "concurrency", app_concurrency())))
+    policy = resolve_policy(getattr(settings, "policy", "standard"))
     return WikiConfig(
+        policy=policy.name,
+        policy_version=policy.version,
         chat_base_url=settings.chat_base_url,
         chat_api_key=settings.chat_api_key,
         chat_model=settings.chat_model,
         temperature=0.7,
         output_language=getattr(settings, "wiki_output_language", "Japanese (日本語)"),
         section_target_lines=int(getattr(settings, "wiki_section_target_lines", 80)),
-        write_attempts=int(getattr(settings, "wiki_write_attempts", 3)),
+        write_attempts=(policy.repair_attempts + 1 if policy.name == "fast" else int(getattr(settings, "wiki_write_attempts", 3))),
         planner_concurrency=int(getattr(settings, "wiki_planner_concurrency", concurrency)),
         rewrite_concurrency=int(
             getattr(settings, "wiki_rewrite_concurrency", concurrency)
@@ -507,7 +511,14 @@ def write_wiki_pages(
     new_text = project.raw_file(rel).read_text(encoding="utf-8")
     old_text = ""
     workbook = None
-    if not resume:
+    stored_run = read_json(state_root / "run.json", default={})
+    requested_policy = str(getattr(settings, "policy", "standard"))
+    stored_policy = str(stored_run.get("policy") or "standard")
+    if resume and old_source.exists() and stored_policy != requested_policy:
+        # A changed policy must not reuse an incompatible page draft. This is
+        # lazy and document-scoped; unchanged documents never reach this code.
+        decision = UpdateDecision(tier=3, reason="policy-switch")
+    elif not resume:
         decision = UpdateDecision(tier=3, reason="forced")
     elif mode == "wiki" and kind == "xlsx" and (workbook := decide_workbook(state_root, new_text, project.wiki_dir(rel))):
         decision = workbook[0]
@@ -652,6 +663,15 @@ def write_wiki_pages(
         target = project.wiki_dir(rel)
         if out_dir is not None:
             publish_output(out_dir, target)
+        if requested_policy == "fast" or "policy" in stored_run:
+            # Also restamp a fast document rebuilt as standard; a never-fast
+            # document gets no new file.
+            from common.policy import resolve_policy
+
+            run_state = read_json(state_root / "run.json", default={})
+            run_state["policy"] = requested_policy
+            run_state["policy_version"] = resolve_policy(requested_policy).version
+            write_json_atomic(state_root / "run.json", run_state)
         write_source_stamp(target, project.raw_file(rel), rel, identity_seed=identity_seed)
         from publisher.human_changes import HumanStore, apply_generated
 

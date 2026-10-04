@@ -6,6 +6,14 @@ Markdown wiki and publishes it to [GROWI](https://growi.org), using per-project
 Git checkpoints for publication recovery. Local state lives in plain files and SQLite
 under `data/`, and GROWI itself is the collaborative editing surface.
 
+The phase boundaries, frozen data contract, runner composition rules, and
+verification commands are documented in [`AGENTS.md`](AGENTS.md).
+
+The public phase packages are `convert/`, `wiki/`, `linker/`, `index/`, and
+`publisher/`; `runner/` composes them and `common/` owns shared paths and
+state primitives. The historical implementation remains behind narrow
+compatibility adapters while each phase is migrated.
+
 `graph/` is copied from the upstream factory allowlist, and `publisher/` plus
 `main.py` are the downstream pipeline.
 

@@ -15,6 +15,7 @@ from graph.common.hashing import short_hash
 from graph.config import app_concurrency
 from graph.wiki.page import strip_reader_references
 from graph.wiki.storage import read_json, write_json_atomic
+from common.policy import resolve_policy
 
 from . import chunks
 from .catalog import Catalog, LinkerModeMismatch
@@ -176,6 +177,19 @@ async def _curate_page(
     from .wire import PageReferencePlan
 
     candidates = footer_edges(edges, page_rel=page_rel, limit=None)
+    if str(getattr(settings, "policy", "standard")) == "fast":
+        # Keep valid existing choices, then add the remaining verified edges in
+        # footer order (footer_edges already filtered them). Fast mode never
+        # spends a curator call or invents an anchor.
+        inline_limit, footer_limit = render_limits(mode, big_document, settings)
+        current = _valid_choices(current, candidates, inline_limit=inline_limit, footer_limit=footer_limit)
+        current_ids = {choice["edge_id"] for choice in current}
+        additions = [
+            {"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary or edge.peer_summary}
+            for edge in candidates
+            if edge.edge_id not in current_ids
+        ]
+        return _valid_choices(current + additions, candidates, inline_limit=inline_limit, footer_limit=footer_limit), sorted(edge.edge_id for edge in candidates)
     if jev_engine is not None and str(getattr(settings, "wiki_linker_judge", "llm")) == "jev":
         from .jev_judge import curate
         try:
@@ -243,6 +257,12 @@ async def render_pages(
 ) -> set[str]:
     from .prompts import REFERENCE_PLAN_VERSION
 
+    reference_version = (
+        REFERENCE_PLAN_VERSION
+        if str(getattr(settings, "policy", "standard")) == "standard"
+        else f"{REFERENCE_PLAN_VERSION}:fast-v1"
+    )
+
     concurrency = _concurrency(settings)
     jev_engine = None
     if str(getattr(settings, "wiki_linker_judge", "llm")) == "jev":
@@ -273,7 +293,7 @@ async def render_pages(
             choices, candidate_ids = await _curate_page(
                 page_rel=page_rel, original=original, edges=curation_edges,
                 current=list(state.get("references", [])),
-                previous_candidates=list(state.get("candidate_ids", [])) if state.get("version") == REFERENCE_PLAN_VERSION else [],
+                previous_candidates=list(state.get("candidate_ids", [])) if state.get("version") == reference_version else [],
                 model=model, settings=settings, big_document=big, mode=mode, jev_engine=jev_engine,
             )
         completed += 1
@@ -285,7 +305,7 @@ async def render_pages(
     touched: set[str] = set()
     for job, (choices, candidate_ids) in zip(jobs, results):
         page_rel, doc, original_path, original, edges, _state, big = job
-        navigation_by_doc[doc].setdefault("pages", {})[original_path.name] = {"version": REFERENCE_PLAN_VERSION, "candidate_ids": candidate_ids, "references": choices}
+        navigation_by_doc[doc].setdefault("pages", {})[original_path.name] = {"version": reference_version, "candidate_ids": candidate_ids, "references": choices}
         rendered = render_page(original, page_rel=page_rel, edges=edges, mode=mode, big_document=big, choices=choices, settings=settings)
         if write_if_changed(Path(project.wiki) / page_rel, rendered):
             touched.add(doc)
@@ -372,6 +392,36 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
 
 async def _filter_target(catalog, model, target, candidates_, *, mode, version, artifact_dir,
                          stop_check, output_language, strict, judge, jev_engine, settings, use_jev=True):
+    if str(getattr(settings, "policy", "standard")) == "fast":
+        # Same-document entity matches are exact. Every other lead (cross-document
+        # name matches, 1-hop) needs a high-confidence Jev verdict without an LLM
+        # tie-break; with Jev unavailable it is omitted.
+        accepted = []
+        leads = []
+        for candidate in candidates_:
+            if candidate.source not in {"use", "define"}:
+                leads.append(candidate)
+                continue
+            if catalog.chunk(candidate.chunk_id) is None:
+                continue
+            via = candidate.via[0] if candidate.via else ""
+            accepted.append({
+                "chunk_a": target.chunk_id,
+                "chunk_b": candidate.chunk_id,
+                "label": candidate.label or "related",
+                "summary": candidate.summary or (f"「{via}」との関係" if via else ""),
+                "source": candidate.source,
+                "via": candidate.via,
+            })
+        if leads and jev_engine is not None and use_jev:
+            from .jev_judge import judge_edges
+            try:
+                accepted += await judge_edges(catalog, jev_engine, target, leads, settings, model=None)
+            except Exception as exc:
+                log.warning("fast Jev edge judge failed for %s: %s", target.chunk_id, exc)
+                return accepted, len(leads), 1
+            return accepted, len(leads), 0
+        return accepted, 0, 0
     if judge == "jev" and jev_engine is not None and use_jev:
         try:
             from .jev_judge import judge_edges
@@ -413,6 +463,7 @@ async def link_document(
     }
     team = _team(project)
     mode = str(getattr(settings, "wiki_linker_mode", "legacy"))
+    policy = resolve_policy(getattr(settings, "policy", "standard"))
     judge = str(getattr(settings, "wiki_linker_judge", "llm"))
     if judge not in {"llm", "jev"}:
         raise ValueError("wiki_linker_judge must be llm or jev")
@@ -431,7 +482,10 @@ async def link_document(
         previous_marker.get("status") == "complete"
         or previous_marker.get("resume") is True
     )
-    write_json_atomic(planning / "linker.json", {"schema_version": 2, "status": "pending", "mode": mode, "run_id": run_id})
+    pending_marker = {"schema_version": 2, "status": "pending", "mode": mode, "run_id": run_id}
+    if policy.name == "fast":
+        pending_marker.update({"policy": policy.name, "policy_version": policy.version})
+    write_json_atomic(planning / "linker.json", pending_marker)
     if on_progress:
         on_progress({"stage": "linker", "step": "pending", "document": rel})
     catalog: Catalog | None = None
@@ -440,6 +494,9 @@ async def link_document(
     jev_failed_chunks: set[str] = set()
     try:
         edge_version = EDGE_VERSION_JEV if judge == "jev" else EDGE_VERSION_NEO if mode == "neo" else EDGE_VERSION_LEGACY
+        meta_version = CHUNK_META_VERSION if policy.name == "standard" else f"{CHUNK_META_VERSION}:fast-v1"
+        if policy.name == "fast":
+            edge_version = f"{edge_version}:fast-v1"
         if judge == "jev":
             try:
                 from jev import get_engine_for
@@ -455,9 +512,9 @@ async def link_document(
             refresh_metadata = (
                 not incremental_scope
                 and model is not None
-                and read_json(chunk_cache_path, default={}).get("meta_version") != CHUNK_META_VERSION
+                and read_json(chunk_cache_path, default={}).get("meta_version") != meta_version
             )
-            previous_cache = chunks.cache_by_hash(chunk_cache_path)
+            previous_cache = chunks.cache_by_hash(chunk_cache_path, meta_version=meta_version)
             original_hashes = chunks.snapshot_originals(project.wiki_dir(rel))
             if on_progress:
                 on_progress({"stage": "linker-entities", "step": "start", "document": rel})
@@ -531,7 +588,7 @@ async def link_document(
             output_language = str(getattr(settings, "wiki_output_language", "Japanese (日本語)"))
             if to_describe and model is not None:
                 before_meta = {item.chunk_id: item.meta.model_dump_json() for item in all_chunks}
-                meta_calls, meta_fallbacks = await chunks.describe_all(to_describe, model=model, output_language=output_language, concurrency=_concurrency(settings), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check, parallel=judge == "jev")
+                meta_calls, meta_fallbacks = await chunks.describe_all(to_describe, model=model, output_language=output_language, concurrency=_concurrency(settings), cache=previous_cache, artifact_dir=run_dir, stop_check=stop_check, parallel=judge == "jev", batch=policy.name == "fast")
                 revised_ids = {item.chunk_id for item in all_chunks if item.meta.model_dump_json() != before_meta[item.chunk_id]}
                 if changed_page_rels is not None and not refresh_metadata:
                     to_describe = [
@@ -548,7 +605,7 @@ async def link_document(
                                          if item.entities and item.meta.role_judge != "jev-1")
                 revised_ids.update(item.chunk_id for item in all_chunks
                                    if previous_roles[item.chunk_id] != [entity.role for entity in item.entities])
-            chunk_data = chunks.to_json(document, team, all_chunks, id_seed=id_seed)
+            chunk_data = chunks.to_json(document, team, all_chunks, id_seed=id_seed, meta_version=meta_version)
             chunk_data["raw_rel"] = rel
             for page in chunk_data["pages"]:
                 page["original_sha256"] = original_hashes.get(page["filename"], "")
@@ -859,13 +916,18 @@ async def link_document(
                 },
             }
             catalog.write_links_json(project, all_docs)
-            complete = {"schema_version": 2, "status": "complete" if render else "render_pending", "mode": mode, "scope": "incremental" if incremental_scope else "full", "meta_version": CHUNK_META_VERSION, "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "jev_fallbacks": jev_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            complete = {"schema_version": 2, "status": "complete" if render else "render_pending", "mode": mode, "scope": "incremental" if incremental_scope else "full", "meta_version": meta_version, "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "jev_fallbacks": jev_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            if policy.name == "fast":
+                complete.update({"policy": policy.name, "policy_version": policy.version})
             write_json_atomic(planning / "linker.json", complete)
             if on_progress:
                 on_progress({"stage": "linker", "step": "done", "document": rel, "edges": len(edge_rows)})
             return LinkResult(sorted(touched_docs), inserted_edges, int(diff.get("edges_removed", 0)), meta_calls, edge_calls, meta_fallbacks, sorted(pages), jev_fallbacks)
     except Exception as exc:
-        write_json_atomic(planning / "linker.json", {"schema_version": 2, "status": "failed", "mode": mode, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"[:500]})
+        failed_marker = {"schema_version": 2, "status": "failed", "mode": mode, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"[:500]}
+        if policy.name == "fast":
+            failed_marker.update({"policy": policy.name, "policy_version": policy.version})
+        write_json_atomic(planning / "linker.json", failed_marker)
         if on_progress:
             on_progress({"stage": "linker", "step": "failed", "document": rel, "error": str(exc)[:200]})
         raise

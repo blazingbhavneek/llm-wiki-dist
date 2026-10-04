@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from graph.config import app_concurrency
@@ -12,6 +14,10 @@ SEED_PLAN_COMPILE_VERSION = "wiki-seed-compile-ja-12"
 REWRITE_PROMPT_VERSION = "wiki-sections-ja-4"
 
 class WikiConfig(BaseModel):
+    # Missing policy in old checkpoints means standard. Fast has a separate
+    # cache key so an existing standard run is never resumed as fast.
+    policy: Literal["standard", "fast"] = "standard"
+    policy_version: str = "standard-v1"
     # Overlapping source observation
     window_target_lines: int = 250
     window_overlap_lines: int = 50

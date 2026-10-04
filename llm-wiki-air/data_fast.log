@@ -1,0 +1,62 @@
+[<batch>] capture: 0.0s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser attempt=1 file=arxiv.....1.pdf timeout=7200s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser elapsed=208.00s characters=702553
+[arxiv.....df.md] parser: 208.0s
+[arxiv.....df.md] planner: 97.6s
+[arxiv.....df.md] wiki writer + judge: 542.8s
+[<batch>] capture: 0.0s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser attempt=1 file=digit......docx timeout=7200s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser elapsed=1.23s characters=16377
+[digit.....cx.md] parser: 1.2s
+[digit.....cx.md] planner: 0.0s
+[digit.....cx.md] wiki writer + judge: 169.1s
+[<batch>] capture: 0.0s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser attempt=1 file=equipment-inventory.csv timeout=7200s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser elapsed=0.00s characters=795
+[equip.....sv.md] parser: 0.0s
+[<batch>] capture: 0.0s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser attempt=1 file=poi-a.....s.xls timeout=7200s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser elapsed=7.16s characters=285608
+[poi-a.....ls.md] parser: 7.2s
+[<batch>] capture: 0.0s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser attempt=1 file=poi-f......pptx timeout=7200s
+INFO    parser_client                            : stage=parser endpoint=http://127.0.0.1:8000/agent/doc-parser elapsed=70.12s characters=4786922
+[poi-f.....tx.md] parser: 70.1s
+[poi-f.....tx.md] planner: 100.0s
+[poi-f.....tx.md] wiki writer + judge: 83.7s
+INFO    cli                                      : first pass complete; final retry documents=0 discovery=0
+[arxiv.....df.md] linker entities: 312.5s
+[arxiv.....df.md] linker main: 4.6s
+[digit.....cx.md] linker entities: 114.0s
+[digit.....cx.md] linker main: 1.8s
+[equip.....sv.md] linker entities: 60.3s
+[equip.....sv.md] linker main: 0.0s
+[poi-a.....ls.md] linker entities: 161.6s
+[poi-a.....ls.md] linker main: 0.4s
+[poi-f.....tx.md] linker entities: 96.0s
+[poi-f.....tx.md] linker main: 0.9s
+ERROR   pipeline                                 : run=pub-e9e77b6028624200 stage=publish error=ConnectError: All connection attempts failed
+Traceback (most recent call last): File "/mnt/.....lt.py", line 101, in map_httpcore_exceptions yield File "/mnt/.....lt.py", line 394, in handle_async_request resp = await self._pool.handle_async_request(req) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....ol.py", line 256, in handle_async_request raise exc from None File "/mnt/.....ol.py", line 236, in handle_async_request response = await connection.handle_async_request( ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ pool_request.request ^^^^^^^^^^^^^^^^^^^^ ) ^ File "/mnt/.....on.py", line 101, in handle_async_request raise exc File "/mnt/.....on.py", line 78, in handle_async_request stream = await self._connect(request) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....on.py", line 124, in _connect stream = await self._network_backend.connect_tcp(**kwargs) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....to.py", line 31, in connect_tcp return await self._backend.connect_tcp( ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ...<5 lines>... ) ^ File "/mnt/.....io.py", line 113, in connect_tcp with map_exceptions(exc_map): ~~~~~~~~~~~~~~^^^^^^^^^ File "/home.....ib.py", line 162, in __exit__ self.gen.throw(value) ~~~~~~~~~~~~~~^^^^^^^ File "/mnt/.....ns.py", line 14, in map_exceptions raise to_exc(exc) from exc
+httpcore.ConnectError: All connection attempts failed The above exception was the direct cause of the following exception: Traceback (most recent call last): File "/mnt/.....ne.py", line 621, in _publish_sweep pages = publisher.publish_documents( project, [raw_rel for _, _, raw_rel in documents], **publish_args ) File "/mnt/.....nt.py", line 947, in publish_documents results = asyncio.run(publish_pages( self.client, ...<14 lines>... on_reconcile=reconcile_prepared, )) File "/home.....rs.py", line 196, in run return runner.run(main) ~~~~~~~~~~^^^^^^ File "/home.....rs.py", line 119, in run return self._loop.run_until_complete(task) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^ File "/home.....ts.py", line 725, in run_until_complete return future.result() ~~~~~~~~~~~~~^^ File "/mnt/.....nt.py", line 703, in publish_pages existing = await client.get_page(**({"page_id": str(expected["page_id"])} if expected else {"path": path})) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....nt.py", line 184, in get_page response = await self._request("GET", "/page", params=params) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....nt.py", line 116, in _request response = await client.request( ^^^^^^^^^^^^^^^^^^^^^ ...<6 lines>... ) ^ File "/mnt/.....nt.py", line 1540, in request return await self.send(request, auth=auth, follow_redirects=follow_redirects) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....nt.py", line 1629, in send response = await self._send_handling_auth( ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ...<4 lines>... ) ^ File "/mnt/.....nt.py", line 1657, in _send_handling_auth response = await self._send_handling_redirects( ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ...<3 lines>... ) ^ File "/mnt/.....nt.py", line 1694, in _send_handling_redirects response = await self._send_single_request(request) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....nt.py", line 1730, in _send_single_request response = await transport.handle_async_request(request) ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ File "/mnt/.....lt.py", line 393, in handle_async_request with map_httpcore_exceptions(): ~~~~~~~~~~~~~~~~~~~~~~~^^ File "/home.....ib.py", line 162, in __exit__ self.gen.throw(value) ~~~~~~~~~~~~~~^^^^^^^ File "/mnt/.....lt.py", line 118, in map_httpcore_exceptions raise mapped_exc(message) from exc
+httpx.ConnectError: All connection attempts failed
+[<batch>] index: 0.1s
+ERROR   root                                     : publish: ConnectError: All connection attempts failed
+ERROR   root                                     : arxiv-1412.6980-adam-v1.pdf: ConnectError: All connection attempts failed
+ERROR   root                                     : digital-agency-data-outline-08.docx: ConnectError: All connection attempts failed
+ERROR   root                                     : equipment-inventory.csv: ConnectError: All connection attempts failed
+ERROR   root                                     : poi-aida-tour-maldives-prices.xls: ConnectError: All connection attempts failed
+ERROR   root                                     : poi-fair-work-commission-awards.pptx: ConnectError: All connection attempts failed
+ERROR   root                                     : folder : ConnectError: All connection attempts failed
+ERROR   root                                     : stale indexes: ConnectError: All connection attempts failed
+Documents: 5/5 processed
+{"path": "arxiv-1412.6980-adam-v1.pdf", "status": "added", "touched": [], "rebuild": "full", "tier": 3, "reason": "no-previous-state", "human_edits_overwritten": []}
+{"path": "digital-agency-data-outline-08.docx", "status": "added", "touched": [], "rebuild": "full", "tier": 3, "reason": "no-previous-state", "human_edits_overwritten": []}
+{"path": "equipment-inventory.csv", "status": "added", "touched": [], "rebuild": "full", "tier": 3, "reason": "format-full-only", "human_edits_overwritten": []}
+{"path": "poi-aida-tour-maldives-prices.xls", "status": "added", "touched": [], "rebuild": "full", "tier": 3, "reason": "format-full-only", "human_edits_overwritten": []}
+{"path": "poi-fair-work-commission-awards.pptx", "status": "added", "touched": [], "rebuild": "full", "tier": 3, "reason": "no-previous-state", "human_edits_overwritten": []}
+{"path": "arxiv-1412.6980-adam-v1_pdf.md", "status": "linked", "touched": ["arxiv-1412.6980-adam-v1_pdf.md"]}
+{"path": "digital-agency-data-outline-08_docx.md", "status": "linked", "touched": ["digital-agency-data-outline-08_docx.md"]}
+{"path": "equipment-inventory_csv.md", "status": "linked", "touched": []}
+{"path": "poi-aida-tour-maldives-prices_xls.md", "status": "linked", "touched": []}
+{"path": "poi-fair-work-commission-awards_pptx.md", "status": "linked", "touched": []}
+{"folder": "", "status": "written"}

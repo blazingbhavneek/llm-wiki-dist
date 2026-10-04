@@ -45,6 +45,33 @@ IMAGE_MARKER_RE = re.compile(r"<media payload omitted:[^>]*>|\[IMAGE [^\]]*\]")
 MD_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~])")
 # "GPUs"/"VEs" in English prose become "GPU"/"VE" in the rewrite; compare stems.
 PLURAL_ACRONYM_RE = re.compile(r"\b([A-Z0-9]{2,})s\b")
+# "1.", "1.2 ", "（1）", "第3章": a section number ends in punctuation or a space,
+# so "2024-04", "1.5倍" and "1:1" are left alone.
+HEADING_NUMBER_RE = re.compile(
+    r"^\s*(?:第\s*[0-9０-９一二三四五六七八九十百]+\s*[章節条項部編]"
+    r"|[(（]?[0-9０-９]{1,3}(?:[.．][0-9０-９]{1,3})*(?:[.．)）、](?![0-9０-９])|(?=\s)))\s*"
+)
+ATX_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def strip_heading_number(text: str) -> str:
+    """Remove a formatting prefix from a title without touching body text."""
+
+    return HEADING_NUMBER_RE.sub("", text, count=1).strip()
+
+
+def strip_heading_numbers(markdown: str) -> str:
+    """strip_heading_number on every ATX heading outside code fences."""
+
+    out: list[str] = []
+    fenced = False
+    for line in markdown.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and (match := ATX_HEADING_RE.match(line)):
+            line = f"{match.group(1)} {strip_heading_number(match.group(2)) or match.group(2)}"
+        out.append(line)
+    return "\n".join(out)
 
 
 def _nonblank(lines: Sequence[str], start: int, end: int) -> int:

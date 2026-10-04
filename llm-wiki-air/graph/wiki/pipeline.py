@@ -246,6 +246,24 @@ def _plan_pages(plan: CompiledSeedPlan) -> list[SeedPage]:
     return pages
 
 
+def _deterministic_seed_plan(lines: Sequence[str]) -> CompiledSeedPlan:
+    """Create a safe single-page plan when fast mode has no model client."""
+
+    first = next((line.strip() for line in lines if line.strip()), "Document")
+    title = re.sub(r"^#{1,6}\s+", "", first).strip() or "Document"
+    return CompiledSeedPlan(
+        summary="fast deterministic plan",
+        pages=[
+            {
+                "title": title,
+                "summary": title,
+                "source_start": 1,
+                "source_end": len(lines),
+            }
+        ],
+    )
+
+
 def _slice_ranges(lines: Sequence[str], ranges: Sequence[tuple[int, int]]) -> str:
     return "\n\n".join(slice_text(list(lines), start, end) for start, end in ranges)
 
@@ -964,6 +982,13 @@ async def _write_section(
     source_text = _prompt_safe(slice_text(list(lines), start, end), section_units)
     facts_text = _facts_text(facts)
     stem = f"section-{index:02d}"
+    if getattr(config, "policy", "standard") == "fast" and model is None:
+        return _SectionResult(
+            markdown=_verbatim_section(lines, start, end, section_units),
+            attempts=0,
+            errors=["model unavailable"],
+            verbatim=True,
+        )
     candidates: list[_SectionCandidate] = []
     feedback: list[str] = []
 
@@ -1086,7 +1111,17 @@ async def _write_section(
             retry_temperature=getattr(config, "retry_temperature", 0.7),
         )
         if judgment is None:
-            candidates.append(_SectionCandidate(draft, attempt, errors=[]))
+            # A failed judge is not approval in fast mode. The safe fallback
+            # is the source section after the bounded repair budget.
+            candidates.append(
+                _SectionCandidate(
+                    draft,
+                    attempt,
+                    errors=[judge_error or "judge unavailable"]
+                    if getattr(config, "policy", "standard") == "fast"
+                    else [],
+                )
+            )
             _emit(on_progress, "write", "judge_unavailable",
                   page=page.title, section=index, attempt=attempt, error=judge_error)
             break
@@ -1113,6 +1148,21 @@ async def _write_section(
                 item.attempt,
             ),
         )
+        if getattr(config, "policy", "standard") == "fast" and best.missing:
+            _emit(
+                on_progress,
+                "write",
+                "section_verbatim",
+                page=page.title,
+                section=index,
+                error="judge reported missing information",
+            )
+            return _SectionResult(
+                markdown=_verbatim_section(lines, start, end, section_units),
+                attempts=len(candidates),
+                errors=best.missing,
+                verbatim=True,
+            )
         return _SectionResult(
             markdown=best.markdown,
             attempts=len(candidates),
@@ -1141,6 +1191,9 @@ async def _write_intro(
     context: str = "",
 ) -> str:
     """One lead paragraph. Anything it cannot justify from the body is dropped."""
+
+    if getattr(config, "policy", "standard") == "fast":
+        return ""  # the first section is the opening; a seed summary is a raw source lead
 
     if stop_check and stop_check():
         raise asyncio.CancelledError("page writing cancelled")
@@ -1204,11 +1257,20 @@ async def _rewrite_page(
     task_dir = work_root / f"page-{page.number:03d}"
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    evidence, _research = await _research_references(
-        page, pages=pages, tokens=tokens, model=model,
-        config=config, work_root=work_root, seed_root=seed_root,
-        stop_check=stop_check, on_progress=on_progress,
-    )
+    if getattr(config, "policy", "standard") == "fast":
+        evidence, _research = [], ""
+    else:
+        evidence, _research = await _research_references(
+            page,
+            pages=pages,
+            tokens=tokens,
+            model=model,
+            config=config,
+            work_root=work_root,
+            seed_root=seed_root,
+            stop_check=stop_check,
+            on_progress=on_progress,
+        )
     facts = [fact for item in evidence for fact in item.facts]
     _emit(on_progress, "writer", "page_start", page=page.title, current=0, total=len(pages))
     # ponytail: sections stay in source order; add reordering only if a smoke run needs it.
@@ -1230,7 +1292,12 @@ async def _rewrite_page(
             stop_check=stop_check, on_progress=on_progress,
             context=context_block(page, pages, parents or {}),
         )
-        drafts.append(result.markdown.rstrip())
+        if getattr(config, "policy", "standard") == "fast":
+            from .page import strip_heading_numbers
+
+            drafts.append(strip_heading_numbers(result.markdown).rstrip())
+        else:
+            drafts.append(result.markdown.rstrip())
         attempts += result.attempts
         if result.score is not None:
             scores.append(result.score)
@@ -1243,7 +1310,7 @@ async def _rewrite_page(
         page, body, model=model, config=config, task_dir=task_dir,
         stop_check=stop_check, context=context_block(page, pages, parents or {}),
     )
-    markdown = f"# {page.title}\n\n{intro.rstrip()}\n\n{body}\n"
+    markdown = f"# {page.title}\n\n{intro.rstrip()}\n\n{body}\n" if intro.strip() or getattr(config, "policy", "standard") != "fast" else f"# {page.title}\n\n{body}\n"
     markdown = link_titles(
         markdown,
         [(item.title, item.filename) for item in pages if item.number != page.number],
@@ -1297,13 +1364,18 @@ async def _rewrite_all(
 
     results: list[RewriteResult] = []
     pending: list[SeedPage] = []
+    rewrite_version = (
+        REWRITE_PROMPT_VERSION
+        if getattr(config, "policy", "standard") == "standard"
+        else f"{REWRITE_PROMPT_VERSION}:{getattr(config, 'policy_version', 'fast-v1')}"
+    )
     for page in pages:
         output_path = wiki_root / page.filename
         state_path = _page_state_path(state_root, page)
         resumed = (
             _resume_rewritten_page(
                 output_path, state_path, page,
-                rewrite_version=REWRITE_PROMPT_VERSION,
+                rewrite_version=rewrite_version,
                 source_line_count=source_line_count,
             )
             if config.resume
@@ -1340,7 +1412,7 @@ async def _rewrite_all(
         write_text_atomic(wiki_root / result.page.filename, result.markdown)
         _write_page_state(
             _page_state_path(state_root, result.page), result,
-            rewrite_version=REWRITE_PROMPT_VERSION, pages=pages,
+            rewrite_version=rewrite_version, pages=pages,
             source_path=source_path, source_snapshot_path=source_snapshot_path,
             source_sha256=source_sha256,
         )
@@ -1443,7 +1515,11 @@ async def run_pipeline(
     normalized = normalize_source(source_text)
     lines = split_source_lines(normalized)
     config = config or WikiConfig()
-    model = model or ChatModelPort(config)
+    # The standalone fast facade may intentionally run without a model client
+    # (for offline conversion and deterministic smoke runs). Production and
+    # standard callers retain the historical implicit client construction.
+    if model is None and not (config.policy == "fast" and not config.chat_base_url):
+        model = ChatModelPort(config)
     slug = slugify(config.document_slug or source_path.stem, fallback="document").casefold()
     _emit(on_progress, "planner", "start", source_lines=len(lines))
     run_root = (
@@ -1467,7 +1543,11 @@ async def run_pipeline(
         plan_path,
         source_sha256=source_hash,
         source_line_count=len(lines),
-        prompt_version=SEED_PLAN_VERSION,
+        prompt_version=(
+            SEED_PLAN_VERSION
+            if config.policy == "standard"
+            else f"{SEED_PLAN_VERSION}:{config.policy_version}"
+        ),
     ) if config.resume else None
     if pages is not None:
         block_index = build_block_index(lines)
@@ -1509,28 +1589,37 @@ async def run_pipeline(
             if seed_plan is None:
                 _emit(on_progress, "seed", "structural_rejected", reason=error)
         if seed_plan is None:
-            observations = await observe_document(
-                source_text,
-                model=model,
-                config=config,
-                document=document_id(normalized),
-                checkpoint_dir=work_root / "observations" / "checkpoints",
-                live_output_dir=work_root / "observations" / "live",
-                on_progress=on_progress,
-                stop_check=stop_check,
-            )
-            seed_plan = await build_seed_plan(
-                observations,
-                lines=lines,
-                model=model,
-                config=config,
-                checkpoint_dir=work_root / "planning",
-                stop_check=stop_check,
-                on_progress=on_progress,
-            )
+            if config.policy == "fast" and model is None:
+                seed_plan = _deterministic_seed_plan(lines)
+            else:
+                observations = await observe_document(
+                    source_text,
+                    model=model,
+                    config=config,
+                    document=document_id(normalized),
+                    checkpoint_dir=work_root / "observations" / "checkpoints",
+                    live_output_dir=work_root / "observations" / "live",
+                    on_progress=on_progress,
+                    stop_check=stop_check,
+                )
+                seed_plan = await build_seed_plan(
+                    observations,
+                    lines=lines,
+                    model=model,
+                    config=config,
+                    checkpoint_dir=work_root / "planning",
+                    stop_check=stop_check,
+                    on_progress=on_progress,
+                )
         _emit(on_progress, "seed", "structural" if structural is not None and seed_plan is not None else "llm", pages=len(seed_plan.pages))
         pages = _plan_pages(seed_plan)
         _verify_ranges(pages, len(lines))
+
+    if config.policy == "fast":
+        from .page import strip_heading_number
+
+        for page in pages:
+            page.title = strip_heading_number(page.title) or page.title
 
     from ..formats.context import summarize_hierarchy
 
@@ -1571,7 +1660,11 @@ async def run_pipeline(
         "source_snapshot": str(source_snapshot_path),
         "source_sha256": sha256_text(source_text),
         "source_line_count": len(lines),
-        "prompt_version": SEED_PLAN_VERSION,
+        "prompt_version": (
+            SEED_PLAN_VERSION
+            if config.policy == "standard"
+            else f"{SEED_PLAN_VERSION}:{config.policy_version}"
+        ),
         "pages": [
             {
                 "number": page.number,

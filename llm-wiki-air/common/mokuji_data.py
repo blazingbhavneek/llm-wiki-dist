@@ -36,7 +36,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from graph.common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
+from common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
 
 FENCE_INFO = "llm-wiki-data"
 VERSION = 1
