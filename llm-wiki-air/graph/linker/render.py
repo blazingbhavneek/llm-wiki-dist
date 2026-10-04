@@ -126,7 +126,22 @@ def render_page(
     big_document: bool = False, choices: list[dict[str, Any]] | None = None,
     settings: Any = None,
 ) -> str:
-    body = strip_reader_references(original).rstrip("\n") + "\n"
+    from publisher.human_changes import substitute_markers
+
+    protected: dict[str, str] = {}
+    def protect(match: re.Match) -> str:
+        token = f"\ue000{len(protected)}\ue001"
+        protected[token] = match.group(0)
+        return token + "\n"
+
+    body = strip_reader_references(substitute_markers(original, protect)).rstrip("\n") + "\n"
+
+    def restore(text: str) -> str:
+        for token, region in protected.items():
+            if text.count(token) != 1:
+                raise ValueError("linker changed a protected human region")
+            text = text.replace(token + "\n", region)
+        return text
     entity_paths: set[str] = set()
     if mode == "neo":
         seen_entities: set[str] = set()
@@ -189,7 +204,7 @@ def render_page(
         unique_footer.append((edge, summary))
     footer = unique_footer[:footer_max]
     if not footer:
-        return body
+        return restore(body)
     lines = [FOOTER_START, FOOTER_TITLE, ""]
     for edge, summary in footer:
         heading = edge.peer_heading if edge.peer_heading and edge.peer_heading != edge.peer_title else ""
@@ -197,7 +212,7 @@ def render_page(
         suffix = f" — {summary}" if summary else ""
         lines.append(f"- [{peer}]({relative_link(page_rel, edge.peer_page_rel)}){suffix}")
     lines.append(FOOTER_END)
-    return body + "\n" + "\n".join(lines) + "\n"
+    return restore(body + "\n" + "\n".join(lines) + "\n")
 
 
 _FOOTER_LINE_RE = re.compile(r"^- \[(?P<title>.*?)\]\((?P<path>[^)]+)\) — (?P<reverse>← )?(?P<label>[a-z][a-z0-9_-]*): (?P<summary>.*)$")

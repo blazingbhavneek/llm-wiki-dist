@@ -118,6 +118,8 @@ class IndexPages(unittest.TestCase):
     def test_index_kind(self):
         self.assertEqual(md.index_kind(self.BODY), "document")
         self.assertEqual(md.index_kind('<span hidden data-llm-wiki-index="1"></span>'), "1")
+        self.assertEqual(md.index_kind("# ordinary page\n\n<!-- llm-wiki-index:1 -->\n"), "1")
+        self.assertTrue(md.is_index_page("# ordinary page\n\n<!-- llm-wiki-index:folder -->\n"))
         self.assertEqual(md.index_kind("# ordinary page"), "")
 
     def test_parse_index_reads_folder_fields(self):

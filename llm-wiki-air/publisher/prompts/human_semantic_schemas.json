@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "scorer_result": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["schema_version", "scorer_version", "scores"],
+    "properties": {
+      "schema_version": {"const": 1},
+      "scorer_version": {"type": "string"},
+      "scores": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "candidate_id", "score"],
+          "properties": {
+            "schema_version": {"const": 1},
+            "candidate_id": {"type": "string"},
+            "score": {"type": "number", "minimum": 0, "maximum": 1}
+          }
+        }
+      }
+    }
+  },
+  "writer_response": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["schema_version", "merged_text", "dispositions"],
+    "properties": {
+      "schema_version": {"const": 1},
+      "merged_text": {"type": "string"},
+      "dispositions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "span_id", "disposition"],
+          "properties": {
+            "schema_version": {"const": 1},
+            "span_id": {"type": "string"},
+            "disposition": {"enum": ["preserved", "source-equivalent", "tombstoned"]}
+          }
+        }
+      }
+    }
+  },
+  "judge_result": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["schema_version", "passed", "reason_codes"],
+    "properties": {
+      "schema_version": {"const": 1},
+      "passed": {"type": "boolean"},
+      "reason_codes": {"type": "array", "items": {"type": "string"}}
+    }
+  }
+}

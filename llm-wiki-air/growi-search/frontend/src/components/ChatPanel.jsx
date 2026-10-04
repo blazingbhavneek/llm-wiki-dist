@@ -368,9 +368,11 @@ function AssistantMessage({
           </div>
 
           <div className="px-4 py-4">
+            {/* 調査マップは横の最終参照と重複するため一旦非表示（ResearchMap はそのまま保持）
             {m.map?.nodes?.length > 0 && (
               <ResearchMap map={m.map} visitedIds={m.visitedIds} onOpenNode={onOpenNode} />
             )}
+            */}
 
             {streaming && (
               <div className="rounded-xl border border-blue-100 bg-blue-50/40 px-4 py-3">

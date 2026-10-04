@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import shutil
 import threading
@@ -16,6 +17,8 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from graph.common.images import find_images
+
+log = logging.getLogger(__name__)
 
 # region Config and Models
 
@@ -504,7 +507,7 @@ def add_or_update_file_record(
                     last[1] = max(last[1], end)
                 else:
                     merged.append([start, end])
-                    print(
+                    log.debug(
                         f"[WARNING] Discontinuous source ranges in {filename}: {record['source_ranges']}"
                     )
 
@@ -1565,7 +1568,7 @@ def try_auto_repair_concept_partition_boundaries(
         if repaired_boundary == bad_boundary:
             return None, error
 
-        print(
+        log.debug(
             f"[Planning] {label}: auto-repairing unsafe boundary "
             f"before line {bad_boundary} -> before line {repaired_boundary}"
         )
@@ -1839,7 +1842,7 @@ async def split_window_until_valid(
         if stop_check and stop_check():
             raise JobCancelled("chunk planning cancelled")
 
-        print(
+        log.debug(
             f"[Planning] {label}: split attempt {attempt}, "
             f"source lines {source_start}-{source_end}"
         )
@@ -1883,7 +1886,7 @@ async def split_window_until_valid(
             )
 
             if repaired is not None:
-                print(
+                log.debug(
                     f"[Planning] {label}: accepted after automatic boundary repair."
                 )
                 return repaired
@@ -1898,7 +1901,7 @@ async def split_window_until_valid(
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
 
-        print(
+        log.debug(
             f"[Planning] {label}: invalid split on attempt {attempt}; retrying. "
             f"Reason: {last_error}"
         )
@@ -1910,7 +1913,7 @@ async def split_window_until_valid(
 
     if CHUNK_FALLBACK_MECHANICAL:
         fallback_title = f"{label} 自動分割"
-        print(
+        log.debug(
             f"[Planning] {label}: using mechanical fallback after "
             f"{PARTITION_RETRY_ATTEMPTS} attempts. Last error: {last_error}"
         )
@@ -2019,7 +2022,7 @@ async def plan_concept_files_streaming(
             committed.extend(split[:-1])
             pending = split[-1]
 
-            print(
+            log.debug(
                 "[Planning] Carrying pending concept forward: "
                 f"{pending.title} [{pending.source_start}-{pending.source_end}]"
             )
@@ -2418,7 +2421,7 @@ async def enrich_concept_plan(
     if not files:
         return EnrichmentResult(inferred_file_name="document.md", files=[])
 
-    print(f"[Enrichment] Inferring global name...")
+    log.debug("[Enrichment] Inferring global name...")
     try:
         global_name_raw = await structured_ainvoke(
             llm,
@@ -2428,7 +2431,7 @@ async def enrich_concept_plan(
         )
         global_name = GlobalName.model_validate(global_name_raw).inferred_file_name
     except Exception as e:
-        print(f"[Enrichment] Failed to infer global name: {e}. Using fallback.")
+        log.debug(f"[Enrichment] Failed to infer global name: {e}. Using fallback.")
         global_name = "ドキュメント.md"
 
     if not global_name.endswith(".md"):
@@ -2438,7 +2441,7 @@ async def enrich_concept_plan(
     inferred_headers = []
 
     # First chunk
-    print(f"[Enrichment] Inferring header for chunk 1/{len(files)}...")
+    log.debug(f"[Enrichment] Inferring header for chunk 1/{len(files)}...")
     if stop_check and stop_check():
         raise JobCancelled("chunk enrichment cancelled")
     try:
@@ -2450,7 +2453,7 @@ async def enrich_concept_plan(
         )
         first_header = ChunkHeader.model_validate(first_raw).header
     except Exception as e:
-        print(f"[Enrichment] Failed to infer header for chunk 1: {e}. Using fallback.")
+        log.debug(f"[Enrichment] Failed to infer header for chunk 1: {e}. Using fallback.")
         first_header = "一般"
     inferred_headers.append(first_header)
 
@@ -2458,7 +2461,7 @@ async def enrich_concept_plan(
     for i in range(1, len(files)):
         if stop_check and stop_check():
             raise JobCancelled("chunk enrichment cancelled")
-        print(f"[Enrichment] Inferring header for chunk {i+1}/{len(files)}...")
+        log.debug(f"[Enrichment] Inferring header for chunk {i+1}/{len(files)}...")
         prompt = build_subsequent_chunk_prompt(
             original_filename=original_filename,
             current=files[i],
@@ -2469,7 +2472,7 @@ async def enrich_concept_plan(
             raw = await structured_ainvoke(llm, ChunkHeader, prompt, max_output_tokens=100)
             header = ChunkHeader.model_validate(raw).header
         except Exception as e:
-            print(
+            log.debug(
                 f"[Enrichment] Failed to infer header for chunk {i+1}: {e}. "
                 "Using fallback."
             )

@@ -535,6 +535,26 @@ def write_wiki_pages(
             )
 
     wiki_document = Path(project.wiki_dir(rel)).relative_to(project.wiki)
+    # Old reverse-sync versions contaminated generator state. Save complete
+    # legacy pages before discarding that state, then rebuild a pure ancestor.
+    legacy_pages = _human_edited(state_root)
+    if legacy_pages:
+        from publisher.human_changes import HumanStore
+
+        store = HumanStore(project)
+        for name in legacy_pages:
+            page = project.wiki_dir(rel) / name
+            if not page.exists():
+                page = state_root / "wiki" / name
+            store.pin_legacy(rel, (wiki_document / name).as_posix(), page.read_text(encoding="utf-8"))
+        decision = UpdateDecision(tier=3, reason="legacy-human-state")
+        workbook = None
+    else:
+        from publisher.human_changes import HumanStore
+
+        if HumanStore(project).document(rel).get("requires_pure_rebuild"):
+            decision = UpdateDecision(tier=3, reason="legacy-missing-ancestor")
+            workbook = None
 
     def decision_event() -> dict[str, Any]:
         pages = set(decision.patch) | decision.regenerate | set(decision.retitle)
@@ -633,6 +653,15 @@ def write_wiki_pages(
         if out_dir is not None:
             publish_output(out_dir, target)
         write_source_stamp(target, project.raw_file(rel), rel, identity_seed=identity_seed)
+        from publisher.human_changes import HumanStore, apply_generated
+
+        if out_dir is not None:
+            overlay = apply_generated(project, rel)
+        else:
+            store = HumanStore(project)
+            store.ensure_generated(rel)
+            overlay = store.render(rel)
+        changed_output_pages.update(Path(path).name for path in overlay.changed_pages)
         marker = target / "_planning" / "linker.json"
         status = "pending" if getattr(settings, "wiki_linker_enabled", True) else "disabled"
         previous_linker = read_json(marker, default={})
@@ -650,8 +679,9 @@ def write_wiki_pages(
             marker_data["resume"] = True
         write_json_atomic(marker, marker_data)
         document = target.relative_to(project.wiki)
-        if human and on_progress:
-            on_progress({"stage": "wiki", "step": "human_edits_overwritten", "file": rel, "pages": sorted(set(human))})
+        if (overlay.conflicts or overlay.orphaned) and on_progress:
+            on_progress({"stage": "wiki", "step": "human_overlay", "file": rel,
+                         "conflicts": overlay.conflicts, "orphaned": overlay.orphaned})
         return WriteResult(
             target=target,
             touched=[],
@@ -660,7 +690,7 @@ def write_wiki_pages(
             tier=decision.tier,
             reason=decision.reason,
             regenerated_pages=sorted((document / name).as_posix() for name in decision.regenerate) if rebuild == "incremental" else [],
-            human_edits_overwritten=sorted((document / name).as_posix() for name in set(human)),
+            human_edits_overwritten=[],
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)

@@ -44,7 +44,9 @@ SUMMARY = "検索用データ"
 
 _BLOCK_RE = re.compile(r"^```" + re.escape(FENCE_INFO) + r"[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
 _LINK_RE = re.compile(r"(?<!!)\[([^\]\n]*)\]\([^)\n]*\)")
-_CHUNK_MARKER_RE = re.compile(r"^<!-- chunk(?:-end)?: [^\n]*-->$")  # the publisher's page frame
+_PUBLISHER_MARKER_RE = re.compile(
+    r"^<!-- (?:chunk(?:-end)?: [^\n]*|llm-wiki-bot-ref:[A-Za-z0-9_-]+|llm-wiki-index:[A-Za-z0-9_-]+) *-->$"
+)  # the publisher's ownership stamp (current and previous form)
 
 
 def _line(record: dict[str, Any]) -> str:
@@ -137,7 +139,7 @@ def search_sections(body: str) -> list[tuple[int, str, str]]:
     end = text.find(LINKS_FOOTER_END, start + 1) if start >= 0 else -1
     if start >= 0 and end >= 0:
         text = text[:start] + text[end + len(LINKS_FOOTER_END):]
-    lines = [line for line in text.splitlines() if not _CHUNK_MARKER_RE.match(line.strip())]
+    lines = [line for line in text.splitlines() if not _PUBLISHER_MARKER_RE.match(line.strip())]
     inside = False
     starts: list[int] = []
     for i, line in enumerate(lines):

@@ -218,15 +218,16 @@ def _owner_pages(hunk: Hunk, pages: Sequence[tuple[int, int]]) -> list[int]:
 def _structural_shape(lines: Sequence[str], *, kind: str, planner: SimpleNamespace) -> list[dict[str, Any]] | None:
     """Pages the deterministic heading planner would build, or None."""
 
-    if kind not in {"docx", "pdf"}:
+    if kind not in {"docx", "pdf", "md"}:
         return None
-    from graph.formats import docx, pdf
+    from graph.formats import docx, md, pdf
 
     from .document_map import validate_seed_plan
     from .markdown_blocks import build_block_index
     from .pipeline import _plan_pages
 
-    plan = docx.plan(lines, config=planner) if kind == "docx" else pdf.plan(lines, config=planner)
+    planners = {"docx": docx.plan, "pdf": pdf.plan, "md": md.plan}
+    plan = planners[kind](lines, config=planner)
     if plan is None:
         return None
     seed, _error = validate_seed_plan(

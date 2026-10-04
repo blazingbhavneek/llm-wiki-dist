@@ -459,6 +459,8 @@ async def link_document(
             )
             previous_cache = chunks.cache_by_hash(chunk_cache_path)
             original_hashes = chunks.snapshot_originals(project.wiki_dir(rel))
+            if on_progress:
+                on_progress({"stage": "linker-entities", "step": "start", "document": rel})
             all_chunks: list[chunks.Chunk] = []
             for page in sorted((planning / "pages").glob("*.md")):
                 all_chunks.extend(chunks.make_chunks(document, team, page.name, page.read_text(encoding="utf-8"), id_seed=id_seed))
@@ -516,6 +518,7 @@ async def link_document(
             else:
                 to_describe = [item for item in all_chunks if refresh_metadata or not previously_complete or item.chunk_id in stale_ids]
             reported_chunks = len(stale_ids) if incremental_scope else len(to_describe)
+            metadata_total = max(len(to_describe), reported_chunks)
             if on_progress:
                 on_progress({
                     "stage": "linker", "step": "chunks", "document": rel,
@@ -573,6 +576,12 @@ async def link_document(
                 catalog.embed_pending(embedder, team=team)
             elif stale_ids:
                 catalog.embed_pending(embedder, team=team, chunk_ids=stale_ids)
+            if on_progress:
+                on_progress({
+                    "stage": "linker-entities", "step": "done", "document": rel,
+                    "current": metadata_total, "total": metadata_total,
+                    "chunks": len(all_chunks), "meta_calls": meta_calls,
+                })
             changed_ids = stale_ids | revised_ids
             affected_ids = changed_ids | set(diff["removed"])
             relevant_edges = [
@@ -602,6 +611,8 @@ async def link_document(
                         if any(str(choice.get("edge_id")) == edge_id for choice in state.get("references", [])):
                             visible_edge_pages.setdefault(edge_id, set()).add(page_rel)
 
+            if on_progress:
+                on_progress({"stage": "linker-edges", "step": "start", "document": rel})
             edge_rows: list[dict[str, Any]] = []
             incremental_candidate_edges: dict[tuple[str, str], dict[str, Any]] = {}
             candidates_for: list[tuple[Any, list[Candidate]]] = []
@@ -727,6 +738,11 @@ async def link_document(
                 if pending:
                     unresolved.append((item, pending))
             edge_calls = 0
+            if on_progress:
+                on_progress({
+                    "stage": "linker-edges", "step": "targets", "document": rel,
+                    "current": 0, "total": len(unresolved),
+                })
             concurrency = _concurrency(settings)
             semaphore = asyncio.Semaphore(concurrency)
             completed = 0
@@ -825,6 +841,12 @@ async def link_document(
             if render:
                 rendered_docs = await render_pages(project, catalog, pages, model=model, settings=settings, mode=mode, on_progress=on_progress)
                 touched_docs.update(_raw_rel(catalog, doc) for doc in rendered_docs if doc != document)
+            if on_progress:
+                on_progress({
+                    "stage": "linker-edges", "step": "done", "document": rel,
+                    "current": len(unresolved), "total": len(unresolved),
+                    "pages": len(pages), "edge_calls": edge_calls,
+                })
             all_docs = {
                 document,
                 *{page.rsplit("/", 1)[0] for page in pages},

@@ -72,7 +72,7 @@ class IndexTreeTest(unittest.TestCase):
     def test_root_lists_team_names_only(self):
         self.build()
         root = self.read_index()
-        self.assertIn('data-llm-wiki-index="root"', root)
+        self.assertIn("<!-- llm-wiki-index:root -->", root)
         self.assertIn("[teamA](/teamA/00-目次)", root)
         self.assertIn("[docRoot](/docRoot/00-目次)", root)
         for team in ("teamA", "teamB"):
@@ -122,7 +122,7 @@ class IndexTreeTest(unittest.TestCase):
         body = (project.metadata / "index/teamA/x/index.md").read_text(encoding="utf-8")
         self.assertIn("## サブフォルダ", body)
         self.assertIn("[y]", body)
-        self.assertIn('data-llm-wiki-index="document"', body)
+        self.assertIn("<!-- llm-wiki-index:document -->", body)
 
     def test_empty_folder_index_is_removed(self):
         self.build()

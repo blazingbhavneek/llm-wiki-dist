@@ -7,10 +7,10 @@ import base64
 import binascii
 import hashlib
 import html
-import json
 import mimetypes
 import posixpath
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,6 +40,18 @@ class GrowiPage(BaseModel):
     title: str = ""
     body: str = ""
     updated_at: str = ""
+    status: str = ""
+
+
+class GrowiActivity(BaseModel):
+    activity_id: str
+    created_at: str
+    action: str
+    page_id: str = ""
+    path: str = ""
+    old_path: str = ""
+    updated_by: str = ""
+    sequence: int | None = None
 
 
 _CHUNK_MARKER_RE = re.compile(
@@ -52,6 +64,11 @@ _CHUNK_END_RE = re.compile(
     r'<span hidden data-llm-wiki-chunk-end="(?P<span_payload>[^"]+)"></span>)[ \t]*$',
     re.MULTILINE,
 )
+
+# One short ownership stamp per published page: an HTML comment GROWI stores verbatim and
+# readers drop. The human-readable seed behind the ID lives in the pipeline ledger.
+MARKER_FORMAT = "bot-ref-1"
+_STAMP_RE = re.compile(r"^<!-- llm-wiki-bot-ref:(?P<id>[A-Za-z0-9_-]+) -->[ \t]*$", re.MULTILINE)
 
 
 class GrowiClient:
@@ -145,6 +162,7 @@ class GrowiClient:
             title=str(page.get("title") or path.rstrip("/").split("/")[-1] or ""),
             body=str(body),
             updated_at=str(page.get("updatedAt") or page.get("updated_at") or ""),
+            status=str(page.get("status") or ""),
         )
 
     async def health(self) -> bool:
@@ -219,6 +237,52 @@ class GrowiClient:
                 return list(seen.values())
             page += 1
 
+    async def list_activities(self, *, offset: int = 0, limit: int = 100) -> tuple[list[GrowiActivity], int]:
+        """Read one newest-first audit-log page using GROWI's offset contract."""
+
+        response = await self._request(
+            "POST", "/activity/list", json_body={"offset": offset, "limit": min(100, max(1, limit))}
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("malformed GROWI activity response")
+        data = payload.get("data", payload)
+        if not isinstance(data, dict):
+            raise ValueError("malformed GROWI activity data")
+        paginate = data.get("serializedPaginationResult") or data.get("paginateResult") or data
+        if not isinstance(paginate, dict):
+            raise ValueError("malformed GROWI activity pagination")
+        rows = paginate.get("docs") or data.get("activities") or payload.get("activities") or []
+        if not isinstance(rows, list):
+            raise ValueError("malformed GROWI activity rows")
+        activities: list[GrowiActivity] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                raise ValueError("malformed GROWI activity row")
+            target_value = raw.get("target")
+            target = target_value if isinstance(target_value, dict) else {}
+            snapshot = raw.get("snapshot") if isinstance(raw.get("snapshot"), dict) else {}
+            user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
+            activity_id = raw.get("_id") or raw.get("id")
+            created_at = raw.get("createdAt") or raw.get("created_at")
+            action = raw.get("action") or raw.get("event")
+            if not activity_id or not created_at or not action:
+                raise ValueError("GROWI activity is missing id, timestamp, or action")
+            activities.append(GrowiActivity(
+                activity_id=str(activity_id),
+                created_at=str(created_at),
+                action=str(action),
+                page_id=str(raw.get("pageId") or snapshot.get("pageId") or target.get("pageId")
+                            or target.get("id") or target.get("_id")
+                            or (target_value if raw.get("targetModel") == "Page" and isinstance(target_value, str) else "")),
+                path=str(raw.get("path") or snapshot.get("pagePath") or target.get("path") or raw.get("newPath") or ""),
+                old_path=str(raw.get("oldPath") or snapshot.get("oldPath") or target.get("oldPath") or ""),
+                updated_by=str(raw.get("userId") or user.get("_id") or user.get("id") or ""),
+                sequence=int(raw["sequence"]) if raw.get("sequence") is not None else None,
+            ))
+        total = int(paginate.get("totalDocs") or paginate.get("totalCount") or data.get("totalCount") or len(rows))
+        return activities, total
+
     async def create_page(self, path: str, body: str) -> GrowiPage:
         response = await self._request(
             "POST",
@@ -235,7 +299,11 @@ class GrowiClient:
                 "pageId": page_id,
                 "revisionId": revision_id,
                 "body": body,
-                "origin": "editor",
+                # GROWI treats editor-origin revisions as collaborative-editor
+                # continuations and deliberately accepts a stale revision ID.
+                # View-origin writes enforce compare-and-swap and return 409
+                # when another revision won the race.
+                "origin": "view",
             },
         )
         return self._page_from_payload(response.json())
@@ -314,11 +382,6 @@ class GrowiClient:
 
 
 _GROWI_BAD = re.compile(r"[\^$*+#<>%?\\]")
-_LINES_RE = re.compile(
-    r'^(?:<!-- chunk: [^ ]+ lines |'
-    r'<span hidden data-llm-wiki-chunk="[^ ]+ lines )(\d+)-(\d+)',
-    re.MULTILINE,
-)
 _MARKDOWN_LINK_RE = re.compile(
     r"(?<!!)(?P<prefix>\[[^\]\n]*\]\()(?P<target>(?:(?!\]\().)*?\.md)(?P<fragment>#[^)\n]*)?\)"
 )
@@ -327,30 +390,31 @@ _PERMALINK_RE = re.compile(
 )
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _IMAGE_DESCRIPTION_RE = re.compile(r"<image-description\b[^>]*>(.*?)</image-description>", re.I | re.S)
-_CHUNK_COMMENT_RE = re.compile(r"^<!-- chunk: (?P<payload>.*?)-->[ \t]*$", re.MULTILINE)
-_CHUNK_END_COMMENT_RE = re.compile(
-    r"^<!-- chunk-end: (?P<payload>.*?)-->[ \t]*$", re.MULTILINE
-)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<text>[^`\n]+)`(?!`)")
 
 
 def _growi_markdown(body: str) -> str:
-    """Remove comments while retaining invisible ownership markers."""
+    """Render generated prose while preserving complete human-managed regions."""
 
-    body = _CHUNK_COMMENT_RE.sub(
-        lambda match: '<span hidden data-llm-wiki-chunk="'
-        + html.escape(match.group("payload").strip(), quote=True)
-        + '"></span>',
+    from publisher.human_changes import marker_matches
+
+    regions = marker_matches(body)
+    if regions:
+        parts, cursor = [], 0
+        for region in regions:
+            parts.extend((_growi_markdown(body[cursor:region.start()]), region.group(0)))
+            cursor = region.end()
+        parts.append(_growi_markdown(body[cursor:]))
+        return "".join(parts)
+
+    body = _HTML_COMMENT_RE.sub(
+        lambda match: match.group(0) if (
+            _STAMP_RE.fullmatch(match.group(0).strip())
+            or match.group(0) in {LINKS_FOOTER_START, LINKS_FOOTER_END}
+        ) else "",
         body,
     )
-    body = _CHUNK_END_COMMENT_RE.sub(
-        lambda match: '<span hidden data-llm-wiki-chunk-end="'
-        + html.escape(match.group("payload").strip(), quote=True)
-        + '"></span>',
-        body,
-    )
-    body = _HTML_COMMENT_RE.sub("", body)
     return _rewrite_outside_fences(
         body, _INLINE_CODE_RE, lambda match: match.group("text")
     )
@@ -485,10 +549,31 @@ def _rewrite_outside_fences(body: str, pattern: re.Pattern[str], replace: Any) -
     return "".join(output)
 
 
+def _page_stamps(body: str) -> list[re.Match]:
+    """Locate real ownership stamps, ignoring examples inside fenced code."""
+    from graph.common.markdown import scan_markdown_fences
+
+    lines = body.splitlines(keepends=True)
+    scan = scan_markdown_fences(lines).inside_after_line
+    flags = [inside or (i > 0 and scan[i - 1]) for i, inside in enumerate(scan)]
+    stamps, offset = [], 0
+    for line, fenced in zip(lines, flags):
+        if not fenced and _STAMP_RE.fullmatch(line.rstrip("\n")):
+            stamps.append(_STAMP_RE.match(body, offset))
+        offset += len(line)
+    return stamps
+
+
 def managed_page_markdown(body: str, marker_id: str) -> str | None:
     """Recover locally editable content while excluding unowned remote text."""
+    stamps = _page_stamps(body)
+    if stamps:
+        if len(stamps) != 1 or stamps[0].group("id") != marker_id:
+            return None
+        return body[:stamps[0].start()].rstrip() + "\n"
+    # Pages published before the bottom stamp existed, until the next sweep rewrites them.
     sections = _marked_sections(body)
-    if not sections:
+    if marker_id not in sections:
         return None
     recovered: list[str] = []
     for chunk_id, (start, end) in sorted(sections.items(), key=lambda item: item[1][0]):
@@ -515,39 +600,23 @@ def team_of_path(path: str, write_path: str) -> str | None:
     return head if sep and head else None
 
 
-def wrap_page(body: str, *, page_id: str, ranges: list[tuple[int, int]]) -> str:
-    if _CHUNK_MARKER_RE.search(body):
+def wrap_page(body: str, *, page_id: str) -> str:
+    """Close a page with its ownership stamp, so the body starts with real content."""
+
+    if _page_stamps(body):
         return body
-    start = min((a for a, _ in ranges), default=0)
-    end = max((b for _, b in ranges), default=0)
-    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
-    marker = f"<!-- chunk: {page_id} lines {start}-{end} hash:{digest} -->"
-    return f"{marker}\n{body.rstrip()}\n<!-- chunk-end: {page_id} -->"
-
-
-def source_ranges(body: str) -> list[tuple[int, int]]:
-    return [(int(a), int(b)) for a, b in _LINES_RE.findall(body) if int(b) >= int(a) > 0]
+    return f"{body.rstrip()}\n\n<!-- llm-wiki-bot-ref:{page_id} -->\n"
 
 
 def split_footer(body: str) -> tuple[str, str]:
     """Split the managed linker footer from the generated body."""
-    start = body.find(LINKS_FOOTER_START)
-    if start < 0:
+    from publisher.human_changes import footer_span
+
+    span = footer_span(body)
+    if span is None:
         return body, ""
-    end = body.find(LINKS_FOOTER_END, start)
-    if end < 0:
-        raise ValueError("unterminated llm-wiki-links footer")
-    end += len(LINKS_FOOTER_END)
-    return body[:start].rstrip("\n") + "\n", body[start:end]
-
-
-def wrap_links(footer: str, *, page_id: str) -> str:
-    digest = hashlib.sha256(footer.encode("utf-8")).hexdigest()[:12]
-    return (
-        f"<!-- chunk: {page_id}-links hash:{digest} -->\n"
-        f"{footer.rstrip()}\n"
-        f"<!-- chunk-end: {page_id}-links -->"
-    )
+    start, end = span
+    return body[:start] + body[end:], body[start:end]
 
 
 def assert_publish_path(path: str, *, mode: str, write_path: str, root_path: str = "/") -> None:
@@ -587,25 +656,18 @@ def _marked_sections(body: str) -> dict[str, tuple[int, int]]:
 
 
 def merge_marked_sections(existing: str, additions: str) -> str:
-    """Replace/append only chunk-marked sections; preserve all other text."""
-    additions_sections = _marked_sections(additions)
-    if not additions_sections:
+    """Replace the page above our stamp, keeping any text a human added below it."""
+    if not _page_stamps(additions):
         raise ValueError("GROWI publish body contains no chunk markers")
-    result = existing
-    for chunk_id, (start, end) in sorted(
-        additions_sections.items(), key=lambda item: item[1][0], reverse=True
-    ):
-        new_section = additions[start:end]
-        existing_sections = _marked_sections(result)
-        if chunk_id in existing_sections:
-            old_start, old_end = existing_sections[chunk_id]
-            if old_end < len(result) and not new_section.endswith("\n"):
-                new_section += "\n\n"
-            result = result[:old_start] + new_section + result[old_end:]
-        else:
-            separator = "" if not result or result.endswith("\n") else "\n"
-            result = result + separator + "\n" + new_section
-    return result
+    stamps = _page_stamps(existing)
+    if stamps:
+        tail = existing[stamps[-1].end():].strip("\n")
+        return additions.rstrip() + ("\n\n" + tail + "\n" if tail else "\n")
+    if existing.strip() and not _CHUNK_MARKER_RE.search(existing):
+        # Somebody else's page: publish alongside it instead of overwriting it.
+        return existing.rstrip() + "\n\n" + additions.rstrip() + "\n"
+    # A page we published in the older chunk-marker format is wholly ours to rewrite.
+    return additions
 
 
 def _complete_page(page: GrowiPage, path: str, body: str) -> GrowiPage:
@@ -622,18 +684,52 @@ async def publish_pages(
     write_path: str,
     root_path: str = "/",
     known_page_ids: dict[str, str] | None = None,
+    expected_pages: dict[str, dict[str, Any]] | None = None,
     on_revision: Any = None,
+    on_conflict: Any = None,
+    on_prepared: Any = None,
+    on_confirmed: Any = None,
+    on_reconcile: Any = None,
 ) -> list[GrowiPage]:
     """Resolve every page ID first, then publish stable permalink bodies."""
-    current: dict[str, GrowiPage] = {}
+    current: dict[str, GrowiPage | None] = {}
+    # Inspect the whole batch before creating/updating any page. The following
+    # PUT still uses this exact revision, so a later race fails with HTTP 409.
     for item in pages:
         path = item["path"]
         body = item["body"]
         assert_publish_path(path, mode=mode, write_path=write_path, root_path=root_path)
-        existing = await client.get_page(path=path)
+        expected = (expected_pages or {}).get(item.get("local_path", ""))
+        existing = await client.get_page(**({"page_id": str(expected["page_id"])} if expected else {"path": path}))
+        if expected:
+            if existing is None:
+                raise RuntimeError(f"GROWI page disappeared before publication: {path}")
+            if existing.path != path or existing.page_id != expected.get("page_id"):
+                raise RuntimeError(f"GROWI page moved before publication: {path}")
+            if not expected.get("revision_id") or existing.revision_id != expected["revision_id"]:
+                raise RuntimeError(f"GROWI page changed before publication: {path}")
+            if managed_page_markdown(existing.body, str(expected.get("marker_id") or "")) is None:
+                raise RuntimeError(f"GROWI ownership marker missing before publication: {path}")
+        elif existing is not None:
+            stamps = _page_stamps(body)
+            marker = stamps[0] if len(stamps) == 1 else None
+            if marker is None or managed_page_markdown(existing.body, marker.group("id")) is None:
+                await _maybe_await(on_conflict, item, existing, "unowned_destination")
+                raise RuntimeError(f"GROWI destination is not owned by this page: {path}")
+            initial = _growi_markdown(_image_fallbacks(body))
+            if merge_marked_sections(existing.body, initial) != existing.body:
+                if not await _maybe_await(on_reconcile, item, existing):
+                    await _maybe_await(on_conflict, item, existing, "missing_published_snapshot")
+                    raise RuntimeError(f"GROWI destination has no inspected published baseline: {path}")
+        current[path] = existing
+    for item in pages:
+        path, body = item["path"], item["body"]
+        existing = current[path]
         if existing is None:
             initial_body = _growi_markdown(_image_fallbacks(body))
+            await _maybe_await(on_prepared, item, None, initial_body)
             existing = _complete_page(await client.create_page(path, initial_body), path, initial_body)
+            await _maybe_await(on_confirmed, item, existing, initial_body)
             await _maybe_await(on_revision, existing)
         if not existing.page_id:
             raise ValueError(f"GROWI returned no page ID for {path}")
@@ -651,97 +747,82 @@ async def publish_pages(
         existing = current[path]
         body = rewrite_page_links(item["body"], item.get("local_path", ""), page_ids)
         body = await _publish_images(client, body, existing.page_id)
-        merged = _growi_markdown(merge_marked_sections(existing.body, body))
+        merged = merge_marked_sections(existing.body, _growi_markdown(body))
         if merged == existing.body:
             results.append(existing)
             await _maybe_await(on_revision, existing)
             continue
+        await _maybe_await(on_prepared, item, existing, merged)
         try:
             page = _complete_page(
                 await client.update_page(existing.page_id, existing.revision_id, merged), path, merged
             )
-            results.append(page)
-            await _maybe_await(on_revision, page)
         except GrowiAPIError as exc:
-            if exc.status_code != 409:
-                raise
-            refreshed = await client.get_page(path=path)
-            if refreshed is None:
-                body = _growi_markdown(body)
-                page = _complete_page(await client.create_page(path, body), path, body)
-                results.append(page)
-                await _maybe_await(on_revision, page)
-                continue
-            retry_body = _growi_markdown(merge_marked_sections(refreshed.body, body))
-            page = _complete_page(
-                await client.update_page(refreshed.page_id, refreshed.revision_id, retry_body), path, retry_body
-            )
-            results.append(page)
-            await _maybe_await(on_revision, page)
+            if exc.status_code == 409:
+                observed = await client.get_page(page_id=existing.page_id)
+                await _maybe_await(on_conflict, item, observed, "revision_race")
+            raise
+        results.append(page)
+        await _maybe_await(on_confirmed, item, page, merged)
+        await _maybe_await(on_revision, page)
     return results
-
-
-_NUMBERED_RE = re.compile(r"^\d+-(.+)$")
-
-
-def _canonical(filename: str) -> str:
-    match = _NUMBERED_RE.match(filename)
-    return match.group(1) if match else filename
-
-
-def _coverage_ranges(folder: Path) -> dict[str, list[tuple[int, int]]]:
-    path = Path(folder) / "_planning" / "coverage.json"
-    if not path.exists():
-        return {}
-    try:
-        files = json.loads(path.read_text(encoding="utf-8")).get("files", [])
-    except (OSError, ValueError):
-        return {}
-    out: dict[str, list[tuple[int, int]]] = {}
-    for item in files:
-        start, end = item.get("source_start"), item.get("source_end")
-        if item.get("filename") and start is not None and end is not None:
-            out.setdefault(str(item["filename"]), []).append((int(start), int(end)))
-    return out
 
 
 class GrowiPublisher:
     """Publish one generated document and trash only pages marked by us."""
 
-    def __init__(self, client: GrowiClient, connection: Any) -> None:
+    def __init__(
+        self,
+        client: GrowiClient,
+        connection: Any,
+        *,
+        human_sync_policy: Any = None,
+        semantic_assistant: Any = None,
+        semantic_assistant_factory: Any = None,
+    ) -> None:
+        from graph.config import HumanSyncPolicy
+
         self.client = client
         self.connection = connection
         self.on_revision: Any = None
+        # Runtime construction always supplies Settings.  The compatibility
+        # default keeps direct deterministic callers on their historic path.
+        self.human_sync_policy = human_sync_policy or HumanSyncPolicy.resolve("apply")
+        self.semantic_assistant = semantic_assistant
+        self.semantic_assistant_factory = semantic_assistant_factory
+        self.human_sync_summary: dict[str, Any] = {}
 
     def doc_path(self, project: Any, rel: str) -> str:
         folder = project.wiki_dir(rel).relative_to(project.wiki).as_posix()
         return growi_path(self.connection.write_path, folder)
 
-    def page_marker_id(self, project: Any, local_path: str) -> str:
+    def page_marker_seed(self, project: Any, local_path: str) -> str:
+        """The readable page identity behind a page's stamp ID (the local half of the map)."""
         document = Path(local_path).parent.as_posix()
         marker = read_json(Path(project.wiki) / document / "_planning" / "source.json", default={})
         id_seed = str(marker.get("id_seed") or document)
-        stable_path = growi_path(self.connection.write_path, id_seed, Path(local_path).name)
-        return "page" + stable_path.replace(" ", "_")
+        return growi_path(self.connection.write_path, id_seed, Path(local_path).name)
+
+    def page_marker_id(self, project: Any, local_path: str) -> str:
+        seed = self.page_marker_seed(project, local_path)
+        return "b" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
 
     def _document_pages(self, project: Any, rel: str) -> list[dict[str, str]]:
         folder = project.wiki_dir(rel)
         doc_path = self.doc_path(project, rel)
-        ranges = _coverage_ranges(folder)
         pages: list[dict[str, str]] = []
         for md in sorted(folder.glob("*.md")):
             name = growi_segment(md.name)
-            body = strip_reader_references(md.read_text(encoding="utf-8"))
+            from publisher.human_changes import map_generated
+
+            body = map_generated(md.read_text(encoding="utf-8"), strip_reader_references)
             page_path = f"{doc_path}/{name}"
-            main, footer = split_footer(body)
             local_path = md.relative_to(project.wiki).as_posix()
             page_id = self.page_marker_id(project, local_path)
             pages.append({
                 "local_path": local_path,
                 "path": page_path,
-                "body": wrap_page(main, page_id=page_id, ranges=ranges.get(_canonical(md.name), []))
-                + "\n\n"
-                + wrap_links(footer, page_id=page_id),
+                "body": wrap_page(body, page_id=page_id),
             })
         return pages
 
@@ -751,7 +832,11 @@ class GrowiPublisher:
         rels: list[str],
         known_pages: dict[str, dict[str, Any]] | None = None,
         only_pages: set[str] | None = None,
+        cleanup_revisions: dict[str, str] | None = None,
     ) -> dict[str, GrowiPage]:
+        from publisher.human_changes import HumanStore
+
+        HumanStore(project).audit()
         pages: list[dict[str, str]] = []
         document_paths: dict[str, set[str]] = {}
         for rel in dict.fromkeys(rels):
@@ -760,10 +845,105 @@ class GrowiPublisher:
                 document_pages = [
                     page for page in document_pages if page["local_path"] in only_pages
                 ]
-            pages.extend(document_pages)
+            # Newest page first: GROWI lists by last-updated, so 001 lands on top (00-目次 follows after).
+            pages.extend(reversed(document_pages))
             document_paths[self.doc_path(project, rel)] = {page["path"] for page in document_pages}
         if len({page["path"] for page in pages}) != len(pages):
             raise ValueError("multiple local wiki pages resolve to the same GROWI path")
+        scoped = {
+            path: row for path, row in (known_pages or {}).items()
+            if any(path.startswith(project.wiki_dir(rel).relative_to(project.wiki).as_posix() + "/") for rel in rels)
+        }
+        self.assert_known_revisions(scoped)
+        def record_conflict(item: dict, observed: GrowiPage | None, reason: str) -> None:
+            from publisher.human_changes import HumanStore
+
+            if observed is None:
+                return
+            store = HumanStore(project)
+            marker = self.page_marker_id(project, item["local_path"])
+            data = store.page(marker)
+            data.update({"schema_version": 1, "marker_id": marker,
+                         "observed_revision": observed.revision_id,
+                         "observed_remote_blob": store.put(observed.body), "publication_error": reason,
+                         "publication_error_attempt_id": str(data.get("prepared_attempt_id") or "")})
+            attempt_id = str(data.get("prepared_attempt_id") or "")
+            for attempt in data.get("attempt_history", []):
+                if attempt.get("attempt_id") == attempt_id:
+                    attempt.update({"status": "rejected" if reason == "revision_race" else "failed",
+                                    "error": reason, "observed_revision": observed.revision_id})
+            store.save_page(data)
+
+        def record_prepared(item: dict, inspected: GrowiPage | None, body: str) -> None:
+            store = HumanStore(project)
+            marker = self.page_marker_id(project, item["local_path"])
+            data = store.page(marker)
+            stamp = read_json(project.wiki / Path(item["local_path"]).parent / "_planning" / "source.json", default={})
+            document = store.document(str(stamp["raw"])) if stamp.get("raw") else {}
+            generated = document.get("pages", {}).get(Path(item["local_path"]).name, {})
+            remote_blob = store.put(body)
+            local_blob = store.put((project.wiki / item["local_path"]).read_text(encoding="utf-8"))
+            attempt_id = "hattempt-" + uuid.uuid4().hex[:24]
+            history = data.setdefault("attempt_history", [])
+            previous_attempt = str(data.get("prepared_attempt_id") or "")
+            for attempt in history:
+                if attempt.get("attempt_id") == previous_attempt and attempt.get("status") not in {
+                    "recovered_exact", "captured_late_human", "not_landed",
+                }:
+                    attempt.update({"status": "superseded", "settled_at": datetime.now(timezone.utc).isoformat()})
+            history.append({
+                "attempt_id": attempt_id,
+                "status": "prepared",
+                "path": item["path"],
+                "page_id": inspected.page_id if inspected else "",
+                "revision": inspected.revision_id if inspected else "",
+                "remote_blob": remote_blob,
+                "local_blob": local_blob,
+                "generated_blob": str(generated.get("body_blob") or ""),
+                "prepared_at": datetime.now(timezone.utc).isoformat(),
+            })
+            data.update({"schema_version": 1, "marker_id": marker, "local_path": item["local_path"],
+                         "prepared_attempt_id": attempt_id,
+                         "prepared_path": item["path"], "prepared_page_id": inspected.page_id if inspected else "",
+                         "prepared_revision": inspected.revision_id if inspected else "",
+                         # A fresh attempt starts without a conflict, so a recorded
+                         # publication_error always describes this prepared write.
+                         "publication_error": "", "publication_error_attempt_id": "",
+                         "prepared_remote_blob": remote_blob,
+                         "prepared_local_blob": local_blob,
+                         # Effective local text can contain protected human regions;
+                         # recovery must use the writer's actual pure generated page.
+                         "prepared_generated_blob": str(generated.get("body_blob") or "")})
+            store.save_page(data)
+
+        def record_confirmed(item: dict, page: GrowiPage, body: str) -> None:
+            """Persist per-page success before the next page can be mutated."""
+            store = HumanStore(project)
+            marker = self.page_marker_id(project, item["local_path"])
+            data = store.page(marker)
+            attempt_id = str(data.get("prepared_attempt_id") or "")
+            if not attempt_id:
+                return
+            confirmation = {
+                "attempt_id": attempt_id,
+                "page_id": page.page_id,
+                "revision": page.revision_id,
+                "path": page.path,
+                "remote_blob": store.put(body),
+                "confirmed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            data["publication_confirmation"] = confirmation
+            for attempt in data.get("attempt_history", []):
+                if attempt.get("attempt_id") == attempt_id:
+                    attempt.update({"status": "confirmed", **confirmation})
+            store.save_page(data)
+
+        def reconcile_prepared(item: dict, observed: GrowiPage) -> bool:
+            """True when an unledgered page already holds exactly the body we prepared."""
+            from publisher.human_changes import HumanStore
+
+            return bool(HumanStore(project).prepared_match(self.page_marker_id(project, item["local_path"]), observed))
+
         results = asyncio.run(publish_pages(
             self.client,
             pages,
@@ -775,12 +955,35 @@ class GrowiPublisher:
                 for path, row in (known_pages or {}).items()
                 if row.get("page_id")
             },
+            expected_pages=scoped,
             on_revision=self.on_revision,
+            on_conflict=record_conflict,
+            on_prepared=record_prepared,
+            on_confirmed=record_confirmed,
+            on_reconcile=reconcile_prepared,
         ))
         if only_pages is None:
             for doc_path, keep in document_paths.items():
-                asyncio.run(self._trash_under(doc_path, keep=keep))
+                asyncio.run(self._trash_under(doc_path, keep=keep, expected_revisions={
+                    **(cleanup_revisions or {}),
+                    **{str(row["page_id"]): str(row["revision_id"]) for row in scoped.values()},
+                }, on_deleted=lambda page: self._remember_deleted(project, scoped, page)))
         return {item["local_path"]: page for item, page in zip(pages, results)}
+
+    def _remember_deleted(self, project: Any, known_pages: dict[str, dict[str, Any]], page: GrowiPage) -> None:
+        from publisher.human_changes import HumanStore, now
+
+        item = next(((path, row) for path, row in known_pages.items() if row.get("page_id") == page.page_id), None)
+        if item is None:
+            return
+        local_path, row = item
+        store = HumanStore(project)
+        marker = str(row.get("marker_id") or self.page_marker_id(project, local_path))
+        data = store.page(marker)
+        data.update({"schema_version": 1, "marker_id": marker, "deleted_page_id": page.page_id,
+                     "deleted_revision": page.revision_id, "deleted_path": page.path,
+                     "deleted_remote_blob": store.put(page.body), "deleted_at": now()})
+        store.save_page(data)
 
     def discover_documents(self, project: Any, rels: list[str]) -> dict[str, GrowiPage]:
         pages = [page for rel in dict.fromkeys(rels) for page in self._document_pages(project, rel)]
@@ -802,7 +1005,13 @@ class GrowiPublisher:
                 if not page_id or not revision_id:
                     raise RuntimeError(f"cannot verify GROWI revision for {local_path}")
                 current = await self.client.get_page(page_id=page_id)
-                if current is not None and current.revision_id != revision_id:
+                if current is None:
+                    raise RuntimeError(f"GROWI page disappeared: {local_path}")
+                if row.get("growi_path") and current.path != row["growi_path"]:
+                    raise RuntimeError(f"GROWI page moved by another editor: {current.path}")
+                if row.get("marker_id") and managed_page_markdown(current.body, str(row["marker_id"])) is None:
+                    raise RuntimeError(f"GROWI ownership markers were removed: {current.path}")
+                if current.revision_id != revision_id:
                     raise RuntimeError(f"GROWI page changed by another editor: {current.path}")
 
         asyncio.run(check())
@@ -825,6 +1034,7 @@ class GrowiPublisher:
 
         async def rename() -> dict[str, GrowiPage]:
             moved: dict[str, GrowiPage] = {}
+            inspected: dict[str, GrowiPage] = {}
             for local_path, row in sorted(known_pages.items()):
                 page_id = str(row.get("page_id") or "")
                 if not page_id:
@@ -832,33 +1042,47 @@ class GrowiPublisher:
                 current = await self.client.get_page(page_id=page_id)
                 if current is None:
                     raise RuntimeError(f"GROWI page missing during move: {page_id}")
+                if current.page_id != page_id:
+                    raise RuntimeError(f"GROWI page ID mismatch during move: {page_id}")
                 expected_revision = str(row.get("revision_id") or "")
+                if check_revisions and not expected_revision:
+                    raise RuntimeError(f"cannot verify GROWI revision for move: {local_path}")
                 if check_revisions and expected_revision and current.revision_id != expected_revision:
                     raise RuntimeError(f"GROWI page changed by another editor: {current.path}")
+                if row.get("growi_path") and current.path != row["growi_path"]:
+                    raise RuntimeError(f"GROWI page moved by another editor: {current.path}")
+                marker = str(row.get("marker_id") or self.page_marker_id(project, local_path))
+                if managed_page_markdown(current.body, marker) is None:
+                    raise RuntimeError(f"GROWI ownership markers were removed: {current.path}")
+                inspected[page_id] = current
             root = await self.client.get_page(path=old_doc_path)
             if root is not None:
-                root = await self.client.rename_page(root.page_id, root.revision_id, new_doc_path, recursively=True)
+                root = await self.client.rename_page(root.page_id, root.revision_id, new_doc_path, recursively=False)
                 await _maybe_await(self.on_revision, root)
             for local_path, row in sorted(known_pages.items()):
                 page_id = str(row.get("page_id") or "")
                 if not page_id:
                     continue
-                current = await self.client.get_page(page_id=page_id)
-                if current is None:
-                    raise RuntimeError(f"GROWI page missing during move: {page_id}")
+                current = inspected[page_id]
                 destination = f"{new_doc_path}/{growi_segment(Path(local_path).name)}"
                 page = current if current.path == destination else await self.client.rename_page(
                     page_id, current.revision_id, destination
                 )
                 if page.page_id != page_id:
                     raise RuntimeError(f"GROWI move did not retain page ID: {page_id}")
+                if page.body and page.body != current.body:
+                    raise RuntimeError(f"GROWI page body changed during move: {destination}")
+                page = _complete_page(page, destination, current.body)
                 await _maybe_await(self.on_revision, page)
-                moved[local_path] = page
+                destination_local = project.wiki_dir(new_rel).relative_to(project.wiki).as_posix() + "/" + Path(local_path).name
+                moved[destination_local] = page
             return moved
 
         moved = asyncio.run(rename())
         published = self.publish_documents(project, [new_rel], known_pages={
-            path: {"page_id": page.page_id} for path, page in moved.items()
+            path: {"page_id": page.page_id, "revision_id": page.revision_id,
+                   "growi_path": page.path, "marker_id": self.page_marker_id(project, path)}
+            for path, page in moved.items()
         })
         if moved and {page.page_id for page in published.values()} != {page.page_id for page in moved.values()}:
             raise RuntimeError("GROWI move changed the published page set")
@@ -870,7 +1094,22 @@ class GrowiPublisher:
         published_pages: dict[str, dict[str, Any]],
         unchanged_documents: set[str],
     ) -> tuple[list[str], list[str], set[str]]:
-        """Pull non-conflicting edits to publisher-owned page sections."""
+        """Capture remote intent durably, then render from the pure generated base."""
+        from publisher.human_changes import DASHBOARD, RETAINED, HumanStore, LegacyBaseUnavailable, editable, map_generated, merge, strip_regions, wrap_edit
+        from graph.wiki.storage import write_json_atomic, write_text_atomic
+
+        store = HumanStore(project)
+        store.audit()
+        policy = self.human_sync_policy
+        mode = policy.mode.value
+        if policy.semantic_observe and self.semantic_assistant is None and self.semantic_assistant_factory is not None:
+            try:
+                self.semantic_assistant = self.semantic_assistant_factory(project)
+            except Exception:  # model construction is optional; deterministic fallback remains authoritative
+                from publisher.human_semantic import SemanticAssistant
+
+                self.semantic_assistant = SemanticAssistant(store)
+
         async def fetch() -> dict[str, GrowiPage | None]:
             return {
                 local_path: await self.client.get_page(page_id=str(row.get("page_id", "")))
@@ -879,90 +1118,262 @@ class GrowiPublisher:
             }
 
         remote = asyncio.run(fetch())
-        page_paths = {
-            str(row.get("page_id")): local_path
-            for local_path, row in published_pages.items()
-            if row.get("page_id")
-        }
-        pulled: list[str] = []
-        conflicts: list[str] = []
-        blocked: set[str] = set()
-        from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
-
+        page_paths = {str(row["page_id"]): path for path, row in published_pages.items() if row.get("page_id")}
+        pulled, conflicts, blocked = [], [], set()
+        decisions = {"unchanged": 0, "observed": 0, "captured": 0, "blocked": 0, "recovered": 0}
         wiki_root = Path(project.wiki).resolve()
+
+        def mark_pending(target: Path) -> None:
+            marker = target.parent / "_planning" / "linker.json"
+            state = read_json(marker, default={})
+            if state.get("status") != "disabled":
+                state["status"] = "pending"
+                write_json_atomic(marker, state)
+
         for local_path, page in remote.items():
             row = published_pages[local_path]
-            if page is None or page.revision_id == row.get("revision_id"):
-                continue
             document = posixpath.dirname(local_path)
-            if document not in unchanged_documents:
-                blocked.add(document)
-                conflicts.append(f"{local_path}: local and GROWI pages both changed")
-                continue
+            row["marker_id"] = str(row.get("marker_id") or self.page_marker_id(project, local_path))
             target = (wiki_root / local_path).resolve()
             try:
                 target.relative_to(wiki_root)
-            except ValueError:
-                blocked.add(document)
-                conflicts.append(f"{local_path}: invalid local page path")
-                continue
-            marker_id = str(row.get("marker_id") or "page" + str(row.get("growi_path") or page.path).replace(" ", "_"))
-            markdown = managed_page_markdown(page.body, marker_id)
-            if markdown is None:
-                blocked.add(document)
-                conflicts.append(f"{local_path}: GROWI ownership markers were removed")
-                continue
-            markdown = restore_page_links(markdown, local_path, page_paths)
-            write_text_atomic(target, markdown)
-            pristine = target.parent / "_planning" / "pages" / target.name
-            if pristine.exists():
-                main, _footer = split_footer(markdown)
-                write_text_atomic(pristine, main)
-                source_marker = target.parent / "_planning" / "source.json"
+                if page is None:
+                    raise ValueError("remote_deleted")
+                if page.status == "deleted":
+                    raise ValueError("remote_deleted")
+                if page.page_id != row.get("page_id"):
+                    raise ValueError("remote page ID mismatch")
+                if row.get("growi_path") and page.path != row["growi_path"]:
+                    raise ValueError("remote_moved")
+                markdown = managed_page_markdown(page.body, row["marker_id"])
+                if markdown is None:
+                    raise ValueError("GROWI ownership markers were removed")
+                stamp = read_json(target.parent / "_planning" / "source.json", default={})
+                raw_rel = str(stamp.get("raw") or "")
+                if not raw_rel:
+                    raise ValueError("source mapping is missing")
+                baseline = store.page(row["marker_id"])
+                if baseline.get("source_id"):
+                    journal = store.document(raw_rel)
+                    if baseline["source_id"] not in {journal["source_id"], *journal.get("legacy_source_ids", [])}:
+                        raise ValueError("published page belongs to a different source identity")
+                if baseline.get("blocked") or row.get("human_sync_blocked"):
+                    blocked_reason = str(baseline.get("blocked") or row.get("human_sync_blocked") or "")
+                    rollout_block = "human_sync_mode=apply" in blocked_reason
+                    if page.revision_id == baseline.get("observed_revision") and not (policy.captures and rollout_block):
+                        raise ValueError(str(baseline.get("blocked") or row["human_sync_blocked"]))
+                    baseline["blocked"] = ""
+                    row.pop("human_sync_blocked", None)
+                    store.save_page(baseline)
+                store.retire_unlanded(row["marker_id"], page)
+                if baseline and baseline.get("accepted_revision") == row.get("revision_id") == page.revision_id:
+                    decisions["unchanged"] += 1
+                    continue
+                accounted = store.account_prepared(row, page, remote=markdown)
+                if accounted.get("exact"):
+                    # The page holds our own unrecorded write: bot intent, not human.
+                    decisions["recovered"] += 1
+                    continue
+                local = target.read_text(encoding="utf-8") if not baseline else store.get(baseline["local_blob"])
+                if not baseline:
+                    # Old ledgers have no exact remote snapshot. A clean revision
+                    # can establish one; an already changed revision must be pinned
+                    # in full because its original transport form is unavailable.
+                    if document not in unchanged_documents:
+                        raise ValueError("missing published snapshot for changed local page")
+                    legacy = page.revision_id != row.get("revision_id")
+                    expected_local = _growi_markdown(map_generated(local, strip_reader_references))
+                    canonical_remote = restore_page_links(markdown, local_path, page_paths)
+                    differs = editable(canonical_remote) != editable(expected_local)
+                    if differs and not policy.captures:
+                        if policy.observes:
+                            store.record_observation(
+                                mode=mode, decision="blocked", local_path=local_path,
+                                page_id=page.page_id, revision_id=page.revision_id,
+                                before=expected_local, after=canonical_remote,
+                                proposed_operation="replace", proposed_status="legacy_pinned",
+                                match_reason="missing_verified_baseline",
+                            )
+                            decisions["observed"] += 1
+                        store.record_event(
+                            mode=mode, decision="blocked_remote_difference", local_path=local_path,
+                            page_id=page.page_id, revision_id=page.revision_id,
+                            reason="missing_verified_baseline",
+                        )
+                        raise ValueError(
+                            f"remote difference requires human_sync_mode=apply (current mode: {mode})"
+                        )
+                    if differs:
+                        legacy = True
+                    try:
+                        store.ensure_generated(raw_rel)
+                    except LegacyBaseUnavailable:
+                        legacy = True
+                    if legacy:
+                        local = restore_page_links(markdown, local_path, page_paths)
+                        pinned = store.pin_legacy(raw_rel, local_path, strip_regions(local), revision=page.revision_id)
+                        effective = wrap_edit(store.get(pinned["human_after_blob"]), pinned["edit_id"])
+                        write_text_atomic(target, effective)
+                        write_text_atomic(target.parent / "_planning" / "pages" / target.name, effective)
+                        mark_pending(target)
+                        pulled.append(local_path)
+                    row["revision_id"] = page.revision_id
+                    store.remember_page(local_path, row, markdown, local, published=False)
+                    if legacy:
+                        baseline = store.page(row["marker_id"])
+                        baseline["legacy_pinned"] = True
+                        store.save_page(baseline)
+                    continue
+                if baseline["accepted_revision"] != row.get("revision_id"):
+                    raise ValueError("published revision and human baseline disagree")
+                if page.revision_id == row.get("revision_id"):
+                    continue
+                previous_remote = store.get(baseline["remote_blob"])
+                previous_local = store.get(baseline["local_blob"])
+                generated_before = store.get(baseline["generated_blob"]) if baseline.get("generated_blob") else None
+                if accounted:
+                    # A late revision sits on our unrecorded write, so it is rebased on
+                    # that write: only the human delta is journaled and the bot delta stays
+                    # generated state instead of becoming a later stale override.
+                    prepared_remote = managed_page_markdown(accounted["remote"], row["marker_id"])
+                    if prepared_remote is None:
+                        raise ValueError("unrecorded bot write is missing its ownership marker")
+                    previous_remote, previous_local = prepared_remote, accounted["local"]
+                    generated_before = accounted["generated"] or generated_before
+                # Rebase the exact remote delta onto its matching local snapshot.
+                # This restores permalink/image spelling without inventing text.
+                canonical, status = merge(editable(previous_remote), editable(markdown), editable(previous_local))
+                if status == "conflict":
+                    raise ValueError("remote transport changes cannot be canonicalized safely")
+                canonical = restore_page_links(canonical, local_path, page_paths)
+                proposed_operation = (
+                    "delete" if not editable(canonical).strip()
+                    else "add" if not editable(previous_local).strip()
+                    else "replace"
+                )
+                if policy.observes:
+                    store.record_observation(
+                        mode=mode,
+                        decision="capture" if policy.captures else "blocked",
+                        local_path=local_path,
+                        page_id=page.page_id,
+                        revision_id=page.revision_id,
+                        before=previous_local,
+                        after=canonical,
+                        proposed_operation=proposed_operation,
+                        proposed_status=status,
+                        match_reason="deterministic_page_rebase",
+                    )
+                    decisions["observed"] += 1
+                if policy.semantic_observe and self.semantic_assistant is not None:
+                    proposal = self.semantic_assistant.propose(
+                        source_id=str(baseline.get("source_id") or ""),
+                        base=previous_local,
+                        human=canonical,
+                        anchor={"page_path": local_path, "heading_path": [], "block_kind": "prose"},
+                        candidates=[{
+                            "candidate_id": "current-generated",
+                            "source_id": str(baseline.get("source_id") or ""),
+                            "page_path": local_path,
+                            "heading_path": [],
+                            "block_kind": "prose",
+                            "text": generated_before or previous_local,
+                        }],
+                        edit_id="hedit-" + hashlib.sha256(
+                            (row["marker_id"] + "\0" + page.revision_id).encode("utf-8")
+                        ).hexdigest()[:24],
+                        policy_mode=mode,
+                    )
+                    store.record_event(
+                        mode=mode, decision="semantic_" + proposal.status,
+                        local_path=local_path, page_id=page.page_id,
+                        revision_id=page.revision_id,
+                        reason=",".join(proposal.reason_codes),
+                    )
+                if not policy.captures:
+                    store.record_event(
+                        mode=mode,
+                        decision="blocked_remote_difference",
+                        local_path=local_path,
+                        page_id=page.page_id,
+                        revision_id=page.revision_id,
+                        reason="authoritative_capture_disabled",
+                    )
+                    raise ValueError(
+                        f"remote difference requires human_sync_mode=apply (current mode: {mode})"
+                    )
+                row["observed_revision_id"] = page.revision_id
+                legacy = False
                 try:
-                    raw_rel = str(read_json(source_marker)["raw"])
-                except (OSError, KeyError, TypeError, ValueError):
-                    raw_rel = ""
-                if raw_rel:
-                    state_root = Path(project.state_dir(raw_rel))
-                    state_page = state_root / "wiki" / target.name
-                    if state_page.exists():
-                        write_text_atomic(state_page, main)
-                        for sidecar in (state_root / "state" / "pages").glob("*.json"):
-                            state = read_json(sidecar, default={})
-                            if state.get("filename") == target.name:
-                                state["content_sha256"] = hashlib.sha256(main.encode("utf-8")).hexdigest()
-                                state["human_edited"] = True
-                                write_json_atomic(sidecar, state)
-                                break
-            marker = target.parent / "_planning" / "linker.json"
-            state = read_json(marker, default={})
-            if state.get("status") == "complete":
-                state["status"] = "pending"
-                write_json_atomic(marker, state)
-            row["growi_path"] = page.path
-            row["page_id"] = page.page_id
-            row["revision_id"] = page.revision_id
-            row["marker_id"] = marker_id
-            pulled.append(local_path)
-        return pulled, conflicts, blocked
+                    if baseline.get("legacy_pinned"):
+                        raise LegacyBaseUnavailable("legacy page has not yet been published with its protected region")
+                    if not baseline.get("generated_blob") and not target.name.startswith((Path(RETAINED).stem, Path(DASHBOARD).stem)):
+                        raise LegacyBaseUnavailable("published pure ancestor is missing; legacy pin required")
+                    store.capture(raw_rel, local_path, row, previous_local, canonical,
+                                  generated_before=generated_before)
+                    decisions["captured"] += 1
+                except LegacyBaseUnavailable:
+                    pinned = store.pin_legacy(raw_rel, local_path, strip_regions(canonical), revision=page.revision_id, replace=True)
+                    effective = wrap_edit(store.get(pinned["human_after_blob"]), pinned["edit_id"])
+                    write_text_atomic(target, effective)
+                    write_text_atomic(target.parent / "_planning" / "pages" / target.name, effective)
+                    mark_pending(target)
+                    legacy = True
+                if editable(previous_local) != editable(canonical):
+                    if legacy:
+                        pulled.append(local_path)
+                    else:
+                        result = store.render(raw_rel)
+                        pulled.extend(sorted(result.changed_pages))
+                row["revision_id"] = page.revision_id
+                row["marker_seed"] = self.page_marker_seed(project, local_path)
+                store.remember_page(local_path, row, markdown, canonical, published=False)
+                if accounted and accounted.get("attempt_id"):
+                    settled = store.page(row["marker_id"])
+                    if settled.get("prepared_attempt_id") == accounted["attempt_id"]:
+                        store.settle_prepared(settled, status="captured_late_human")
+                if legacy:
+                    baseline = store.page(row["marker_id"])
+                    baseline["legacy_pinned"] = True
+                    store.save_page(baseline)
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                reason = str(exc)
+                store.block_page(local_path, row, reason, page)
+                blocked.add(document)
+                conflicts.append(f"{local_path}: {reason}")
+                decisions["blocked"] += 1
+        self.human_sync_summary = {"mode": mode, **decisions}
+        return list(dict.fromkeys(pulled)), conflicts, blocked
 
-    def delete_document(self, project: Any, rel: str) -> int:
-        return asyncio.run(self._trash_under(self.doc_path(project, rel), keep=set()))
+    def delete_document(self, project: Any, rel: str, *, known_pages: dict[str, dict[str, Any]] | None = None) -> int:
+        return asyncio.run(self._trash_under(self.doc_path(project, rel), keep=set(), expected_revisions=(
+            {str(row["page_id"]): str(row["revision_id"]) for row in known_pages.values()}
+            if known_pages is not None else None
+        ), on_deleted=lambda page: self._remember_deleted(project, known_pages or {}, page)))
 
     def reset(self) -> int:
         """Trash every publisher-marked page below the configured write path."""
         return asyncio.run(self._trash_under(growi_path(self.connection.write_path), keep=set()))
 
-    async def _trash_under(self, doc_path: str, *, keep: set[str]) -> int:
+    async def _trash_under(self, doc_path: str, *, keep: set[str], expected_revisions: dict[str, str] | None = None,
+                           on_deleted: Any = None) -> int:
         doomed: dict[str, str] = {}
+        inspected: dict[str, GrowiPage] = {}
         for listed in await self.client.list_all_pages(doc_path):
             if listed.path == doc_path or listed.path in keep:
                 continue
             full = await self.client.get_page(page_id=listed.page_id)
-            if full and _CHUNK_MARKER_RE.search(full.body):
+            if full and (_STAMP_RE.search(full.body) or _CHUNK_MARKER_RE.search(full.body)):
+                if expected_revisions is not None and full.revision_id != expected_revisions.get(full.page_id):
+                    raise RuntimeError(f"GROWI page changed before deletion: {full.path}")
                 doomed[full.page_id] = full.revision_id
-        await self.client.delete_pages(doomed)
+                inspected[full.page_id] = full
+        items = list(doomed.items())
+        for start in range(0, len(items), 20):
+            batch = dict(items[start:start + 20])
+            await self.client.delete_pages(batch)
+            for page_id in batch:
+                await _maybe_await(on_deleted, inspected[page_id])
         return len(doomed)
 
 

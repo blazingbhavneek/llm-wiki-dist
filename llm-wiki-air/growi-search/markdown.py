@@ -272,11 +272,15 @@ def extract_links(body: str) -> list[ParsedLink]:
 
 
 def is_index_page(body: str) -> bool:
-    return 'data-llm-wiki-index="' in (body or "")
+    text = body or ""
+    return 'data-llm-wiki-index="' in text or "<!-- llm-wiki-index:" in text
 
 
 def index_kind(body: str) -> str:
-    match = re.search(r'data-llm-wiki-index="([^"<>]*)"', body or "")
+    text = body or ""
+    match = re.search(r"<!-- llm-wiki-index:([^ <>]+) -->", text) or re.search(
+        r'data-llm-wiki-index="([^"<>]*)"', text
+    )
     return match.group(1) if match else ""
 
 

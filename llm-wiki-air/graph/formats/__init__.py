@@ -13,7 +13,7 @@ def kind_of(document_name: str) -> str:
     stem = PurePosixPath(document_name).stem
     _base, sep, ext = stem.rpartition("_")
     ext = ext.lower()
-    aliases = {"xlsm": "xlsx", "xls": "xlsx", "doc": "docx"}
+    aliases = {"xlsm": "xlsx", "xls": "xlsx", "doc": "docx", "txt": "pdf"}
     return aliases.get(ext, ext) if sep and (ext in KINDS or ext in aliases) else "md"
 
 
@@ -45,4 +45,8 @@ async def structural_seed_plan(
         from . import pdf
 
         return pdf.plan(lines, config=config)
+    if kind == "md":
+        from . import md
+
+        return md.plan(lines, config=config)
     return None

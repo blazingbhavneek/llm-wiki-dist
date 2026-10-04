@@ -6,6 +6,7 @@ build wiki [<raw-rel>...]   raw/ -> wiki pages only
 build link [<raw-rel>...]   link pending wiki pages only
 build all [<raw-rel>...]    wiki batch first, then link batch (bare build is an alias)
 publish                     publish the current wiki/ tree to GROWI
+pull                        capture GROWI edits and update the local human overlay
 index [<raw-rel>...]        publish per-document + root index pages for growi-search
 sync [<mount-rel>...]       scan and drain queue -> candidate -> GROWI -> commit
                             then reconcile every index page against the wiki tree
@@ -36,18 +37,14 @@ from graph.workspace.project import open_project
 PROJECT_ROOT = Path(__file__).resolve().parent
 config.PROJECT_ROOT = PROJECT_ROOT
 
+log = logging.getLogger(__name__)
+LOG_FORMAT = "%(levelname)s %(message)s"
+
 
 def _settings(args: argparse.Namespace) -> Settings:
     settings = Settings.from_env(getattr(args, "project", ""))
-    # downstream .env names the chat endpoint WIKI_CHAT_*; upstream reads OPENAI_*/WIKI_MODEL
-    overrides = {
-        "chat_base_url": os.environ.get("WIKI_CHAT_BASE_URL", ""),
-        "chat_api_key": os.environ.get("WIKI_CHAT_API_KEY", ""),
-        "chat_model": os.environ.get("WIKI_CHAT_MODEL", ""),
-    }
-    for key, value in overrides.items():
-        if value:
-            setattr(settings, key, value)
+    # .env (WIKI_CHAT_*/OPENAI_*/WIKI_MODEL) is the default; the project INI is
+    # project-specific and already wins inside Settings.from_env.
     if getattr(args, "data_root", None):
         settings.data_root = str(resolve_project_path(args.data_root).resolve())
     if getattr(args, "mode", None) and args.command != "link":
@@ -74,7 +71,7 @@ def _progress(event: dict[str, Any]) -> None:
         event.pop("current", None)
         event.pop("total", None)
     details = json.dumps(event, ensure_ascii=False, default=str)
-    print(f"[{stage}] {step}{progress} {details}".rstrip(), flush=True)
+    log.debug(f"[{stage}] {step}{progress} {details}".rstrip())
 
 
 def _report(result: dict[str, Any]) -> int:
@@ -167,47 +164,288 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    from publisher import pipeline
     from publisher.queue import retry_failed, scan, work_once, worker_lock
+    from publisher.progress import SyncProgress
 
     settings = _settings(args)
+    requested_isolation = getattr(args, "isolated", None)
+    isolated = (
+        bool(getattr(settings, "sync_isolated", True))
+        if requested_isolation is None
+        else bool(requested_isolation)
+    )
+    if isolated:
+        return _cmd_sync_isolated(args, settings)
     project = open_project(settings)
     combined: dict[str, Any] = {"done": [], "failures": []}
-    with worker_lock(project):
-        retry_failed(project)
-        first = True
-        resume = bool(getattr(args, "continue_run", False))
-        while True:
-            scan(
+    progress = SyncProgress()
+
+    def on_event(event: dict[str, Any]) -> None:
+        progress.on_event(event)
+        if args.verbose:
+            _progress(event)
+
+    try:
+        stale = pipeline.republish_if_stale(settings)
+        if stale is not None:
+            print(f"growi endpoint or markers changed: full republish {stale['run_id']}", flush=True)
+            combined["failures"].extend(stale["failures"])
+        with worker_lock(project):
+            retry_failed(project)
+            first = True
+            resume = bool(getattr(args, "continue_run", False))
+            while True:
+                scan_result = scan(
+                    settings,
+                    only=args.items or None,
+                    settle_seconds=0,
+                    force=args.force and first,
+                    verify_content=True,
+                )
+                progress.add_scan_result(scan_result)
+                first = False
+                result = work_once(settings, on_event=on_event, continue_run=resume)
+                # Only the first batch can resume a kept worktree; later batches
+                # in the same process are always fresh.
+                resume = False
+                if result is None:
+                    break
+                paths = result.get("paths", [])
+                progress.add_documents(paths)
+                combined["done"].extend(result.get("done", []))
+                combined["failures"].extend(result.get("failures", []))
+                if result.get("failures"):
+                    break
+                progress.mark_completed(paths)
+        if not combined["failures"]:
+            # Index pages are derived output, so reconcile them against the whole wiki tree
+            # here: a wiki built before its index exists catches up, and a page whose body
+            # already matches GROWI is read but never rewritten.
+            from publisher.index import build_index
+
+            try:
+                index_callback = on_event if args.verbose or progress.has_documents else None
+                index = build_index(settings, on_progress=index_callback)
+            except Exception as exc:  # a stale table of contents must not fail a sync
+                index = {"done": [], "failures": [f"index: {type(exc).__name__}: {exc}"]}
+            combined["done"].extend(index["done"])
+            combined["failures"].extend(index["failures"])
+        return _report(combined)
+    finally:
+        progress.close()
+
+
+def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
+    """One retry owner; each operation starts from the latest accepted main."""
+    import traceback
+    import uuid
+
+    from publisher import pipeline
+    from publisher.failure_logs import save_failure
+    from publisher.queue import recover, retry_failed, scan, status, work_once, worker_lock
+    from publisher.progress import SyncProgress
+
+    project = open_project(settings)
+    run_id = "sync-" + uuid.uuid4().hex
+    combined: dict[str, Any] = {"done": [], "failures": []}
+    progress = SyncProgress()
+    wanted = {item.strip().lstrip("/") for item in args.items or ()}
+    logs: dict[str, list[str]] = {}
+    discovery: dict[str, str] = {}
+    recorded: set[tuple[int, str, str]] = set()
+    recovered: list[str] = []
+    blocked = False
+
+    def selected(row: dict[str, Any]) -> bool:
+        return not wanted or row["rel"] in wanted or row.get("from_rel") in wanted
+
+    def on_event(event: dict[str, Any]) -> None:
+        progress.on_event(event)
+        if args.verbose:
+            _progress(event)
+
+    try:
+        with worker_lock(project):
+            # Uncertain remote state must be examined before pruning, scanning,
+            # retrying jobs, or issuing any unrelated publication.
+            recover(project, settings)
+            stale = pipeline.republish_if_stale(settings)
+            if stale is not None and stale.get("failures"):
+                combined["failures"].extend(stale["failures"])
+                return _report(combined)
+            retry_failed(project, only=args.items or None)
+            scanned = scan(
                 settings,
                 only=args.items or None,
                 settle_seconds=0,
-                force=args.force and first,
+                force=args.force,
                 verify_content=True,
             )
-            first = False
-            result = work_once(settings, on_event=_progress if args.verbose else None, continue_run=resume)
-            # Only the first batch can resume a kept worktree; later batches
-            # in the same process are always fresh.
-            resume = False
-            if result is None:
-                break
-            combined["done"].extend(result.get("done", []))
-            combined["failures"].extend(result.get("failures", []))
-            if result.get("failures"):
-                break
-    if not combined["failures"]:
-        # Index pages are derived output, so reconcile them against the whole wiki tree
-        # here: a wiki built before its index exists catches up, and a page whose body
-        # already matches GROWI is read but never rewritten.
-        from publisher.index import build_index
+            progress.add_scan_result(scanned)
+            progress.add_documents(
+                row["rel"] for row in status(project)
+                if selected(row) and row["status"] in {"queued", "running", "failed"}
+            )
+            discovery = {
+                rel: error for rel, error in scanned.get("errors", {}).items()
+                if not wanted or rel in wanted or rel == "." or any(
+                    item.startswith(rel.rstrip("/") + "/") for item in wanted
+                )
+            }
+            for rel, error in discovery.items():
+                key = (1, rel, error)
+                recorded.add(key)
+                path = save_failure(
+                    settings,
+                    project,
+                    run_id,
+                    1,
+                    rel,
+                    {"stage": "scan", "error": error},
+                    error,
+                )
+                logs.setdefault(rel, []).append(path)
+                log.error("source discovery failed: %s; log=%s", rel, path)
+            attempt = 1
+            while True:
+                result = work_once(settings, on_event=on_event, isolated=True,
+                                   only=args.items or None, run_id=run_id, attempt=attempt,
+                                   exclude=list(discovery), defer_linker=True)
+                if result is None:
+                    if attempt == 2:
+                        break
+                    # Snapshot exact current versions once. No scan or worker
+                    # loop below automatically requeues failed final attempts.
+                    targets = {row["rel"]: row["version"] for row in status(project)
+                               if selected(row) and row["status"] == "failed"}
+                    retry_failed(project, only=args.items or None, versions=targets)
+                    attempt = 2
+                    log.info("first pass complete; final retry documents=%d discovery=%d", len(targets), len(discovery))
+                    continue
+                paths = result.get("paths", [])
+                progress.add_documents(paths)
+                evidence = result.get("failure_logs", [])
+                if evidence:
+                    for rel in paths:
+                        logs.setdefault(rel, []).extend(evidence)
+                if result.get("recovery_required") or result.get("cancelled"):
+                    blocked = True
+                    combined["failures"].extend(result.get("failures") or ["sync cancelled; pending jobs retained"])
+                    break
+                if result.get("failures"):
+                    log.warning("document attempt %d failed: %s; logs=%s", attempt, paths, result.get("failure_logs", []))
+                    continue
+                combined["done"].extend(result.get("done", []))
+                progress.mark_completed(paths)
+                if attempt == 2:
+                    recovered.extend(paths)
+            if not blocked and getattr(settings, "wiki_linker_enabled", True):
+                link_only = None
+                if wanted:
+                    from publisher.ledger import load_ledger
 
-        try:
-            index = build_index(settings, on_progress=_progress if args.verbose else None)
-        except Exception as exc:  # a stale table of contents must not fail a sync
-            index = {"done": [], "failures": [f"index: {type(exc).__name__}: {exc}"]}
-        combined["done"].extend(index["done"])
-        combined["failures"].extend(index["failures"])
-    return _report(combined)
+                    ledger = load_ledger(project.metadata / "pipeline.json")
+                    link_only = sorted({
+                        str(row.get("raw_rel") or "")
+                        for rel, row in ledger.sources.items()
+                        if (rel in wanted or str(row.get("mount_rel") or "") in wanted)
+                        and row.get("raw_rel")
+                    })
+                linked = pipeline.link_pending_isolated(
+                    settings,
+                    only=link_only,
+                    on_progress=on_event,
+                )
+                combined["done"].extend(linked.get("done", []))
+                combined["failures"].extend(linked.get("failures", []))
+            pending = [row for row in status(project) if selected(row)]
+            for row in pending:
+                evidence = ", ".join(logs.get(row["rel"], []))
+                combined["failures"].append(
+                    f"{row['rel']}: {row.get('error') or 'pending dependent work'}"
+                    + (f"; logs: {evidence}" if evidence else "")
+                )
+            for rel, error in discovery.items():
+                combined["failures"].append(f"scan {rel}: {error.splitlines()[-1]}; logs: {', '.join(logs.get(rel, []))}")
+            if not blocked:
+                from publisher.index import build_index
+
+                try:
+                    index = build_index(settings, on_progress=on_event if args.verbose or progress.has_documents else None)
+                    combined["done"].extend(index.get("done", []))
+                    combined["failures"].extend(index.get("failures", []))
+                except Exception as exc:
+                    combined["failures"].append(f"index: {type(exc).__name__}: {exc}")
+        if recovered:
+            print(json.dumps({"recovered_on_final_retry": recovered}, ensure_ascii=False))
+        if logs:
+            print(json.dumps({"failure_logs": logs, "run_id": run_id}, ensure_ascii=False))
+        return _report(combined)
+    except Exception as exc:
+        evidence = save_failure(settings, project, run_id, 1, "<shared>",
+                                {"stage": "sync", "error": traceback.format_exc()}, traceback.format_exc())
+        combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}; log: {evidence}")
+        return _report(combined)
+    finally:
+        progress.close()
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    from publisher.pipeline import pull_growi_once
+
+    settings = _settings(args)
+    result = (
+        pull_growi_once(settings, force_inventory=True)
+        if getattr(args, "inventory", False)
+        else pull_growi_once(settings)
+    )
+    if result.get("human_sync"):
+        print(json.dumps({"human_sync": result["human_sync"]}, ensure_ascii=False, default=str))
+    return _report(result)
+
+
+def cmd_human(args: argparse.Namespace) -> int:
+    from publisher.human_changes import HumanStore
+
+    settings = _settings(args)
+    project = open_project(settings)
+    store = HumanStore(project)
+    if args.human_command == "status":
+        print(json.dumps(store.project_summary(), ensure_ascii=False, default=str))
+        return 0
+    if args.human_command == "resolve":
+        combined = ""
+        if args.text_file:
+            combined = Path(args.text_file).read_text(encoding="utf-8")
+        result = store.resolve(
+            args.edit_id,
+            action=args.action,
+            expected_revision=args.revision,
+            combined_text=combined,
+            document=args.document or "",
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.human_command == "recover-legacy":
+        from publisher.legacy_recovery import recover_legacy_ancestor
+
+        result = recover_legacy_ancestor(store, args.document)
+        print(json.dumps(result, ensure_ascii=False, default=str))
+        return 0 if result.get("status") in {"recovered", "no_legacy_pin"} else 1
+    if args.human_command == "live-plan":
+        from publisher.live_verification import LiveVerificationReport
+
+        report = LiveVerificationReport.create(project, settings, args.path)
+        print(json.dumps({
+            "report": str(report.path),
+            "resolved_boundary": report.data["disposable_path"],
+            "endpoint": report.data["endpoint"],
+            "confirmation_code": report.data["confirmation_code"],
+            "status": report.data["status"],
+        }, ensure_ascii=False))
+        return 0
+    raise ValueError(f"unknown human command: {args.human_command}")
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -291,7 +529,12 @@ def cmd_build(args: argparse.Namespace) -> int:
 def cmd_publish(args: argparse.Namespace) -> int:
     from publisher.pipeline import publish_only
 
-    return _report(publish_only(_settings(args)))
+    allow_unlinked = bool(getattr(args, "allow_unlinked", False))
+    return _report(publish_only(
+        _settings(args),
+        allow_unlinked=allow_unlinked,
+        link_pending=not allow_unlinked,
+    ))
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -369,8 +612,12 @@ def build_parser() -> argparse.ArgumentParser:
     sync.description = "Drain the queue, then reconcile index pages for the whole wiki tree."
     sync.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
     sync.add_argument("--force", action="store_true", help="regenerate selected sources even when unchanged")
+    sync.add_argument(
+        "--isolated", action=argparse.BooleanOptionalAction, default=None,
+        help="build all sources with one final retry pass, then do the same for pending links (default: enabled; use --no-isolated for legacy batch mode)",
+    )
     sync.add_argument("--continue", dest="continue_run", action="store_true",
-                      help="resume the previous run's kept candidate worktree instead of discarding it")
+                      help="in batch mode, resume a kept candidate; isolated mode recovers it and starts from accepted main")
     sync.set_defaults(fn=cmd_sync)
     watch = sub.add_parser("watch", help="run the metadata scanner and persistent queue worker"); pipeline_flags(watch)
     watch.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
@@ -401,7 +648,34 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--from-file", help="text file with one raw-relative path per line")
     build.add_argument("--force", action="store_true", help="regenerate even when the raw source is unchanged")
     build.set_defaults(fn=cmd_build)
-    publish = sub.add_parser("publish", help="publish the current wiki tree only"); project_flags(publish); publish.set_defaults(fn=cmd_publish)
+    publish = sub.add_parser("publish", help="publish the current wiki tree only"); project_flags(publish)
+    publish.add_argument(
+        "--allow-unlinked",
+        action="store_true",
+        help="publish built wiki pages even when linking is pending or failed; keep them pending for a later sync",
+    )
+    publish.set_defaults(fn=cmd_publish)
+    pull = sub.add_parser("pull", help="capture GROWI edits into the local human overlay"); project_flags(pull)
+    pull.add_argument("--inventory", action="store_true", help="force a complete read-only inventory below the configured GROWI root")
+    pull.set_defaults(fn=cmd_pull)
+    human = sub.add_parser("human", help="inspect and resolve durable human overlays"); project_flags(human)
+    human_sub = human.add_subparsers(dest="human_command", required=True)
+    human_status = human_sub.add_parser("status", help="write and print the project-wide human-sync summary")
+    project_flags(human_status)
+    human_resolve = human_sub.add_parser("resolve", help="apply one revision-checked operator decision")
+    project_flags(human_resolve)
+    human_resolve.add_argument("edit_id")
+    human_resolve.add_argument("--action", required=True, choices=("keep-human", "accept-source", "combine", "suppress", "delete", "retry-match"))
+    human_resolve.add_argument("--revision", required=True, help="last inspected GROWI revision")
+    human_resolve.add_argument("--document", help="expected raw document identity")
+    human_resolve.add_argument("--text-file", help="UTF-8 combined body for --action combine")
+    human_recover = human_sub.add_parser("recover-legacy", help="recover a uniquely verified pure ancestor from project Git")
+    project_flags(human_recover)
+    human_recover.add_argument("document", help="raw-relative document path")
+    human_live = human_sub.add_parser("live-plan", help="create a local-only redacted plan for a disposable live verification subtree")
+    project_flags(human_live)
+    human_live.add_argument("--path", required=True, help="confirmed disposable path below the configured project boundary")
+    human.set_defaults(fn=cmd_human)
     index = sub.add_parser("index", help="publish per-document + root index pages for growi-search"); project_flags(index)
     index.add_argument("items", nargs="*", metavar="raw-rel", help="raw-relative paths; omit for every linked document")
     index.add_argument("--no-publish", action="store_true", help="only write metadata/index/, do not touch GROWI")
@@ -425,8 +699,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     args = build_parser().parse_args()
+    from publisher.progress import ShortNameFormatter, TqdmStreamHandler
+
+    handler = TqdmStreamHandler(sys.stderr)
+    handler.setFormatter(ShortNameFormatter(LOG_FORMAT))
+    logging.basicConfig(
+        level="DEBUG" if getattr(args, "verbose", False) else os.environ.get("LOG_LEVEL", "INFO"),
+        handlers=[handler],
+    )
+    # -v means "show our debug", not third-party HTTP/client chatter.
+    # Keep client warnings out of the progress display as well; real errors
+    # from these clients remain visible.
+    for noisy in (
+        "httpx",
+        "httpcore",
+        "h11",
+        "urllib3",
+        "openai",
+        "langchain",
+        "langchain_openai",
+        "langchain-openai",
+        "anthropic",
+    ):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
     return int(args.fn(args) or 0)
 
 

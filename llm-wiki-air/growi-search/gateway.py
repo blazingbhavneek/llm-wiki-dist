@@ -52,6 +52,21 @@ def normalize_scores(values: list[float]) -> list[float]:
     return [(v - low) / (high - low) for v in values]
 
 
+EMBED_TOKEN_LIMIT = 8000  # the embed server's window is 8192 tokens; chars ~ tokens for CJK
+EMBED_MAX_PARTS = 32
+
+
+def _pieces(text: str, parts: int) -> list[str]:
+    """Split text into exactly ``parts`` near-equal slices (empty text stays one slice)."""
+    parts = max(1, min(parts, len(text) or 1))
+    step = max(1, -(-len(text) // parts))
+    return [text[start:start + step] for start in range(0, len(text), step)] or [""]
+
+
+def _mean(vectors: list[list[float]]) -> list[float]:
+    return [sum(values) / len(values) for values in zip(*vectors)]
+
+
 class Embedder:
     """OpenAI-compatible /v1/embeddings client with the model's retrieval prefixes."""
 
@@ -89,7 +104,30 @@ class Embedder:
         return f"{self.model}|{self.dim}|{self.doc_prefix}"
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._client.embed_documents([self.doc_prefix + text for text in texts])
+        return self._embed([self.doc_prefix + text for text in texts], 1)
+
+    def _embed(self, texts: list[str], parts: int) -> list[list[float]]:
+        """Embed a batch, splitting any text that does not fit the server's window into
+        ``parts`` slices and averaging their vectors back into one vector per text.  The
+        server's own tokenizer decides what fits, so a rejected batch is retried with
+        parts + 1 (1 -> 2 -> 3 ...) until it is accepted."""
+        limit = max(1, EMBED_TOKEN_LIMIT // parts)
+        plan = [max(1, min(-(-len(text) // limit), len(text) or 1)) for text in texts]
+        pieces = [piece for text, count in zip(texts, plan) for piece in _pieces(text, count)]
+        try:
+            vectors = self._client.embed_documents(pieces)
+        except Exception as exc:  # noqa: BLE001 - the only reliable length signal is the reply
+            if parts >= EMBED_MAX_PARTS:
+                raise
+            log.warning("embeddings rejected (%s); retrying with %d parts per %d-char slice",
+                        exc, parts + 1, EMBED_TOKEN_LIMIT // (parts + 1))
+            return self._embed(texts, parts + 1)
+        out: list[list[float]] = []
+        index = 0
+        for count in plan:
+            out.append(_mean(vectors[index:index + count]) if count > 1 else vectors[index])
+            index += count
+        return out
 
     def embed_query(self, text: str) -> list[float]:
         return self._client.embed_query(self.query_prefix + text)

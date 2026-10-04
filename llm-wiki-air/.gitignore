@@ -5,12 +5,18 @@ __pycache__/
 data-excel/
 .vscode/mcp.json
 growi-search/.env
+# Local project configs contain deployment credentials.
+configs/projectE_test.ini
+configs/projectF_test.ini
+configs/projectG_test.ini
 growi-search/frontend/node_modules/
 growi-search/frontend/dist/
 !growi-search/frontend/src/data/
 tests/
 !tests/
 tests/*
+!tests/test_sync_fallback.py
+!tests/test_md_txt_formats.py
 !tests/test_search_speedup.py
 !growi-search/
 !growi-search/tests/
@@ -22,6 +28,8 @@ tests/*
 !tests/test_xlsm_lineage_equivalence.py
 !tests/test_mount_diff_pipeline.py
 !tests/test_update_tiers.py
+!tests/test_human_changes.py
+!tests/test_human_sync_rollout.py
 !tests/samples/
 !tests/samples/digital-agency-pdl.docx
 !doc-parser/tests/
@@ -31,3 +39,4 @@ zip.py
 growi-llm-wiki.zip
 growi-search/chaoliangUNSW
 jev/models
+logs/

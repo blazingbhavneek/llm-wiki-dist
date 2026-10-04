@@ -265,7 +265,7 @@ class JevEngine:
             self._stats["token_cache_misses"] = backend_stats.get("token_cache_misses", self._stats["token_cache_misses"])
             if "fast_kernels" in backend_stats: self._stats["fast_kernels"] = backend_stats["fast_kernels"]
         if self.stats_seconds and time.monotonic() - self._last_stats_log >= self.stats_seconds:
-            log.info("Jev stats: %s", stats_summary(self._stats, time.monotonic() - self._started))
+            log.debug("Jev stats: %s", stats_summary(self._stats, time.monotonic() - self._started))
             self._last_stats_log = time.monotonic()
 
     def stats(self):

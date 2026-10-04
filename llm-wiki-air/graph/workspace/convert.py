@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .parser_client import UnsupportedDocument, parse_document
-from .project import Project, assert_unique_generated_paths, raw_name_for
+from .project import VERBATIM, Project, assert_unique_generated_paths, raw_name_for
 
 SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
@@ -29,7 +29,7 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
             continue
         target = project.raw / Path(rel).parent / raw_name_for(Path(rel).name)
         try:
-            if path.suffix.lower() == ".md":
+            if path.suffix.lower() in VERBATIM:
                 markdown = path.read_text(encoding="utf-8")
             else:
                 if not parser_base_url:

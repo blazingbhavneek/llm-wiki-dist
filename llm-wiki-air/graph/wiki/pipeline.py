@@ -622,8 +622,24 @@ async def _research_references(
 ) -> tuple[list[_ReferenceEvidence], str]:
     """Python selects references; one structured compare call per page."""
 
+    _emit(
+        on_progress,
+        "research",
+        "page_start",
+        page=page.title,
+        current=0,
+        total=len(pages),
+    )
     selected = _select_references(page, pages, tokens, limit=config.reference_candidates)
     if not selected:
+        _emit(
+            on_progress,
+            "research",
+            "page_done",
+            page=page.title,
+            total=len(pages),
+            references=0,
+        )
         return [], "# 参照調査結果\n\n他のWikiページはない。\n"
 
     research_dir = work_root / f"research-{page.number:03d}"
@@ -646,6 +662,7 @@ async def _research_references(
             research = _render_reference_research(page, evidence, seed_root=seed_root)
             write_text_atomic(research_dir / "reference-research.md", research)
             _emit(on_progress, "research", "resumed", page=page.title)
+            _emit(on_progress, "research", "page_done", page=page.title, total=len(pages), resumed=True)
             return evidence, research
 
     research_dir = clean_workdir(research_dir)
@@ -726,6 +743,7 @@ async def _research_references(
 
     research = _render_reference_research(page, evidence, seed_root=seed_root)
     write_text_atomic(research_dir / "reference-research.md", research)
+    _emit(on_progress, "research", "page_done", page=page.title, total=len(pages), references=len(selected))
     return evidence, research
 
 
@@ -1192,6 +1210,7 @@ async def _rewrite_page(
         stop_check=stop_check, on_progress=on_progress,
     )
     facts = [fact for item in evidence for fact in item.facts]
+    _emit(on_progress, "writer", "page_start", page=page.title, current=0, total=len(pages))
     # ponytail: sections stay in source order; add reordering only if a smoke run needs it.
     sections = split_sections(
         lines, start, end,
@@ -1292,6 +1311,8 @@ async def _rewrite_all(
         )
         if resumed is not None:
             results.append(resumed)
+            _emit(on_progress, "writer", "page_start", page=page.title, current=0, total=len(pages), resumed=True)
+            _emit(on_progress, "writer", "page_done", page=page.title, total=len(pages), resumed=True)
             _emit(on_progress, "rewrite", "page_resumed",
                   current=len(results), total=len(pages), page=page.title)
         else:
@@ -1301,13 +1322,15 @@ async def _rewrite_all(
 
     async def one(page: SeedPage) -> RewriteResult:
         async with semaphore:
-            return await _rewrite_page(
+            result = await _rewrite_page(
                 page, pages=pages, lines=lines, units=units, tokens=tokens,
                 model=model, config=config, work_root=work_root, seed_root=seed_root,
                 source_line_count=source_line_count,
                 stop_check=stop_check, on_progress=on_progress,
                 parents=parents,
             )
+            _emit(on_progress, "writer", "page_done", page=page.title, total=len(pages))
+            return result
 
     for completed, task in enumerate(
         asyncio.as_completed([one(page) for page in pending]), start=len(results) + 1
@@ -1422,6 +1445,7 @@ async def run_pipeline(
     config = config or WikiConfig()
     model = model or ChatModelPort(config)
     slug = slugify(config.document_slug or source_path.stem, fallback="document").casefold()
+    _emit(on_progress, "planner", "start", source_lines=len(lines))
     run_root = (
         Path(config.run_dir).resolve()
         if config.run_dir
@@ -1445,6 +1469,13 @@ async def run_pipeline(
         source_line_count=len(lines),
         prompt_version=SEED_PLAN_VERSION,
     ) if config.resume else None
+    if pages is not None:
+        block_index = build_block_index(lines)
+        if any(
+            start > 1 and not block_index.cut_is_safe(start)
+            for page in pages for start, _end in page.owner_ranges
+        ):
+            pages = None
     if pages is None and config.require_resume:
         raise ResumeUnavailable(f"stored seed plan for {source_path.name} could not be resumed")
     resumed_seed_plan = pages is not None
@@ -1565,6 +1596,7 @@ async def run_pipeline(
     write_json_atomic(plan_path, plan_json)
     write_text_atomic(wiki_root / "index.md", _index_text(source_path.stem, pages))
     _emit(on_progress, "seed", "done", pages=len(pages), images=len(units))
+    _emit(on_progress, "planner", "done", current=len(pages), total=len(pages), pages=len(pages))
 
     results = await _rewrite_all(
         pages,

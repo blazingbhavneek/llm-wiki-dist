@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "status": "offline-fixture-baseline",
+  "thresholds_are_apply_approved": false,
+  "observe_proposal_thresholds": {"minimum_score": 0.72, "minimum_margin": 0.08},
+  "apply_thresholds": null,
+  "scorer": "deterministic-offline-fake-jev-v1",
+  "fixtures": [
+    {"label": "exact moved block", "expected_match": true, "observed_score": 0.98, "deterministic_similarity": 1.0},
+    {"label": "same heading unrelated identifiers", "expected_match": false, "observed_score": 0.14, "deterministic_similarity": 0.12},
+    {"label": "rewritten Japanese limits block", "expected_match": true, "observed_score": 0.83, "deterministic_similarity": 0.74}
+  ],
+  "note": "These deterministic fake-Jev observations exercise the offline contract only. Semantic output remains observe-only pending labelled live Jev calibration and explicit approval."
+}

@@ -167,7 +167,7 @@ class TorchBackend:
             backend.stats["fast_kernels"] = True
         except ImportError:
             backend.stats["fast_kernels"] = False
-        log.info("Jev fast kernels available: %s", backend.stats["fast_kernels"])
+        log.debug("Jev fast kernels available: %s", backend.stats["fast_kernels"])
         renderer = getattr(runtime, "renderer", None)
         serializer = getattr(module, "serialize_state", None)
         if renderer is not None and serializer is not None:

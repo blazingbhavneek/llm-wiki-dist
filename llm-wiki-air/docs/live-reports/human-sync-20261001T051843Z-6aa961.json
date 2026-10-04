@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "status": "failed_rollback_required",
+  "created_at": "2026-10-01T05:18:43.559237+00:00",
+  "endpoint": "http://10.160.152.38:3000",
+  "endpoint_identity": "aeca40a3eb21d4e3ffa96563fd1d6c15919735ecb1e8aece483d0356b23e010d",
+  "disposable_path": "/diff_test/codex-live-20261001T051843Z-6aa961",
+  "confirmation_code": "ab31b9852097f75c",
+  "mode": "off",
+  "marker_format": "bot-ref-1",
+  "commit": "047898adc6b7fd07c7e54054252aa38aa7899ea0",
+  "configuration_sha256": "e84424f27918eb108cd93277e36e453e25b3ece975dd66842099418a158ebfc0",
+  "tokens_recorded": false,
+  "cases": {
+    "initial_multi_page_publish": {
+      "status": "passed",
+      "recorded_at": "2026-10-01T05:59:29.320133+00:00",
+      "initial_hashes": {},
+      "final_hashes": {
+        "content": "d7143b8c3ff00619c3ecf88b0273a7c385b9eda7de5a4005d286814e1c03c1bd"
+      },
+      "revisions": {
+        "codex-live-20261001T051843Z-6aa961/fixture/002.md": "6abdf6c16aaadd7d2ebfbf7d",
+        "codex-live-20261001T051843Z-6aa961/fixture/001.md": "6abdf6c16aaadd7d2ebfbf7e"
+      },
+      "operation": "publish two disposable owned pages",
+      "expected": "two owned pages created inside boundary",
+      "actual": "two owned pages created",
+      "calls": {
+        "GET /page": 2,
+        "GET /pages/list": 1,
+        "POST /page/": 2
+      },
+      "reason_codes": []
+    },
+    "normal_update": {
+      "status": "passed",
+      "recorded_at": "2026-10-01T05:59:30.340006+00:00",
+      "initial_hashes": {
+        "content": "09366f6dcdfd240a17056933f57cb2a730190b22ab25ab049828e136e15e0054"
+      },
+      "final_hashes": {
+        "content": "35704d114bd708bc46aaf2f3f2d6ac0a8c090b0c9249a5e14e66a80fa2fb4fd5"
+      },
+      "revisions": {
+        "codex-live-20261001T051843Z-6aa961/fixture/001.md": "6abdf6c26aaadd7d2ebfbf7f"
+      },
+      "operation": "conditional source update",
+      "expected": "MANUAL published with CAS",
+      "actual": "MANUAL published",
+      "calls": {
+        "GET /page": 5,
+        "GET /pages/list": 1,
+        "PUT /page/": 1
+      },
+      "reason_codes": []
+    },
+    "noop_repeat": {
+      "status": "passed",
+      "recorded_at": "2026-10-01T05:59:29.743249+00:00",
+      "initial_hashes": {
+        "content": "09366f6dcdfd240a17056933f57cb2a730190b22ab25ab049828e136e15e0054"
+      },
+      "final_hashes": {
+        "content": "09366f6dcdfd240a17056933f57cb2a730190b22ab25ab049828e136e15e0054"
+      },
+      "revisions": {
+        "codex-live-20261001T051843Z-6aa961/fixture/002.md": "6abdf6c16aaadd7d2ebfbf7d",
+        "codex-live-20261001T051843Z-6aa961/fixture/001.md": "6abdf6c16aaadd7d2ebfbf7e"
+      },
+      "operation": "repeat identical publish",
+      "expected": "no PUT and stable revisions",
+      "actual": "stable revisions",
+      "calls": {
+        "GET /page": 4,
+        "GET /pages/list": 1
+      },
+      "reason_codes": []
+    },
+    "process_restart": {
+      "status": "passed",
+      "recorded_at": "2026-10-01T05:59:30.678010+00:00",
+      "initial_hashes": {
+        "content": "35704d114bd708bc46aaf2f3f2d6ac0a8c090b0c9249a5e14e66a80fa2fb4fd5"
+      },
+      "final_hashes": {
+        "content": "35704d114bd708bc46aaf2f3f2d6ac0a8c090b0c9249a5e14e66a80fa2fb4fd5"
+      },
+      "revisions": {
+        "codex-live-20261001T051843Z-6aa961/fixture/002.md": "6abdf6c16aaadd7d2ebfbf7d",
+        "codex-live-20261001T051843Z-6aa961/fixture/001.md": "6abdf6c26aaadd7d2ebfbf7f"
+      },
+      "operation": "recreate store and publisher then publish",
+      "expected": "durable no-op",
+      "actual": "durable no-op",
+      "calls": {
+        "GET /page": 4,
+        "GET /pages/list": 1
+      },
+      "reason_codes": []
+    },
+    "human_add": {
+      "status": "pending"
+    },
+    "human_replace": {
+      "status": "pending"
+    },
+    "human_delete": {
+      "status": "pending"
+    },
+    "same_edit": {
+      "status": "pending"
+    },
+    "disjoint_edit": {
+      "status": "pending"
+    },
+    "contradiction": {
+      "status": "pending"
+    },
+    "keep_human": {
+      "status": "pending"
+    },
+    "accept_source": {
+      "status": "pending"
+    },
+    "combine": {
+      "status": "pending"
+    },
+    "suppress": {
+      "status": "pending"
+    },
+    "tier_0": {
+      "status": "pending"
+    },
+    "tier_1": {
+      "status": "pending"
+    },
+    "tier_2": {
+      "status": "pending"
+    },
+    "tier_3": {
+      "status": "pending"
+    },
+    "split_combine_rename_reorder": {
+      "status": "pending"
+    },
+    "remote_move": {
+      "status": "pending"
+    },
+    "remote_delete": {
+      "status": "pending"
+    },
+    "marker_damage": {
+      "status": "pending"
+    },
+    "foreign_destination": {
+      "status": "pending"
+    },
+    "duplicate_marker": {
+      "status": "pending"
+    },
+    "source_rename": {
+      "status": "pending"
+    },
+    "bulk_delete": {
+      "status": "pending"
+    },
+    "markdown_integrity": {
+      "status": "failed",
+      "recorded_at": "2026-10-01T05:59:29.397534+00:00",
+      "initial_hashes": {
+        "content": "348590207859af7b3504c7088c26a17dc9becefdfe36897789903fe4346e0c90"
+      },
+      "final_hashes": {
+        "content": "a982fb3df9e1e0f2f7dbcfbac67caf1c63005232562b36445be540f6313dde38"
+      },
+      "revisions": {
+        "codex-live-20261001T051843Z-6aa961/fixture/002.md": "6abdf6c16aaadd7d2ebfbf7d"
+      },
+      "operation": "round-trip table/code/Japanese/link/comment fixture",
+      "expected": "byte-exact managed Markdown",
+      "actual": "mismatch",
+      "calls": {},
+      "reason_codes": []
+    },
+    "attachments_images": {
+      "status": "pending"
+    },
+    "conditional_409": {
+      "status": "pending"
+    },
+    "edit_after_preflight": {
+      "status": "pending"
+    },
+    "edit_during_generation": {
+      "status": "pending"
+    },
+    "lost_update": {
+      "status": "pending"
+    },
+    "lost_create": {
+      "status": "pending"
+    },
+    "partial_publish_late_edit": {
+      "status": "pending"
+    },
+    "watcher_restart": {
+      "status": "pending"
+    },
+    "activity_cursor_restart": {
+      "status": "pending"
+    },
+    "full_inventory_equivalence": {
+      "status": "pending"
+    },
+    "candidate_rollback": {
+      "status": "pending"
+    },
+    "last_good_restore": {
+      "status": "pending"
+    },
+    "service_restart_reconcile": {
+      "status": "pending"
+    },
+    "model_outage_fallback": {
+      "status": "pending"
+    }
+  },
+  "rollback_triggers": [
+    "missing_or_duplicated_human_span",
+    "unexpected_overwrite_delete_or_move",
+    "cursor_gap",
+    "corrupt_store",
+    "non_idempotent_retry",
+    "unexplained_ledger_remote_disagreement"
+  ],
+  "cleanup": {
+    "status": "cleanup_failed",
+    "recovery_possible": true
+  },
+  "recommendation": "Remain off until the disposable boundary is confirmed and the matrix passes.",
+  "confirmed_at": "2026-10-01T05:39:00.000147+00:00",
+  "local_metadata_backup": "/tmp/llm-wiki-live-20261001T051843Z-6aa961/backup-local-metadata",
+  "remote_backup": {
+    "status": "confirmed_empty",
+    "scope": "/diff_test/codex-live-20261001T051843Z-6aa961",
+    "exact_paths_checked": [
+      "/diff_test/codex-live-20261001T051843Z-6aa961/fixture/001"
+    ]
+  },
+  "data_access_policy": "exact disposable paths and returned page IDs only; no global activity/listing",
+  "live_exception": {
+    "type": "AssertionError"
+  },
+  "cleanup_failures": [
+    "remaining:6abdf6c0826c31a99782defd",
+    "remaining:6abdf6c1826c31a99782df31"
+  ],
+  "api_calls": {
+    "GET /page": 23,
+    "GET /pages/list": 4,
+    "POST /page/": 2,
+    "POST /pages/delete": 2,
+    "PUT /page/": 3
+  },
+  "data_access": {
+    "existing_company_pages_read": 0,
+    "global_activity_feed_read": false,
+    "global_page_listing_read": false,
+    "page_listing_boundary": "/diff_test/codex-live-20261001T051843Z-6aa961",
+    "page_ids_read": [
+      "6abdf6c0826c31a99782defd",
+      "6abdf6c1826c31a99782df31"
+    ]
+  }
+}

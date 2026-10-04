@@ -43,7 +43,8 @@ growi-search/
 
 ## Configuration
 
-Read from an optional `growi-search/.env` first, then the repository `.env`. With
+Read from `growi-search/.env` only — this service shares no config file with the rest of
+the repository (`override=False`, so an exported shell variable still wins). With
 `WIKI_PROJECT=projectA` (or an absolute INI path) the project's `growi_url`,
 `growi_token` and `settings.chat_base_url` are used.
 
@@ -60,7 +61,7 @@ Read from an optional `growi-search/.env` first, then the repository `.env`. Wit
 | `WIKI_RERANK_BASE_URL` / `WIKI_RERANK_MODEL` | — | Cross-encoder `/v1/rerank`; optional. |
 | `WIKI_JEV_ENABLED` + `WIKI_JEV_*` | off | JEV judge (see below). |
 | `WIKI_JEV_HELP_THRESHOLD` / `WIKI_JEV_DIRECT_THRESHOLD` | `0.5` / `0.8` | Question B ("helps?") and question A ("answers directly?"). |
-| `WIKI_SEARCH_STORE_DIR` | `../data/growi-search-store` | Qdrant files + `state.json`; disposable. |
+| `WIKI_SEARCH_STORE_DIR` | `../data/growi-search-store` | Qdrant files + `state.json`; disposable, and rebuilt automatically when the embedder or the GROWI endpoint/root changes. |
 | `WIKI_SEARCH_SYNC_SECONDS` / `WIKI_SEARCH_REVISION_SWEEP_SECONDS` | `30` / `300` | Root 目次 poll / page-revision sweep (hand edits). |
 | `WIKI_SEARCH_POOL` / `WIKI_RERANK_POOL` | `300` / `200` | Sections pulled from Qdrant / reranked. |
 | `WIKI_JEV_WAVE_SIZE` / `WIKI_JEV_MAX_WAVES` | `100` / `4` | Sections per JEV wave / most waves. |

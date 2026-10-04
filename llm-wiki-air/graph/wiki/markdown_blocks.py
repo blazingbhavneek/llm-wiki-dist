@@ -23,7 +23,7 @@ from graph.common.markdown import is_tableish_line, scan_markdown_fences
 IMAGE_UNIT_OPEN = "<image-unit>"
 IMAGE_UNIT_CLOSE = "</image-unit>"
 
-BlockKind = Literal["fence", "table", "image-unit"]
+BlockKind = Literal["fence", "table", "html-table", "quote", "image-unit"]
 
 
 class MalformedBlockError(RuntimeError):
@@ -49,20 +49,20 @@ class AtomicBlock:
 
 @dataclass
 class BlockIndex:
-    """Which atomic block (if any) a candidate cut would fall inside."""
+    """Atomic blocks covering each line, used to validate candidate cuts."""
 
     line_count: int
     blocks: list[AtomicBlock] = field(default_factory=list)
-    owner: list[int] = field(default_factory=list)
+    owner: list[list[int]] = field(default_factory=list)
 
     def block_at_cut(self, split_line: int) -> AtomicBlock | None:
         if split_line <= 1 or split_line > self.line_count:
             return None
-        index = self.owner[split_line]
-        if index < 0:
-            return None
-        block = self.blocks[index]
-        return block if block.contains_cut(split_line) else None
+        for index in self.owner[split_line]:
+            block = self.blocks[index]
+            if block.contains_cut(split_line):
+                return block
+        return None
 
     def cut_is_safe(self, split_line: int) -> bool:
         if split_line <= 1 or split_line > self.line_count + 1:
@@ -134,19 +134,13 @@ def _scan_image_unit_blocks(lines: list[str]) -> list[AtomicBlock]:
 
     for number, line in enumerate(lines, start=1):
         lowered = line.lower()
-        if open_line is None:
-            opened = re.search(r"<image-unit\b", lowered)
-            if opened:
-                tail = lowered[opened.end():]
-                if IMAGE_UNIT_CLOSE in tail:
-                    blocks.append(AtomicBlock("image-unit", number, number))
-                else:
-                    open_line = number
-            continue
-
-        if IMAGE_UNIT_CLOSE in lowered:
-            blocks.append(AtomicBlock("image-unit", open_line, number))
-            open_line = None
+        for tag in re.finditer(r"</image-unit\s*>|<image-unit\b", lowered):
+            if tag.group().startswith("</"):
+                if open_line is not None:
+                    blocks.append(AtomicBlock("image-unit", open_line, number))
+                    open_line = None
+            elif open_line is None:
+                open_line = number
 
     if open_line is not None:
         raise MalformedBlockError(f"unclosed <image-unit> opened at line {open_line}")
@@ -180,6 +174,36 @@ def _scan_table_blocks(lines: list[str]) -> list[AtomicBlock]:
     return blocks
 
 
+def _scan_html_table_blocks(lines: list[str]) -> list[AtomicBlock]:
+    """Protect complete HTML tables; leave unmatched tags alone."""
+
+    blocks: list[AtomicBlock] = []
+    openings: list[int] = []
+    for number, line in enumerate(lines, start=1):
+        for tag in re.finditer(r"<table\b[^>]*>|</table\s*>", line, flags=re.I):
+            if tag.group().lower().startswith("</"):
+                if openings:
+                    blocks.append(AtomicBlock("html-table", openings.pop(), number))
+            else:
+                openings.append(number)
+    return blocks
+
+
+def _scan_quote_blocks(lines: list[str]) -> list[AtomicBlock]:
+    blocks: list[AtomicBlock] = []
+    start: int | None = None
+    for number, line in enumerate(lines, start=1):
+        if re.match(r"^ {0,3}>", line):
+            if start is None:
+                start = number
+        elif start is not None:
+            blocks.append(AtomicBlock("quote", start, number - 1))
+            start = None
+    if start is not None:
+        blocks.append(AtomicBlock("quote", start, len(lines)))
+    return blocks
+
+
 def _scan_fence_blocks(lines: list[str]) -> list[AtomicBlock]:
     scan = scan_markdown_fences(lines)
     if scan.unclosed is not None:
@@ -194,19 +218,21 @@ def _scan_fence_blocks(lines: list[str]) -> list[AtomicBlock]:
 
 
 def build_block_index(lines: list[str]) -> BlockIndex:
-    """One pass over the source: fences, tables, and image units (plan 5.1)."""
+    """Index source blocks that must remain on a single output page."""
 
     blocks = [
         *_scan_fence_blocks(lines),
         *_scan_table_blocks(lines),
+        *_scan_html_table_blocks(lines),
+        *_scan_quote_blocks(lines),
         *_scan_image_unit_blocks(lines),
     ]
     blocks.sort(key=lambda block: (block.start, block.end, block.kind))
 
-    owner = [-1] * (len(lines) + 2)
+    owner: list[list[int]] = [[] for _ in range(len(lines) + 2)]
     for index, block in enumerate(blocks):
         for line in range(block.start, min(block.end, len(lines)) + 1):
-            owner[line] = index
+            owner[line].append(index)
 
     return BlockIndex(line_count=len(lines), blocks=blocks, owner=owner)
 

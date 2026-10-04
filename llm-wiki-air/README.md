@@ -2,22 +2,24 @@
 
 A self-contained document pipeline that turns a directory of source documents
 (PDF, DOCX, PPTX, XLSX/XLSM, CSV, Markdown) into a cross-linked, LLM-rewritten
-Markdown wiki and publishes it to [GROWI](https://growi.org) — with **no Git
-repository anywhere in the loop**. Local state lives in plain files and SQLite
+Markdown wiki and publishes it to [GROWI](https://growi.org), using per-project
+Git checkpoints for publication recovery. Local state lives in plain files and SQLite
 under `data/`, and GROWI itself is the collaborative editing surface.
 
-The name "air" is the no-Git edition: `graph/` is copied from the upstream
-factory allowlist, and `publisher/` plus `main.py` are the downstream pipeline.
+`graph/` is copied from the upstream factory allowlist, and `publisher/` plus
+`main.py` are the downstream pipeline.
 
 ## What it does
 
 ```mermaid
 flowchart LR
     M["external mount<br/>(NFS / bind / local dir)"] -->|convert| R["raw/<br/>Markdown"]
-    R -->|wiki generation| W["wiki/<br/>numbered pages"]
+    R -->|wiki generation| B["metadata/state/<br/>pure generated base"]
+    B --> W["wiki/<br/>effective pages"]
+    H["metadata/human-sync/<br/>human journal + snapshots"] -->|overlay| W
     W -->|neo linker| L["cross-document<br/>links + catalog"]
     L -->|publish| G[("GROWI")]
-    G -.->|revision pull<br/>inside markers| W
+    G -.->|capture before generation| H
 ```
 
 | Stage | Input | Output | Notes |
@@ -25,7 +27,7 @@ flowchart LR
 | **convert** | mounted source tree (`source_mount`) | `data/<target>/raw/*.md` | `.md` is copied as-is; other formats go through the external doc-parser service, `.xlsm` gets a static lineage pass first |
 | **wiki** | one raw Markdown file | a folder of numbered pages + `_planning/` state | overlapping-window observation, seed-page planning, section-wise lossless rewriting; the model never decides what survives, Python does |
 | **link** (neo/legacy) | the whole wiki batch | `<!-- llm-wiki-links -->` footers + SQLite catalog | chunks, metadata, embedding candidates, then per-page link decisions |
-| **publish** | wiki tree | GROWI pages | only inside `<!-- chunk: ... -->` markers; links are rewritten to GROWI `/{pageId}` permalinks |
+| **publish** | effective wiki tree | GROWI pages | managed body above `<!-- llm-wiki-bot-ref:... -->`; inspected revisions protect human edits, and links use GROWI `/{pageId}` permalinks |
 
 Everything runs through a single entry point, `main.py`. Each invocation
 operates on exactly **one project** selected with `--project`, and every
@@ -238,7 +240,7 @@ Quick map — the numbered sections below explain each command in detail:
 | smoke-test one source end to end | `sync … "path/in/mount"` |
 | keep a project continuously fresh | `watch`, or cron + `sync` |
 | inspect or drive the queue by hand | `queue scan\|work\|status\|retry` |
-| push the current wiki tree as it is | `publish` |
+| push the current wiki tree as it is | `publish` (`--allow-unlinked` also includes pending/failed linker documents) |
 | repair or dry-run the growi-search index pages | `index [<raw-rel>...]` |
 | fix one document's links | `link relink <doc>` |
 | remove this publisher's GROWI pages | `reset` |
@@ -323,8 +325,21 @@ Run the complete project once:
 .venv/bin/python main.py -v sync --project projectA
 ```
 
-This performs `mount -> raw -> wiki -> neo linker -> GROWI`. It does not require
-step 2 because `sync` performs its own mount conversion.
+The default isolated flow builds every healthy wiki locally first, retrying
+failed builds once after the first pass. It then links the pending documents,
+skips linker failures, retries them once, and publishes only linker-complete
+documents. It does not require step 2 because `sync` performs its own mount
+conversion.
+
+If the linker is interrupted, publish the accepted base wikis without consuming
+their pending linker state:
+
+```bash
+.venv/bin/python main.py publish --project projectA --allow-unlinked
+```
+
+A later isolated `sync` sees those pending markers, links them, and publishes the
+updated documents without rebuilding their wikis.
 
 ### 4. Build wiki and linker output
 
@@ -498,15 +513,83 @@ stored in `metadata/wiki-linker.sqlite` and rendered into a managed
 `llm-wiki-links` footer (plus inline see-also links) — pure footer rendering
 and parsing lives in `render.py`, so relinking is idempotent.
 
-**Publish** (`graph/growi/` + `publisher/`). Each generated page is wrapped in
-`<!-- chunk: ... -->` markers before it is pushed. On write, only marked
-sections owned by this publisher are replaced (`merge_marked_sections`), so
-human text outside the markers on a GROWI page is never touched; `attach` mode
-additionally refuses any write outside the project's GROWI path. Local links
+**Publish** (`graph/growi/` + `publisher/`). Each page ends with a stable
+`<!-- llm-wiki-bot-ref:... -->` ownership stamp. Writes replace the managed body
+above that stamp and preserve the remote tail below it. `attach` mode
+refuses writes outside the project's GROWI path. Local links
 are resolved before writing so published links are stable `/{pageId}`
 permalinks, while the local tree keeps portable relative paths. The reverse
-direction (GROWI revision check during `watch`) pulls edits made *inside* the
-markers back into local wiki state.
+direction captures managed GROWI edits into a tracked human journal before
+source processing. Generation keeps a pure source-based state; the overlay
+is reapplied afterwards, and the linker reads the effective pages.
+
+### Human edits and source updates
+
+Human additions, replacements and suppressions live in
+`metadata/human-sync/`, with complete bodies in validated, content-addressed
+snapshots. The journal participates in candidate commits, promotion and
+rollback. Every update tier reapplies it from a fresh generated base.
+
+Unchanged and disjoint changes merge deterministically. A different value for
+the same information keeps human text first and shows the exact new source
+version under **Updated source document says:**. Short single-line facts use
+parentheses. Ambiguous or disappeared blocks go to `99-Retained-Human-Notes.md`;
+`98-Human-Conflicts.md` contains status and links. A matching later source
+version absorbs an edit without deleting its history, so it can reactivate.
+
+Deleting a human change in GROWI records a durable tombstone. For a conflict,
+removing its source candidate keeps the human version; replacing its human
+version with the source version accepts the source. Incomplete marker edits
+block publication and save the complete remote body for review.
+
+Publication checks IDs, paths, markers and revisions before writes. A 409
+aborts the batch and records the observed body. Missing or moved remote pages
+also block publication. Legacy pages without a verified pure ancestor are
+pinned in full and require a fresh rebuild. Matching uses structural anchors
+and deterministic diffs; uncertain cases retain text without model resolution.
+
+To capture edits once, run `python main.py --project <project> pull`. This
+updates the local effective wiki and journal, marks linking pending, and
+checkpoints the result. It performs no source generation or GROWI publication.
+
+Human synchronization has an explicit rollout policy. New and legacy project
+configurations default to `off`; set it per project under `[settings]` or with
+`WIKI_HUMAN_SYNC_MODE`:
+
+```ini
+[settings]
+human_sync_mode = observe
+human_sync_activity_audit_seconds = 3600
+human_sync_activity_overlap_seconds = 60
+```
+
+- `off` keeps ownership, path, revision, marker and conditional-write checks
+  active. A remote difference blocks publication and is not adopted.
+- `observe` adds one idempotent, text-redacted proposal under
+  `metadata/human-sync/observations/`. It leaves the wiki, pure generator state,
+  linker state, accepted revision and remote page unchanged. Ambiguous cases
+  use the configured bounded Jev scorer plus independent structured writer and
+  judge calls; all model text stays in delimited user data, and every failure
+  returns the exact deterministic conflict artifact.
+- `apply` captures the re-fetched revision as authoritative human intent and
+  runs the reviewed deterministic overlay. Semantic scorer/writer output still
+  remains observe-only.
+
+An existing authoritative journal is always rendered in every mode, so moving
+from `apply` back to `off` cannot expose a pure page over protected human text.
+Moving from `observe` to `apply` re-fetches and checks the current revision; it
+does not promote a stale observation.
+
+The normal `pull` command uses the audit activity index when available and
+falls back to a complete boundary inventory on startup, cursor/API gaps and the
+configured audit interval. Force that read-only reconciliation with
+`python main.py --project <project> pull --inventory`. Inspect redacted status
+with `python main.py --project <project> human status`. Revision-checked actions
+are available through `human resolve`; run its `-h` output for arguments.
+
+`human live-plan --path /<project>/disposable/...` creates a local redacted E2E
+report and boundary confirmation code. It performs no remote writes. Live test
+writes and cleanup require that exact disposable URL/path to be confirmed first.
 
 ## Code map (for agents)
 
@@ -527,6 +610,11 @@ doc-parser/                  separate service (FastAPI + MinerU/GPU, pandoc,
 
 publisher/                   downstream no-Git pipeline (edit freely)
   pipeline.py                sync_once/build_raw/build_wiki_only/link_raw/
+  human_changes.py           durable journal, overlay, operator summary/actions
+  human_semantic.py          bounded observe-only scorer/writer/judge contracts
+  activity.py                audit cursor and correctness-first full inventory
+  legacy_recovery.py         byte-verified pure ancestor recovery from Git
+  live_verification.py       redacted disposable-subtree E2E report lifecycle
                              publish_only/reset_growi: one reconciliation pass,
                              per-source state machine (convert->wiki->link->publish)
   scanner.py                 content-addressed mount scan; SUPPORTED extensions
@@ -590,7 +678,7 @@ GROWI content is preserved.
 
 ## Tests
 
-The suite is stdlib `unittest`, offline, and fast (~1 s):
+The tests use stdlib `unittest` and offline fixtures:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -q
@@ -601,13 +689,16 @@ The suite is stdlib `unittest`, offline, and fast (~1 s):
 - `test_wiki_reference_context.py` — wiki reference-selection prompts/contexts
 - `test_growi_images.py`, `test_model_thinking.py` — GROWI image handling,
   chat-model thinking options
+- `test_human_changes.py` — durable overlays, tombstones, tier updates,
+  publication races, retained notes and candidate recovery
 
 ## Notes
 
 Publishing resolves local pages before writing links, so generated links use
 stable GROWI `/{pageId}` permalinks while local Markdown keeps portable relative
-paths. GROWI edits inside publisher markers are pulled into unchanged local wiki
-pages; simultaneous local and remote edits fail as conflicts.
+paths. Managed GROWI edits are captured against the last accepted remote/local
+snapshots and their published pure ancestor. Concurrent source and human edits
+are rebased, retaining both versions when they disagree.
 
 Local generation and linking failures never start publishing. A source event
 that changes while its batch is running cancels that batch at the next phase

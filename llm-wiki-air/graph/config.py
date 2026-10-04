@@ -24,6 +24,44 @@ load_dotenv()
 PROJECT_ROOT: Path | None = None
 
 
+class HumanSyncMode(str, Enum):
+    """Rollout policy for remote human changes.
+
+    The default is deliberately fail-closed.  A project must opt in before a
+    remote difference becomes authoritative local state.
+    """
+
+    off = "off"
+    observe = "observe"
+    apply = "apply"
+
+
+@dataclass(frozen=True)
+class HumanSyncPolicy:
+    mode: HumanSyncMode
+
+    @classmethod
+    def resolve(cls, value: "HumanSyncMode | str | None") -> "HumanSyncPolicy":
+        raw = value.value if isinstance(value, HumanSyncMode) else str(value or "off").strip().lower()
+        try:
+            return cls(HumanSyncMode(raw))
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in HumanSyncMode)
+            raise ValueError(f"human_sync_mode must be one of {allowed}; got {value!r}") from exc
+
+    @property
+    def captures(self) -> bool:
+        return self.mode is HumanSyncMode.apply
+
+    @property
+    def observes(self) -> bool:
+        return self.mode in {HumanSyncMode.observe, HumanSyncMode.apply}
+
+    @property
+    def semantic_observe(self) -> bool:
+        return self.mode is HumanSyncMode.observe
+
+
 def resolve_project_path(value: str) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
@@ -195,7 +233,9 @@ class Settings(BaseModel):
     target_name: str = ""
     mount_path: str = ""
     parser_base_url: str = ""
+    parser_fallback_base_url: str = ""
     parser_timeout: float = 7200.0
+    sync_isolated: bool = True
     # Ask the doc-parser to generate vision descriptions for extracted images.
     # Set WIKI_PARSER_DESCRIBE_IMAGES=0 to convert without any LLM image calls
     # (parser gets describe_images=false; unseen images keep empty descriptions).
@@ -204,6 +244,11 @@ class Settings(BaseModel):
     growi_token: str = ""
     growi_mode: Literal["attach", "own"] = "attach"
     growi_timeout: float = 30.0
+    # Human edits are fail-closed until a project explicitly opts in.  The
+    # enum makes invalid environment/INI values a configuration error.
+    human_sync_mode: HumanSyncMode = HumanSyncMode.off
+    human_sync_activity_audit_seconds: int = Field(default=3600, ge=0)
+    human_sync_activity_overlap_seconds: int = Field(default=60, ge=0)
 
     # Legacy read-only config fields. Runtime vector selection is deliberately
     # sqlite-vec-only; keep these for callers that still deserialize Settings.
@@ -389,7 +434,11 @@ class Settings(BaseModel):
             target_name=project_name,
             mount_path=mount_path,
             parser_base_url=env("WIKI_PARSER_BASE_URL", cls.parser_base_url),
+            parser_fallback_base_url=env("WIKI_PARSER_FALLBACK_BASE_URL", cls.parser_fallback_base_url),
             parser_timeout=float(env("WIKI_PARSER_TIMEOUT", cls.parser_timeout)),
+            sync_isolated=env(
+                "WIKI_SYNC_ISOLATED", "1" if cls.sync_isolated else "0"
+            ).lower() in {"1", "true", "yes", "on"},
             parser_describe_images=env(
                 "WIKI_PARSER_DESCRIBE_IMAGES",
                 "1" if cls.parser_describe_images else "0",
@@ -398,6 +447,13 @@ class Settings(BaseModel):
             growi_token=_normalize_growi_token(project_growi_token or env("GROWI_TOKEN", cls.growi_token)),
             growi_mode=env("GROWI_MODE", cls.growi_mode),
             growi_timeout=float(env("GROWI_TIMEOUT", cls.growi_timeout)),
+            human_sync_mode=env("WIKI_HUMAN_SYNC_MODE", cls.human_sync_mode.value),
+            human_sync_activity_audit_seconds=int(
+                env("WIKI_HUMAN_SYNC_AUDIT_SECONDS", cls.human_sync_activity_audit_seconds)
+            ),
+            human_sync_activity_overlap_seconds=int(
+                env("WIKI_HUMAN_SYNC_OVERLAP_SECONDS", cls.human_sync_activity_overlap_seconds)
+            ),
             vector_backend=env("WIKI_VECTOR_BACKEND", cls.vector_backend),
             qdrant_url=env("QDRANT_URL", cls.qdrant_url),
             qdrant_collection=env("WIKI_QDRANT_COLLECTION", cls.qdrant_collection),

@@ -287,14 +287,14 @@ def candidate(project: Project, operation_id: str, *, keep: bool = False) -> Ite
                 _git(project, "worktree", "prune")
             except subprocess.CalledProcessError:
                 pass
-            return
-        subprocess.run(
-            ["git", "-C", str(project.root), "worktree", "remove", "--force", str(root)],
-            check=False,
-            capture_output=True,
-        )
-        shutil.rmtree(root.parent, ignore_errors=True)
-        _git(project, "worktree", "prune")
+        else:
+            subprocess.run(
+                ["git", "-C", str(project.root), "worktree", "remove", "--force", str(root)],
+                check=False,
+                capture_output=True,
+            )
+            shutil.rmtree(root.parent, ignore_errors=True)
+            _git(project, "worktree", "prune")
 
 
 def remove_candidate(project: Project, operation_id: str) -> None:
@@ -385,7 +385,7 @@ def candidate_is_clean(candidate_project: Project, commit: str) -> bool:
         return False
     paths = [
         ".gitignore", "sources", "raw", "wiki", "metadata/state",
-        "metadata/pipeline.json", "metadata/source-identities.json",
+        "metadata/pipeline.json", "metadata/source-identities.json", "metadata/human-sync",
     ]
     return not str(_git(candidate_project, "status", "--porcelain", "--untracked-files=all", "--", *paths))
 
@@ -398,7 +398,7 @@ def checkpoint_live(project: Project, message: str) -> str:
     _stage_durable(project)
     paths = [
         ".gitignore", "sources", "raw", "wiki", "metadata/state",
-        "metadata/pipeline.json", "metadata/source-identities.json",
+        "metadata/pipeline.json", "metadata/source-identities.json", "metadata/human-sync",
     ]
     if not str(_git(project, "status", "--porcelain", "--untracked-files=all", "--", *paths)):
         return previous
@@ -411,7 +411,7 @@ def checkpoint_live(project: Project, message: str) -> str:
 def _stage_durable(project: Project) -> None:
     paths = [
         ".gitignore", "sources", "raw", "wiki", "metadata/state",
-        "metadata/pipeline.json", "metadata/source-identities.json",
+        "metadata/pipeline.json", "metadata/source-identities.json", "metadata/human-sync",
     ]
     selected = [
         path for path in paths

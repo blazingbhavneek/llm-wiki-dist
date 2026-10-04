@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import os
+import stat as stat_module
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 
-SUPPORTED = {".md", ".docx", ".doc", ".pdf", ".pptx", ".xlsx", ".xlsm", ".xls", ".csv"}
+SUPPORTED = {".md", ".txt", ".docx", ".doc", ".pdf", ".pptx", ".xlsx", ".xlsm", ".xls", ".csv"}
 IGNORED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORED_DIRS = {".git", ".hg", ".svn"}
 
@@ -26,6 +29,7 @@ class Scan:
     added: list[str]
     changed: list[str]
     deleted: list[str]
+    errors: dict[str, str] = field(default_factory=dict)
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -36,29 +40,56 @@ def _inside(path: Path, root: Path) -> bool:
     return True
 
 
+def discover_mount(root: Path, errors: dict[str, str]) -> dict[str, os.stat_result]:
+    """Report inaccessible entries; an incomplete scan must never imply deletion."""
+    root = Path(root)
+    if not root.is_dir():
+        raise OSError(f"source mount is unavailable: {root}")
+    files: dict[str, os.stat_result] = {}
+
+    def failed(exc: OSError) -> None:
+        path = Path(exc.filename or root)
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            rel = "."
+        errors[rel] = "".join(traceback.format_exception(exc))
+
+    for directory, dirs, names in os.walk(root, onerror=failed):
+        dirs[:] = sorted(name for name in dirs if name not in IGNORED_DIRS)
+        for name in sorted(names):
+            path = Path(directory) / name
+            if name in IGNORED_NAMES or name.startswith("~$") or path.suffix.lower() not in SUPPORTED:
+                continue
+            try:
+                info = path.stat()
+                if stat_module.S_ISREG(info.st_mode) and _inside(path, root):
+                    files[path.relative_to(root).as_posix()] = info
+            except OSError as exc:
+                failed(exc)
+    return files
+
+
 def scan_mount(root: Path, previous: dict[str, dict[str, object]] | None = None) -> Scan:
     root = Path(root)
     previous = previous or {}
     files: dict[str, SourceFile] = {}
-    if root.is_dir():
-        for path in sorted(root.rglob("*")):
-            if any(part in IGNORED_DIRS for part in path.parts):
-                continue
-            if path.name in IGNORED_NAMES or path.name.startswith("~$") or not path.is_file() or not _inside(path, root):
-                continue
-            suffix = path.suffix.lower()
-            if suffix not in SUPPORTED:
-                continue
-            stat = path.stat()
+    errors: dict[str, str] = {}
+    for rel, stat in discover_mount(root, errors).items():
+        path = root / rel
+        try:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            rel = path.relative_to(root).as_posix()
-            files[rel] = SourceFile(rel, digest, stat.st_size, stat.st_mtime_ns, "md" if suffix == ".md" else suffix[1:])
+        except OSError:
+            errors[rel] = traceback.format_exc()
+            continue
+        suffix = path.suffix.lower()
+        files[rel] = SourceFile(rel, digest, stat.st_size, stat.st_mtime_ns, "md" if suffix == ".md" else suffix[1:])
     current = set(files)
     known = set(previous)
     added = sorted(current - known)
     changed = sorted(rel for rel in current & known if str(previous[rel].get("source_sha256", "")) != files[rel].source_sha256)
-    deleted = sorted(known - current)
-    return Scan(files, added, changed, deleted)
+    deleted = [] if errors else sorted(known - current)
+    return Scan(files, added, changed, deleted, errors)
 
 
 __all__ = ["Scan", "SourceFile", "SUPPORTED", "scan_mount"]

@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import io
+import logging
 import sqlite3
 import subprocess
 import threading
 import time
+import traceback
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,7 +30,9 @@ from .history import (
     prune_candidates, read_blob, remove_candidate, reopen_candidate, restore_last_good, resumed_candidate, stage_blob,
 )
 from .ledger import load_ledger
-from .scanner import IGNORED_DIRS, IGNORED_NAMES, SUPPORTED, _inside
+from .scanner import discover_mount
+
+log = logging.getLogger(__name__)
 
 SMALL_DOCUMENT_LINES = 1000
 SMALL_DOCUMENT_RATIO = 0.25
@@ -137,22 +141,9 @@ def _connect(project: Project):
         conn.close()
 
 
-def _snapshot(root: Path) -> dict[str, tuple[str, int, int]]:
+def _snapshot(root: Path, errors: dict[str, str] | None = None) -> dict[str, tuple[str, int, int]]:
     files: dict[str, tuple[str, int, int]] = {}
-    if not root.is_dir():
-        return files
-    for path in root.rglob("*"):
-        if any(part in IGNORED_DIRS for part in path.parts):
-            continue
-        if path.name in IGNORED_NAMES or path.name.startswith("~$") or not path.is_file() or not _inside(path, root):
-            continue
-        if path.suffix.lower() not in SUPPORTED:
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        rel = path.relative_to(root).as_posix()
+    for rel, stat in discover_mount(root, errors if errors is not None else {}).items():
         raw_rel = (Path(rel).parent / raw_name_for(Path(rel).name)).as_posix()
         files[rel] = (raw_rel, stat.st_size, stat.st_mtime_ns)
     assert_unique_generated_paths(files)
@@ -269,12 +260,13 @@ def scan(
     """Stat the mount, stage changed bytes once, and coalesce desired state."""
     project = open_project(settings)
     base_commit = ensure_repository(project)
-    current = _snapshot(project.mount)
+    errors: dict[str, str] = {}
+    current = _snapshot(project.mount, errors)
     wanted = {item.strip().lstrip("/") for item in only or ()}
     if wanted:
         current = {rel: row for rel, row in current.items() if rel in wanted}
     now = time.time()
-    result: dict[str, Any] = {"added": [], "updated": [], "deleted": [], "cancelled": [], "moved": [], "classification": {}}
+    result: dict[str, Any] = {"added": [], "updated": [], "deleted": [], "cancelled": [], "moved": [], "classification": {}, "errors": errors}
     ledger = load_ledger(project.metadata / "pipeline.json")
     with _connect(project) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -328,9 +320,10 @@ def scan(
             try:
                 staged[rel] = stage_blob(project, project.mount / rel)
             except (FileNotFoundError, OSError, RuntimeError):
+                errors[rel] = traceback.format_exc()
                 continue
 
-        disappeared = set(previous) - set(current)
+        disappeared = set() if errors else set(previous) - set(current)
         appeared = set(current) - set(previous)
         old_by_hash: dict[str, list[str]] = {}
         new_by_hash: dict[str, list[str]] = {}
@@ -407,6 +400,12 @@ def scan(
             blob = staged.get(rel)
             content_changed = bool(blob and blob.sha256 != str(old["source_sha256"] if old is not None else ""))
             changed = old is None or force or content_changed
+            pending_delete = conn.execute("SELECT lane FROM jobs WHERE rel=?", (rel,)).fetchone()
+            if blob is not None and not changed and pending_delete is not None and pending_delete["lane"] == "fast":
+                # The source returned before its deletion was accepted.
+                conn.execute("DELETE FROM jobs WHERE rel=?", (rel,))
+                queued.discard(rel)
+                result["cancelled"].append(rel)
             if changed and blob is None:
                 continue
             if changed:
@@ -457,9 +456,17 @@ def scan(
                         ),
                     )
                 document = project.wiki_dir(raw_rel).relative_to(project.wiki).as_posix()
+                linker_status = str(read_json(
+                    project.wiki_dir(raw_rel) / "_planning" / "linker.json",
+                    default={},
+                ).get("status") or "")
+                built_locally = linker_status in {
+                    "pending", "failed", "render_pending", "complete", "disabled",
+                }
                 incomplete = (
                     not source or bool(source.get("last_error")) or not project.raw_file(raw_rel).exists()
-                    or not project.wiki_dir(raw_rel).exists() or document not in ledger.published_documents
+                    or not project.wiki_dir(raw_rel).exists()
+                    or (document not in ledger.published_documents and not built_locally)
                 )
                 if incomplete:
                     blob_oid = str(old["blob_oid"] or "")
@@ -468,6 +475,7 @@ def scan(
                         try:
                             staged_blob = stage_blob(project, project.mount / rel)
                         except (FileNotFoundError, OSError, RuntimeError):
+                            errors[rel] = traceback.format_exc()
                             continue
                         blob_oid, digest = staged_blob.oid, staged_blob.sha256
                     operation = "update" if source else "add"
@@ -476,7 +484,7 @@ def scan(
                              target_sha256=digest, base_commit=base_commit)
                     result["updated" if source else "added"].append(rel)
 
-        for rel in sorted((set(previous) - set(current)) - moved_old):
+        for rel in sorted((set() if errors else set(previous) - set(current)) - moved_old):
             old = previous[rel]
             source_id = _source_identity(project, ledger, rel, old)
             origin = ledger_rel_by_id.get(source_id, rel)
@@ -490,6 +498,11 @@ def scan(
                 conn.execute("DELETE FROM jobs WHERE rel=?", (rel,))
                 result["cancelled"].append(rel)
             elif known:
+                pending_delete = conn.execute("SELECT lane,source_id FROM jobs WHERE rel=?", (origin,)).fetchone()
+                if pending_delete is not None and pending_delete["lane"] == "fast" and pending_delete["source_id"] == source_id:
+                    # Repeated scans of an unchanged absence must preserve the
+                    # failed/running version instead of requeueing it forever.
+                    continue
                 conn.execute("DELETE FROM jobs WHERE rel=? OR (source_id<>'' AND source_id=?)", (rel, source_id))
                 _enqueue(conn, origin, raw_rel, "delete", now, settle_seconds,
                          source_id=source_id, base_commit=base_commit)
@@ -702,7 +715,8 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
     return cursor.rowcount
 
 
-def claim(project: Project, lane: str) -> list[Job]:
+def claim(project: Project, lane: str, *, limit: int | None = None, only: list[str] | None = None,
+          exclude: list[str] | None = None) -> list[Job]:
     token = uuid.uuid4().hex
     now = time.time()
     base_commit = last_good(project)
@@ -714,6 +728,20 @@ def claim(project: Project, lane: str) -> list[Job]:
                FROM jobs WHERE status='queued' AND lane=? AND available_at<=? ORDER BY created_at,rel""",
             (lane, now),
         ))
+        wanted = {item.strip().lstrip("/") for item in only or ()}
+        if wanted:
+            rows = [row for row in rows if row["rel"] in wanted or row["from_rel"] in wanted]
+        rows = [row for row in rows if not any(
+            rel == "." or row["rel"] == rel or row["rel"].startswith(rel.rstrip("/") + "/")
+            for rel in exclude or ()
+        )]
+        if limit is not None:
+            blocked = list(conn.execute("SELECT rel,source_id FROM jobs WHERE lane='fast' AND status='failed'"))
+            rows = [row for row in rows if not any(
+                row["rel"] == failed["rel"] or (row["source_id"] and row["source_id"] == failed["source_id"])
+                for failed in blocked
+            )]
+            rows = rows[:limit]
         if rows:
             conn.executemany(
                 "UPDATE jobs SET status='running',token=?,base_commit=?,updated_at=? WHERE rel=? AND version=? AND status='queued'",
@@ -757,10 +785,23 @@ def finish(project: Project, jobs: list[Job], *, error: str = "", retry: bool = 
                 conn.execute("DELETE FROM jobs WHERE rel=? AND version=? AND token=?", (job.rel, job.version, job.token))
 
 
-def retry_failed(project: Project) -> int:
+def retry_failed(project: Project, *, only: list[str] | None = None,
+                 versions: dict[str, int] | None = None) -> int:
     with _connect(project) as conn:
-        cursor = conn.execute("UPDATE jobs SET status='queued',error='',available_at=?,updated_at=? WHERE status='failed'", (time.time(), time.time()))
-        return cursor.rowcount
+        wanted = {item.strip().lstrip("/") for item in only or ()}
+        rows = list(conn.execute("SELECT rel,from_rel,version FROM jobs WHERE status='failed'"))
+        count = 0
+        for row in rows:
+            rel = str(row["rel"])
+            if wanted and rel not in wanted and row["from_rel"] not in wanted:
+                continue
+            if versions is not None and versions.get(rel) != int(row["version"]):
+                continue
+            count += conn.execute(
+                "UPDATE jobs SET status='queued',error='',available_at=?,updated_at=? WHERE rel=? AND version=? AND status='failed'",
+                (time.time(), time.time(), rel, row["version"]),
+            ).rowcount
+        return count
 
 
 def status(project: Project) -> list[dict[str, Any]]:
@@ -835,7 +876,48 @@ def _finish_transaction(project: Project, operation_id: str) -> None:
         conn.execute("DELETE FROM transactions WHERE operation_id=?", (operation_id,))
 
 
-def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool = False) -> dict[str, Any] | None:
+def _verify_completed_jobs(staged: Project, jobs: list[Job], *, allow_unlinked: bool = False) -> None:
+    """Verify either a deferred local build or a fully published result."""
+    from .pipeline import _content_hash, _folders
+
+    ledger = load_ledger(staged.metadata / "pipeline.json")
+    folders = _folders(staged, allow_unlinked=allow_unlinked)
+    for job in jobs:
+        row = ledger.sources.get(job.rel)
+        if job.operation == "delete":
+            if row is not None or (job.source_id and any(
+                source.get("source_id") == job.source_id for source in ledger.sources.values()
+            )):
+                raise RuntimeError(f"delete did not complete: {job.rel}")
+            document = staged.wiki_dir(job.raw_rel).relative_to(staged.wiki).as_posix()
+            if document in ledger.published_documents or any(
+                path.startswith(document + "/") for path in ledger.published_pages
+            ):
+                raise RuntimeError(f"delete publication did not complete: {job.rel}")
+            continue
+        if not row or row.get("last_error") or row.get("source_id") != job.source_id or row.get("source_sha256") != job.target_sha256:
+            raise RuntimeError(f"source did not complete: {job.rel}")
+        document = staged.wiki_dir(job.raw_rel).relative_to(staged.wiki).as_posix()
+        folder = folders.get(document)
+        if allow_unlinked:
+            if folder is None or not any(folder.glob("*.md")):
+                raise RuntimeError(f"wiki generation did not complete: {job.rel}")
+            continue
+        published = ledger.published_documents.get(document, {})
+        if folder is None or published.get("content_sha256") != _content_hash(folder):
+            raise RuntimeError(f"wiki publication did not complete: {job.rel}")
+        expected = {path.relative_to(staged.wiki).as_posix() for path in folder.glob("*.md")}
+        pages = {path: page for path, page in ledger.published_pages.items() if Path(path).parent.as_posix() == document}
+        if not expected or expected != set(pages) or any(
+            not page.get("page_id") or not page.get("revision_id") for page in pages.values()
+        ):
+            raise RuntimeError(f"page publication evidence is incomplete: {job.rel}")
+
+
+def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool = False,
+                      isolated: bool = False, only: list[str] | None = None,
+                      exclude: list[str] | None = None,
+                      defer_linker: bool = False) -> dict[str, Any] | None:
     """Run one immutable candidate from last-good, then publish and promote it.
 
     With ``continue_run`` (``--continue``) an interrupted building/prepared
@@ -849,16 +931,15 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
     ensure_repository(project)
     resumable_id: str | None = None
     resumable_commit = ""
-    if continue_run:
+    # Isolated retries always start from accepted main. A legacy interrupted
+    # operation is recovered in its original scope before any candidate cleanup.
+    if continue_run and not isolated:
         resumable = _resumable_transaction(project)
         if resumable is None and _adopt_resumable_orphan(project) is not None:
             resumable = _resumable_transaction(project)
         if resumable is not None:
             resumable_id = str(resumable["operation_id"])
             resumable_commit = str(resumable["candidate_commit"] or resumable["base_commit"])
-        _prune_orphan_candidates(project, keep=resumable_id)
-    else:
-        prune_candidates(project)
     with _connect(project) as conn:
         unfinished = conn.execute("SELECT 1 FROM transactions LIMIT 1").fetchone() is not None
     if unfinished:
@@ -870,12 +951,18 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 resumable_commit = ""
             else:
                 resumable_commit = str(refreshed["candidate_commit"] or refreshed["base_commit"])
-    jobs = claim(project, "fast")
+    elif resumable_id is not None:
+        _prune_orphan_candidates(project, keep=resumable_id)
+    else:
+        prune_candidates(project)
+    claim_args = {"limit": 1, "only": only, "exclude": exclude} if isolated else {}
+    jobs = claim(project, "fast", **claim_args)
     if not jobs:
-        with _connect(project) as conn:
-            if conn.execute("SELECT 1 FROM jobs WHERE lane='fast' AND status='failed' LIMIT 1").fetchone():
-                return None
-        jobs = claim(project, "slow")
+        if not isolated:
+            with _connect(project) as conn:
+                if conn.execute("SELECT 1 FROM jobs WHERE lane='fast' AND status='failed' LIMIT 1").fetchone():
+                    return None
+        jobs = claim(project, "slow", **claim_args)
     if not jobs:
         return None
     if on_event is not None:
@@ -964,7 +1051,8 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 if move_jobs:
                     moved = move_sources(staged_settings, move_jobs, should_continue=is_current,
                                          on_progress=on_event, prepare_publish=prepare_publish,
-                                         begin_publish=begin_publish, on_revision=record_revision)
+                                         begin_publish=begin_publish, on_revision=record_revision,
+                                         defer_linker=defer_linker)
                     result["done"].extend(moved["done"])
                     result["failures"].extend(moved["failures"])
                     result["cancelled"] = moved["cancelled"]
@@ -972,11 +1060,13 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 if normal_jobs and not result["failures"] and not result["cancelled"]:
                     synced = sync_once(
                         staged_settings, only=[job.rel for job in normal_jobs], force=True, resume=True,
-                        should_continue=is_current, include_pending=True, on_progress=on_event,
+                        should_continue=is_current, include_pending=not isolated, on_progress=on_event,
                         source_details=details,
                         prepare_publish=prepare_publish,
                         begin_publish=begin_publish,
                         on_revision=record_revision,
+                        retry_documents=not isolated,
+                        defer_linker=defer_linker,
                     )
                     result["run_id"] = synced["run_id"]
                     result["done"].extend(synced["done"])
@@ -984,15 +1074,32 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                     result["cancelled"] = synced["cancelled"]
                     result.setdefault("index_paths", []).extend(synced.get("index_paths") or [])
                 result["index_paths"] = sorted(set(result.get("index_paths") or []))
+            if not result.get("cancelled"):
+                completed = {
+                    str(row.get("path")) for row in result.get("done", [])
+                    if row.get("status") in {"added", "changed", "deleted", "moved"}
+                }
+                omitted = sorted(job.rel for job in jobs if job.rel not in completed)
+                if omitted:
+                    result.setdefault("failures", []).append(f"pipeline omitted claimed paths: {omitted}")
             if not result.get("cancelled") and not result.get("failures"):
+                if isolated:
+                    _verify_completed_jobs(staged, jobs, allow_unlinked=defer_linker)
                 commit = amend_candidate(staged) if prepared_commit else commit_candidate(
-                    staged, f"publish {operation_id}", _commit_metadata(staged, jobs, base, operation_id)
+                    staged, f"{'build' if defer_linker else 'publish'} {operation_id}",
+                    _commit_metadata(staged, jobs, base, operation_id),
                 )
-                _transaction(project, operation_id, base, "publishing", commit)
+                _transaction(
+                    project,
+                    operation_id,
+                    base,
+                    "building" if defer_linker else "publishing",
+                    commit,
+                )
                 promote(project, staged, commit)
                 if on_event:
                     on_event({"stage": "history", "step": "promote", "base_commit": base, "commit": commit})
-            elif result.get("failures") and publishing:
+            elif publishing:
                 _transaction(project, operation_id, base, "restoring", prepared_commit)
                 restored = restore_publication(
                     settings, staged, jobs, known_revisions=_transaction_revisions(project, operation_id)
@@ -1001,39 +1108,74 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 if on_event:
                     on_event({"stage": "history", "step": "rollback", "base_commit": base})
     except Exception as exc:
+        log.exception("operation=%s stage=operation failed", operation_id)
+        recovery_error = ""
+        if publishing:
+            try:
+                _transaction(project, operation_id, base, "restoring", prepared_commit)
+                restored = restore_publication(
+                    settings, staged, jobs, known_revisions=_transaction_revisions(project, operation_id)
+                )
+                _transaction(project, operation_id, base, "restored", restored)
+                publishing = False
+            except Exception as restore_exc:
+                log.exception("operation=%s stage=recovery failed", operation_id)
+                recovery_error = f"; recovery: {type(restore_exc).__name__}: {restore_exc}"
         prefix = "recovery required: " if publishing else ""
-        finish(project, jobs, error=f"{prefix}{type(exc).__name__}: {exc}")
+        error = f"{prefix}{type(exc).__name__}: {exc}{recovery_error}"
+        finish(project, jobs, error=error)
         if not publishing:
             _finish_transaction(project, operation_id)
-        return {"lane": jobs[0].lane, "jobs": len(jobs), "failures": [f"{type(exc).__name__}: {exc}"], "cancelled": False}
+        return {"lane": jobs[0].lane, "jobs": len(jobs), "paths": [job.rel for job in jobs],
+                "job_versions": [vars(job) for job in jobs], "operation_id": operation_id,
+                "failures": [error], "cancelled": False,
+                "recovery_required": publishing}
     if result.get("cancelled"):
         finish(project, jobs, error="superseded by a newer mount event", retry=True)
-    else:
-        completed = {
-            str(row.get("path")) for row in result.get("done", [])
-            if row.get("status") in {"added", "changed", "deleted", "moved"}
-        }
-        omitted = sorted(job.rel for job in jobs if job.rel not in completed)
-        if omitted:
-            result.setdefault("failures", []).append(f"pipeline omitted claimed paths: {omitted}")
-    if result.get("cancelled"):
-        pass
     elif result.get("failures"):
         finish(project, jobs, error="; ".join(result["failures"]))
     else:
         finish(project, jobs)
     _finish_transaction(project, operation_id)
     result.pop("scan", None)
-    return {"lane": jobs[0].lane, "jobs": len(jobs), "paths": [job.rel for job in jobs], **result}
+    if result.get("failures") or result.get("cancelled"):
+        result["done"] = []  # Generated candidate output has not been accepted.
+    return {"lane": jobs[0].lane, "jobs": len(jobs), "paths": [job.rel for job in jobs],
+            "job_versions": [vars(job) for job in jobs], "operation_id": operation_id, **result}
 
 
-def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False) -> dict[str, Any] | None:
+def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False,
+              isolated: bool = False, only: list[str] | None = None,
+              run_id: str = "", attempt: int = 1,
+              exclude: list[str] | None = None,
+              defer_linker: bool = False) -> dict[str, Any] | None:
     """Promote one candidate, then reconcile derived indexes from live state."""
     from .pipeline import _lock
 
     with _lock(open_project(settings)):
-        result = _work_once_locked(settings, on_event=on_event, continue_run=continue_run)
+        if isolated:
+            from .failure_logs import AttemptLog
+
+            with AttemptLog(settings, open_project(settings), run_id, attempt) as evidence:
+                def event(row: dict[str, Any]) -> None:
+                    evidence.event(row)
+                    if on_event:
+                        on_event(row)
+                result = _work_once_locked(settings, on_event=event, continue_run=continue_run,
+                                           isolated=True, only=only, exclude=exclude,
+                                           defer_linker=defer_linker)
+                if result and result.get("failures"):
+                    result["failure_logs"] = evidence.save(result)
+        else:
+            result = _work_once_locked(
+                settings,
+                on_event=on_event,
+                continue_run=continue_run,
+                defer_linker=defer_linker,
+            )
         if result is None or result.get("failures") or result.get("cancelled"):
+            return result
+        if defer_linker:
             return result
 
         # metadata/index is deliberately derived and is not part of the Git commit.
@@ -1088,7 +1230,7 @@ def serve(
     continue_run: bool = False,
 ) -> None:
     """Scan cheaply while the foreground worker runs long jobs."""
-    from .pipeline import _lock, pull_growi_once
+    from .pipeline import _lock, pull_growi_once, republish_if_stale
 
     project = open_project(settings)
     if only:
@@ -1115,6 +1257,9 @@ def serve(
             stop.wait(max(1.0, interval))
 
     with worker_lock(project):
+        switched = republish_if_stale(settings)
+        if switched is not None:
+            emit("stale-republish", switched)
         with _lock(project):
             _preserved_id = resumable_operation_id(project, adopt_orphan=True) if continue_run else None
             recover(project, settings, preserve_operation_id=(

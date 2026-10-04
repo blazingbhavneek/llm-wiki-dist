@@ -30,7 +30,9 @@ from publisher.ledger import Ledger, load_ledger
 from publisher.pipeline import _connection, _folders, _lock, _publisher
 
 INDEX_NAME = "00-目次"  # sorts before 001-…; growi-search reads it (WIKI_INDEX_PAGE_NAME)
-MARKER = '<span hidden data-llm-wiki-index="{kind}"></span>'
+# Kept distinct from the page stamp so _trash_under never mistakes an index for a page.
+MARKER = "<!-- llm-wiki-index:{kind} -->"
+LEGACY_MARKER = 'data-llm-wiki-index="'
 MAX_KEYWORDS_PER_PAGE = 12
 MAX_ENTITIES_PER_PAGE = 8
 MAX_KINDS_PER_PAGE = 5
@@ -44,6 +46,11 @@ MAX_FOLDER_KEYWORDS = 30
 MAX_FOLDER_ENTITIES = 20
 _PREFIX_RE = re.compile(r"^\d+-")
 _ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+
+
+def _is_index_page(body: str) -> bool:
+    """Recognise the bottom stamp and the span form published before it."""
+    return LEGACY_MARKER in body or "<!-- llm-wiki-index:" in body
 
 log = logging.getLogger(__name__)
 
@@ -124,7 +131,7 @@ def document_records(cards: list[dict[str, Any]], page_row: Callable[[str], dict
 
 
 def render_document_index(title: str, cards: list[dict[str, Any]], link_for: Callable[[str], str], related: list[tuple[str, str]] | None = None) -> str:
-    lines = [f"# {_one_line(title, 200)}", "", MARKER.format(kind="document"), "", "ページは原文での登場順に並んでいます。", ""]
+    lines = [f"# {_one_line(title, 200)}", "", "ページは原文での登場順に並んでいます。", ""]
     for card in cards:
         lines.append(f"- [{card['title']}]({link_for(card['filename'])}) — {card['summary'] or '要約なし'}")
         if card["chapter"]:
@@ -140,7 +147,7 @@ def render_document_index(title: str, cards: list[dict[str, Any]], link_for: Cal
     if related:
         lines.extend(["", "## 関連文書", ""])
         lines.extend(f"- [{name}]({link})" for name, link in related)
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines).rstrip() + "\n\n" + MARKER.format(kind="document") + "\n"
 
 
 def _related_documents(settings: Any, folders: dict[str, Path], summaries: dict[str, dict[str, Any]], connection: Any | None) -> dict[str, list[tuple[str, str]]]:
@@ -283,10 +290,10 @@ def render_folder_card(summary: dict[str, Any], link: str, *, name_only: bool) -
 
 
 def render_folder_index(title: str, kind: str, child_cards: list[str]) -> str:
-    lines = [f"# {_one_line(title, 200)}", "", MARKER.format(kind=kind), "", "このフォルダに含まれるフォルダと文書の索引です。", ""]
+    lines = [f"# {_one_line(title, 200)}", "", "このフォルダに含まれるフォルダと文書の索引です。", ""]
     for card in child_cards:
         lines.extend(card.splitlines())
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines).rstrip() + "\n\n" + MARKER.format(kind=kind) + "\n"
 
 
 async def _upsert(client: GrowiClient, path: str, body: str, *, mode: str, write_path: str, root_path: str) -> tuple[GrowiPage, bool]:
@@ -302,7 +309,7 @@ async def _upsert(client: GrowiClient, path: str, body: str, *, mode: str, write
 
 async def _delete_if_index(client: GrowiClient, path: str) -> bool:
     page = await client.get_page(path=path)
-    if page is None or 'data-llm-wiki-index="' not in page.body:
+    if page is None or not _is_index_page(page.body):
         return False
     await client.delete_pages({page.page_id: page.revision_id})
     return True
@@ -330,7 +337,7 @@ async def _delete_stale_indexes(
         if path in expected_paths or path.rstrip("/").rsplit("/", 1)[-1] != index_segment:
             continue
         full = await client.get_page(page_id=listed.page_id)
-        if full is None or 'data-llm-wiki-index="' not in full.body:
+        if full is None or not _is_index_page(full.body):
             continue
         doomed[full.page_id] = full.revision_id
         deleted_paths.append(full.path)
@@ -449,6 +456,8 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     run_id = "idx-" + uuid.uuid4().hex[:16]
     done: list[dict[str, Any]] = []
     failures: list[str] = []
+    if on_progress:
+        on_progress({"stage": "index", "step": "start", "run_id": run_id})
     folders = _folders(project)
     paths = list(folders)
     tree = folder_tree(paths)
@@ -483,6 +492,8 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
         doc_scope = set(paths)
     total = len(doc_scope) + len(affected)
     indexed = 0
+    if on_progress:
+        on_progress({"stage": "index", "step": "progress", "current": 0, "total": total, "run_id": run_id})
     with contextlib.nullcontext() if locked else _lock(project):
         ledger = ledger if ledger is not None else load_ledger(project.metadata / "pipeline.json")
         target = str(settings.target_name).strip("/")
@@ -584,6 +595,8 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                         done.append({"stale_growi_indexes": removed_remote, "status": "deleted"})
                 except Exception as exc:
                     failures.append(f"stale indexes: {type(exc).__name__}: {exc}")
+    if on_progress:
+        on_progress({"stage": "index", "step": "done", "current": indexed, "total": total, "run_id": run_id})
     return {"run_id": run_id, "done": done, "failures": failures}
 
 

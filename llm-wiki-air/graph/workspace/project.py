@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+VERBATIM = {".md", ".txt"}
+
 
 def wiki_folder_name(raw_name: str) -> str:
     stem = PurePosixPath(raw_name).stem

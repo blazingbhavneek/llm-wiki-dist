@@ -24,7 +24,6 @@ def _load_env_files() -> None:
     # load_dotenv does not overwrite already-set variables, so service-local wins.
     service_dir = Path(__file__).resolve().parent
     load_dotenv(service_dir / ".env", override=False)
-    load_dotenv(service_dir.parent / ".env", override=False)
 
 
 def _project_values() -> dict[str, str]:

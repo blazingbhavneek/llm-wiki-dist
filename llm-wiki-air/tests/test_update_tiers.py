@@ -624,7 +624,7 @@ class WriterTierTest(unittest.TestCase):
                     llm=None, embedder=None, resume=True,
                 )
 
-    def test_human_edited_page_is_reported_when_regenerated(self) -> None:
+    def test_legacy_human_page_is_retained_before_pure_rebuild(self) -> None:
         page_one, page_two = "# P1\n\n" + "\n".join(BODY[:50]), "# P2\n\n" + "\n".join(BODY[50:])
         model = PatchModel(fail=True)
         with tempfile.TemporaryDirectory() as tmp:
@@ -634,9 +634,20 @@ class WriterTierTest(unittest.TestCase):
             metadata["human_edited"] = True
             sidecar.write_text(json.dumps(metadata), encoding="utf-8")
             self._write_raw(project, rel, OLD_SOURCE.replace("line 5\n", "line 5 changed\n"))
-            with patch.object(writer, "build_wiki_output", side_effect=self._regen_page):
+            def rebuild(**kwargs):
+                self.assertFalse(state.exists())
+                docs = Path(kwargs["out_dir"]) / "docs"
+                docs.mkdir(parents=True)
+                (docs / "001.md").write_text("# P1\n\nPure rebuilt source.\n", encoding="utf-8")
+                return SimpleNamespace(out_dir=Path(kwargs["out_dir"]))
+
+            with patch.object(writer, "build_wiki_output", side_effect=rebuild):
                 result = writer.write_wiki_pages(project, rel, mode="wiki", settings=SETTINGS, llm=model, embedder=None)
-            self.assertEqual(result.human_edits_overwritten, ["test.md/001.md"])
+            self.assertEqual(result.human_edits_overwritten, [])
+            self.assertEqual((result.tier, result.reason), (3, "legacy-human-state"))
+            retained = (project.wiki_dir(rel) / "99-Retained-Human-Notes.md").read_text(encoding="utf-8")
+            self.assertIn(page_one, retained)
+            self.assertNotIn(page_one, (project.wiki_dir(rel) / "001.md").read_text(encoding="utf-8"))
 
     def test_tabular_is_always_full(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

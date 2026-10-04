@@ -174,7 +174,7 @@ class DiffPipelineSafetyTest(unittest.TestCase):
             )
             self.assertTrue(
                 _can_resume_parsed_source(
-                    {"source_sha256": "", "source_blob_oid": "blob-1"}, item, raw,
+                    {"source_sha256": "", "source_blob_oid": "blob-1", "parsed_source_sha256": "same-hash"}, item, raw,
                     requested_resume=True, classification="none",
                     known_source_sha256="same-hash",
                     known_source_blob_oid="blob-1",
@@ -406,7 +406,10 @@ class DiffPipelineSafetyTest(unittest.TestCase):
     def test_sync_command_rescans_until_the_queue_is_drained(self) -> None:
         import main
 
-        settings = SimpleNamespace(data_root="/tmp/data", target_name="test", mount_path="/tmp/mount")
+        settings = SimpleNamespace(
+            data_root="/tmp/data", target_name="test", mount_path="/tmp/mount",
+            sync_isolated=False,
+        )
         args = SimpleNamespace(items=["test.docx"], force=True, verbose=False)
         first = {"done": [{"path": "test.docx", "status": "added"}], "failures": []}
         second = {"done": [{"path": "test.docx", "status": "changed"}], "failures": []}
@@ -414,6 +417,7 @@ class DiffPipelineSafetyTest(unittest.TestCase):
         with (
             patch.object(main, "_settings", return_value=settings),
             patch.object(main, "open_project", return_value=project),
+            patch("publisher.pipeline.republish_if_stale", return_value=None),
             patch("publisher.queue.worker_lock", return_value=contextlib.nullcontext()),
             patch("publisher.queue.retry_failed") as retry,
             patch("publisher.queue.scan") as scan,
@@ -1110,7 +1114,7 @@ class DiffPipelineSafetyTest(unittest.TestCase):
             marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
             new_body = publisher._document_pages(project, new_rel)[0]["body"]
-            pattern = re.compile(r"<!-- chunk: ([^ ]+)")
+            pattern = re.compile(r"<!-- llm-wiki-bot-ref:([A-Za-z0-9_-]+) -->")
             self.assertEqual(pattern.search(old_body).group(1), pattern.search(new_body).group(1))
 
     def test_candidate_worker_respects_the_live_pipeline_lock(self) -> None:

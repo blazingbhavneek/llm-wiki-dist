@@ -94,6 +94,9 @@ class Store:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.identity = embedder.identity if embedder is not None else "sparse-only"
+        # A different GROWI endpoint (or root) means every page id, revision and section in
+        # the store belongs to another wiki, so the store is dropped like a new embedder is.
+        self.source = f"{settings.growi_url}|{settings.growi_root_path}"
         self.state_path = self.dir / "state.json"
         self.state = self._load_state()
         # ponytail: local file mode is brute-force search and fine to ~100k points; switch
@@ -115,14 +118,15 @@ class Store:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             state = {}
-        if state.get("version") != STATE_VERSION or state.get("identity") != self.identity:
+        if (state.get("version") != STATE_VERSION or state.get("identity") != self.identity
+                or state.get("source") != self.source):
             state = self._fresh_state()
             state["reset"] = True
         return state
 
     def _fresh_state(self) -> dict[str, Any]:
         return {"version": STATE_VERSION, "identity": self.identity, "blocks": {}, "tree": {},
-                "docs": {}, "folders": {}, "pages": {}}
+                "source": self.source, "docs": {}, "folders": {}, "pages": {}}
 
     def save_state(self) -> None:
         with self.lock:

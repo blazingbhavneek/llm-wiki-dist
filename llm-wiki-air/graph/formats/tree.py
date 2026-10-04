@@ -61,6 +61,38 @@ def _close(node: Section, end: int) -> None:
         _close(child, child_end)
 
 
+def heading_tree_usable(
+    tree: Section,
+    *,
+    line_count: int,
+    max_depth: int = 3,
+    collapse_title: bool = False,
+) -> bool:
+    """Return whether headings are frequent and balanced enough to plan from."""
+
+    candidate = tree
+    if (
+        collapse_title
+        and len(tree.children) == 1
+        and tree.children[0].start == 1
+        and tree.children[0].end == line_count
+    ):
+        candidate = tree.children[0]
+    return not (
+        _count(candidate) < line_count / 300
+        or _depth(candidate) > max_depth
+        or any(child.size > 0.6 * line_count for child in candidate.children)
+    )
+
+
+def _count(node: Section) -> int:
+    return len(node.children) + sum(_count(child) for child in node.children)
+
+
+def _depth(node: Section) -> int:
+    return 1 + max((_depth(child) for child in node.children), default=0) if node.children else 0
+
+
 def lead(lines: Sequence[str], start: int, end: int, *, limit: int = 200) -> str:
     out: list[str] = []
     for line in lines[start - 1 : end]:
