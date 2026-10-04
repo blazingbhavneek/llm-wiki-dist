@@ -385,6 +385,12 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 )
                 combined["done"].extend(linked.get("done", []))
                 combined["failures"].extend(linked.get("failures", []))
+            elif not blocked and not policy_of(settings).link:
+                # A policy without linking (fast) still publishes what it built; the
+                # link phase above is where a linking sync publishes.
+                published = pipeline.publish_only(settings, only=link_scope(), allow_unlinked=True, link_pending=False)
+                combined["done"].extend(published.get("done", []))
+                combined["failures"].extend(published.get("failures", []))
             pending = [row for row in status(project) if selected(row)]
             for row in pending:
                 evidence = ", ".join(logs.get(row["rel"], []))

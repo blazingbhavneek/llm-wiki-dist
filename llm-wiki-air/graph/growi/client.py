@@ -1309,8 +1309,10 @@ class GrowiPublisher:
                         raise LegacyBaseUnavailable("legacy page has not yet been published with its protected region")
                     if not baseline.get("generated_blob") and not target.name.startswith((Path(RETAINED).stem, Path(DASHBOARD).stem)):
                         raise LegacyBaseUnavailable("published pure ancestor is missing; legacy pin required")
+                    unlinked_path = target.parent / "_planning" / "pages" / target.name
                     store.capture(raw_rel, local_path, row, previous_local, canonical,
-                                  generated_before=generated_before)
+                                  generated_before=generated_before,
+                                  unlinked=unlinked_path.read_text(encoding="utf-8") if unlinked_path.exists() else None)
                     decisions["captured"] += 1
                 except LegacyBaseUnavailable:
                     pinned = store.pin_legacy(raw_rel, local_path, strip_regions(canonical), revision=page.revision_id, replace=True)

@@ -939,6 +939,26 @@ class PartialPublicationTest(unittest.TestCase):
         store.generated(self.raw_rel, {page.name: page.read_text(encoding="utf-8") for page in folder.glob("*.md")})
         store.render(self.raw_rel)
 
+    def test_linker_links_are_not_recorded_as_part_of_a_human_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live, folder, store, _client, _publisher, _settings, rows = self._harness(tmp)
+            path = f"{self.document}/001.md"
+            row = dict(rows[path], observed_revision_id="human-1")
+            linked = BASE.replace("Mode is AUTO.", "[Mode](002.md) is AUTO.")  # what the linker published
+            human = linked.replace("Maximum is 40°C.", "Maximum is 40°C (checked).")
+
+            def stored(unlinked):
+                fresh = HumanStore(live)
+                fresh.capture(self.raw_rel, path, dict(row), linked, human, generated_before=BASE, unlinked=unlinked)
+                edits = [e for e in fresh.document(self.raw_rel)["edits"] if e["status"] != "deleted"]
+                self.assertEqual(len(edits), 1)
+                return fresh.get(edits[0]["human_after_blob"])
+
+            # only the human's change is stored against the pure block
+            self.assertEqual(stored(BASE), "## Limits\n\nMaximum is 40°C (checked).\nMode is AUTO.\n\n")
+            store.document(self.raw_rel)["edits"].clear()
+            store.save(store.document(self.raw_rel))
+
     def test_unrecorded_published_page_is_not_captured_as_a_human_edit(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp)
@@ -1129,3 +1149,26 @@ class PartialPublicationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TransportSpellingMergeTest(unittest.TestCase):
+    """GROWI holds inline code without backticks; adjacent spelling-only lines must not
+    swallow a human token edit when the capture rebases it onto the local page."""
+
+    def test_human_edit_inside_a_multi_line_spelling_hunk_is_captured(self):
+        from publisher.human_changes import merge
+
+        remote = "- 供給温度は通常 18 °C に設定します。\n- 戻り温度が 26 °C を超えた場合は確認する。\n"
+        human = "- 供給温度は通常 18 °C に設定します（夏季は 16 °C）。\n- 戻り温度が 26 °C を超えた場合は確認する。\n"
+        local = "- 供給温度は通常 `18 °C` に設定します。\n- 戻り温度が `26 °C` を超えた場合は確認する。\n"
+        merged, status = merge(remote, human, local)
+        self.assertEqual(status, "active")
+        self.assertEqual(merged, "- 供給温度は通常 `18 °C` に設定します（夏季は 16 °C）。\n- 戻り温度が `26 °C` を超えた場合は確認する。\n")
+
+    def test_same_token_still_conflicts_inside_a_multi_line_hunk(self):
+        from publisher.human_changes import merge
+
+        base = "- 高温警報: 60 °C\n- 低圧警報: 0.15 MPa\n"
+        human = "- 高温警報: 65 °C\n- 低圧警報: 0.15 MPa\n"
+        source = "- 高温警報: 55 °C\n- 低圧警報: 0.20 MPa\n"
+        self.assertEqual(merge(base, human, source)[1], "conflict")

@@ -296,6 +296,16 @@ class IsolatedSyncTest(unittest.TestCase):
             self.assertEqual(self.run_sync(), 0)
         self.assertEqual(order, ["link-ahead:a_md.md", "build:b.md", "link-ahead:b_md.md", "link"])
 
+    def test_a_sync_without_linking_publishes_what_it_built(self):
+        self.add("a.md")
+        self.settings.policy = "fast"  # linking off: the CLI also turns the linker switch off
+        calls = []
+        with patch.object(pipeline, "publish_only", side_effect=lambda settings, **kwargs: calls.append(kwargs) or {"done": [], "failures": []}), \
+             patch.object(pipeline, "link_pending_isolated") as link:
+            self.assertEqual(self.run_sync(), 0)
+        link.assert_not_called()
+        self.assertEqual(calls, [{"only": None, "allow_unlinked": True, "link_pending": False}])
+
     def test_unlinked_folder_requires_explicit_publication_opt_in(self):
         folder = self.project.wiki_dir("pending.md")
         (folder / "_planning").mkdir(parents=True)

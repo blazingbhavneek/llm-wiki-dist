@@ -92,16 +92,22 @@ def _changes(before: str, after: str) -> list[tuple[int, int, str]]:
     ):
         first, last = offsets[start - 1], offsets[start - 1 + count]
         replacement = "".join(new[new_start - 1:new_start - 1 + new_count])
-        if count == new_count == 1 and not any(_overlaps((first, last, ""), (s, e, "")) for s, e in atoms):
+        if count == new_count and not any(_overlaps((first, last, ""), (s, e, "")) for s, e in atoms):
+            # Line for line, as for a one-line hunk: a hunk of N rewritten lines (two
+            # adjacent lines differing only in publication spelling, e.g. stripped
+            # inline code) must not become one span that swallows a human token edit.
             token_re = re.compile(r"\d+(?:[.,]\d+)*(?:[ ]?[%°℃\w/]+)?|\w+|[^\w\s]|\s+")
-            old_tokens = list(token_re.finditer(before[first:last]))
-            new_tokens = list(token_re.finditer(replacement))
-            matcher = SequenceMatcher(a=[t.group() for t in old_tokens], b=[t.group() for t in new_tokens], autojunk=False)
-            for tag, i, j, k, l in matcher.get_opcodes():
-                if tag != "equal":
-                    s = old_tokens[i].start() if i < len(old_tokens) else last - first
-                    e = old_tokens[j - 1].end() if j > i else s
-                    result.append((first + s, first + e, "".join(t.group() for t in new_tokens[k:l])))
+            for line in range(count):
+                line_first, line_last = offsets[start - 1 + line], offsets[start + line]
+                line_new = new[new_start - 1 + line]
+                old_tokens = list(token_re.finditer(before[line_first:line_last]))
+                new_tokens = list(token_re.finditer(line_new))
+                matcher = SequenceMatcher(a=[t.group() for t in old_tokens], b=[t.group() for t in new_tokens], autojunk=False)
+                for tag, i, j, k, l in matcher.get_opcodes():
+                    if tag != "equal":
+                        s = old_tokens[i].start() if i < len(old_tokens) else line_last - line_first
+                        e = old_tokens[j - 1].end() if j > i else s
+                        result.append((line_first + s, line_first + e, "".join(t.group() for t in new_tokens[k:l])))
         else:
             result.append((first, last, replacement))
     # git's line comparison omits final-newline-only differences.
@@ -1007,8 +1013,14 @@ class HumanStore:
                 target["path"] = new_document + target["path"][len(old_document):]
         self.save(document)
 
-    def capture(self, raw_rel: str, local_path: str, row: dict, before: str, remote: str, *, generated_before: str | None = None) -> None:
-        """Capture P -> R; store changes against the inspected generated ancestor."""
+    def capture(self, raw_rel: str, local_path: str, row: dict, before: str, remote: str, *,
+                generated_before: str | None = None, unlinked: str | None = None) -> None:
+        """Capture P -> R; store changes against the inspected generated ancestor.
+
+        ``unlinked`` is the published page before the linker added inline links
+        (``_planning/pages``); with it only the human's own change is stored, not the
+        linker's links around it.
+        """
         document = self.ensure_generated(raw_rel)
         revision_key = f"{row['marker_id']}:{row['revision_id']}:{row['observed_revision_id']}"
         if revision_key in document["captured_revisions"]:
@@ -1098,8 +1110,14 @@ class HumanStore:
         new_body = substitute_markers(new_body, lambda m: unquote_source(m.group(2)), kind="source")
         old_blocks, new_blocks = blocks({local_path: old_body}), blocks({local_path: new_body})
         generated = {name: self.get(value["body_blob"]) for name, value in document["pages"].items()}
+        current_pure = generated.get(Path(local_path).name)
         if generated_before is not None:
             generated[Path(local_path).name] = generated_before
+        if generated_before is None or current_pure != generated_before:
+            # The local pre-link page belongs to the published page only while the
+            # local generation is still the published one (not after a build whose
+            # publication failed), so otherwise the whole human block is stored.
+            unlinked = None
         prefix = Path(local_path).parent.as_posix()
         pure_blocks = blocks({f"{prefix}/{name}": text for name, text in generated.items()})
         pairs = SequenceMatcher(a=[b.heading for b in old_blocks], b=[b.heading for b in new_blocks], autojunk=False)
@@ -1112,7 +1130,18 @@ class HumanStore:
                 changed_pairs.extend((old, "") for old in old_blocks[i:j])
                 changed_pairs.extend((Block(local_path, new.heading, new.ordinal, "", new.start, new.end), new.text)
                                      for new in new_blocks[k:l])
+        plain_blocks = (
+            {(b.heading, b.ordinal): b.text for b in blocks({local_path: strip_regions(editable(unlinked))})}
+            if unlinked is not None else {}
+        )
         for ordinal, (old, human) in enumerate(changed_pairs):
+            plain = plain_blocks.get((old.heading, old.ordinal))
+            if plain is not None and old.text and human.strip() and plain != old.text:
+                # Inline links in the published block are linker output, not human text:
+                # apply only the human's own change to the block as it was before linking.
+                rebased, status = merge(old.text, human, plain)
+                if status != "conflict":
+                    human = rebased
             candidates = [b for b in pure_blocks if b.path == local_path and b.heading == old.heading]
             base = candidates[0] if len(candidates) == 1 else Block(old.path, old.heading, old.ordinal, "", 0, 0)
             # Replace the prior intent for this block only as a result of this
