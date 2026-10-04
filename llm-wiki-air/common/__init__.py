@@ -8,6 +8,6 @@ package for paths, state IO, policies, and execution context.
 from .context import Context, Event, Stage
 from . import mokuji_data
 from .paths import DataLayout
-from .policy import FAST, STANDARD, Policy
+from .policy import STANDARD, Policy
 
-__all__ = ["Context", "DataLayout", "Event", "FAST", "Policy", "STANDARD", "Stage", "mokuji_data"]
+__all__ = ["Context", "DataLayout", "Event", "Policy", "STANDARD", "Stage", "mokuji_data"]

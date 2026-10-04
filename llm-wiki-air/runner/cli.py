@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import time
+from common.policy import policy_of
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,10 @@ def _settings(args: argparse.Namespace) -> Settings:
         settings.wiki_request_timeout = args.timeout
     if getattr(args, "fast", False):
         settings.policy = "fast"
+    if not policy_of(settings).link:
+        # every stage already honours this switch: no link phase or link-ahead, and
+        # each document gets a "disabled" marker, which publication accepts
+        settings.wiki_linker_enabled = False
     return settings
 
 
@@ -244,12 +249,15 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     import uuid
 
     from publisher import pipeline
+    from publisher.ahead import LinkAhead, ParseAhead
     from publisher.failure_logs import save_failure
-    from publisher.queue import recover, retry_failed, scan, status, work_once, worker_lock
+    from publisher.queue import queued_jobs, recover, retry_failed, scan, status, work_once, worker_lock
     from publisher.progress import SyncProgress
 
     project = open_project(settings)
     run_id = "sync-" + uuid.uuid4().hex
+    parse_ahead: ParseAhead | None = None
+    link_ahead: LinkAhead | None = None
     combined: dict[str, Any] = {"done": [], "failures": []}
     progress = SyncProgress()
     wanted = {item.strip().lstrip("/") for item in args.items or ()}
@@ -261,6 +269,20 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
 
     def selected(row: dict[str, Any]) -> bool:
         return not wanted or row["rel"] in wanted or row.get("from_rel") in wanted
+
+    def link_scope() -> list[str] | None:
+        """Raw paths of the selected sources (None: every document)."""
+        if not wanted:
+            return None
+        from publisher.ledger import load_ledger
+
+        ledger = load_ledger(project.metadata / "pipeline.json")
+        return sorted({
+            str(row.get("raw_rel") or "")
+            for rel, row in ledger.sources.items()
+            if (rel in wanted or str(row.get("mount_rel") or "") in wanted)
+            and row.get("raw_rel")
+        })
 
     def on_event(event: dict[str, Any]) -> None:
         progress.on_event(event)
@@ -309,6 +331,14 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 )
                 logs.setdefault(rel, []).append(path)
                 log.error("source discovery failed: %s; log=%s", rel, path)
+            # The parser works through the queue ahead of the builder, and built documents
+            # get their linker metadata while later ones build (publisher/ahead.py).
+            settings.cache_dir = getattr(settings, "cache_dir", "") or str((project.metadata / "cache").resolve())
+            parse_ahead = ParseAhead(project, settings, queued_jobs(project, only=args.items or None))
+            if getattr(settings, "wiki_linker_enabled", True):
+                link_ahead = LinkAhead(project, settings)
+                # Built earlier but not linked yet (e.g. a stopped run): these go first.
+                link_ahead.add(project, pipeline._pending_link_rels(project, settings, link_scope()))
             attempt = 1
             while True:
                 result = work_once(settings, on_event=on_event, isolated=True,
@@ -340,23 +370,17 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                     continue
                 combined["done"].extend(result.get("done", []))
                 progress.mark_completed(paths)
+                if link_ahead is not None and result.get("lane") == "slow":
+                    link_ahead.add(project, [str(job["raw_rel"]) for job in result.get("job_versions", [])])
                 if attempt == 2:
                     recovered.extend(paths)
+            parse_ahead.stop()
+            if link_ahead is not None:
+                link_ahead.close(wait=not blocked)
             if not blocked and getattr(settings, "wiki_linker_enabled", True):
-                link_only = None
-                if wanted:
-                    from publisher.ledger import load_ledger
-
-                    ledger = load_ledger(project.metadata / "pipeline.json")
-                    link_only = sorted({
-                        str(row.get("raw_rel") or "")
-                        for rel, row in ledger.sources.items()
-                        if (rel in wanted or str(row.get("mount_rel") or "") in wanted)
-                        and row.get("raw_rel")
-                    })
                 linked = pipeline.link_pending_isolated(
                     settings,
-                    only=link_only,
+                    only=link_scope(),
                     on_progress=on_event,
                 )
                 combined["done"].extend(linked.get("done", []))
@@ -390,6 +414,10 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
         combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}; log: {evidence}")
         return _report(combined)
     finally:
+        if parse_ahead is not None:
+            parse_ahead.stop()
+        if link_ahead is not None:
+            link_ahead.close(wait=False)
         progress.close()
 
 

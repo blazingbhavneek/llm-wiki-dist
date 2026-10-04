@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from common.policy import policy_of
+
 from .catalog import Catalog
 from .legacy import EDGE_GROUP_SIZE, rrf_fuse
 from .prompts import EDGE_VERSION_NEO, neo_edge_messages
@@ -79,9 +81,7 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None, setting
                         selected.append(Candidate(definer, "define_define", [entity.name])); selected_ids.add(definer)
     entity_names = {normalize_name(item.name) for item in chunk.entities}
     caps = [HOP1_MAX, HOP2_MAX, HOP3_MAX]
-    if str(getattr(settings, "policy", "standard")) == "fast":
-        caps = [HOP1_MAX, 0, 0]
-        judge = False
+    caps, judge = policy_of(settings).neo_limits(caps, judge)
     if judge and settings is not None:
         # Fewer values than hops means fewer hops: "40,30" disables the 3-hop expansion.
         try: caps = ([int(value) for value in settings.wiki_linker_hop_caps.split(",")] + [0, 0, 0])[:3]

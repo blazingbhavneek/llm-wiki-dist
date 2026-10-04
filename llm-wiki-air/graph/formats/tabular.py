@@ -16,6 +16,7 @@ from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, Field
 
+from common.policy import policy_of
 from graph.config import app_concurrency
 
 Cell = tuple[int, int]
@@ -291,8 +292,8 @@ async def decide_structure(sheet: str, grid: Grid, regions: Sequence[Region], *,
         header_row=getattr(config, "source_kind", "csv") != "xlsx",
         orientation="rows",
     )
-    if getattr(config, "policy", "standard") == "fast":
-        return row_structure  # fast: deterministic row-oriented reading, no model call
+    if not policy_of(config).model_table_structure:
+        return row_structure  # deterministic row-oriented reading, no model call
     column_structure = heuristic_structure(regions, grid, orientation="columns")
     previews = "\n\n".join(
         f"### 領域 {region.id}\n{region.preview(grid, rows=config.tabular_preview_rows, cols=config.tabular_preview_cols)}"
@@ -546,9 +547,8 @@ async def write_tables(
             regions = [] if is_vba else find_regions(grid)
             # An unchanged sheet reuses its LLM answers, so a workbook update pays only for
             # the sheets that changed. The cache lives in the run state a full rebuild deletes.
-            # Fast answers are keyed apart so a later standard run never reuses them.
-            fast_key = "\0fast-v1" if getattr(config, "policy", "standard") == "fast" else ""
-            digest = hashlib.sha256(f"{sheet}\0{table_text}{fast_key}".encode("utf-8")).hexdigest()[:32]
+            # Another policy's answers are keyed apart so a standard run never reuses them.
+            digest = hashlib.sha256(f"{sheet}\0{table_text}{policy_of(config).cache_key('')}".encode("utf-8")).hexdigest()[:32]
             cache = Path(config.run_dir) / "sheet-cache" / f"{digest}.json" if getattr(config, "run_dir", None) else None
             cached = read_json(cache, default={}) if cache else {}
             if cached:

@@ -26,7 +26,7 @@ from graph.wiki.incremental import line_hunks
 from graph.wiki.storage import read_json
 
 from .history import (
-    amend_candidate, candidate, candidate_is_clean, candidate_project, commit_candidate, ensure_repository, last_good, list_candidate_ids, promote,
+    amend_candidate, candidate, candidate_is_clean, candidate_project, commit_candidate, ensure_repository, is_ancestor, last_good, list_candidate_ids, promote,
     prune_candidates, read_blob, remove_candidate, reopen_candidate, restore_last_good, resumed_candidate, stage_blob,
 )
 from .ledger import load_ledger
@@ -653,7 +653,20 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
                     )
                 _finish_transaction(project, operation_id)
                 continue
+            if phase in {"building", "prepared"} and last_good(project) != str(transaction["base_commit"]):
+                # Nothing of this operation reached GROWI, and last-good moved on (a sync
+                # stopped mid-document, then `publish` checkpointed). Its work is either
+                # already in last-good (promoted before the stop) or simply built again.
+                if commit and is_ancestor(project, commit, last_good(project)):
+                    with _connect(project) as conn:
+                        conn.execute(
+                            "DELETE FROM jobs WHERE status='running' AND base_commit=?",
+                            (str(transaction["base_commit"]),),
+                        )
+                _finish_transaction(project, operation_id)
+                continue
             if last_good(project) != str(transaction["base_commit"]):
+                # A publishing operation may have written pages from that older base.
                 raise RuntimeError(f"cannot recover publication {operation_id}: last-good changed")
             if phase in {"publishing", "restoring"}:
                 if not staged.root.exists():
@@ -715,6 +728,25 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
     return cursor.rowcount
 
 
+# Claim order: everything the parser finishes quickly (txt, md, docx, pptx, Excel, csv)
+# before pdfs, smallest first within each group, so the builder starts early and the
+# slow pdf parses run ahead in the background (publisher/ahead.py) in the same order.
+_PRIORITY = "CASE WHEN lower(jobs.rel) LIKE '%.pdf' THEN 1 ELSE 0 END, COALESCE(sources.size, 0), jobs.created_at, jobs.rel"
+
+
+def queued_jobs(project: Project, *, only: list[str] | None = None) -> list[Job]:
+    """Queued document jobs in claim order, read-only (the parse-ahead worker's list)."""
+    with _connect(project) as conn:
+        rows = [dict(row) for row in conn.execute(
+            f"""SELECT jobs.rel,jobs.raw_rel,jobs.operation,jobs.lane,jobs.version,jobs.source_id,jobs.from_rel,
+                       jobs.target_blob_oid,jobs.target_sha256,jobs.classification,jobs.base_commit
+                FROM jobs LEFT JOIN sources ON sources.rel=jobs.rel
+                WHERE jobs.status='queued' AND jobs.lane='slow' ORDER BY {_PRIORITY}"""
+        )]
+    wanted = {item.strip().lstrip("/") for item in only or ()}
+    return [_job_from_row(row | {"token": ""}) for row in rows if not wanted or row["rel"] in wanted]
+
+
 def claim(project: Project, lane: str, *, limit: int | None = None, only: list[str] | None = None,
           exclude: list[str] | None = None) -> list[Job]:
     token = uuid.uuid4().hex
@@ -723,9 +755,11 @@ def claim(project: Project, lane: str, *, limit: int | None = None, only: list[s
     with _connect(project) as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = list(conn.execute(
-            """SELECT rel,raw_rel,CASE WHEN from_rel<>'' THEN 'move' ELSE operation END AS operation,
-                      lane,version,source_id,from_rel,target_blob_oid,target_sha256,classification,base_commit
-               FROM jobs WHERE status='queued' AND lane=? AND available_at<=? ORDER BY created_at,rel""",
+            f"""SELECT jobs.rel,jobs.raw_rel,CASE WHEN jobs.from_rel<>'' THEN 'move' ELSE jobs.operation END AS operation,
+                       jobs.lane,jobs.version,jobs.source_id,jobs.from_rel,jobs.target_blob_oid,jobs.target_sha256,
+                       jobs.classification,jobs.base_commit
+                FROM jobs LEFT JOIN sources ON sources.rel=jobs.rel
+                WHERE jobs.status='queued' AND jobs.lane=? AND jobs.available_at<=? ORDER BY {_PRIORITY}""",
             (lane, now),
         ))
         wanted = {item.strip().lstrip("/") for item in only or ()}

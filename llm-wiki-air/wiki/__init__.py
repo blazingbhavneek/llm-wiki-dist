@@ -11,7 +11,7 @@ from typing import Any
 from common.context import Context
 from common.legacy import build_wiki_output, project, publish_output
 from common.paths import DataLayout
-from common.policy import Policy, resolve_policy
+from common.policy import STANDARD, Policy, resolve_policy
 from common.storage import read_json, write_json_atomic
 
 
@@ -98,7 +98,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
             resume=not inp.force_full,
         )
         publish_output(result.out_dir, layout.wiki_dir(raw_rel))
-        if cfg.policy.name == "fast":
+        if cfg.policy is not STANDARD:
             stamp = read_json(state_dir / "run.json", default={})
             stamp["policy"] = cfg.policy.name
             stamp["policy_version"] = cfg.policy.version

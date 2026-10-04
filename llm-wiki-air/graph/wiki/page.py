@@ -8,7 +8,7 @@ rewrite verbatim, where cross-page facts go, and which titles get linked.
 from __future__ import annotations
 
 import re
-from typing import Sequence
+from typing import Callable, Sequence
 import unicodedata
 
 from .markdown_blocks import atomic_windows, build_block_index
@@ -45,33 +45,6 @@ IMAGE_MARKER_RE = re.compile(r"<media payload omitted:[^>]*>|\[IMAGE [^\]]*\]")
 MD_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~])")
 # "GPUs"/"VEs" in English prose become "GPU"/"VE" in the rewrite; compare stems.
 PLURAL_ACRONYM_RE = re.compile(r"\b([A-Z0-9]{2,})s\b")
-# "1.", "1.2 ", "（1）", "第3章": a section number ends in punctuation or a space,
-# so "2024-04", "1.5倍" and "1:1" are left alone.
-HEADING_NUMBER_RE = re.compile(
-    r"^\s*(?:第\s*[0-9０-９一二三四五六七八九十百]+\s*[章節条項部編]"
-    r"|[(（]?[0-9０-９]{1,3}(?:[.．][0-9０-９]{1,3})*(?:[.．)）、](?![0-9０-９])|(?=\s)))\s*"
-)
-ATX_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
-
-
-def strip_heading_number(text: str) -> str:
-    """Remove a formatting prefix from a title without touching body text."""
-
-    return HEADING_NUMBER_RE.sub("", text, count=1).strip()
-
-
-def strip_heading_numbers(markdown: str) -> str:
-    """strip_heading_number on every ATX heading outside code fences."""
-
-    out: list[str] = []
-    fenced = False
-    for line in markdown.split("\n"):
-        if line.lstrip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and (match := ATX_HEADING_RE.match(line)):
-            line = f"{match.group(1)} {strip_heading_number(match.group(2)) or match.group(2)}"
-        out.append(line)
-    return "\n".join(out)
 
 
 def _nonblank(lines: Sequence[str], start: int, end: int) -> int:
@@ -154,12 +127,15 @@ def opaque_free(text: str) -> str:
     return unicodedata.normalize("NFKC", MD_ESCAPE_RE.sub(r"\1", cleaned))
 
 
-def code_tokens(text: str) -> set[str]:
+def code_tokens(text: str, *, prepare: Callable[[str], str] | None = None) -> set[str]:
     """Identifier-like tokens that a lossless rewrite must keep verbatim."""
 
     # ponytail: bare numbers are too noisy; add units-aware numeric checks if needed.
     found: set[str] = set()
-    cleaned = PLURAL_ACRONYM_RE.sub(r"\1", opaque_free(text))
+    cleaned = opaque_free(text)
+    if prepare is not None:  # a policy hook (common/policy.py: Policy.code_tokens)
+        cleaned = prepare(cleaned)
+    cleaned = PLURAL_ACRONYM_RE.sub(r"\1", cleaned)
     for token in CODE_TOKEN_RE.findall(cleaned):
         if (
             token[:2].lower() == "0x"
@@ -251,6 +227,7 @@ def check_section(
     placeholders: Sequence[str],
     facts: Sequence[ReferenceFact],
     check_identifiers: bool = True,
+    tokens: Callable[[str], set[str]] = code_tokens,
 ) -> list[str]:
     """Mechanical lossless checks. Every returned string is writer feedback."""
 
@@ -287,7 +264,7 @@ def check_section(
             errors.append(f"画像トークン {placeholder} は必ず1回だけ置くこと（現在{count}回）。")
 
     missing_tokens = (
-        sorted(code_tokens(source_text) - code_tokens(draft))
+        sorted(tokens(source_text) - tokens(draft))
         if check_identifiers
         else []
     )

@@ -105,29 +105,6 @@ def chunk_meta_prompt(
     )
 
 
-def chunk_meta_batch_prompt(
-    *, page_title: str, document: str, sections: list[tuple[str, str, str]], output_language: str,
-) -> Prompt:
-    """Fast policy: several sections of one page in one call, same fields as chunk_meta_prompt."""
-    text = "\n\n".join(f"### [{key}] {heading or '(導入)'}\n{body}" for key, heading, body in sections)
-    single = chunk_meta_prompt(page_title=page_title, heading="（下記の各節）", document=document,
-                               text=text, output_language=output_language)
-    item = ChunkMeta.model_json_schema()
-    defs = item.pop("$defs", {})
-    item["properties"].pop("role_judge", None)
-    item["properties"] = {"section": {"type": "string"}, **item["properties"]}
-    schema = {"type": "object", "properties": {"sections": {"type": "array", "items": item}},
-              "required": ["sections"], "$defs": defs}
-    return Prompt(
-        kind="chunk_meta_batch",
-        version=f"{CHUNK_META_VERSION}:fast-v1",
-        system=single.system.split("\nJSON形式:\n")[0]
-        + "\n本文は「### [S番号] 見出し」で区切られた複数の節である。各節を独立に読み、下記の項目を節ごとに記述し、"
-        "section にその S番号を入れて全ての節を返す。\nJSON形式:\n" + json.dumps(schema, ensure_ascii=False),
-        body=single.body,
-    )
-
-
 def edge_tiebreak_messages(target: dict[str, Any], candidate: dict[str, Any]) -> list[Any]:
     """Yes/no second opinion on a link Jev was unsure about; same criterion as its verify step."""
     def section(item: dict[str, Any]) -> str:

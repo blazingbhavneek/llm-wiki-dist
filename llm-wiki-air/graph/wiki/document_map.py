@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 from typing import Callable, Sequence
 
+from common.policy import policy_of
+
 from .config import SEED_PLAN_COMPILE_VERSION, SEED_PLAN_VERSION, WikiConfig
 from .markdown_blocks import BlockIndex, build_block_index
 from .page import split_sections
@@ -761,7 +763,7 @@ async def build_seed_plan(
         stop_check=stop_check,
         on_progress=on_progress,
     )
-    return await _compile_seed_plan(
+    plan = await _compile_seed_plan(
         semantic,
         regions,
         lines=lines,
@@ -771,3 +773,4 @@ async def build_seed_plan(
         stop_check=stop_check,
         on_progress=on_progress,
     )
+    return policy_of(config).adjust_seed_plan(plan, config=config)

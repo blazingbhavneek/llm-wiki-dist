@@ -211,6 +211,15 @@ def last_good(project: Project) -> str:
     return str(_git(project, "rev-parse", "--verify", LAST_GOOD_REF))
 
 
+def is_ancestor(project: Project, commit: str, descendant: str) -> bool:
+    """True when ``commit`` is already part of ``descendant``'s history."""
+    result = subprocess.run(
+        ["git", "-C", str(project.root), "merge-base", "--is-ancestor", commit, descendant],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
 def stage_blob(project: Project, source_path: Path) -> Blob:
     """Read one stable sample and store it in the project's Git object database."""
     ensure_repository(project)
@@ -477,6 +486,6 @@ def prune_candidates(project: Project) -> None:
 
 __all__ = [
     "Blob", "LAST_GOOD_REF", "amend_candidate", "candidate", "candidate_is_clean", "candidate_project", "checkpoint_live", "commit_candidate",
-    "ensure_repository", "last_good", "list_candidate_ids", "promote", "prune_candidates", "read_blob",
+    "ensure_repository", "is_ancestor", "last_good", "list_candidate_ids", "promote", "prune_candidates", "read_blob",
     "remove_candidate", "reopen_candidate", "restore_last_good", "resumed_candidate", "stage_blob",
 ]

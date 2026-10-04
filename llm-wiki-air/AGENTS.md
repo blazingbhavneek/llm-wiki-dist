@@ -12,7 +12,13 @@ phase-neutral paths, storage, settings, context, policies, and markers.
 - The CLI is an adapter over runner functions. Existing command names and flags
   remain compatible.
 - `standard` is the default policy. Missing persisted policy data means
-  `standard`; `fast` is additive and uses `fast-v1` cache keys.
+  `standard`. The engine never branches on a policy name: it calls the hooks on
+  `common/policy.py:Policy`, whose defaults are the standard behaviour, and
+  `graph/fast/` overrides them (`sync --fast`). Fast keys its caches with
+  `<version>:<fast version>` via `Policy.cache_key`.
+- `sync` builds and promotes one document at a time; `publisher/ahead.py` only
+  fills content-addressed caches (parse, linker metadata) under
+  `metadata/cache/` in the background. Keep every write in the serial loop.
 
 ## Frozen data contract
 

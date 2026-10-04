@@ -23,6 +23,68 @@ from publisher.human_changes import HumanStore
 from publisher.ledger import load_ledger
 
 
+class StoppedBuildRecoveryTest(unittest.TestCase):
+    """A sync stopped mid-document, then `publish`, then `sync` again must continue."""
+
+    def setUp(self) -> None:
+        from graph.workspace.project import Project
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Project(Path(self.tmp.name) / "p", Path(self.tmp.name) / "p" / "mount").ensure()
+        ensure_repository(self.project)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _advance_last_good(self, name: str) -> str:
+        from publisher.history import checkpoint_live
+
+        (self.project.wiki / name).write_text("built\n", encoding="utf-8")
+        return checkpoint_live(self.project, f"publish {name}")
+
+    def _stopped_build(self, base: str, commit: str = "") -> None:
+        with queue._connect(self.project) as conn:
+            conn.execute(
+                "INSERT INTO transactions(operation_id,candidate_commit,base_commit,phase,started_at) VALUES('op-x',?,?,'building',0)",
+                (commit, base),
+            )
+            conn.execute(
+                "INSERT INTO jobs(rel,raw_rel,operation,lane,status,available_at,created_at,updated_at,base_commit) "
+                "VALUES('a.xls','a_xls.md','upsert','slow','running',0,0,0,?)",
+                (base,),
+            )
+
+    def _state(self) -> tuple[list, list]:
+        with queue._connect(self.project) as conn:
+            return (list(conn.execute("SELECT operation_id FROM transactions")),
+                    [tuple(row) for row in conn.execute("SELECT rel,status FROM jobs")])
+
+    def test_unpublished_build_is_requeued_after_publish_moved_last_good(self) -> None:
+        self._stopped_build(last_good(self.project))
+        self._advance_last_good("published.md")
+        queue.recover(self.project, SimpleNamespace(wiki_linker_enabled=False))
+        self.assertEqual(self._state(), ([], [("a.xls", "queued")]))
+
+    def test_build_promoted_before_the_stop_is_not_redone(self) -> None:
+        base = last_good(self.project)
+        built = self._advance_last_good("built.md")  # the build's own promoted commit
+        self._stopped_build(base, commit=built)
+        self._advance_last_good("published.md")
+        queue.recover(self.project, SimpleNamespace(wiki_linker_enabled=False))
+        self.assertEqual(self._state(), ([], []))
+
+    def test_interrupted_publication_still_refuses_a_moved_base(self) -> None:
+        base = last_good(self.project)
+        self._advance_last_good("published.md")
+        with queue._connect(self.project) as conn:
+            conn.execute(
+                "INSERT INTO transactions(operation_id,candidate_commit,base_commit,phase,started_at) VALUES('op-p','',?,'publishing',0)",
+                (base,),
+            )
+        with self.assertRaisesRegex(RuntimeError, "last-good changed"):
+            queue.recover(self.project, SimpleNamespace(wiki_linker_enabled=False))
+
+
 class ParserFallbackTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -201,6 +263,38 @@ class IsolatedSyncTest(unittest.TestCase):
              patch.object(pipeline, "link_pending_isolated", side_effect=link):
             self.assertEqual(self.run_sync(), 0)
         self.assertEqual(order, ["build:a.md", "build:b.md", "link"])
+
+    def test_three_queues_link_earlier_built_documents_while_new_ones_build(self):
+        """A document built by a stopped run goes to the linker queue before any new build."""
+        self.add("a.md")
+        self.assertEqual(self.run_sync(), 0)  # built; linker disabled
+        self.settings.wiki_linker_enabled = True  # a.md is now built but not linked
+        self.add("b.md")
+        order = []
+
+        class Linker:
+            def __init__(self, project, settings, **_kwargs):
+                pass
+
+            def add(self, project, raw_rels):
+                order.extend(f"link-ahead:{rel}" for rel in raw_rels)
+
+            def close(self, *, wait):
+                pass
+
+        def parse(item, path, settings, **kwargs):
+            order.append(f"build:{item.rel}")
+            return path.read_text()
+
+        def link(settings, **kwargs):
+            order.append("link")
+            return {"done": [], "failures": []}
+
+        with patch("publisher.ahead.LinkAhead", Linker), \
+             patch.object(pipeline, "_parse", side_effect=parse), \
+             patch.object(pipeline, "link_pending_isolated", side_effect=link):
+            self.assertEqual(self.run_sync(), 0)
+        self.assertEqual(order, ["link-ahead:a_md.md", "build:b.md", "link-ahead:b_md.md", "link"])
 
     def test_unlinked_folder_requires_explicit_publication_opt_in(self):
         folder = self.project.wiki_dir("pending.md")

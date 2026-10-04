@@ -286,20 +286,19 @@ class WriteResult:
     human_edits_overwritten: list[str] = field(default_factory=list)
 def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kind: str = "md", require_resume: bool = False):
     from graph.wiki.config import WikiConfig
-    from common.policy import resolve_policy
+    from common.policy import policy_of
 
     concurrency = max(1, int(getattr(settings, "concurrency", app_concurrency())))
-    policy = resolve_policy(getattr(settings, "policy", "standard"))
-    return WikiConfig(
+    policy = policy_of(settings)
+    fields = dict(
         policy=policy.name,
-        policy_version=policy.version,
         chat_base_url=settings.chat_base_url,
         chat_api_key=settings.chat_api_key,
         chat_model=settings.chat_model,
         temperature=0.7,
         output_language=getattr(settings, "wiki_output_language", "Japanese (日本語)"),
         section_target_lines=int(getattr(settings, "wiki_section_target_lines", 80)),
-        write_attempts=(policy.repair_attempts + 1 if policy.name == "fast" else int(getattr(settings, "wiki_write_attempts", 3))),
+        write_attempts=int(getattr(settings, "wiki_write_attempts", 3)),
         planner_concurrency=int(getattr(settings, "wiki_planner_concurrency", concurrency)),
         rewrite_concurrency=int(
             getattr(settings, "wiki_rewrite_concurrency", concurrency)
@@ -318,6 +317,8 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
         tabular_preview_rows=int(getattr(settings, "tabular_preview_rows", 12)),
         tabular_preview_cols=int(getattr(settings, "tabular_preview_cols", 12)),
     )
+    fields.update(policy.config_overrides())
+    return WikiConfig(**fields)
 
 
 def run_wiki(
@@ -663,11 +664,11 @@ def write_wiki_pages(
         target = project.wiki_dir(rel)
         if out_dir is not None:
             publish_output(out_dir, target)
-        if requested_policy == "fast" or "policy" in stored_run:
-            # Also restamp a fast document rebuilt as standard; a never-fast
-            # document gets no new file.
-            from common.policy import resolve_policy
+        from common.policy import STANDARD, resolve_policy
 
+        if resolve_policy(requested_policy) is not STANDARD or "policy" in stored_run:
+            # Also restamp a variant-built document rebuilt as standard; a document
+            # only ever built as standard gets no new file.
             run_state = read_json(state_root / "run.json", default={})
             run_state["policy"] = requested_policy
             run_state["policy_version"] = resolve_policy(requested_policy).version

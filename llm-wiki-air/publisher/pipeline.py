@@ -312,6 +312,24 @@ def _lock(project: Project):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+# Parses the parse-ahead worker (publisher/ahead.py) is running now; _parse waits for
+# one instead of sending the same document to the parser a second time.
+_PARSING: dict[str, threading.Event] = {}
+_PARSING_LOCK = threading.Lock()
+
+
+def parse_cache_file(settings: Any, source_sha256: str, previous_markdown: str | None, validating: bool) -> Path | None:
+    """Where the parsed Markdown for these exact parser inputs is cached (None: caching off)."""
+
+    root = str(getattr(settings, "cache_dir", "") or "")
+    if not root or not source_sha256:
+        return None
+    previous = hashlib.sha256(previous_markdown.encode("utf-8")).hexdigest() if previous_markdown is not None else ""
+    base_url = str(getattr(settings, "parser_base_url", ""))
+    key = hashlib.sha256(f"{source_sha256}\0{base_url}\0{previous}\0{int(validating)}".encode("utf-8")).hexdigest()
+    return Path(root) / "parse" / f"{key}.md"
+
+
 def _parse(
     item: SourceFile,
     path: Path,
@@ -324,7 +342,18 @@ def _parse(
     base_url = str(getattr(settings, "parser_base_url", ""))
     if not base_url:
         raise RuntimeError(f"WIKI_PARSER_BASE_URL is required for {item.rel}")
-    return parse_document(
+    cached = parse_cache_file(settings, item.source_sha256, previous_markdown, validate_markdown is not None)
+    if cached is not None:
+        with _PARSING_LOCK:
+            running = _PARSING.get(cached.name)
+        if running is not None:
+            running.wait()
+        if cached.exists():
+            markdown = cached.read_text(encoding="utf-8")
+            if validate_markdown is not None:
+                validate_markdown(markdown)
+            return markdown
+    markdown = parse_document(
         path,
         base_url=base_url,
         settings=settings,
@@ -332,6 +361,9 @@ def _parse(
         previous_markdown=previous_markdown,
         validate_markdown=validate_markdown,
     )
+    if cached is not None:
+        _write_raw(cached, markdown)
+    return markdown
 
 
 def _model(settings: Any, project: Project) -> ChatModelPort:

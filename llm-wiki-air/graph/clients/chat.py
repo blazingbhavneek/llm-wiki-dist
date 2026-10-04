@@ -16,17 +16,47 @@ def make_llm(model: str, base_url: str, api_key: str, temperature: float = 0.7, 
     return ChatOpenAI(model=model, base_url=base_url, api_key=api_key, temperature=temperature, timeout=timeout)
 
 
+# Models write LaTeX into JSON strings unescaped ("\hat{m}_t"); the strict parser rejects
+# it and a math-heavy chunk then fails every retry. After a failure only, keep such
+# backslashes literal. Kept as is: \\, \", \/, \uXXXX and a lone \b \f \n \r \t.
+_ESCAPE_RE = re.compile(r'\\(\\|"|/|u[0-9a-fA-F]{4}|[A-Za-z]+|.)', re.S)
+
+
+def _literal_backslashes(text: str) -> str:
+    def fix(match: re.Match[str]) -> str:
+        body = match.group(1)
+        valid = body in {"\\", '"', "/", "b", "f", "n", "r", "t"} or (
+            len(body) == 5 and body[0] == "u" and all(c in "0123456789abcdefABCDEF" for c in body[1:])
+        )
+        return match.group(0) if valid else "\\\\" + body
+
+    return _ESCAPE_RE.sub(fix, text)
+
+
+def _loads(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        repaired = _literal_backslashes(text)
+        if repaired == text:
+            raise
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            raise error from None
+
+
 def extract_json_from_text(text: str) -> Any:
     text = text.strip()
     match = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
     if match:
         text = match.group(1).strip()
     try:
-        return json.loads(text)
+        return _loads(text)
     except json.JSONDecodeError:
         start, end = text.find("{"), text.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(text[start : end + 1])
+            return _loads(text[start : end + 1])
         raise ValueError("could not extract valid JSON from model response")
 
 

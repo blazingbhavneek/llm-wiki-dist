@@ -187,8 +187,12 @@ class Settings(BaseModel):
     concurrency: int = app_concurrency()
     # Both ingest modes remain available; chunks is the historical default.
     ingest_mode: Literal["chunks", "wiki"] = "wiki"
-    # Generation policy is additive persisted state. Missing means standard.
+    # Generation policy (common/policy.py). Only `sync --fast` sets it; there is no env knob,
+    # so a stray variable can never switch production sync.
     policy: Literal["standard", "fast"] = "standard"
+    # Untracked, content-addressed caches shared by sync's background workers and the
+    # serial steps (publisher/ahead.py). Set by sync to the live project; empty = off.
+    cache_dir: str = ""
     # wiki mode: lossless section-wise rewrite, see graph/wiki
     wiki_section_target_lines: int = 80
     wiki_write_attempts: int = 3
@@ -390,7 +394,6 @@ class Settings(BaseModel):
             not in {"0", "false", "False", ""},
             concurrency=concurrency,
             ingest_mode=env("WIKI_INGEST_MODE", cls.ingest_mode),
-            policy=env("WIKI_POLICY", cls.policy),
             wiki_section_target_lines=int(
                 env("WIKI_SECTION_TARGET_LINES", cls.wiki_section_target_lines)
             ),

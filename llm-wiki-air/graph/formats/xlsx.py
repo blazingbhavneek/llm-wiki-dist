@@ -359,17 +359,14 @@ async def run(source_path: Path, *, run_dir: Path, model: Any, config: Any, on_p
     for item, (sheet, _body, _source_range) in zip(files, sheets):
         item.pop("source_ranges", None)
         item["source_cells"] = _cell_sources(sheet, by_title[sheet])
-    if str(getattr(config, "policy", "standard")) != "fast":
-        await _append_story(
-            source_path,
-            sheets,
-            files,
-            run_dir=Path(run_dir),
-            model=model,
-            config=config,
-            on_progress=on_progress,
-            stop_check=stop_check,
-        )
-    else:
-        _write_planning(run_dir, files, source_name=source_path.name)
+    await _append_story(
+        source_path,
+        sheets,
+        files,
+        run_dir=Path(run_dir),
+        model=model,
+        config=config,
+        on_progress=on_progress,
+        stop_check=stop_check,
+    )
     return files

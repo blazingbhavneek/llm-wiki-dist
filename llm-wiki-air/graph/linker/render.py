@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from graph.common.markdown import LINKS_FOOTER_END as FOOTER_END, LINKS_FOOTER_START as FOOTER_START
+from common.policy import policy_of
 from graph.wiki.page import link_entity_mentions, link_titles, strip_reader_references
 from graph.wiki.storage import write_text_atomic
 
@@ -135,6 +136,7 @@ def render_page(
         return token + "\n"
 
     body = strip_reader_references(substitute_markers(original, protect)).rstrip("\n") + "\n"
+    body, unmask = policy_of(settings).mask_for_linking(body)
 
     def restore(text: str) -> str:
         for token, region in protected.items():
@@ -204,7 +206,7 @@ def render_page(
         unique_footer.append((edge, summary))
     footer = unique_footer[:footer_max]
     if not footer:
-        return restore(body)
+        return restore(unmask(body))
     lines = [FOOTER_START, FOOTER_TITLE, ""]
     for edge, summary in footer:
         heading = edge.peer_heading if edge.peer_heading and edge.peer_heading != edge.peer_title else ""
@@ -212,7 +214,7 @@ def render_page(
         suffix = f" — {summary}" if summary else ""
         lines.append(f"- [{peer}]({relative_link(page_rel, edge.peer_page_rel)}){suffix}")
     lines.append(FOOTER_END)
-    return restore(body + "\n" + "\n".join(lines) + "\n")
+    return restore(unmask(body + "\n" + "\n".join(lines) + "\n"))
 
 
 _FOOTER_LINE_RE = re.compile(r"^- \[(?P<title>.*?)\]\((?P<path>[^)]+)\) — (?P<reverse>← )?(?P<label>[a-z][a-z0-9_-]*): (?P<summary>.*)$")
