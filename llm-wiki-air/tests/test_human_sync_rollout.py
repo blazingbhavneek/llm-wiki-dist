@@ -22,20 +22,9 @@ from graph.wiki.storage import read_json, write_json_atomic
 from graph.workspace import writer
 from graph.workspace.project import Project
 from publisher.activity import ActivityDetector
-from publisher.human_changes import HumanStore
-from publisher.human_semantic import (
-    JudgeResult,
-    ProtectedSpan,
-    SemanticAssistant,
-    SpanDisposition,
-    WriterRequest,
-    WriterResponse,
-    build_runtime_semantic_assistant,
-    mechanical_validate,
-    shortlist,
-)
+from publisher.human_changes import HumanStore, apply_generated
+from graph.wiki.storage import write_text_atomic
 from publisher.live_verification import LiveVerificationReport, verify_boundary_confirmation
-from publisher.legacy_recovery import recover_legacy_ancestor
 
 
 BASE = "# Page\n\n## Limits\n\nMaximum is 40°C.\nMode is AUTO.\n"
@@ -119,9 +108,9 @@ class ModePullTest(unittest.TestCase):
         folder.mkdir(parents=True)
         writer.write_source_stamp(folder, project.raw_file("doc.md"), "doc.md", identity_seed="source-1")
         write_json_atomic(folder / "_planning" / "linker.json", {"status": "complete"})
+        write_text_atomic(folder / "001.md", BASE)
+        apply_generated(project, "doc.md")
         store = HumanStore(project)
-        store.generated("doc.md", {"001.md": BASE})
-        store.render("doc.md")
         row = {"marker_id": "b1", "page_id": "p1", "growi_path": "/docs/doc/001", "revision_id": "r0"}
         store.remember_page("doc/001.md", row, BASE, BASE, published=True)
 
@@ -144,7 +133,6 @@ class ModePullTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 project, store, row, _client, publisher = self.harness(mode)
                 before = (project.wiki / "doc/001.md").read_bytes()
-                pure = store.document("doc.md")["pages"]["001.md"]["body_blob"]
                 pulled, failures, _blocked = publisher.pull_changes(project, {"doc/001.md": row}, {"doc"})
                 if mode == "apply":
                     self.assertFalse(failures)
@@ -155,9 +143,31 @@ class ModePullTest(unittest.TestCase):
                     self.assertTrue(failures)
                     self.assertEqual((project.wiki / "doc/001.md").read_bytes(), before)
                     self.assertEqual(row["revision_id"], "r0")
-                    self.assertEqual(store.document("doc.md")["pages"]["001.md"]["body_blob"], pure)
-                    self.assertEqual(len(store.document("doc.md")["edits"]), 0)
+                    self.assertIsNone(store.state("doc.md"))
                 self.assertEqual(len(store.observations()), 0 if mode == "off" else 1)
+
+    def test_only_apply_calls_the_model(self):
+        from tests.test_human_changes import FakeModel
+
+        for mode in ("off", "observe", "apply"):
+            with self.subTest(mode=mode):
+                project, _store, row, _client, publisher = self.harness(mode)
+                fake = FakeModel(classes=[{"kind": "structure", "instruction": "tidy"}])
+                publisher.human_model_factory = lambda _project: fake
+                publisher.pull_changes(project, {"doc/001.md": row}, {"doc"})
+                self.assertEqual(sum(fake.calls.values()), 1 if mode == "apply" else 0)
+
+    def test_a_transport_only_revision_is_not_a_human_change_in_any_mode(self):
+        for mode in ("off", "observe", "apply"):
+            with self.subTest(mode=mode):
+                project, store, row, _client, publisher = self.harness(mode, remote_body=BASE + "\n\n")
+                before = (project.wiki / "doc/001.md").read_bytes()
+                pulled, failures, blocked = publisher.pull_changes(project, {"doc/001.md": row}, {"doc"})
+                self.assertEqual((pulled, failures, blocked), ([], [], set()))
+                self.assertEqual((project.wiki / "doc/001.md").read_bytes(), before)
+                self.assertEqual(row["revision_id"], "r1")
+                self.assertIsNone(store.state("doc.md"))
+                self.assertEqual(len(store.observations()), 0)
 
     def test_safety_failures_block_in_every_mode(self):
         for mode in ("off", "observe", "apply"):
@@ -184,158 +194,15 @@ class ModePullTest(unittest.TestCase):
         pulled, failures, _ = applier.pull_changes(project, {"doc/001.md": row}, {"doc"})
         self.assertFalse(failures)
         self.assertTrue(pulled)
-        self.assertEqual(len([row for row in store.document("doc.md")["edits"] if row["status"] != "deleted"]), 1)
-        store.generated("doc.md", {"001.md": BASE.replace("AUTO", "MANUAL")})
-        store.render("doc.md")
+        self.assertEqual(store.status()["counts"]["human_information"], 1)
+        write_text_atomic(project.wiki_dir("doc.md") / "001.md", BASE.replace("AUTO", "MANUAL"))
+        apply_generated(project, "doc.md")
         off = GrowiPublisher(client, observer.connection, human_sync_policy=HumanSyncPolicy.resolve("off"))
         off.pull_changes(project, {"doc/001.md": row}, {"doc"})
         applier.pull_changes(project, {"doc/001.md": row}, {"doc"})
         text = (project.wiki / "doc/001.md").read_text(encoding="utf-8")
         self.assertEqual(text.count("60°C"), 1)
         self.assertIn("MANUAL", text)
-
-    def test_semantic_factory_runs_only_in_observe(self):
-        for mode, expected in (("off", 0), ("observe", 1), ("apply", 0)):
-            with self.subTest(mode=mode):
-                project, _store, row, client, _publisher = self.harness(mode)
-                calls = {"factory": 0, "proposal": 0}
-
-                class Assistant:
-                    def propose(self, **_kwargs):
-                        calls["proposal"] += 1
-                        return SimpleNamespace(status="fallback", reason_codes=["test"])
-
-                def factory(_project):
-                    calls["factory"] += 1
-                    return Assistant()
-
-                publisher = GrowiPublisher(
-                    client, SimpleNamespace(write_path="/docs", root_path="/docs", mode="attach"),
-                    human_sync_policy=HumanSyncPolicy.resolve(mode),
-                    semantic_assistant_factory=factory,
-                )
-                publisher.pull_changes(project, {"doc/001.md": row}, {"doc"})
-                self.assertEqual(calls["factory"], expected)
-                self.assertEqual(calls["proposal"], expected)
-
-
-class SemanticAssistanceTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.project = Project(Path(self.tmp.name) / "project").ensure()
-        self.store = HumanStore(self.project)
-
-    def test_shortlist_is_stable_bounded_and_excludes_impossible_candidates(self):
-        candidates = [
-            {"candidate_id": "b", "source_id": "s1", "page_path": "doc/002.md", "heading_path": ["H"], "text": BASE},
-            {"candidate_id": "a", "source_id": "s1", "page_path": "doc/001.md", "heading_path": ["H"], "text": BASE},
-            {"candidate_id": "wrong-source", "source_id": "s2", "page_path": "doc/003.md", "heading_path": ["H"], "text": BASE},
-            {"candidate_id": "wrong-type", "source_id": "s1", "page_path": "doc/004.md", "heading_path": ["H"], "block_kind": "code", "text": "```\nx\n```"},
-        ]
-        first = shortlist(source_id="s1", base=BASE, human=HUMAN,
-                          anchor={"page_path": "doc/old.md", "heading_path": ["H"]}, candidates=candidates, cap=1)
-        second = shortlist(source_id="s1", base=BASE, human=HUMAN,
-                           anchor={"page_path": "doc/old.md", "heading_path": ["H"]}, candidates=list(reversed(candidates)), cap=1)
-        self.assertEqual([row.candidate_id for row in first], ["a"])
-        self.assertEqual(first, second)
-
-    def test_mechanical_validation_is_authoritative(self):
-        request = WriterRequest(
-            base_g0="Limit 40°C.\n", human_h="Limit 60°C.\n", candidate_g1="Mode MANUAL.\n",
-            source_id="s", page_path="doc/001.md", heading_path=["Limits"],
-            protected_spans=[ProtectedSpan(span_id="h", kind="human", text="Limit 60°C.\n")], attempt=1,
-        )
-        valid = WriterResponse(
-            merged_text="Limit 60°C.\nMode MANUAL.\n",
-            dispositions=[SpanDisposition(span_id="h", disposition="preserved")],
-        )
-        self.assertTrue(mechanical_validate(request, valid).passed)
-        missing = valid.model_copy(update={"merged_text": "Mode MANUAL.\n"})
-        self.assertIn("protected_missing", mechanical_validate(request, missing).reason_codes)
-        invented = valid.model_copy(update={"merged_text": valid.merged_text + "URL https://evil.invalid\n"})
-        self.assertIn("critical_token_invented", mechanical_validate(request, invented).reason_codes)
-
-    def test_bounded_feedback_cache_and_every_failure_falls_back(self):
-        calls = {"score": 0, "write": 0, "judge": 0}
-
-        def scorer(rows):
-            calls["score"] += 1
-            return {"schema_version": 1, "scorer_version": "fake", "scores": [
-                {"schema_version": 1, "candidate_id": rows[0]["candidate_id"], "score": 0.95}
-            ]}
-
-        def writer_call(request):
-            calls["write"] += 1
-            merged = request["human_h"] if calls["write"] == 1 else request["human_h"] + request["candidate_g1"]
-            return {"schema_version": 1, "merged_text": merged, "dispositions": [
-                {"schema_version": 1, "span_id": "human-1", "disposition": "preserved"}
-            ]}
-
-        def judge(_request):
-            calls["judge"] += 1
-            return JudgeResult(passed=True, reason_codes=[]).model_dump()
-
-        assistant = SemanticAssistant(self.store, scorer, writer_call, judge, model_version="fake-v1")
-        args = dict(
-            source_id="s1", base=BASE, human=HUMAN,
-            anchor={"page_path": "doc/001.md", "heading_path": ["Limits"]},
-            candidates=[{"candidate_id": "c1", "source_id": "s1", "page_path": "doc/001.md",
-                         "heading_path": ["Limits"], "text": BASE.replace("AUTO", "MANUAL")}],
-            edit_id="hedit-abc123", policy_mode="observe",
-        )
-        proposal = assistant.propose(**args)
-        self.assertEqual(proposal.status, "proposed")
-        self.assertEqual(calls, {"score": 1, "write": 2, "judge": 1})
-        self.assertEqual(assistant.propose(**args).merged_blob, proposal.merged_blob)
-        self.assertEqual(calls, {"score": 1, "write": 2, "judge": 1})
-        failed = SemanticAssistant(self.store, lambda _rows: {"bad": True}, writer_call, judge)
-        fallback = failed.propose(**{**args, "edit_id": "hedit-def456"})
-        self.assertEqual(fallback.status, "fallback")
-        self.assertEqual(self.store.get(fallback.merged_blob), self.store.get(fallback.fallback_blob))
-        self.assertEqual(assistant.propose(**{**args, "policy_mode": "apply"}).reason_codes, ["observe_only"])
-
-    def test_runtime_adapters_keep_page_text_in_bounded_data_messages(self):
-        model_calls = []
-        engine_requests = []
-
-        class FakeModel:
-            def __init__(self, config):
-                self.name = "fake"
-                self.provider = "fake://local"
-                self.kind = "judge" if "judge" in str(config.run_dir) else "writer"
-
-            async def structured(self, schema, messages, **_kwargs):
-                model_calls.append((self.kind, messages))
-                if schema is WriterResponse:
-                    payload = json.loads(messages[1].content.split("<DATA>\n", 1)[1].rsplit("\n</DATA>", 1)[0])
-                    request = WriterRequest.model_validate(payload)
-                    return WriterResponse(
-                        merged_text=request.human_h + request.candidate_g1,
-                        dispositions=[SpanDisposition(span_id="human-1", disposition="preserved")],
-                    )
-                return JudgeResult(passed=True, reason_codes=[])
-
-        class FakeEngine:
-            def decide_batch(self, requests):
-                engine_requests.extend(requests)
-                return [SimpleNamespace(p_yes=0.95) for _request in requests]
-
-        with patch("graph.wiki.model.ChatModelPort", FakeModel), patch("jev.get_engine_for", return_value=FakeEngine()):
-            assistant = build_runtime_semantic_assistant(self.store, Settings())
-            proposal = assistant.propose(
-                source_id="s1", base=BASE, human=HUMAN,
-                anchor={"page_path": "doc/001.md", "heading_path": ["Limits"]},
-                candidates=[{"candidate_id": "c1", "source_id": "s1", "page_path": "doc/001.md",
-                             "heading_path": ["Limits"], "text": BASE.replace("AUTO", "MANUAL")}],
-                edit_id="hedit-abc999", policy_mode="observe",
-            )
-        self.assertEqual(proposal.status, "proposed")
-        self.assertEqual(len(engine_requests), 1)
-        self.assertEqual(engine_requests[0].state["H"], HUMAN)
-        self.assertEqual([kind for kind, _messages in model_calls], ["writer", "judge"])
-        self.assertNotIn(HUMAN, model_calls[0][1][0].content)
-
 
 class ActivityDetectorTest(unittest.TestCase):
     def setUp(self):
@@ -461,31 +328,25 @@ class OperatorAndLiveGateTest(unittest.TestCase):
         folder.mkdir(parents=True)
         writer.write_source_stamp(folder, self.project.raw_file("doc.md"), "doc.md", identity_seed="source-1")
         write_json_atomic(folder / "_planning" / "linker.json", {"status": "complete"})
+        write_text_atomic(folder / "001.md", BASE)
+        apply_generated(self.project, "doc.md")
         self.store = HumanStore(self.project)
-        self.store.generated("doc.md", {"001.md": BASE})
-        self.store.render("doc.md")
         row = {"marker_id": "b1", "page_id": "p1", "growi_path": "/docs/doc/001", "revision_id": "r0",
                "observed_revision_id": "r1"}
         self.store.remember_page("doc/001.md", row, BASE, BASE, published=True)
-        row["observed_revision_id"] = "r1"
-        self.store.capture("doc.md", "doc/001.md", row, BASE, HUMAN)
-        self.store.render("doc.md")
+        self.store.accept("doc.md", "doc/001.md", "b1", "r1", BASE, HUMAN)
         baseline = self.store.page("b1")
         baseline["observed_revision"] = "r1"
         self.store.save_page(baseline)
 
-    def test_summary_is_redacted_and_resolution_is_checked_idempotent(self):
-        edit = next(row for row in self.store.document("doc.md")["edits"] if row["status"] != "deleted")
-        summary = self.store.project_summary()
-        encoded = json.dumps(summary, ensure_ascii=False)
-        self.assertIn(edit["edit_id"], encoded)
-        self.assertNotIn("60°C", encoded)
-        resolution = self.store.resolve(edit["edit_id"], action="keep-human", expected_revision="r1")
-        self.assertEqual(self.store.resolve(edit["edit_id"], action="keep-human", expected_revision="r1"), resolution)
-        with self.assertRaisesRegex(ValueError, "stale"):
-            self.store.resolve(edit["edit_id"], action="accept-source", expected_revision="old")
+    def test_status_is_redacted_and_reports_blocked_pages(self):
+        self.store.block_page("doc/001.md", {"marker_id": "b1"}, "remote_moved")
+        status = self.store.status()
+        self.assertEqual(status["blocked"], [{"page": "doc/001.md", "reason": "remote_moved"}])
+        self.assertEqual(status["counts"]["human_information"], 1)
+        self.assertNotIn("60°C", json.dumps(status, ensure_ascii=False))
 
-    def test_human_cli_checkpoints_summary_and_rejects_a_dirty_live_tree(self):
+    def test_human_status_rejects_a_dirty_live_tree(self):
         from publisher.history import last_good
         from runner import cli
 
@@ -502,17 +363,15 @@ class OperatorAndLiveGateTest(unittest.TestCase):
                 check=True, capture_output=True, text=True,
             ).stdout.strip()
             self.assertEqual(last_good(project), head)
-            summary_path = project.metadata / "human-sync" / "operator-summary.json"
-            self.assertTrue(summary_path.is_file())
-
-            # Stable summaries are a no-op; a second status must not create an
-            # empty checkpoint.
+            # Status writes nothing, so a second status must not create a checkpoint.
             with patch.object(cli, "_settings", return_value=settings), \
                  patch.object(cli, "open_project", return_value=project), \
                  patch("builtins.print"):
                 self.assertEqual(cli.cmd_human(args), 0)
             self.assertEqual(last_good(project), head)
 
+            summary_path = project.metadata / "human-sync" / "dirty.json"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
             summary_path.write_text("dirty\n", encoding="utf-8")
             with patch.object(cli, "_settings", return_value=settings), \
                  patch.object(cli, "open_project", return_value=project), \
@@ -540,6 +399,25 @@ class OperatorAndLiveGateTest(unittest.TestCase):
             store = HumanStore(project)
             self.assertEqual(read_json(store.root / "schema.json"), {"schema_version": 1})
 
+    def test_an_old_report_without_the_new_cases_never_finalizes_as_complete(self):
+        from publisher.live_verification import LIVE_CASES
+
+        settings = SimpleNamespace(target_name="docs", growi_url="https://example.test/growi",
+                                   growi_mode="attach", human_sync_mode=HumanSyncMode.off)
+        report = LiveVerificationReport.create(self.project, settings, "/docs/disposable/old")
+        self.assertEqual(len(LIVE_CASES), 62)
+        old = {name: report.data["cases"][name] for name in LIVE_CASES[:41]}
+        report.data["cases"] = old
+        for name in LIVE_CASES[:41]:
+            report.record_case(name, passed=True, initial_hashes={}, final_hashes={}, revisions={}, operation="",
+                               expected="", actual="", calls={})
+        reopened = LiveVerificationReport.open(report.path)
+        self.assertEqual(len(reopened.data["cases"]), 41)  # not rewritten on open
+        self.assertEqual(reopened.finalize(cleanup_status="done", recovery_possible=True)["status"], "incomplete")
+        reopened.record_case("human_revert", passed=True, initial_hashes={}, final_hashes={}, revisions={},
+                             operation="", expected="", actual="", calls={})
+        self.assertEqual(reopened.data["cases"]["human_revert"]["status"], "passed")
+
     def test_live_report_records_constraints_without_claiming_a_pass(self):
         settings = SimpleNamespace(target_name="docs", growi_url="https://example.test/growi",
                                    growi_mode="attach", human_sync_mode=HumanSyncMode.off)
@@ -548,68 +426,3 @@ class OperatorAndLiveGateTest(unittest.TestCase):
         self.assertEqual(report.data["cases"]["activity_cursor_restart"]["status"], "constrained")
         final = report.finalize(cleanup_status="not_started", recovery_possible=True)
         self.assertEqual(final["status"], "incomplete")
-
-
-class LegacyRecoveryTest(unittest.TestCase):
-    def make_history(self, *, second_candidate: bool = False):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        project = Project(Path(temporary.name) / "project").ensure()
-        raw = project.raw_file("doc.md")
-        raw.write_text("source\n", encoding="utf-8")
-        folder = project.wiki_dir("doc.md")
-        folder.mkdir(parents=True)
-        writer.write_source_stamp(folder, raw, "doc.md", identity_seed="source-1")
-        state_wiki = project.state_dir("doc.md") / "wiki"
-        state_pages = project.state_dir("doc.md") / "state" / "pages"
-        state_wiki.mkdir(parents=True)
-        state_pages.mkdir(parents=True)
-
-        def write_candidate(text: str):
-            (state_wiki / "001.md").write_text(text, encoding="utf-8")
-            write_json_atomic(state_pages / "p1.json", {
-                "filename": "001.md", "content_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                "human_edited": False,
-            })
-
-        write_candidate(BASE)
-        write_json_atomic(project.metadata / "pipeline.json", {
-            "schema_version": 4,
-            "sources": {"doc.md": {"raw_rel": "doc.md", "source_id": "source-1", "id_seed": "source-1"}},
-            "published_documents": {}, "published_pages": {}, "endpoint": "", "marker_format": "",
-        })
-        subprocess.run(["git", "init", "-q", str(project.root)], check=True)
-        subprocess.run(["git", "-C", str(project.root), "config", "user.name", "test"], check=True)
-        subprocess.run(["git", "-C", str(project.root), "config", "user.email", "test@example.test"], check=True)
-        subprocess.run(["git", "-C", str(project.root), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(project.root), "commit", "-q", "-m", "pure one"], check=True)
-        if second_candidate:
-            write_candidate(BASE.replace("40°C", "45°C"))
-            subprocess.run(["git", "-C", str(project.root), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(project.root), "commit", "-q", "-m", "pure two"], check=True)
-        store = HumanStore(project)
-        store.pin_legacy("doc.md", "doc/001.md", HUMAN, revision="r1")
-        return project, store
-
-    def test_unique_verified_git_ancestor_recovers_and_records_evidence(self):
-        project, store = self.make_history()
-        result = recover_legacy_ancestor(store, "doc.md")
-        self.assertEqual(result["status"], "recovered")
-        self.assertEqual(result["recovered"], 1)
-        document = store.document("doc.md")
-        self.assertTrue(document["legacy_recovery"])
-        self.assertTrue(document["legacy_recovery"][0]["body_blob_ids"])
-        self.assertTrue(document["legacy_recovery"][0]["raw_blob_ids"])
-        self.assertFalse(any(row["status"] == "legacy_pinned" for row in document["edits"]))
-        self.assertIn("60°C", (project.wiki / "doc/001.md").read_text(encoding="utf-8"))
-
-    def test_multiple_verified_bodies_remain_pinned_without_partial_recovery(self):
-        _project, store = self.make_history(second_candidate=True)
-        before = json.dumps(store.document("doc.md"), sort_keys=True)
-        result = recover_legacy_ancestor(store, "doc.md")
-        self.assertEqual(result["status"], "legacy_pinned")
-        self.assertEqual(json.dumps(store.document("doc.md"), sort_keys=True), before)
-
-
-if __name__ == "__main__":
-    unittest.main()

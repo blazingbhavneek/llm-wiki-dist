@@ -21,7 +21,7 @@ from graph.workspace import parser_client, writer
 from graph.workspace.project import open_project
 from publisher import pipeline, queue
 from publisher.history import candidate, commit_candidate, ensure_repository, last_good
-from publisher.human_changes import HumanStore
+from publisher.human_changes import apply_generated
 from publisher.ledger import load_ledger
 
 
@@ -366,9 +366,8 @@ class IsolatedSyncTest(unittest.TestCase):
         folder.mkdir(parents=True, exist_ok=True)
         writer.write_source_stamp(folder, project.raw_file(raw_rel), raw_rel, identity_seed=kwargs.get("identity_seed"))
         write_json_atomic(folder / "_planning" / "linker.json", {"status": "disabled"})
-        store = HumanStore(project)
-        store.generated(raw_rel, {"001.md": project.raw_file(raw_rel).read_text()})
-        store.render(raw_rel)
+        (folder / "001.md").write_text(project.raw_file(raw_rel).read_text(), encoding="utf-8")
+        apply_generated(project, raw_rel)
         return writer.WriteResult(target=folder, touched=[raw_rel])
 
     def run_sync(self, only=None):
@@ -400,6 +399,46 @@ class IsolatedSyncTest(unittest.TestCase):
              patch.object(pipeline, "link_pending_isolated", side_effect=link):
             self.assertEqual(self.run_sync(), 0)
         self.assertEqual(order, ["build:a.md", "build:b.md", "link"])
+
+    def test_idle_sync_captures_a_ui_edit_before_any_scan_or_build(self):
+        from publisher.human_changes import HumanStore
+
+        self.add("a.md")
+        self.settings.policy = "fast"  # linking off: the first sync publishes what it built
+        self.assertEqual(self.run_sync(), 0)
+        page = next(iter(self.client.pages.values()))
+        marker_text = page.body
+        human = marker_text.replace("Useful source content.", "Useful source content, as edited in GROWI.")
+        self.assertNotEqual(human, marker_text)
+        page.body, page.revision_id = human, "human-1"
+        order = []
+        real_pull = pipeline.pull_growi_once
+
+        def pull(settings, **kwargs):
+            order.append("pull")
+            return real_pull(settings, **kwargs)
+
+        def build(*args, **kwargs):
+            order.append("build")
+            return self.generate(*args, **kwargs)
+
+        with patch.object(pipeline, "pull_growi_once", side_effect=pull), \
+             patch.object(pipeline, "write_wiki_pages", side_effect=build):
+            self.assertEqual(self.run_sync(), 0)
+        self.assertEqual(order, ["pull"])  # nothing changed in the source: no build, but the edit is taken
+        folder = self.project.wiki_dir("a_md.md")
+        self.assertIn("as edited in GROWI", (folder / "001.md").read_text(encoding="utf-8"))
+        self.assertEqual(HumanStore(self.project).status()["counts"]["human_information"], 1)
+        # A repeat run with no new change is a no-op.
+        with patch.object(pipeline, "write_wiki_pages", side_effect=build):
+            self.assertEqual(self.run_sync(), 0)
+        self.assertEqual(order, ["pull"])
+
+    def test_sync_does_not_pull_after_republishing_for_a_changed_endpoint(self):
+        self.stack.enter_context(patch.object(pipeline, "republish_if_stale", return_value={"failures": [], "done": []}))
+        with patch.object(pipeline, "pull_growi_once") as pull:
+            self.assertEqual(self.run_sync(), 0)
+        pull.assert_not_called()
 
     def test_parse_ahead_advances_once_for_each_slow_claim(self):
         for rel in ("a.md", "b.md"):

@@ -27,6 +27,13 @@ markers, IDs, prompt/version constants, Git refs, or GROWI paths. New data is
 additive. Upgrade old artifacts lazily, only when a document is already being
 touched, and keep the old bytes when a deterministic upgrade would differ.
 
+The human-edit subsystem (`publisher/human_changes.py`) is the one approved
+exception: it no longer writes the journal (`metadata/human-sync/documents/`,
+`semantic/`, `operator-summary.*`), the `llm-wiki-human`/`llm-wiki-source`
+markers, the `98-*`/`99-*` auxiliary pages, or the `generated_blob` page-record
+keys, and adds `metadata/human-sync/doc/<key>/` (see `handoff-conflicts.md`).
+Existing files are left untouched, not migrated or deleted.
+
 ## Verification
 
 From this directory, use the project's configured Python environment:

@@ -399,6 +399,14 @@ def page_judge_prompt(
 # --------------------------------------------------------------------------
 
 
+def _guidance_block(guidance: Sequence[str]) -> str:
+    """What human editors want this page to look like; empty (and absent) without guidance."""
+
+    if not guidance:
+        return ""
+    return "# 人間の編集者の要望（このページの体裁。事実は変えない）\n- " + "\n- ".join(guidance) + "\n\n"
+
+
 def section_write_prompt(
     *,
     page_title: str,
@@ -415,6 +423,7 @@ def section_write_prompt(
     context: str = "",
     code_identifiers: Sequence[str] = (),
     policy_rules: str = "",
+    guidance: Sequence[str] = (),
 ) -> Prompt:
     """Rewrite one section losslessly; everything needed is in this prompt."""
 
@@ -461,6 +470,7 @@ def section_write_prompt(
             f"- この節: {index}/{count}（原文 {source_start}-{source_end}行）\n"
             f"- 本文は{output_language}で書く。\n\n"
             + context_block
+            + _guidance_block(guidance)
             + "# 書き方\n"
             "- 見出しは`##`以下を使う。`# `（H1）は書かない。\n"
             "- 原文の見出しは残してよいが、内容が分かる名前に変えてよい。\n"
@@ -496,6 +506,7 @@ def intro_prompt(
     body: str,
     output_language: str,
     context: str = "",
+    guidance: Sequence[str] = (),
 ) -> Prompt:
     """One additive lead paragraph written from the finished body only."""
 
@@ -516,6 +527,7 @@ def intro_prompt(
             f"# タイトル\n{page_title}\n\n"
             f"# 要約\n{page_summary or '要約なし'}\n\n"
             + context_block
+            + _guidance_block(guidance)
             + f"# 本文\n{body}"
         ),
     )
@@ -531,6 +543,7 @@ def incremental_page_edit_prompt(
     output_language: str,
     feedback: Sequence[str] = (),
     reference_only: bool = False,
+    guidance: Sequence[str] = (),
 ) -> Prompt:
     """Ask the model for exact, page-local patches for a small source diff."""
 
@@ -578,6 +591,7 @@ def incremental_page_edit_prompt(
                 if reference_only else ""
             )
             + feedback_block
+            + _guidance_block(guidance)
             + "# 現在のWikiページ\n"
             f"{current_page}"
         ),

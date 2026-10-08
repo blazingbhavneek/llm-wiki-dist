@@ -395,18 +395,7 @@ _INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<text>[^`\n]+)`(?!`)")
 
 
 def _growi_markdown(body: str) -> str:
-    """Render generated prose while preserving complete human-managed regions."""
-
-    from publisher.human_changes import marker_matches
-
-    regions = marker_matches(body)
-    if regions:
-        parts, cursor = [], 0
-        for region in regions:
-            parts.extend((_growi_markdown(body[cursor:region.start()]), region.group(0)))
-            cursor = region.end()
-        parts.append(_growi_markdown(body[cursor:]))
-        return "".join(parts)
+    """Render generated prose for GROWI."""
 
     body = _HTML_COMMENT_RE.sub(
         lambda match: match.group(0) if (
@@ -828,8 +817,7 @@ class GrowiPublisher:
         connection: Any,
         *,
         human_sync_policy: Any = None,
-        semantic_assistant: Any = None,
-        semantic_assistant_factory: Any = None,
+        human_model_factory: Any = None,
     ) -> None:
         from graph.config import HumanSyncPolicy
 
@@ -839,8 +827,7 @@ class GrowiPublisher:
         # Runtime construction always supplies Settings.  The compatibility
         # default keeps direct deterministic callers on their historic path.
         self.human_sync_policy = human_sync_policy or HumanSyncPolicy.resolve("apply")
-        self.semantic_assistant = semantic_assistant
-        self.semantic_assistant_factory = semantic_assistant_factory
+        self.human_model_factory = human_model_factory
         self.human_sync_summary: dict[str, Any] = {}
 
     def doc_path(self, project: Any, rel: str) -> str:
@@ -864,9 +851,7 @@ class GrowiPublisher:
         pages: list[dict[str, str]] = []
         for md in sorted(folder.glob("*.md")):
             name = growi_segment(md.name)
-            from publisher.human_changes import map_generated
-
-            body = map_generated(md.read_text(encoding="utf-8"), strip_reader_references)
+            body = strip_reader_references(md.read_text(encoding="utf-8"))
             page_path = f"{doc_path}/{name}"
             local_path = md.relative_to(project.wiki).as_posix()
             page_id = self.page_marker_id(project, local_path)
@@ -939,9 +924,6 @@ class GrowiPublisher:
             store = HumanStore(project)
             marker = self.page_marker_id(project, item["local_path"])
             data = store.page(marker)
-            stamp = read_json(project.wiki / Path(item["local_path"]).parent / "_planning" / "source.json", default={})
-            document = store.document(str(stamp["raw"])) if stamp.get("raw") else {}
-            generated = document.get("pages", {}).get(Path(item["local_path"]).name, {})
             remote_blob = store.put(body)
             local_blob = store.put((project.wiki / item["local_path"]).read_text(encoding="utf-8"))
             attempt_id = "hattempt-" + uuid.uuid4().hex[:24]
@@ -960,7 +942,6 @@ class GrowiPublisher:
                 "revision": inspected.revision_id if inspected else "",
                 "remote_blob": remote_blob,
                 "local_blob": local_blob,
-                "generated_blob": str(generated.get("body_blob") or ""),
                 "prepared_at": datetime.now(timezone.utc).isoformat(),
             })
             data.update({"schema_version": 1, "marker_id": marker, "local_path": item["local_path"],
@@ -971,10 +952,7 @@ class GrowiPublisher:
                          # publication_error always describes this prepared write.
                          "publication_error": "", "publication_error_attempt_id": "",
                          "prepared_remote_blob": remote_blob,
-                         "prepared_local_blob": local_blob,
-                         # Effective local text can contain protected human regions;
-                         # recovery must use the writer's actual pure generated page.
-                         "prepared_generated_blob": str(generated.get("body_blob") or "")})
+                         "prepared_local_blob": local_blob})
             store.save_page(data)
 
         def record_confirmed(item: dict, page: GrowiPage, body: str) -> None:
@@ -1166,21 +1144,14 @@ class GrowiPublisher:
         unchanged_documents: set[str],
         on_progress: Any = None,
     ) -> tuple[list[str], list[str], set[str]]:
-        """Capture remote intent durably, then render from the pure generated base."""
-        from publisher.human_changes import DASHBOARD, RETAINED, HumanStore, LegacyBaseUnavailable, editable, map_generated, merge, strip_regions, wrap_edit
-        from graph.wiki.storage import write_json_atomic, write_text_atomic
+        """Accept human revisions: each changed page is re-based onto the document's current pages."""
+        from publisher.human_changes import HumanStore, editable, merge
 
         store = HumanStore(project)
         store.audit()
         policy = self.human_sync_policy
         mode = policy.mode.value
-        if policy.semantic_observe and self.semantic_assistant is None and self.semantic_assistant_factory is not None:
-            try:
-                self.semantic_assistant = self.semantic_assistant_factory(project)
-            except Exception:  # model construction is optional; deterministic fallback remains authoritative
-                from publisher.human_semantic import SemanticAssistant
-
-                self.semantic_assistant = SemanticAssistant(store)
+        model = self.human_model_factory(project) if self.human_model_factory is not None else None
 
         async def fetch() -> dict[str, GrowiPage | None]:
             return {
@@ -1202,13 +1173,6 @@ class GrowiPublisher:
         pulled, conflicts, blocked = [], [], set()
         decisions = {"unchanged": 0, "observed": 0, "captured": 0, "blocked": 0, "recovered": 0}
         wiki_root = Path(project.wiki).resolve()
-
-        def mark_pending(target: Path) -> None:
-            marker = target.parent / "_planning" / "linker.json"
-            state = read_json(marker, default={})
-            if state.get("status") != "disabled":
-                state["status"] = "pending"
-                write_json_atomic(marker, state)
 
         for index, (local_path, page) in enumerate(remote.items(), 1):
             row = published_pages[local_path]
@@ -1233,10 +1197,6 @@ class GrowiPublisher:
                 if not raw_rel:
                     raise ValueError("source mapping is missing")
                 baseline = store.page(row["marker_id"])
-                if baseline.get("source_id"):
-                    journal = store.document(raw_rel)
-                    if baseline["source_id"] not in {journal["source_id"], *journal.get("legacy_source_ids", [])}:
-                        raise ValueError("published page belongs to a different source identity")
                 if baseline.get("blocked") or row.get("human_sync_blocked"):
                     blocked_reason = str(baseline.get("blocked") or row.get("human_sync_blocked") or "")
                     rollout_block = "human_sync_mode=apply" in blocked_reason
@@ -1257,21 +1217,19 @@ class GrowiPublisher:
                 local = target.read_text(encoding="utf-8") if not baseline else store.get(baseline["local_blob"])
                 if not baseline:
                     # Old ledgers have no exact remote snapshot. A clean revision
-                    # can establish one; an already changed revision must be pinned
-                    # in full because its original transport form is unavailable.
+                    # can establish one; a changed one cannot be told apart from
+                    # transport spelling, so it blocks until a baseline exists.
                     if document not in unchanged_documents:
                         raise ValueError("missing published snapshot for changed local page")
-                    legacy = page.revision_id != row.get("revision_id")
-                    expected_local = _growi_markdown(map_generated(local, strip_reader_references))
+                    expected_local = _growi_markdown(strip_reader_references(local))
                     canonical_remote = restore_page_links(markdown, local_path, page_paths)
-                    differs = editable(canonical_remote) != editable(expected_local)
-                    if differs and not policy.captures:
+                    if editable(canonical_remote) != editable(expected_local):
                         if policy.observes:
                             store.record_observation(
                                 mode=mode, decision="blocked", local_path=local_path,
                                 page_id=page.page_id, revision_id=page.revision_id,
                                 before=expected_local, after=canonical_remote,
-                                proposed_operation="replace", proposed_status="legacy_pinned",
+                                proposed_operation="replace", proposed_status="blocked",
                                 match_reason="missing_verified_baseline",
                             )
                             decisions["observed"] += 1
@@ -1280,29 +1238,9 @@ class GrowiPublisher:
                             page_id=page.page_id, revision_id=page.revision_id,
                             reason="missing_verified_baseline",
                         )
-                        raise ValueError(
-                            f"remote difference requires human_sync_mode=apply (current mode: {mode})"
-                        )
-                    if differs:
-                        legacy = True
-                    try:
-                        store.ensure_generated(raw_rel)
-                    except LegacyBaseUnavailable:
-                        legacy = True
-                    if legacy:
-                        local = restore_page_links(markdown, local_path, page_paths)
-                        pinned = store.pin_legacy(raw_rel, local_path, strip_regions(local), revision=page.revision_id)
-                        effective = wrap_edit(store.get(pinned["human_after_blob"]), pinned["edit_id"])
-                        write_text_atomic(target, effective)
-                        write_text_atomic(target.parent / "_planning" / "pages" / target.name, effective)
-                        mark_pending(target)
-                        pulled.append(local_path)
+                        raise ValueError("missing verified baseline; the remote page differs from the local page")
                     row["revision_id"] = page.revision_id
                     store.remember_page(local_path, row, markdown, local, published=False)
-                    if legacy:
-                        baseline = store.page(row["marker_id"])
-                        baseline["legacy_pinned"] = True
-                        store.save_page(baseline)
                     continue
                 if baseline["accepted_revision"] != row.get("revision_id"):
                     raise ValueError("published revision and human baseline disagree")
@@ -1310,103 +1248,60 @@ class GrowiPublisher:
                     continue
                 previous_remote = store.get(baseline["remote_blob"])
                 previous_local = store.get(baseline["local_blob"])
-                generated_before = store.get(baseline["generated_blob"]) if baseline.get("generated_blob") else None
                 if accounted:
                     # A late revision sits on our unrecorded write, so it is rebased on
-                    # that write: only the human delta is journaled and the bot delta stays
-                    # generated state instead of becoming a later stale override.
+                    # that write: only the human delta is accepted and the bot delta stays
+                    # generated state.
                     prepared_remote = managed_page_markdown(accounted["remote"], row["marker_id"])
                     if prepared_remote is None:
                         raise ValueError("unrecorded bot write is missing its ownership marker")
                     previous_remote, previous_local = prepared_remote, accounted["local"]
-                    generated_before = accounted["generated"] or generated_before
                 # Rebase the exact remote delta onto its matching local snapshot.
                 # This restores permalink/image spelling without inventing text.
                 canonical, status = merge(editable(previous_remote), editable(markdown), editable(previous_local))
                 if status == "conflict":
                     raise ValueError("remote transport changes cannot be canonicalized safely")
                 canonical = restore_page_links(canonical, local_path, page_paths)
-                proposed_operation = (
-                    "delete" if not editable(canonical).strip()
-                    else "add" if not editable(previous_local).strip()
-                    else "replace"
-                )
-                if policy.observes:
-                    store.record_observation(
-                        mode=mode,
-                        decision="capture" if policy.captures else "blocked",
-                        local_path=local_path,
-                        page_id=page.page_id,
-                        revision_id=page.revision_id,
-                        before=previous_local,
-                        after=canonical,
-                        proposed_operation=proposed_operation,
-                        proposed_status=status,
-                        match_reason="deterministic_page_rebase",
+                # Linker output and transport spelling are not human changes, in every mode.
+                base, human = store.separate(raw_rel, local_path, previous_local, canonical)
+                if base != human:
+                    proposed_operation = (
+                        "delete" if not editable(canonical).strip()
+                        else "add" if not editable(previous_local).strip()
+                        else "replace"
                     )
-                    decisions["observed"] += 1
-                if policy.semantic_observe and self.semantic_assistant is not None:
-                    proposal = self.semantic_assistant.propose(
-                        source_id=str(baseline.get("source_id") or ""),
-                        base=previous_local,
-                        human=canonical,
-                        anchor={"page_path": local_path, "heading_path": [], "block_kind": "prose"},
-                        candidates=[{
-                            "candidate_id": "current-generated",
-                            "source_id": str(baseline.get("source_id") or ""),
-                            "page_path": local_path,
-                            "heading_path": [],
-                            "block_kind": "prose",
-                            "text": generated_before or previous_local,
-                        }],
-                        edit_id="hedit-" + hashlib.sha256(
-                            (row["marker_id"] + "\0" + page.revision_id).encode("utf-8")
-                        ).hexdigest()[:24],
-                        policy_mode=mode,
-                    )
-                    store.record_event(
-                        mode=mode, decision="semantic_" + proposal.status,
-                        local_path=local_path, page_id=page.page_id,
-                        revision_id=page.revision_id,
-                        reason=",".join(proposal.reason_codes),
-                    )
-                if not policy.captures:
-                    store.record_event(
-                        mode=mode,
-                        decision="blocked_remote_difference",
-                        local_path=local_path,
-                        page_id=page.page_id,
-                        revision_id=page.revision_id,
-                        reason="authoritative_capture_disabled",
-                    )
-                    raise ValueError(
-                        f"remote difference requires human_sync_mode=apply (current mode: {mode})"
-                    )
+                    if policy.observes:
+                        store.record_observation(
+                            mode=mode,
+                            decision="capture" if policy.captures else "blocked",
+                            local_path=local_path,
+                            page_id=page.page_id,
+                            revision_id=page.revision_id,
+                            before=previous_local,
+                            after=canonical,
+                            proposed_operation=proposed_operation,
+                            proposed_status=status,
+                            match_reason="deterministic_page_rebase",
+                        )
+                        decisions["observed"] += 1
+                    if not policy.captures:
+                        store.record_event(
+                            mode=mode,
+                            decision="blocked_remote_difference",
+                            local_path=local_path,
+                            page_id=page.page_id,
+                            revision_id=page.revision_id,
+                            reason="authoritative_capture_disabled",
+                        )
+                        raise ValueError(
+                            f"remote difference requires human_sync_mode=apply (current mode: {mode})"
+                        )
                 row["observed_revision_id"] = page.revision_id
-                legacy = False
-                try:
-                    if baseline.get("legacy_pinned"):
-                        raise LegacyBaseUnavailable("legacy page has not yet been published with its protected region")
-                    if not baseline.get("generated_blob") and not target.name.startswith((Path(RETAINED).stem, Path(DASHBOARD).stem)):
-                        raise LegacyBaseUnavailable("published pure ancestor is missing; legacy pin required")
-                    unlinked_path = target.parent / "_planning" / "pages" / target.name
-                    store.capture(raw_rel, local_path, row, previous_local, canonical,
-                                  generated_before=generated_before,
-                                  unlinked=unlinked_path.read_text(encoding="utf-8") if unlinked_path.exists() else None)
+                if base != human:
+                    pulled.extend(sorted(store.accept(
+                        raw_rel, local_path, row["marker_id"], page.revision_id, base, human, model=model,
+                    )))
                     decisions["captured"] += 1
-                except LegacyBaseUnavailable:
-                    pinned = store.pin_legacy(raw_rel, local_path, strip_regions(canonical), revision=page.revision_id, replace=True)
-                    effective = wrap_edit(store.get(pinned["human_after_blob"]), pinned["edit_id"])
-                    write_text_atomic(target, effective)
-                    write_text_atomic(target.parent / "_planning" / "pages" / target.name, effective)
-                    mark_pending(target)
-                    legacy = True
-                if editable(previous_local) != editable(canonical):
-                    if legacy:
-                        pulled.append(local_path)
-                    else:
-                        result = store.render(raw_rel)
-                        pulled.extend(sorted(result.changed_pages))
                 row["revision_id"] = page.revision_id
                 row["marker_seed"] = self.page_marker_seed(project, local_path)
                 store.remember_page(local_path, row, markdown, canonical, published=False)
@@ -1414,10 +1309,6 @@ class GrowiPublisher:
                     settled = store.page(row["marker_id"])
                     if settled.get("prepared_attempt_id") == accounted["attempt_id"]:
                         store.settle_prepared(settled, status="captured_late_human")
-                if legacy:
-                    baseline = store.page(row["marker_id"])
-                    baseline["legacy_pinned"] = True
-                    store.save_page(baseline)
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 reason = str(exc)
                 store.block_page(local_path, row, reason, page)

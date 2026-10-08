@@ -174,18 +174,19 @@ def _gate(
 def model_pair(config: WikiConfig) -> ModelPair:
     """Build the fast writer/judge pair; standard policy never imports this module."""
 
-    writer_config = config.model_copy(
-        update={
-            "chat_base_url": config.writer_base_url or config.chat_base_url,
-            "chat_api_key": config.writer_api_key or config.chat_api_key,
-            "chat_model": config.writer_model or config.chat_model,
-        }
-    )
     judge_config = config.model_copy(
         update={
             "chat_base_url": config.judge_base_url or config.chat_base_url,
             "chat_api_key": config.judge_api_key or config.chat_api_key,
             "chat_model": config.judge_model or config.chat_model,
+        }
+    )
+    # An unconfigured writer is the judge, not the chat default.
+    writer_config = config.model_copy(
+        update={
+            "chat_base_url": config.writer_base_url or judge_config.chat_base_url,
+            "chat_api_key": config.writer_api_key or judge_config.chat_api_key,
+            "chat_model": config.writer_model or judge_config.chat_model,
         }
     )
     concurrency = max(1, int(config.rewrite_concurrency))

@@ -673,6 +673,23 @@ class FastRepairTest(unittest.TestCase):
         )
         self.assertEqual(make.call_args_list[0].kwargs["temperature"], 0.7)
 
+    def test_unset_writer_follows_judge(self):
+        config = WikiConfig(
+            chat_base_url="http://chat/v1",
+            chat_model="chat",
+            judge_base_url="http://judge/v1",
+            judge_model="large-judge",
+        )
+        with patch("graph.clients.chat.make_llm", side_effect=[object(), object()]) as make:
+            pair = model_pair(config)
+
+        self.assertEqual(pair.writer.name, "large-judge")
+        self.assertEqual(pair.judge.name, "large-judge")
+        self.assertEqual(
+            [call.kwargs["base_url"] for call in make.call_args_list],
+            ["http://judge/v1", "http://judge/v1"],
+        )
+
     def test_model_call_gate_respects_concurrency(self):
         async def run():
             gate = FastRoleGate(max_concurrency=3)

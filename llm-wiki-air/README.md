@@ -526,38 +526,42 @@ above that stamp and preserve the remote tail below it. `attach` mode
 refuses writes outside the project's GROWI path. Local links
 are resolved before writing so published links are stable `/{pageId}`
 permalinks, while the local tree keeps portable relative paths. The reverse
-direction captures managed GROWI edits into a tracked human journal before
-source processing. Generation keeps a pure source-based state; the overlay
-is reapplied afterwards, and the linker reads the effective pages.
+direction pulls managed GROWI edits before any source processing. A document
+with human edits keeps two copies of each page: what the generator last produced
+and the same page with every human change; every update re-applies the
+difference to the new generation, and the linker reads the result.
 
 ### Human edits and source updates
 
-Human additions, replacements and suppressions live in
-`metadata/human-sync/`, with complete bodies in validated, content-addressed
-snapshots. The journal participates in candidate commits, promotion and
-rollback. Every update tier reapplies it from a fresh generated base.
+The page is the journal. When a human edit is accepted, the document gets
+`metadata/human-sync/doc/<key>/` holding `pure/` (the generator's last pages),
+`current/` (the same pages with every human change; the authority, mirrored to
+the live wiki), `doc.json` (Appendix name and writer guidance) and `captures/`
+(one record per accepted GROWI revision). Documents nobody edited have no state.
+The state participates in candidate commits, promotion and rollback.
 
-Unchanged and disjoint changes merge deterministically. A different value for
-the same information keeps human text first and shows the exact new source
-version under **Updated source document says:**. Short single-line facts use
-parentheses. Ambiguous or disappeared blocks go to `99-Retained-Human-Notes.md`;
-`98-Human-Conflicts.md` contains status and links. A matching later source
-version absorbs an edit without deleting its history, so it can reactivate.
-
-Deleting a human change in GROWI records a durable tombstone. For a conflict,
-removing its source candidate keeps the human version; replacing its human
-version with the source version accepts the source. Incomplete marker edits
-block publication and save the complete remote body for review.
+At each sync, X is what the source changed and Y what humans changed in GROWI:
+Y alone is kept; X alone updates the page; the same change on both sides is
+kept once; different changes coexist; if both changed the same fact, the human
+value stays and the source value follows as `（元文書の更新: …）`. Resolve a
+conflict by editing the page in GROWI (delete the note to keep the human value,
+or replace the human value). If the source deletes text a human changed, that
+text moves to the last page, `<last page number + 1>-付録.md`. Formatting and
+heading edits also become a short instruction in the writer's prompts for that
+page. The merge is `rebase()` in `publisher/human_changes.py`; mechanical where
+text is unique, a model call (merge, then verify) otherwise, with a note as the
+fallback, so human text is never dropped.
 
 Publication checks IDs, paths, markers and revisions before writes. A 409
 aborts the batch and records the observed body. Missing or moved remote pages
-also block publication. Legacy pages without a verified pure ancestor are
-pinned in full and require a fresh rebuild. Matching uses structural anchors
-and deterministic diffs; uncertain cases retain text without model resolution.
+also block publication. A document whose old journal (`documents/*.json`) still
+holds live edits is blocked with `legacy human journal`. Deleting a source
+document that holds human information is blocked until that text is removed or
+moved in GROWI.
 
-To capture edits once, run `python main.py --project <project> pull`. This
-updates the local effective wiki and journal, marks linking pending, and
-checkpoints the result. It performs no source generation or GROWI publication.
+`sync` pulls GROWI edits first, so a UI-only edit is captured even when no source
+changed. To capture edits once, run `python main.py --project <project> pull`;
+it performs no source generation or GROWI publication.
 
 Human synchronization has an explicit rollout policy. New and legacy project
 configurations default to `off`; set it per project under `[settings]` or with
@@ -573,26 +577,23 @@ human_sync_activity_overlap_seconds = 60
 - `off` keeps ownership, path, revision, marker and conditional-write checks
   active. A remote difference blocks publication and is not adopted.
 - `observe` adds one idempotent, text-redacted proposal under
-  `metadata/human-sync/observations/`. It leaves the wiki, pure generator state,
-  linker state, accepted revision and remote page unchanged. Ambiguous cases
-  use the configured bounded Jev scorer plus independent structured writer and
-  judge calls; all model text stays in delimited user data, and every failure
-  returns the exact deterministic conflict artifact.
-- `apply` captures the re-fetched revision as authoritative human intent and
-  runs the reviewed deterministic overlay. Semantic scorer/writer output still
-  remains observe-only.
+  `metadata/human-sync/observations/`. It leaves the wiki, generator state,
+  linker state, accepted revision and remote page unchanged, and makes no model
+  call.
+- `apply` accepts the re-fetched revision as human intent and merges it as
+  described above.
 
-An existing authoritative journal is always rendered in every mode, so moving
-from `apply` back to `off` cannot expose a pure page over protected human text.
-Moving from `observe` to `apply` re-fetches and checks the current revision; it
-does not promote a stale observation.
+A revision that only differs by linker output or transport spelling is not a
+human change in any mode. Existing state is always applied at generation, so
+moving from `apply` back to `off` cannot expose a pure page over human text.
+Moving from `observe` to `apply` re-fetches and checks the current revision.
 
 The normal `pull` command uses the audit activity index when available and
 falls back to a complete boundary inventory on startup, cursor/API gaps and the
 configured audit interval. Force that read-only reconciliation with
 `python main.py --project <project> pull --inventory`. Inspect redacted status
-with `python main.py --project <project> human status`. Revision-checked actions
-are available through `human resolve`; run its `-h` output for arguments.
+with `python main.py --project <project> human status` (blocked pages, documents
+with human information, Appendix entries, guidance).
 
 `human live-plan --path /<project>/disposable/...` creates a local redacted E2E
 report and boundary confirmation code. It performs no remote writes. Live test
@@ -617,10 +618,8 @@ doc-parser/                  separate service (FastAPI + MinerU/GPU, pandoc,
 
 publisher/                   downstream no-Git pipeline (edit freely)
   pipeline.py                sync_once/build_raw/build_wiki_only/link_raw/
-  human_changes.py           durable journal, overlay, operator summary/actions
-  human_semantic.py          bounded observe-only scorer/writer/judge contracts
+  human_changes.py           page-diff human state, rebase(), model calls, status
   activity.py                audit cursor and correctness-first full inventory
-  legacy_recovery.py         byte-verified pure ancestor recovery from Git
   live_verification.py       redacted disposable-subtree E2E report lifecycle
                              publish_only/reset_growi: one reconciliation pass,
                              per-source state machine (convert->wiki->link->publish)

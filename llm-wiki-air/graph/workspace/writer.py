@@ -83,6 +83,7 @@ def _apply_incremental_edits(
     settings: Any,
     llm: Any,
     stop_check: StopCheck = None,
+    guidance: dict[str, list[str]] | None = None,
 ) -> tuple[set[str], dict[str, str]]:
     """Let the model patch every tier-1 page. Returns (changed pages, failed pages)."""
 
@@ -178,6 +179,7 @@ def _apply_incremental_edits(
                 output_language=str(getattr(settings, "wiki_output_language", "Japanese (日本語)")),
                 feedback=feedback,
                 reference_only=not owned,
+                guidance=(guidance or {}).get(filename, ()),
             )
             try:
                 async with semaphore:
@@ -293,7 +295,8 @@ class WriteResult:
     reason: str = ""
     regenerated_pages: list[str] = field(default_factory=list)
     human_edits_overwritten: list[str] = field(default_factory=list)
-def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kind: str = "md", require_resume: bool = False):
+def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kind: str = "md", require_resume: bool = False,
+                human_guidance: dict[str, list[str]] | None = None):
     from graph.wiki.config import WikiConfig
     from common.policy import policy_of
 
@@ -334,6 +337,7 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
         slide_delimiter=getattr(settings, "slide_delimiter", r"^## Slide (\d+)\s*$"),
         slide_title=getattr(settings, "slide_title", r"^### (.+?)\s*$"),
         pdf_use_headings=bool(getattr(settings, "pdf_use_headings", False)),
+        human_guidance=dict(human_guidance or {}),
         tabular_slice_records=int(getattr(settings, "tabular_slice_records", 40)),
         tabular_preview_rows=int(getattr(settings, "tabular_preview_rows", 12)),
         tabular_preview_cols=int(getattr(settings, "tabular_preview_cols", 12)),
@@ -353,12 +357,14 @@ def run_wiki(
     resume: bool = True,
     source_kind: str = "md",
     require_resume: bool = False,
+    human_guidance: dict[str, list[str]] | None = None,
 ) -> Path:
     from graph.common.async_tools import run_async_blocking
     from graph.wiki.pipeline import run_pipeline
     from graph.wiki.model import ChatModelPort
 
-    config = wiki_config(settings, run_dir=run_dir, resume=resume, source_kind=source_kind, require_resume=require_resume)
+    config = wiki_config(settings, run_dir=run_dir, resume=resume, source_kind=source_kind,
+                         require_resume=require_resume, human_guidance=human_guidance)
     model = llm if hasattr(llm, "structured") and hasattr(llm, "text") else ChatModelPort(config, llm=llm) if llm is not None else None
     return run_async_blocking(
         run_pipeline(
@@ -386,6 +392,7 @@ def build_wiki_output(
     source_kind: str | None = None,
     resume: bool = True,
     require_resume: bool = False,
+    human_guidance: dict[str, list[str]] | None = None,
 ) -> SimpleNamespace:
     source_path = Path(source_path)
     out_dir = Path(out_dir)
@@ -437,6 +444,7 @@ def build_wiki_output(
             source_kind=kind,
             resume=resume,
             require_resume=require_resume,
+            human_guidance=human_guidance,
         )
         export_ingest_layout(run_root, out_dir, document_name=document_name)
         return SimpleNamespace(
@@ -605,26 +613,12 @@ def write_wiki_pages(
             )
 
     wiki_document = Path(project.wiki_dir(rel)).relative_to(project.wiki)
-    # Old reverse-sync versions contaminated generator state. Save complete
-    # legacy pages before discarding that state, then rebuild a pure ancestor.
-    legacy_pages = _human_edited(state_root)
-    if legacy_pages:
-        from publisher.human_changes import HumanStore
+    # Old reverse-sync versions put human text into generator state; a rebuild would drop it.
+    if _human_edited(state_root):
+        raise ValueError("legacy human state")
+    from publisher.human_changes import HumanStore, LlmHumanModel, apply_generated
 
-        store = HumanStore(project)
-        for name in legacy_pages:
-            page = project.wiki_dir(rel) / name
-            if not page.exists():
-                page = state_root / "wiki" / name
-            store.pin_legacy(rel, (wiki_document / name).as_posix(), page.read_text(encoding="utf-8"))
-        decision = UpdateDecision(tier=3, reason="legacy-human-state")
-        workbook = None
-    else:
-        from publisher.human_changes import HumanStore
-
-        if HumanStore(project).document(rel).get("requires_pure_rebuild"):
-            decision = UpdateDecision(tier=3, reason="legacy-missing-ancestor")
-            workbook = None
+    guidance = HumanStore(project).guidance(rel)
 
     def decision_event() -> dict[str, Any]:
         pages = set(decision.patch) | decision.regenerate | set(decision.retitle)
@@ -667,7 +661,7 @@ def write_wiki_pages(
                     source_path=project.raw_file(rel), document_name=rel, out_dir=work / "out",
                     mode=mode, settings=settings, llm=llm, embedder=embedder,
                     state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
-                    source_kind=kind, resume=True,
+                    source_kind=kind, resume=True, human_guidance=guidance,
                 ).out_dir
         elif decision.tier in (0, 1, 2):
             human = apply_update(state_root, decision, new_text)
@@ -676,7 +670,7 @@ def write_wiki_pages(
             if decision.patch:
                 _changed, failed = _apply_incremental_edits(
                     state_root, old_text, new_text, decision,
-                    settings=settings, llm=llm, stop_check=stop_check,
+                    settings=settings, llm=llm, stop_check=stop_check, guidance=guidance,
                 )
             if failed:
                 plan_pages = read_json(state_root / "state" / "plan.json")["pages"]
@@ -693,7 +687,7 @@ def write_wiki_pages(
                         source_path=project.raw_file(rel), document_name=rel, out_dir=work / "out",
                         mode=mode, settings=settings, llm=llm, embedder=embedder,
                         state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
-                        source_kind=kind, resume=True, require_resume=True,
+                        source_kind=kind, resume=True, require_resume=True, human_guidance=guidance,
                     ).out_dir
                 except ResumeUnavailable:
                     decision = UpdateDecision(tier=3, reason="resume-failed")
@@ -712,7 +706,7 @@ def write_wiki_pages(
                 source_path=project.raw_file(rel), document_name=rel, out_dir=work / "out",
                 mode=mode, settings=settings, llm=llm, embedder=embedder,
                 state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
-                source_kind=kind, resume=resume_initial_build,
+                source_kind=kind, resume=resume_initial_build, human_guidance=guidance,
             ).out_dir
         # A rebuilt workbook republishes and relinks as a whole (the linker's caches make
         # unchanged sheets cheap); only its 解説 regeneration is incremental.
@@ -735,15 +729,9 @@ def write_wiki_pages(
                 run_state["generation_mode"] = generation_mode
             write_json_atomic(state_root / "run.json", run_state)
         write_source_stamp(target, project.raw_file(rel), rel, identity_seed=identity_seed)
-        from publisher.human_changes import HumanStore, apply_generated
-
         if out_dir is not None:
-            overlay = apply_generated(project, rel)
-        else:
-            store = HumanStore(project)
-            store.ensure_generated(rel)
-            overlay = store.render(rel)
-        changed_output_pages.update(Path(path).name for path in overlay.changed_pages)
+            overlay = apply_generated(project, rel, model=LlmHumanModel(settings, project))
+            changed_output_pages.update(Path(path).name for path in overlay.changed_pages)
         marker = target / "_planning" / "linker.json"
         status = "pending" if getattr(settings, "wiki_linker_enabled", True) else "disabled"
         previous_linker = read_json(marker, default={})
@@ -761,9 +749,6 @@ def write_wiki_pages(
             marker_data["resume"] = True
         write_json_atomic(marker, marker_data)
         document = target.relative_to(project.wiki)
-        if (overlay.conflicts or overlay.orphaned) and on_progress:
-            on_progress({"stage": "wiki", "step": "human_overlay", "file": rel,
-                         "conflicts": overlay.conflicts, "orphaned": overlay.orphaned})
         return WriteResult(
             target=target,
             touched=[],

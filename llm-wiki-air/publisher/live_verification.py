@@ -29,6 +29,16 @@ LIVE_CASES = (
     "lost_update", "lost_create", "partial_publish_late_edit", "watcher_restart",
     "activity_cursor_restart", "full_inventory_equivalence", "candidate_rollback",
     "last_good_restore", "service_restart_reconcile", "model_outage_fallback",
+    # page-merge design (handoff-conflicts.md, Group H)
+    "concurrent_add_same_anchor", "human_delete_source_modify", "human_modify_source_delete",
+    "concurrent_delete_same_fact", "multiple_remote_revisions_before_pull",
+    "mixed_page_capture_failure", "source_move_delete_with_remote_edit",
+    "transport_only_remote_revision", "mode_transition_same_revision",
+    "growi_conflict_ui_resolution", "remote_revision_rollback",
+    "idle_sync_remote_reconciliation", "human_section_placement",
+    "conflict_survives_unrelated_edit", "fast_policy_human_overlay", "human_revert",
+    "source_catches_up", "source_removes_then_restores", "regeneration_without_fact_change",
+    "structure_only_edit", "pull_onto_unpublished_generation",
 )
 
 
@@ -134,7 +144,7 @@ class LiveVerificationReport:
         calls: dict[str, int],
         reason_codes: list[str] | None = None,
     ) -> None:
-        if name not in self.data["cases"]:
+        if name not in LIVE_CASES:
             raise ValueError(f"unknown live verification case: {name}")
         self.data["cases"][name] = {
             "status": "passed" if passed else "failed",
@@ -154,7 +164,7 @@ class LiveVerificationReport:
     def record_constraint(self, name: str, *, reason_codes: list[str]) -> None:
         """Record a deliberately unexecuted live case without calling it a pass."""
 
-        if name not in self.data["cases"]:
+        if name not in LIVE_CASES:
             raise ValueError(f"unknown live verification case: {name}")
         if not reason_codes:
             raise ValueError("a constrained live case requires a reason code")
@@ -168,7 +178,8 @@ class LiveVerificationReport:
         write_json_atomic(self.path, self.data)
 
     def finalize(self, *, cleanup_status: str, recovery_possible: bool) -> dict[str, Any]:
-        statuses = [row["status"] for row in self.data["cases"].values()]
+        # A case an older report never knew counts as pending: it cannot finalize as complete.
+        statuses = [self.data["cases"].get(name, {"status": "pending"})["status"] for name in LIVE_CASES]
         passed = all(status == "passed" for status in statuses)
         self.data["status"] = "complete" if passed else "incomplete"
         self.data["cleanup"] = {"status": cleanup_status, "recovery_possible": recovery_possible}

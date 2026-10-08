@@ -57,10 +57,6 @@ class HumanSyncPolicy:
     def observes(self) -> bool:
         return self.mode in {HumanSyncMode.observe, HumanSyncMode.apply}
 
-    @property
-    def semantic_observe(self) -> bool:
-        return self.mode is HumanSyncMode.observe
-
 
 def resolve_project_path(value: str) -> Path:
     path = Path(value).expanduser()
@@ -132,7 +128,8 @@ class Settings(BaseModel):
     chat_api_key: str = "local"
     chat_model: str = "gemma-4-31B"
     # Optional fast-mode writer endpoint/model. The normal chat settings are
-    # the judge defaults; explicit judge variables are additive overrides.
+    # the judge defaults; explicit judge variables are additive overrides, and
+    # an unset writer follows the judge.
     writer_base_url: str = ""
     writer_api_key: str = ""
     writer_model_name: str = ""

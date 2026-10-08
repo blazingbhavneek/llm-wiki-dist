@@ -1321,6 +1321,7 @@ async def _write_section(
                 else sorted(policy.code_tokens(source_text))
             ),
             policy_rules=policy.wiki_prompt_rules("writer"),
+            guidance=config.human_guidance.get(page.filename, ()),
         )
         rendered_prompt = prompt.render()
         cached_prompt = task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md"
@@ -1522,6 +1523,7 @@ async def _write_intro(
         body=body,
         output_language=config.output_language,
         context=context,
+        guidance=config.human_guidance.get(page.filename, ()),
     )
     rendered_prompt = prompt.render()
     cached_prompt = task_dir / "intro-prompt.md"

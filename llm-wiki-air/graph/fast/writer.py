@@ -66,6 +66,7 @@ def _prompt(session: SectionSession, *, lines: Sequence[str], config: Any, polic
             else sorted(policy.code_tokens(session.source_text))
         ),
         policy_rules=policy.wiki_prompt_rules("writer"),
+        guidance=config.human_guidance.get(session.page.filename, ()),
     )
 
 

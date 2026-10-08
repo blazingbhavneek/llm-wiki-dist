@@ -571,6 +571,12 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
             if stale is not None and stale.get("failures"):
                 combined["failures"].extend(stale["failures"])
                 return _report(combined)
+            if stale is None:
+                # Capture GROWI edits before any scan or build, so a UI-only edit is taken even
+                # when no source changed. A blocked page is reported; its document is blocked
+                # again by its own capture before it is published.
+                pulled = pipeline.pull_growi_once(settings)
+                combined["failures"].extend(pulled.get("failures", []))
             retry_failed(project, only=args.items or None)
             scanned = scan(
                 settings,
@@ -738,25 +744,8 @@ def cmd_human(args: argparse.Namespace) -> int:
             raise RuntimeError("cannot modify human state from a dirty last-good working tree")
         store = HumanStore(project)
         if args.human_command == "status":
-            result = store.project_summary()
+            result = store.status()
             code = 0
-        elif args.human_command == "resolve":
-            combined = ""
-            if args.text_file:
-                combined = Path(args.text_file).read_text(encoding="utf-8")
-            result = store.resolve(
-                args.edit_id,
-                action=args.action,
-                expected_revision=args.revision,
-                combined_text=combined,
-                document=args.document or "",
-            )
-            code = 0
-        elif args.human_command == "recover-legacy":
-            from publisher.legacy_recovery import recover_legacy_ancestor
-
-            result = recover_legacy_ancestor(store, args.document)
-            code = 0 if result.get("status") in {"recovered", "no_legacy_pin"} else 1
         elif args.human_command == "live-plan":
             from publisher.live_verification import LiveVerificationReport
 
@@ -1060,20 +1049,10 @@ def build_parser() -> argparse.ArgumentParser:
     pull = sub.add_parser("pull", help="capture GROWI edits into the local human overlay"); project_flags(pull)
     pull.add_argument("--inventory", action="store_true", help="force a complete read-only inventory below the configured GROWI root")
     pull.set_defaults(fn=cmd_pull)
-    human = sub.add_parser("human", help="inspect and resolve durable human overlays"); project_flags(human)
+    human = sub.add_parser("human", help="inspect human edits (resolve a conflict by editing the page in GROWI)"); project_flags(human)
     human_sub = human.add_subparsers(dest="human_command", required=True)
-    human_status = human_sub.add_parser("status", help="write and print the project-wide human-sync summary")
+    human_status = human_sub.add_parser("status", help="print blocked pages, documents with human information, Appendix entries and guidance")
     project_flags(human_status)
-    human_resolve = human_sub.add_parser("resolve", help="apply one revision-checked operator decision")
-    project_flags(human_resolve)
-    human_resolve.add_argument("edit_id")
-    human_resolve.add_argument("--action", required=True, choices=("keep-human", "accept-source", "combine", "suppress", "delete", "retry-match"))
-    human_resolve.add_argument("--revision", required=True, help="last inspected GROWI revision")
-    human_resolve.add_argument("--document", help="expected raw document identity")
-    human_resolve.add_argument("--text-file", help="UTF-8 combined body for --action combine")
-    human_recover = human_sub.add_parser("recover-legacy", help="recover a uniquely verified pure ancestor from project Git")
-    project_flags(human_recover)
-    human_recover.add_argument("document", help="raw-relative document path")
     human_live = human_sub.add_parser("live-plan", help="create a local-only redacted plan for a disposable live verification subtree")
     project_flags(human_live)
     human_live.add_argument("--path", required=True, help="confirmed disposable path below the configured project boundary")

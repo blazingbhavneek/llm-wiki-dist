@@ -1,19 +1,23 @@
-"""Preservation, revision races and transaction tests without external services."""
+"""Human edits as a page diff: rebase, the state layer, model calls, and publication safety.
+
+No network: the model is a scripted fake.
+"""
 
 import asyncio
 import json
 import shutil
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from graph.growi.client import GrowiAPIError, GrowiPage, GrowiPublisher, _growi_markdown, publish_pages, wrap_page
+from graph.growi.client import GrowiAPIError, GrowiPage, GrowiPublisher, publish_pages, wrap_page
 from graph.workspace.project import Project
 from graph.workspace import writer
 from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
-from publisher.human_changes import HumanStore, RETAINED, DASHBOARD, merge, regions, strip_regions
+from publisher.human_changes import HumanStore, apply_generated, classify, merge, rebase, unlinked
 from publisher.history import candidate, candidate_is_clean, commit_candidate, ensure_repository, last_good, promote
 from publisher import pipeline
 
@@ -22,7 +26,250 @@ BASE = "# Page\n\nIntro.\n\n## Limits\n\nMaximum is 40°C.\nMode is AUTO.\n\n## 
 HUMAN = BASE.replace("40°C", "60°C")
 
 
-class HumanChangesTest(unittest.TestCase):
+class FakeModel:
+    """Scripted classify / merge / verify; counts every call."""
+
+    def __init__(self, merges=(), verdicts=(), classes=None):
+        self.merges, self.verdicts, self.classes = list(merges), list(verdicts), classes
+        self.calls = Counter()
+        self.merge_args = []
+
+    def merge(self, old_w, cur_w, new_w, guidance, failure):
+        self.calls["merge"] += 1
+        self.merge_args.append((old_w, cur_w, new_w, list(guidance), failure))
+        if not self.merges:
+            raise RuntimeError("no scripted merge")
+        return self.merges.pop(0)
+
+    def verify(self, old_w, cur_w, new_w, result, appendix):
+        self.calls["verify"] += 1
+        return self.verdicts.pop(0) if self.verdicts else {"human_kept": True, "source_kept": True}
+
+    def classify(self, pairs):
+        self.calls["classify"] += 1
+        if self.classes is None:
+            raise RuntimeError("classification unavailable")
+        return self.classes
+
+
+class NoModel:
+    def __getattr__(self, name):
+        raise AssertionError(f"unexpected model call: {name}")
+
+
+def one(old, human, new, **kwargs):
+    pages, entries = rebase({"a.md": old}, {"a.md": human}, {"a.md": new}, **kwargs)
+    return pages["a.md"], entries
+
+
+class RebaseTest(unittest.TestCase):
+    def test_no_human_change_gives_the_new_text_and_no_source_change_gives_the_human_text(self):
+        import random
+
+        random.seed(3)
+
+        def text():
+            return "".join(f"line {random.randint(0, 9)}\n" if random.random() < 0.8 else "\n"
+                           for _ in range(random.randint(0, 12)))
+
+        for _ in range(500):
+            x = {"a.md": text(), "b.md": text()}
+            y = {name: text() if random.random() < 0.6 else body for name, body in x.items()}
+            z = {"a.md": text(), "b.md": text()}
+            self.assertEqual(rebase(x, x, z, model=NoModel())[0], z)
+            self.assertEqual(rebase(x, y, x, model=NoModel())[0], y)
+
+    def test_rule_1_and_2_human_only_and_source_only(self):
+        self.assertEqual(one(BASE, HUMAN, BASE, model=NoModel()), (HUMAN, []))
+        source = BASE.replace("AUTO", "MANUAL")
+        self.assertEqual(one(BASE, BASE, source, model=NoModel()), (source, []))
+
+    def test_rule_3_same_change_is_kept_once_without_a_note_or_model(self):
+        stats = Counter()
+        text, entries = one(BASE, HUMAN, HUMAN.replace("Unchanged.", "More."), model=NoModel(), stats=stats)
+        self.assertEqual(text.count("60°C"), 1)
+        self.assertNotIn("元文書", text)
+        self.assertEqual(entries, [])
+        self.assertEqual(stats["window1"], 1)
+
+    def test_rule_4_same_fact_differently_through_the_merge_call(self):
+        merged = {"edits": [{"find": "Maximum is 55°C.\n", "replace": "Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\n"}],
+                  "appendix": ""}
+        model = FakeModel([merged])
+        text, entries = one(BASE, HUMAN, BASE.replace("40°C", "55°C"), model=model, guidance={"a.md": ["use ##"]})
+        self.assertIn("Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\n", text)
+        self.assertIn("Mode is AUTO.", text)
+        self.assertEqual(model.calls, Counter(merge=1, verify=1))
+        self.assertEqual(model.merge_args[0][3], ["use ##"])
+        self.assertEqual(entries, [])
+
+    def test_rule_4_fallback_note_keeps_both_versions_visible(self):
+        text, _ = one(BASE, HUMAN, BASE.replace("40°C", "55°C"))
+        self.assertIn("Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\nMode is AUTO.", text)
+        long = "Maximum is 55°C. " + "x" * 220
+        text, _ = one(BASE, HUMAN, BASE.replace("Maximum is 40°C.", long))
+        self.assertIn("Maximum is 60°C.\n\n> **元文書の更新:**\n> " + long + "\n", text)
+
+    def test_rule_5_different_facts_coexist(self):
+        text, _ = one(BASE, HUMAN, BASE.replace("AUTO", "MANUAL"), model=NoModel())
+        self.assertIn("60°C", text)
+        self.assertIn("MANUAL", text)
+
+    def test_exact_match_is_line_aligned_and_needs_uniqueness_in_old_and_new(self):
+        old = "# T\n\nA\nOK\n\nB\nOK\n\nC\n"
+        human = old.replace("A\nOK\n", "A\nOK (checked)\n")  # "OK" occurs twice: no exact match
+        stats = Counter()
+        text, _ = one(old, human, old.replace("C\n", "C2\n"), model=NoModel(), stats=stats)
+        self.assertEqual(text, human.replace("C\n", "C2\n"))
+        self.assertEqual(stats["exact"], 0)
+        self.assertEqual(stats["window3"] + stats["window2"], 1)
+        # A unique line that is also a substring of another line must not be matched inside it.
+        old = "x\nfoo\nfoo bar\ny\n"
+        text, _ = one(old, "x\nFOO\nfoo bar\ny\n", "x\nfoo\nfoo bar\ny\nz\n", model=NoModel())
+        self.assertEqual(text, "x\nFOO\nfoo bar\ny\nz\n")
+
+    def test_human_change_follows_a_section_the_source_moves_or_reorders(self):
+        old = {"a.md": "# A\n\n## One\n\nalpha 1\n\n## Two\n\nbeta 2\n", "b.md": "# B\n\nbravo\n"}
+        human = {"a.md": old["a.md"].replace("beta 2", "beta 20")}
+        reordered = {"a.md": "# A\n\n## Two\n\nbeta 2\n\n## One\n\nalpha 1\n", "b.md": old["b.md"]}
+        pages, entries = rebase(old, human, reordered, model=NoModel())
+        self.assertEqual(pages["a.md"], reordered["a.md"].replace("beta 2", "beta 20"))
+        moved = {"a.md": "# A\n\n## One\n\nalpha 1\n", "b.md": "# B\n\nbravo\n\n## Two\n\nbeta 2\n"}
+        pages, entries = rebase(old, human, moved, model=NoModel())
+        self.assertEqual(pages["b.md"], "# B\n\nbravo\n\n## Two\n\nbeta 20\n")
+        self.assertEqual(entries, [])
+
+    def test_a_section_added_mid_page_a_renamed_heading_and_reordering_keep_their_place(self):
+        human = BASE.replace("## Other", "## Notes\n\nHuman note 77.\n\n## Other")
+        human = human.replace("## Limits", "## Operating limits")
+        self.assertEqual(one(BASE, human, BASE, model=NoModel())[0], human)
+        self.assertEqual(one(BASE, human, BASE.replace("Unchanged.", "Source v2."), model=NoModel())[0],
+                         human.replace("Unchanged.", "Source v2."))
+
+    def test_source_deletes_a_changed_section_or_page_into_the_appendix_once(self):
+        stats = Counter()
+        pages, entries = rebase({"001.md": BASE, "002.md": "# Two\n\ntwo\n"}, {"001.md": HUMAN},
+                                {"001.md": BASE.split("## Limits")[0], "002.md": "# Two\n\ntwo\n"}, model=NoModel(), stats=stats)
+        self.assertNotIn("60°C", pages["001.md"])
+        self.assertEqual(len(entries), 1)
+        self.assertIn("Maximum is 60°C.", entries[0])
+        self.assertNotIn("Mode is AUTO", entries[0])
+        self.assertIn("## Limits", entries[0])
+        self.assertIn("元ページ: 001.md", entries[0])
+        self.assertEqual(stats["window4"], 1)
+        # A whole page that disappears.
+        pages, entries = rebase({"001.md": BASE}, {"001.md": HUMAN}, {"002.md": "# New\n"}, model=NoModel())
+        self.assertEqual(pages, {"002.md": "# New\n"})
+        self.assertEqual(len(entries), 1)
+        self.assertIn("Maximum is 60°C.", entries[0])
+
+    def test_both_sides_delete_the_same_text(self):
+        human = BASE.replace("Mode is AUTO.\n", "")
+        text, entries = one(BASE, human, human, model=NoModel())
+        self.assertEqual((text, entries), (human, []))
+        # The human deleted text the source no longer has anywhere: nothing to keep.
+        pages, entries = rebase({"a.md": BASE}, {"a.md": human}, {"a.md": "# Other\n\nx\n"}, model=NoModel())
+        self.assertEqual(entries, [])
+        self.assertNotIn("AUTO", pages["a.md"])
+
+    def test_human_deletion_stays_deleted_and_the_new_source_value_becomes_a_note(self):
+        human = BASE.replace("Maximum is 40°C.\n", "")
+        text, _ = one(BASE, human, BASE.replace("40°C", "55°C"))
+        self.assertEqual(text, BASE.replace("Maximum is 40°C.\n", "（元文書の更新: Maximum is 55°C.）\n"))
+
+    def test_merge_output_is_checked_before_it_is_accepted(self):
+        source = BASE.replace("40°C", "55°C")
+        good_edit = {"find": "Maximum is 55°C.\n", "replace": "Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\n"}
+        cases = {
+            "drops a human number": {"edits": [{"find": "Maximum is 55°C.\n", "replace": "Maximum is high.\n"}], "appendix": ""},
+            "find is missing": {"edits": [{"find": "no such text", "replace": "x"}], "appendix": ""},
+            "find is not unique": {"edits": [{"find": "°C", "replace": "K"}], "appendix": ""},
+            "empty find": {"edits": [{"find": "", "replace": "x"}], "appendix": ""},
+            "edits overlap": {"edits": [{"find": "Maximum is 55°C.", "replace": "60"}, {"find": "55°C.\nMode", "replace": "60"}], "appendix": ""},
+        }
+        for name, bad in cases.items():
+            with self.subTest(name):
+                model = FakeModel([bad, good_edit and {"edits": [good_edit], "appendix": ""}])
+                text, _ = one(BASE, HUMAN, source, model=model)
+                self.assertIn("Maximum is 60°C.\n（元文書の更新", text)
+                self.assertEqual(model.calls["merge"], 2)
+                self.assertIn(" ", model.merge_args[1][4])  # the second attempt is told why
+        stats = Counter()
+        model = FakeModel([{"edits": [good_edit], "appendix": ""}] * 2, [{"human_kept": False, "source_kept": True}] * 2)
+        text, _ = one(BASE, HUMAN, source, model=model, stats=stats)
+        self.assertEqual((model.calls["merge"], model.calls["verify"]), (2, 2))
+        self.assertEqual(stats["fallback"], 1)
+        self.assertIn("Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\nMode is AUTO.", text)
+        model = FakeModel([{"edits": [good_edit], "appendix": ""}] * 2, [{"human_kept": True, "source_kept": False}, {"human_kept": True, "source_kept": True}])
+        one(BASE, HUMAN, source, model=model)
+        self.assertEqual(model.calls["merge"], 2)
+
+    def test_merge_can_send_the_human_text_to_the_appendix(self):
+        source = "# Page\n\nRewritten completely.\n"
+        model = FakeModel([{"edits": [], "appendix": "Maximum is 60°C.\n"}])
+        text, entries = one(BASE, HUMAN, source, model=model)
+        self.assertEqual(text, source)
+        self.assertEqual(len(entries), 1)
+        self.assertIn("Maximum is 60°C.", entries[0])
+
+    def test_an_input_over_the_size_limit_takes_the_fallback_without_a_call(self):
+        big = " " + "x" * 31000
+        model = FakeModel()
+        text, _ = one(BASE, HUMAN.replace("60°C.", "60°C." + big), BASE.replace("40°C.", "55°C." + big), model=model)
+        self.assertEqual(sum(model.calls.values()), 0)
+        self.assertIn("元文書の更新", text)
+        self.assertIn("60°C.", text)
+
+    def test_classification_only_collects_structure_instructions(self):
+        model = FakeModel(classes=[{"kind": "structure", "instruction": "Use ## for steps"},
+                                   {"kind": "content", "instruction": "ignored"}])
+        self.assertEqual(classify(model, [("a", "b"), ("c", "d")]), ["Use ## for steps"])
+        self.assertEqual(classify(FakeModel(), [("a", "b")]), [])
+        self.assertEqual(classify(None, [("a", "b")]), [])
+
+
+class AdapterTest(unittest.TestCase):
+    """LlmHumanModel on a fake chat port: structured results arrive as instances or dicts."""
+
+    def adapter(self, answer):
+        from publisher.human_changes import LlmHumanModel
+
+        seen = []
+
+        class Port:
+            async def structured(self, schema, messages, **kwargs):
+                seen.append((schema.__name__, kwargs, [m.content for m in messages]))
+                return answer(schema)
+
+        model = LlmHumanModel(SimpleNamespace(), SimpleNamespace(metadata=Path("/nonexistent")))
+        model._port = Port()
+        return model, seen
+
+    def test_calls_return_plain_dicts_and_keep_page_text_in_data_messages(self):
+        from publisher import human_changes as hc
+
+        model, seen = self.adapter(lambda schema: schema.model_validate(
+            {"items": [{"kind": "structure", "instruction": "tidy"}]} if schema is hc._Classes else
+            {"edits": [{"find": "a", "replace": "b"}], "appendix": ""} if schema is hc._Merged else
+            {"human_kept": True, "source_kept": False}))
+        self.assertEqual(model.classify([("B text", "A text")]), [{"kind": "structure", "instruction": "tidy"}])
+        self.assertEqual(model.merge("o", "h", "n", ["g"], "why")["edits"], [{"find": "a", "replace": "b"}])
+        self.assertEqual(model.verify("o", "h", "n", "r", ""), {"human_kept": True, "source_kept": False})
+        self.assertEqual([name for name, _kw, _m in seen], ["_Classes", "_Merged", "_Verdict"])
+        self.assertTrue(all(kw["temperature"] == 0.0 and "thinking" not in kw for _n, kw, _m in seen))
+        self.assertIn("B text", seen[0][2][1])
+        self.assertNotIn("B text", seen[0][2][0])  # page text is only in the delimited data message
+        self.assertTrue(seen[0][2][1].startswith("<DATA>"))
+
+    def test_a_dict_answer_is_validated_and_a_bad_one_falls_back_in_rebase(self):
+        model, _seen = self.adapter(lambda schema: {"edits": "not a list"} if schema.__name__ == "_Merged" else {})
+        text, _ = one(BASE, HUMAN, BASE.replace("40°C", "55°C"), model=model)
+        self.assertIn("（元文書の更新: Maximum is 55°C.）", text)  # both attempts rejected: the note
+
+
+class StoreCase(unittest.TestCase):
+    """A document with a project, as the writer leaves it after an export."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -33,479 +280,349 @@ class HumanChangesTest(unittest.TestCase):
         self.project.raw_file(self.rel).write_text("source\n", encoding="utf-8")
         writer.write_source_stamp(self.folder, self.project.raw_file(self.rel), self.rel, identity_seed="source-1")
         write_json_atomic(self.folder / "_planning" / "linker.json", {"status": "complete"})
-        self.path = "doc/001.md"
         self.store = HumanStore(self.project)
-        self.store.generated(self.rel, {"001.md": BASE})
-        self.store.render(self.rel)
-        self.row = {"marker_id": "b1", "page_id": "p1", "growi_path": "/docs/doc/001", "revision_id": "r0"}
-        self.store.remember_page(self.path, self.row, BASE, BASE, published=True)
+        self.model = None
+        self.generate({"001.md": BASE})
 
-    def capture(self, human=HUMAN, before=BASE, revision="r1"):
-        self.row["observed_revision_id"] = revision
-        self.store.capture(self.rel, self.path, self.row, before, human)
-        return self.store.render(self.rel)
+    def generate(self, pages):
+        """What the writer does: rebuild the folder from the new pages, then apply_generated."""
+        for page in self.folder.glob("*.md"):
+            page.unlink()
+        shutil.rmtree(self.folder / "_planning" / "pages", ignore_errors=True)
+        for name, text in pages.items():
+            write_text_atomic(self.folder / name, text)
+        return apply_generated(self.project, self.rel, model=self.model)
+
+    def pull(self, human, *, base=None, page="001.md", revision="r1"):
+        base = self.text(page) if base is None else base
+        return self.store.accept(self.rel, f"doc/{page}", "b1", revision, base, human, model=self.model)
 
     def text(self, name="001.md"):
         return (self.folder / name).read_text(encoding="utf-8")
 
-    def update(self, pages):
-        self.store.generated(self.rel, pages)
-        return self.store.render(self.rel)
+    def current(self, name="001.md"):
+        return (self.store._dir(self.rel) / "current" / name).read_text(encoding="utf-8")
 
-    def active(self):
-        return [e for e in self.store.document(self.rel)["edits"] if e["status"] != "deleted"]
+    def names(self):
+        return sorted(p.name for p in self.folder.glob("*.md"))
 
-    def test_human_edit_survives_four_updates_and_restart_without_duplicates(self):
-        self.capture()
+
+class StateTest(StoreCase):
+    def test_no_state_is_written_until_the_first_human_edit(self):
+        self.assertFalse((self.store.root / "doc").exists())
+        self.assertEqual((self.folder / "_planning" / "pages" / "001.md").read_text(encoding="utf-8"), BASE)
+        self.pull(HUMAN)
+        directory = self.store._dir(self.rel)
+        self.assertEqual((directory / "pure" / "001.md").read_text(encoding="utf-8"), BASE)
+        self.assertEqual(self.current(), HUMAN)
+        self.assertEqual(self.text(), HUMAN)
+        self.assertEqual((self.folder / "_planning" / "pages" / "001.md").read_text(encoding="utf-8"), HUMAN)
+        doc = read_json(directory / "doc.json")
+        self.assertEqual((doc["raw_rel"], doc["appendix"], doc["guidance"]), (self.rel, None, {}))
+        record = read_json(next((directory / "captures").glob("*.json")))
+        self.assertEqual((record["page"], record["revision"]), ("001.md", "r1"))
+        self.assertEqual(self.store.get(record["human_blob"]), HUMAN)
+        self.store.audit()
+
+    def test_human_change_survives_four_source_updates_and_a_restart(self):
+        self.pull(HUMAN)
         for number in range(4):
-            self.update({"001.md": BASE.replace("Unchanged.", f"Source version {number}.")})
+            self.generate({"001.md": BASE.replace("Unchanged.", f"Source version {number}.")})
             self.store = HumanStore(self.project)
             self.assertEqual(self.text().count("60°C"), 1)
-            self.assertNotIn("60°C", self.store.get(self.store.document(self.rel)["pages"]["001.md"]["body_blob"]))
-        self.assertFalse(self.store.render(self.rel).changed_pages)
+            self.assertIn(f"Source version {number}.", self.text())
+        self.assertEqual(self.store.status()["counts"]["human_information"], 1)
 
-    def test_different_lines_and_different_tokens_in_same_line_merge(self):
-        self.capture()
-        result = self.update({"001.md": BASE.replace("AUTO", "MANUAL")})
-        self.assertFalse(result.conflicts)
+    def test_full_regeneration_keeps_every_human_change(self):
+        self.pull(HUMAN.replace("Intro.", "Intro by a human."))
+        self.generate({"001.md": "# Page\n\nIntro.\n\n## Limits\n\nMaximum is 40°C.\nMode is AUTO.\n\n## Other\n\nAll new words.\n"})
         self.assertIn("60°C", self.text())
-        self.assertIn("MANUAL", self.text())
-        self.assertEqual(merge("Limit 40°C; mode AUTO.\n", "Limit 60°C; mode AUTO.\n", "Limit 40°C; mode MANUAL.\n"),
-                         ("Limit 60°C; mode MANUAL.\n", "active"))
+        self.assertIn("Intro by a human.", self.text())
+        self.assertIn("All new words.", self.text())
 
-    def test_same_information_conflicts_and_both_versions_survive(self):
-        self.capture()
-        result = self.update({"001.md": BASE.replace("40°C", "55°C")})
-        self.assertEqual(len(result.conflicts), 1)
-        self.assertLess(self.text().index("60°C"), self.text().index("55°C"))
-        self.assertIn("Updated source document says:", self.text())
-        self.assertIn(result.conflicts[0], self.text(DASHBOARD))
-        self.assertNotIn("60°C", self.text(DASHBOARD))
+    def test_pull_while_the_local_generation_is_newer_than_the_published_one(self):
+        newer = BASE.replace("Unchanged.", "Newer source.")
+        self.generate({"001.md": newer})  # a build whose publication failed
+        self.pull(HUMAN, base=BASE)  # the remote edit sits on the older published page
+        self.assertEqual(self.text(), newer.replace("40°C", "60°C"))
 
-    def test_same_change_is_absorbed_and_reactivates_after_source_regresses(self):
-        self.capture()
-        self.update({"001.md": HUMAN.replace("Unchanged.", "Source also changed here.")})
-        self.assertEqual(self.active()[0]["status"], "absorbed")
-        self.assertEqual(self.text().count("60°C"), 1)
-        self.update({"001.md": BASE})
-        self.assertEqual(self.active()[0]["status"], "active")
-        self.assertIn("60°C", self.text())
-
-    def test_block_moves_to_another_page(self):
-        self.capture()
-        self.update({"002.md": BASE.replace("# Page", "# Moved")})
-        self.assertIn("60°C", self.text("002.md"))
-        self.assertFalse((self.folder / RETAINED).exists())
-
-    def test_disappeared_block_retained_then_restored(self):
-        self.capture()
-        self.update({"001.md": "# New page\n\nNew subject.\n"})
-        self.assertIn("60°C", self.text(RETAINED))
-        self.assertEqual(self.active()[0]["status"], "orphaned")
-        self.update({"001.md": BASE})
-        self.assertIn("60°C", self.text())
-        self.assertFalse((self.folder / RETAINED).exists())
-
-    def test_retained_notes_never_overwrite_a_source_page_with_the_same_name(self):
-        self.capture()
-        source_page = "# Source page\n\nSource fact E-555.\n"
-        self.update({RETAINED: source_page})
-        self.assertEqual(self.text(RETAINED), source_page)
-        retained_name = self.store.document(self.rel)["retained_filename"]
-        self.assertNotEqual(retained_name, RETAINED)
-        self.assertIn("60°C", self.text(retained_name))
-
-    def test_human_deletion_from_retained_notes_tombstones_original_edit(self):
-        from publisher.human_changes import _REGION
-        self.capture()
-        self.update({"001.md": "# New page\n\nNew subject.\n"})
-        before = self.text(RETAINED)
-        row = {"marker_id": "bnotes", "revision_id": "r1", "observed_revision_id": "r2"}
-        self.store.capture(self.rel, "doc/" + RETAINED, row, before, _REGION.sub("", before))
-        self.store.render(self.rel)
-        self.assertFalse(self.active())
-        self.assertFalse((self.folder / RETAINED).exists())
-        self.update({"001.md": BASE})
-        self.assertNotIn("60°C", self.text())
-
-    def test_editing_retained_note_keeps_original_anchor_for_later_restoration(self):
-        self.capture()
-        self.update({"001.md": "# New page\n\nNew subject.\n"})
-        before = self.text(RETAINED)
-        row = {"marker_id": "bnotes", "revision_id": "r1", "observed_revision_id": "r2"}
-        self.store.capture(self.rel, "doc/" + RETAINED, row, before, before.replace("60°C", "65°C"))
-        self.store.render(self.rel)
-        self.assertEqual(self.text(RETAINED).count("65°C"), 1)
-        self.update({"001.md": BASE})
-        self.assertIn("65°C", self.text())
-        self.assertNotIn("60°C", self.text())
-
-    def test_new_section_stays_on_its_page(self):
-        self.capture(BASE + "\n## Operator notes\n\nHuman warning E-901.\n")
-        self.assertIn("Human warning E-901.", self.text())
-        for number in range(4):
-            self.update({"001.md": BASE.replace("Unchanged.", str(number))})
-            self.assertEqual(self.text().count("Human warning E-901."), 1)
-
-    def test_human_deletes_own_replacement_and_it_does_not_return(self):
-        self.capture()
-        before = self.text()
-        self.row["revision_id"] = "r1"
-        self.capture(BASE, before, "r2")
-        self.assertFalse(self.active())
-        self.update({"001.md": BASE.replace("Unchanged.", "Later")})
-        self.assertNotIn("60°C", self.text())
-        self.assertTrue(any(e.get("deleted_from_revision") == "r2" for e in self.store.document(self.rel)["edits"]))
-
-    def test_generated_fact_deletion_is_durable_suppression(self):
-        self.capture(BASE.replace("Mode is AUTO.\n", ""))
-        self.assertNotIn("Mode is AUTO.", self.text())
-        self.update({"001.md": BASE.replace("Unchanged.", "Later")})
-        self.assertNotIn("Mode is AUTO.", self.text())
-
-    def test_changed_existing_human_region_supersedes_without_duplicate(self):
-        self.capture()
-        before = self.text()
-        self.row["revision_id"] = "r1"
-        self.capture(before.replace("60°C", "65°C"), before, "r2")
-        self.update({"001.md": BASE.replace("AUTO", "MANUAL")})
-        self.assertEqual(self.text().count("65°C"), 1)
-        self.assertNotIn("60°C", self.text())
-        self.assertEqual(len(self.active()), 1)
-
-    def test_repeated_remote_revision_is_idempotent(self):
-        self.capture()
-        self.capture()
-        self.assertEqual(len(self.store.document(self.rel)["edits"]), 1)
-
-    def test_keep_human_resolution_and_accept_source_tombstone(self):
-        self.capture()
+    def test_rule_4_conflict_is_a_note_and_repeating_the_same_source_adds_none(self):
+        self.pull(HUMAN)
         source = BASE.replace("40°C", "55°C")
-        self.update({"001.md": source})
-        before = self.text()
-        edit_id = self.active()[0]["edit_id"]
-        from publisher.human_changes import _SOURCE
-        remote = _SOURCE.sub("", before)
-        self.row["revision_id"] = "r1"
-        self.capture(remote, before, "r2")
-        self.assertIn("60°C", self.text())
-        self.assertNotIn("55°C", self.text())
-        self.update({"001.md": BASE.replace("40°C", "50°C")})
-        self.assertIn("Updated source document says:", self.text())
-        before = self.text()
-        remote = before.replace(regions(before)[edit_id], self.store.get(self.active()[0]["conflict"]["source_blob"]))
-        self.row["revision_id"] = "r2"
-        self.capture(remote, before, "r3")
-        self.assertNotIn("60°C", self.text())
-        self.assertFalse(self.active())
+        self.generate({"001.md": source})
+        self.assertIn("Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\n", self.text())
+        self.generate({"001.md": source})
+        self.assertEqual(self.text().count("元文書の更新"), 1)
 
-    def test_accepting_the_quoted_source_does_not_suppress_it(self):
-        from publisher.human_changes import _SOURCE
-        self.capture()
-        self.update({"001.md": BASE.replace("40°C", "55°C")})
-        before = self.text()
-        edit_id = self.active()[0]["edit_id"]
-        region = regions(before)[edit_id]
-        source_only = _SOURCE.search(region).group(0).lstrip("\n")
-        remote = before.replace(region, source_only)
-        row = dict(self.row, revision_id="r1", observed_revision_id="r2")
-        self.store.capture(self.rel, self.path, row, before, remote)
-        self.store.render(self.rel)
+    def test_a_human_who_deletes_the_note_keeps_their_value_and_it_does_not_return(self):
+        self.pull(HUMAN)
+        source = BASE.replace("40°C", "55°C")
+        self.generate({"001.md": source})
+        self.pull(self.text().replace("（元文書の更新: Maximum is 55°C.）\n", ""), revision="r2")
+        self.assertNotIn("元文書", self.text())
+        self.generate({"001.md": source.replace("Unchanged.", "Next.")})
+        self.assertNotIn("元文書", self.text())
+        self.assertIn("60°C", self.text())
+
+    def test_human_revert_follows_the_source_again_and_rule_2_applies_after_catching_up(self):
+        self.pull(HUMAN)
+        self.pull(BASE, revision="r2")
+        self.generate({"001.md": BASE.replace("40°C", "55°C")})
         self.assertIn("55°C", self.text())
         self.assertNotIn("60°C", self.text())
-        self.assertFalse(self.active())
+        self.assertFalse(self.store.status()["counts"]["human_information"])
+        # The source catches up to a human change, then changes the fact again.
+        self.pull(HUMAN.replace("60", "65"), revision="r3")
+        self.generate({"001.md": BASE.replace("40°C", "65°C")})
+        self.assertEqual(self.text().count("65°C"), 1)
+        self.assertNotIn("元文書", self.text())
+        self.generate({"001.md": BASE.replace("40°C", "70°C")})
+        self.assertIn("70°C", self.text())
+        self.assertNotIn("65°C", self.text().replace("（元文書の更新", ""))
 
-    def test_corrupt_or_missing_blob_fails_closed(self):
-        self.capture()
-        digest = self.active()[0]["human_after_blob"]
-        (self.store.root / "snapshots" / f"{digest}.md").write_text("corrupted", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "checksum"):
-            self.store.render(self.rel)
+    def test_a_page_the_human_emptied_stays_blank_unpublished_and_deleted(self):
+        self.generate({"001.md": BASE, "002.md": "# Two\n\ntwo\n"})
+        self.pull("", page="002.md")
+        self.assertEqual(self.current("002.md"), "")
+        self.assertEqual(self.names(), ["001.md"])
+        self.assertFalse((self.folder / "_planning" / "pages" / "002.md").exists())
+        self.generate({"001.md": BASE, "002.md": "# Two\n\ntwo\n"})
+        self.assertEqual(self.names(), ["001.md"])
+        self.assertEqual(self.current("002.md"), "")
+        self.assertFalse(self.store.status()["counts"]["human_information"])
 
-    def test_table_and_code_are_atomic(self):
-        for body, human, source in [
-            ("| x | y |\n| - | - |\n| A | 1 |\n| B | 2 |\n", "A | 3", "B | 4"),
-            ("```c\n#define A 1\n#define B 2\n```\n", "A 3", "B 4"),
-        ]:
-            h = body.replace("A | 1", human).replace("A 1", human)
-            g = body.replace("B | 2", source).replace("B 2", source)
-            text, status = merge(body, h, g)
-            self.assertEqual((text, status), (h, "conflict"))
+    def test_the_source_deletes_a_changed_part_into_the_appendix_and_repeat_runs_add_nothing(self):
+        self.generate({"001.md": BASE, "002.md": "# Two\n\ntwo\n", "003.md": "# Three\n\nthree\n"})
+        self.pull(HUMAN)
+        shrunk = {"001.md": BASE.split("## Limits")[0], "002.md": "# Two\n\ntwo\n", "003.md": "# Three\n\nthree\n"}
+        self.generate(shrunk)
+        self.assertEqual(self.names(), ["001.md", "002.md", "003.md", "004-付録.md"])
+        appendix = self.text("004-付録.md")
+        self.assertTrue(appendix.startswith("# 付録\n\n"))
+        self.assertEqual(appendix.count("Maximum is 60°C."), 1)
+        self.assertNotIn("Mode is AUTO", appendix)
+        for _ in range(2):
+            self.generate(shrunk)
+        self.assertEqual(self.text("004-付録.md"), appendix)
+        # The source restores the part: it appears normally and the entry stays.
+        self.generate({"001.md": BASE, "002.md": "# Two\n\ntwo\n", "003.md": "# Three\n\nthree\n"})
+        self.assertIn("Maximum is 40°C.", self.text("001.md"))
+        self.assertEqual(self.text("004-付録.md").count("Maximum is 60°C."), 1)
 
-    def test_sign_and_number_changes_conflict_instead_of_inventing_a_value(self):
-        self.assertEqual(merge("40°C\n", "-40°C\n", "45°C\n"), ("-40°C\n", "conflict"))
+    def test_the_appendix_is_renamed_to_stay_last_and_human_edits_to_it_are_kept(self):
+        self.generate({"001.md": BASE, "002.md": "# Two\n\ntwo\n"})
+        self.pull(HUMAN)
+        self.generate({"001.md": "# Page\n\nIntro.\n", "002.md": "# Two\n\ntwo\n"})
+        self.assertIn("003-付録.md", self.names())
+        doc = read_json(self.store._dir(self.rel) / "doc.json")
+        self.assertEqual(doc["appendix"], "003-付録.md")
+        self.generate({"001.md": "# Page\n\nIntro.\n", "002.md": "# Two\n\ntwo\n", "003.md": "# Three\n\nthree\n"})
+        self.assertEqual(self.names(), ["001.md", "002.md", "003.md", "004-付録.md"])
+        self.assertEqual(self.text("004-付録.md").count("Maximum is 60°C."), 1)
+        self.assertEqual(read_json(self.store._dir(self.rel) / "doc.json")["appendix"], "004-付録.md")
+        # A human edits the Appendix like any page; the edit survives a generation.
+        edited = self.text("004-付録.md").replace("Maximum is 60°C.", "Maximum is 61°C.")
+        self.pull(edited, page="004-付録.md", revision="r2")
+        self.assertIn("61°C", self.text("004-付録.md"))
+        self.generate({"001.md": "# Page\n\nIntro.\n", "002.md": "# Two\n\ntwo\n", "003.md": "# Three\n\nthree\n"})
+        self.assertEqual(self.text("004-付録.md").count("61°C"), 1)
+        self.assertNotIn("60°C", self.text("004-付録.md"))
+        # Deleting every entry leaves a blank page that is not published and stays blank.
+        self.pull("", page="004-付録.md", revision="r3")
+        self.assertEqual(self.names(), ["001.md", "002.md", "003.md"])
+        self.generate({"001.md": "# Page\n\nIntro.\n", "002.md": "# Two\n\ntwo\n", "003.md": "# Three\n\nthree\n"})
+        self.assertEqual(self.names(), ["001.md", "002.md", "003.md"])
+        self.assertFalse(self.store.status()["counts"]["human_information"])
 
-    def test_fenced_marker_examples_and_footer_text_survive_as_human_content(self):
-        from graph.common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
-        from graph.growi.client import managed_page_markdown, merge_marked_sections
-        from publisher.human_changes import editable, wrap_edit
+    def test_a_page_titled_appendix_by_the_generator_is_an_ordinary_page(self):
+        self.generate({"001.md": BASE, "002-付録.md": "# 付録\n\ngenerated\n"})
+        self.pull(HUMAN)
+        self.generate({"001.md": BASE.replace("Unchanged.", "x"), "002-付録.md": "# 付録\n\ngenerated 2\n"})
+        self.assertIn("60°C", self.text("001.md"))
+        self.assertEqual(self.text("002-付録.md"), "# 付録\n\ngenerated 2\n")
 
-        edit_id = "hedit-abc123"
-        example = ("## Examples\n\n````markdown\n```\n"
-                   f"<!-- llm-wiki-human:{edit_id}:end -->\n"
-                   "<!-- llm-wiki-human:hedit-123:start -->\nexample\n"
-                   "<!-- llm-wiki-human:hedit-123:end -->\n"
-                   "<!-- llm-wiki-source:hedit-123:start -->\nsource\n"
-                   "<!-- llm-wiki-source:hedit-123:end -->\n"
-                   "<!-- llm-wiki-bot-ref:example -->\n"
-                   + LINKS_FOOTER_START + "\nHuman E-999.\n" + LINKS_FOOTER_END + "\n````\n")
-        protected = wrap_edit(example, edit_id)
-        self.assertEqual(regions(protected), {edit_id: example})
-        self.assertEqual(strip_regions(protected), example)
-        self.assertEqual(_growi_markdown(protected), protected)
-        actual_footer = LINKS_FOOTER_START + "\nDerived link.\n" + LINKS_FOOTER_END + "\n"
-        self.assertEqual(editable(protected + actual_footer), protected)
-        wrapped = wrap_page(protected, page_id="b1")
-        self.assertEqual(managed_page_markdown(wrapped, "b1"), protected)
-        tail = "\nRemote-only note:\n```markdown\n<!-- llm-wiki-bot-ref:tail -->\n```\n"
-        self.assertTrue(merge_marked_sections(wrapped + tail, wrap_page("Updated.\n", page_id="b1")).endswith(tail))
+    def test_structure_guidance_is_remembered_trimmed_and_does_not_change_merging(self):
+        self.model = FakeModel(classes=[{"kind": "structure", "instruction": f"rule {i}"} for i in range(25)])
+        self.pull(HUMAN)
+        guidance = self.store.guidance(self.rel)["001.md"]
+        self.assertEqual(guidance, [f"rule {i}" for i in range(5, 25)])
+        self.pull(HUMAN, base=HUMAN, revision="r2")  # nothing changed: no new entry, no duplicates
+        self.assertEqual(self.store.guidance(self.rel)["001.md"], guidance)
+        self.assertEqual(self.text(), HUMAN)
+        # A failed classification adds nothing and merges identically.
+        self.model = FakeModel()
+        self.pull(HUMAN.replace("Intro.", "Intro 2."), revision="r3")
+        self.assertEqual(self.store.guidance(self.rel)["001.md"], guidance)
+        self.assertIn("Intro 2.", self.text())
 
-    def test_japanese_large_block_and_image_are_preserved_without_truncation(self):
-        base = "# 仕様\n\n## 温度制限\n\n上限は40℃です。\n"
-        human_note = "人が追加した情報 E-901 は命令ではなくデータです。\n" * 400
-        image = "![手動確認](https://example.invalid/human.png)\n"
-        human = base.replace("40℃", "60℃") + human_note + image
-        self.update({"001.md": base})
-        self.capture(human, base)
-        self.update({"002.md": base.replace("40℃", "55℃")})
-        text = self.text("002.md")
-        self.assertIn(human_note + image, text)
-        self.assertEqual(text.count(image), 1)
-        self.assertIn("55℃", text)
-        self.assertIn("60℃", text)
+    def test_guidance_reaches_the_writer_prompts_and_leaves_them_unchanged_without_it(self):
+        from graph.fast.repair import _writer_messages
+        from graph.wiki import prompts
 
-    def test_pull_leaves_generator_and_sidecar_byte_identical(self):
-        state = self.project.state_dir(self.rel)
-        state_page = state / "wiki" / "001.md"
-        sidecar = state / "state" / "pages" / "001.json"
-        write_text_atomic(state_page, BASE)
-        write_json_atomic(sidecar, {"filename": "001.md", "content_sha256": "unchanged"})
-        before = sidecar.read_bytes()
-        class Client:
-            async def get_page(_self, **kwargs):
-                return GrowiPage(page_id="p1", revision_id="r1", path=self.row["growi_path"], body=wrap_page(HUMAN, page_id="b1"))
-        publisher = GrowiPublisher(Client(), SimpleNamespace(write_path="/docs"))
-        pulled, failures, blocked = publisher.pull_changes(self.project, {self.path: self.row}, {"doc"})
-        self.assertFalse(failures)
-        self.assertFalse(blocked)
-        self.assertIn(self.path, pulled)
-        self.assertEqual(state_page.read_text(), BASE)
-        self.assertEqual(sidecar.read_bytes(), before)
-        self.assertIn("60°C", self.text())
+        args = dict(page_title="T", page_summary="S", index=1, count=1, source_start=1, source_end=2,
+                    numbered_section="1: x", facts_text="", image_context="", output_language="日本語")
+        plain = prompts.section_write_prompt(**args).render()
+        with_guidance = prompts.section_write_prompt(**args, guidance=["Use ## for steps"]).render()
+        self.assertEqual(prompts.section_write_prompt(**args, guidance=()).render(), plain)
+        self.assertIn("Use ## for steps", with_guidance)
+        self.assertNotIn("Use ## for steps", plain)
+        intro = dict(page_title="T", page_summary="S", body="b", output_language="日本語")
+        self.assertIn("Use ## for steps", prompts.intro_prompt(**intro, guidance=["Use ## for steps"]).render())
+        self.assertEqual(prompts.intro_prompt(**intro).render(), prompts.intro_prompt(**intro, guidance=()).render())
+        edit = dict(page_title="T", current_page="p", current_source="s", edits="e", image_context="", output_language="日本語")
+        self.assertIn("Use ## for steps", prompts.incremental_page_edit_prompt(**edit, guidance=["Use ## for steps"]).render())
+        self.assertEqual(prompts.incremental_page_edit_prompt(**edit).render(),
+                         prompts.incremental_page_edit_prompt(**edit, guidance=()).render())
+        page = SimpleNamespace(images=[], shell=SimpleNamespace(title="T"), masked_body="b", number=1, filename="001.md",
+                               owner_evidence="o", reference_evidence="r", guidance=["Use ## for steps"])
+        joined = lambda page: "".join(str(m.content) for m in _writer_messages(page, "T", "b", ["f"], attempt=1))
+        self.assertIn("Use ## for steps", joined(page))
+        page.guidance = []
+        self.assertNotIn("人間の編集者", joined(page))
 
-    def test_pull_during_resumed_generation_uses_published_pure_ancestor(self):
-        self.update({"001.md": BASE.replace("40°C", "55°C")})
-        class Client:
-            async def get_page(_self, **kwargs):
-                return GrowiPage(page_id="p1", revision_id="r1", path=self.row["growi_path"], body=wrap_page(HUMAN, page_id="b1"))
-        publisher = GrowiPublisher(Client(), SimpleNamespace(write_path="/docs"))
-        pulled, failures, blocked = publisher.pull_changes(self.project, {self.path: self.row}, set())
-        self.assertFalse(failures)
-        self.assertFalse(blocked)
-        self.assertIn(self.path, pulled)
-        self.assertIn("60°C", self.text())
-        self.assertIn("55°C", self.text())
-        self.assertEqual(self.active()[0]["status"], "conflict")
+    def test_linker_output_is_removed_and_human_links_are_kept(self):
+        linked = BASE.replace("Mode is AUTO.", "[Mode](002.md) is AUTO.")
+        human = linked.replace("Maximum is 40°C.", "Maximum is 40°C (see [spec](https://example.test/spec)).")
+        base, remote = self.store.separate(self.rel, "doc/001.md", linked, human)
+        self.assertEqual(base, BASE)
+        self.assertEqual(remote, BASE.replace("Maximum is 40°C.", "Maximum is 40°C (see [spec](https://example.test/spec))."))
+        # A link-only or transport-only revision is not a human change.
+        self.assertEqual(self.store.separate(self.rel, "doc/001.md", linked, linked.replace("[Mode](002.md)", "Mode")),
+                         (BASE, BASE))
+        self.assertEqual(self.store.separate(self.rel, "doc/001.md", BASE, BASE + "\n\n"), (BASE, BASE))
+        self.assertEqual(unlinked("a [b](c) ![i](p.png) [d](e)", {"[b](c)"}), "a b ![i](p.png) [d](e)")
 
-    def test_remote_move_delete_and_marker_damage_block_publication(self):
-        for remote, reason in [
-            (None, "remote_deleted"),
-            (GrowiPage(page_id="p1", revision_id="r0", path="/trash/docs/doc/001",
-                       body=wrap_page(BASE, page_id="b1"), status="deleted"), "remote_deleted"),
-            (GrowiPage(page_id="p1", revision_id="r0", path="/moved", body=wrap_page(BASE, page_id="b1")), "remote_moved"),
-            (GrowiPage(page_id="p1", revision_id="r1", path=self.row["growi_path"], body=HUMAN), "ownership"),
-        ]:
-            class Client:
-                async def get_page(_self, **kwargs):
-                    return remote
-            # Separate markers avoid one persistent block masking another case.
-            row = dict(self.row, marker_id="b" + reason)
-            publisher = GrowiPublisher(Client(), SimpleNamespace(write_path="/docs"))
-            pulled, failures, blocked = publisher.pull_changes(self.project, {self.path: row}, {"doc"})
-            self.assertFalse(pulled)
-            self.assertEqual(blocked, {"doc"})
-            self.assertIn(reason, failures[0])
-            self.assertEqual(self.text(), BASE)
+    def test_pull_removes_links_the_current_page_does_not_have(self):
+        linked = BASE.replace("Mode is AUTO.", "[Mode](002.md) is AUTO.")
+        write_text_atomic(self.folder / "001.md", linked)  # the linker rewrote the live page
+        human = linked.replace("Maximum is 40°C.", "Maximum is 60°C.")
+        base, remote = self.store.separate(self.rel, "doc/001.md", linked, human)
+        self.store.accept(self.rel, "doc/001.md", "b1", "r1", base, remote)
+        self.assertEqual(self.current(), HUMAN)
+        self.assertEqual(self.text(), HUMAN)
+        self.assertEqual(read_json(self.folder / "_planning" / "linker.json")["status"], "pending")
 
-    def test_rollback_rebases_captured_human_journal_onto_old_source(self):
-        staged = Project(Path(self.tmp.name) / "candidate").ensure()
-        shutil.copytree(self.project.wiki, staged.wiki, dirs_exist_ok=True)
-        shutil.copytree(self.project.raw, staged.raw, dirs_exist_ok=True)
-        shutil.copytree(self.project.metadata / "human-sync", staged.metadata / "human-sync")
-        store = HumanStore(staged)
-        row = dict(self.row, observed_revision_id="r1")
-        store.capture(self.rel, self.path, row, BASE, HUMAN)
-        store.generated(self.rel, {"001.md": BASE.replace("40°C", "55°C")})
-        store.render(self.rel)
-        self.store.import_captured(staged, [self.rel])
-        self.assertIn("60°C", self.text())
-        self.assertNotIn("55°C", self.text())
-        self.assertNotIn("60°C", self.store.get(self.store.document(self.rel)["pages"]["001.md"]["body_blob"]))
+    def test_the_inline_link_manifest_loses_the_rows_of_rewritten_pages(self):
+        self.generate({"001.md": BASE, "002.md": "# Two\n\ntwo\n"})
+        manifest = self.project.metadata / "cache" / "fast-inline-links" / "manifest.json"
+        write_json_atomic(manifest, {"pages": {"doc/001.md": {"edits": []}, "doc/002.md": {"edits": []}, "other/001.md": {"edits": []}}})
+        self.pull(HUMAN)
+        self.assertEqual(sorted(read_json(manifest)["pages"]), ["doc/002.md", "other/001.md"])
+        self.generate({"001.md": HUMAN, "002.md": "# Two\n\ntwo\n"})
+        self.assertEqual(sorted(read_json(manifest)["pages"]), ["other/001.md"])
 
-    def test_human_region_survives_remote_formatting_exactly(self):
-        self.capture(HUMAN.replace("Mode is AUTO.", "Mode is `AA29`. <!-- human comment -->"))
-        effective = self.text()
-        self.assertEqual(regions(_growi_markdown(effective)), regions(effective))
+    def test_status_counts_without_page_text(self):
+        self.model = FakeModel(classes=[{"kind": "structure", "instruction": "tidy"}])
+        self.pull(HUMAN)
+        status = self.store.status()
+        self.assertEqual(status["counts"], {"blocked": 0, "documents": 1, "human_information": 1,
+                                            "appendix_entries": 0, "guidance": 1})
+        self.assertNotIn("60°C", json.dumps(status, ensure_ascii=False))
 
-    def test_footer_only_revision_does_not_create_human_operation(self):
-        from graph.common.markdown import LINKS_FOOTER_START, LINKS_FOOTER_END
-        before = BASE + f"\n{LINKS_FOOTER_START}\n## Related\nold\n{LINKS_FOOTER_END}\n"
-        after = before.replace("old", "new")
-        self.capture(after, before)
-        self.assertFalse(self.active())
 
-    def test_snapshot_preserves_crlf_bytes(self):
-        body = "exact\r\nhuman\r\n"
-        self.assertEqual(self.store.get(self.store.put(body)), body)
+class IdentityAndDeleteTest(StoreCase):
+    def journal(self, status="active"):
+        key, stamp = self.store.identity(self.rel)
+        write_json_atomic(self.store.root / "documents" / f"{key}.json", {
+            "schema_version": 1, "key": key, "source_id": stamp["source_id"], "pages": {}, "captured_revisions": [],
+            "edits": [{"edit_id": "hedit-1", "status": status}],
+        })
+        self.store._initialize()
 
-    def test_partial_human_marker_removal_fails_closed(self):
-        self.capture()
-        before = self.text()
-        damaged = before.replace(":end -->", ":damaged -->", 1)
-        with self.assertRaisesRegex(ValueError, "unbalanced"):
-            self.capture(damaged, before, "r2")
-        self.assertEqual(len(self.active()), 1)
+    def test_a_document_with_a_live_legacy_journal_is_blocked(self):
+        self.journal()
+        with self.assertRaisesRegex(ValueError, "legacy human journal"):
+            self.pull(HUMAN)
+        with self.assertRaisesRegex(ValueError, "legacy human journal"):
+            self.generate({"001.md": BASE})
+        with self.assertRaisesRegex(ValueError, "legacy human journal"):
+            self.store.assert_deletable(self.rel)
+        self.assertFalse((self.store.root / "doc").exists())
 
-    def test_linker_preserves_human_tables_code_comments_and_values_exactly(self):
-        from graph.linker.render import RenderEdge, render_page
-        human = HUMAN.replace("Mode is AUTO.", "Mode is `AA29`. <!-- operator comment -->\n\n```c\n#define AA29 60\n```\n")
-        self.capture(human)
-        original = self.text()
-        linked = render_page(original, page_rel=self.path, mode="neo", edges=[
-            RenderEdge("e1", "peer/001.md", "AA29", "", "defines", "peer definition", source="use", via=["AA29"])
-        ])
-        self.assertEqual(regions(linked), regions(original))
+    def test_finished_legacy_edits_do_not_block(self):
+        self.journal("deleted")
+        self.pull(HUMAN)
+        self.assertEqual(self.text(), HUMAN)
 
-    def test_moved_source_keeps_journal_identity_and_intro_target(self):
-        self.capture(BASE.replace("Intro.", "Human intro E-901."))
-        new_rel = "archive/moved.md"
-        self.project.raw_file(new_rel).parent.mkdir(parents=True)
-        shutil.move(self.project.raw_file(self.rel), self.project.raw_file(new_rel))
-        new_folder = self.project.wiki_dir(new_rel)
-        new_folder.parent.mkdir(parents=True)
-        shutil.move(self.folder, new_folder)
-        writer.write_source_stamp(new_folder, self.project.raw_file(new_rel), new_rel, identity_seed="source-1")
-        self.store.move(new_rel, "doc", "archive/moved")
-        self.store.generated(new_rel, {"001.md": BASE.replace("Unchanged.", "Later source.")})
-        self.store.render(new_rel)
-        self.assertIn("Human intro E-901.", (new_folder / "001.md").read_text())
-        self.assertEqual(self.store.document(new_rel)["source_id"], "source-1")
+    def _ledger(self, source_id):
+        write_json_atomic(self.project.metadata / "pipeline.json",
+                          {"sources": {"doc.md": {"raw_rel": self.rel, "source_id": source_id, "id_seed": "source-1"}}})
 
-    def test_archived_journal_is_reapplied_when_same_identity_returns(self):
-        self.capture()
-        self.store.archive(self.rel)
-        self.assertTrue(self.store.document(self.rel)["archived"])
-        self.update({"001.md": BASE.replace("Unchanged.", "Restored source.")})
-        self.assertFalse(self.store.document(self.rel)["archived"])
-        self.assertIn("60°C", self.text())
+    def test_a_different_source_at_the_same_path_inherits_nothing_and_is_blocked_by_human_text(self):
+        self._ledger("src-1")
+        self.pull(HUMAN)
+        old = self.store._dir(self.rel)
+        self._ledger("src-2")
+        self.assertNotEqual(self.store._dir(self.rel), old)
+        self.assertIsNone(self.store.state(self.rel))
+        with self.assertRaisesRegex(ValueError, "different source"):
+            self.generate({"001.md": BASE})
+        with self.assertRaisesRegex(ValueError, "different source"):
+            self.pull(HUMAN, revision="r9")
+        # The same document with only a human deletion does not block a new source.
+        self._ledger("src-1")
+        self.pull(BASE.replace("Mode is AUTO.\n", ""), base=HUMAN, revision="r2")
+        self.assertFalse(self.store.status()["counts"]["human_information"])
+        self._ledger("src-3")
+        self.generate({"001.md": BASE})
+        self.assertEqual(self.text(), BASE)
 
-    def test_journal_uses_stable_source_id_after_legacy_seed_migration(self):
-        from publisher.ledger import Ledger, save_ledger
-        self.capture()
-        save_ledger(self.project.metadata / "pipeline.json", Ledger(
-            {self.rel: {"source_id": "stable-uuid", "id_seed": "source-1", "raw_rel": self.rel}}, {},
-        ))
-        journal = self.store.document(self.rel)
-        self.assertEqual(journal["source_id"], "stable-uuid")
-        self.assertEqual(journal["edits"][0]["source_id"], "stable-uuid")
-        self.store.archive(self.rel)
-        save_ledger(self.project.metadata / "pipeline.json", Ledger({}, {}))
-        writer.write_source_stamp(self.folder, self.project.raw_file(self.rel), self.rel, identity_seed="stable-uuid")
-        self.update({"001.md": BASE})
-        self.assertIn("60°C", self.text())
-        self.assertEqual(self.store.document(self.rel)["source_id"], "stable-uuid")
+    def test_a_moved_document_keeps_its_state(self):
+        self._ledger("src-1")
+        self.pull(HUMAN)
+        key = self.store.identity(self.rel)[0]
+        self.assertEqual(self.store.identity(self.rel)[0], key)
+        self.assertEqual(read_json(self.store._dir(self.rel) / "doc.json")["raw_rel"], self.rel)
 
-    def test_reused_path_with_different_source_id_does_not_inherit_human_journal(self):
-        from publisher.ledger import Ledger, save_ledger
-        self.capture()
-        save_ledger(self.project.metadata / "pipeline.json", Ledger(
-            {self.rel: {"source_id": "old-uuid", "id_seed": "source-1", "raw_rel": self.rel}}, {},
-        ))
-        self.store.document(self.rel)
-        self.store.archive(self.rel)
-        save_ledger(self.project.metadata / "pipeline.json", Ledger(
-            {self.rel: {"source_id": "new-uuid", "id_seed": "source-1", "raw_rel": self.rel}}, {},
-        ))
-        self.update({"001.md": BASE})
-        self.assertNotIn("60°C", self.text())
-        self.assertFalse(self.active())
+    def test_deleting_a_document_with_human_information_is_blocked_but_not_with_only_deletions(self):
+        self.store.assert_deletable(self.rel)
+        self.pull(HUMAN)
+        with self.assertRaisesRegex(ValueError, "human information"):
+            self.store.assert_deletable(self.rel)
+        self.pull(BASE.replace("Mode is AUTO.\n", ""), base=HUMAN, revision="r2")
+        self.pull(HUMAN.replace("Mode is AUTO.\n", "").replace("60", "40"), base=self.text(), revision="r3")
+        self.store.assert_deletable(self.rel)
 
-    def test_legacy_page_without_pure_ancestor_is_pinned_before_any_publish(self):
-        shutil.rmtree(self.store.root)
-        legacy = HUMAN.replace("AUTO", "`AA29` <!-- human-only warning E-900 -->")
-        write_text_atomic(self.folder / "001.md", legacy)
-        class Client:
-            async def get_page(_self, **kwargs):
-                return GrowiPage(page_id="p1", revision_id="r0", path=self.row["growi_path"], body=wrap_page(legacy, page_id="b1"))
-        publisher = GrowiPublisher(Client(), SimpleNamespace(write_path="/docs"))
-        _pulled, failures, _blocked = publisher.pull_changes(self.project, {self.path: self.row}, {"doc"})
-        self.assertFalse(failures)
-        self.store = HumanStore(self.project)
-        journal = self.store.document(self.rel)
-        self.assertEqual(journal["pages"], {})
-        self.assertTrue(journal["requires_pure_rebuild"])
-        self.assertEqual(journal["edits"][0]["status"], "legacy_pinned")
-        published = _growi_markdown(self.text())
-        self.assertIn("`AA29` <!-- human-only warning E-900 -->", published)
+    def test_remove_sources_reports_a_blocked_delete_and_keeps_the_document(self):
+        from publisher.ledger import Ledger
 
-    def test_discovered_revision_with_unverified_human_body_is_legacy_pinned(self):
-        (self.store.root / "pages" / "b1.json").unlink()
-        class Client:
-            page = GrowiPage(page_id="p1", revision_id="discovered-r1", path=self.row["growi_path"], body=wrap_page(HUMAN, page_id="b1"))
-            async def get_page(client, **kwargs):
-                return client.page
-        client = Client()
-        publisher = GrowiPublisher(client, SimpleNamespace(write_path="/docs", root_path="/docs", mode="attach"))
-        row = dict(self.row, revision_id="discovered-r1")
-        pulled, failures, blocked = publisher.pull_changes(self.project, {self.path: row}, {"doc"})
-        self.assertFalse(failures)
-        self.assertFalse(blocked)
-        self.assertIn(self.path, pulled)
-        self.assertIn("60°C", self.text())
-        self.assertEqual(len(self.active()), 1)
-        self.assertEqual(self.active()[0]["status"], "legacy_pinned")
-        client.page = client.page.model_copy(update={"revision_id": "human-r2", "body": wrap_page(HUMAN.replace("60°C", "65°C"), page_id="b1")})
-        publisher.pull_changes(self.project, {self.path: row}, {"doc"})
-        self.assertEqual(len(self.active()), 1)
-        self.assertIn("65°C", self.store.get(self.active()[0]["human_after_blob"]))
-        self.assertNotIn("60°C", self.text())
+        self.pull(HUMAN)
+        ledger = Ledger({"doc.md": {"raw_rel": self.rel}}, {}, {})
+        done, _touched, failures = pipeline._remove_sources(self.project, ledger, {"doc.md": self.rel})
+        self.assertEqual(done, [])
+        self.assertTrue(any("human information" in failure for failure in failures))
+        self.assertTrue(self.folder.exists())
+        self.assertIn("doc.md", ledger.sources)
 
-    def test_blocked_idle_pull_is_checkpointed_and_human_repair_can_retry(self):
-        from publisher.ledger import Ledger, save_ledger
-        self.project.mount.mkdir()
-        (self.project.mount / self.rel).write_text("source\n", encoding="utf-8")
-        save_ledger(self.project.metadata / "pipeline.json", Ledger(
-            {self.rel: {"raw_rel": self.rel, "source_id": "source-1", "id_seed": "source-1"}},
-            {"doc": {"raw_rel": self.rel, "content_sha256": pipeline._content_hash(self.folder)}},
-            {self.path: self.row},
-        ))
-        base = ensure_repository(self.project)
-        class Client:
-            page = None
-            async def get_page(self, **kwargs):
-                return self.page
-        client = Client()
-        publisher = GrowiPublisher(client, SimpleNamespace(write_path="/docs"))
-        settings = SimpleNamespace(data_root=str(self.project.root.parent), target_name=self.project.root.name,
-                                   mount_path=str(self.project.mount))
-        with patch.object(pipeline, "_publisher", return_value=publisher):
-            result = pipeline.pull_growi_once(settings)
-            self.assertTrue(result["failures"])
-            self.assertNotEqual(last_good(self.project), base)
-            self.assertTrue(candidate_is_clean(self.project, last_good(self.project)))
-            client.page = GrowiPage(page_id="p1", revision_id="r1", path=self.row["growi_path"], body=wrap_page(BASE, page_id="b1"))
-            repaired = pipeline.pull_growi_once(settings)
-            self.assertFalse(repaired["failures"])
-            self.assertTrue(candidate_is_clean(self.project, last_good(self.project)))
 
-    def test_conflict_marker_damage_is_saved_and_blocks(self):
-        self.capture()
-        self.update({"001.md": BASE.replace("40°C", "55°C")})
-        before = self.text()
-        self.row["observed_revision_id"] = "r2"
-        with self.assertRaisesRegex(ValueError, "ambiguous"):
-            self.store.capture(self.rel, self.path, self.row, before, "# Page\n\nUnknown final statement.\n")
-        self.assertEqual(self.active()[0]["status"], "conflict")
+class RollbackReplayTest(unittest.TestCase):
+    def test_replay_applies_candidate_captures_to_live_once_and_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = {}
+            for name in ("live", "cand"):
+                project = Project(Path(tmp) / name).ensure()
+                folder = project.wiki_dir("doc.md")
+                folder.mkdir(parents=True)
+                project.raw_file("doc.md").write_text("source\n", encoding="utf-8")
+                writer.write_source_stamp(folder, project.raw_file("doc.md"), "doc.md", identity_seed="source-1")
+                write_text_atomic(folder / "001.md", BASE)
+                apply_generated(project, "doc.md")
+                projects[name] = project
+            live, cand = projects["live"], projects["cand"]
+            candidate_store = HumanStore(cand)
+            candidate_store.accept("doc.md", "doc/001.md", "b1", "r1", BASE, HUMAN)
+            second = HUMAN.replace("Intro.", "Intro 2.")
+            candidate_store.accept("doc.md", "doc/001.md", "b1", "r2", HUMAN, second)
+            # The candidate's own source generation must not be copied.
+            write_text_atomic(cand.wiki_dir("doc.md") / "001.md", second.replace("Unchanged.", "Candidate source."))
+            apply_generated(cand, "doc.md")
+            store = HumanStore(live)
+            store.replay_captured(cand, ["doc.md"])
+            self.assertEqual((live.wiki_dir("doc.md") / "001.md").read_text(encoding="utf-8"), second)
+            self.assertEqual(len(list((store._dir("doc.md") / "captures").glob("*.json"))), 2)
+            store.replay_captured(cand, ["doc.md"])  # nothing is captured twice
+            self.assertEqual((live.wiki_dir("doc.md") / "001.md").read_text(encoding="utf-8"), second)
+            store.audit()
 
 
 class PublicationSafetyTest(unittest.TestCase):
@@ -646,9 +763,9 @@ class TransactionSafetyTest(unittest.TestCase):
             folder = live.wiki_dir(raw_rel)
             folder.mkdir()
             writer.write_source_stamp(folder, live.raw_file(raw_rel), raw_rel, identity_seed="source-1")
+            write_text_atomic(folder / "001.md", BASE)
+            apply_generated(live, raw_rel)
             store = HumanStore(live)
-            store.generated(raw_rel, {"001.md": BASE})
-            store.render(raw_rel)
             path = document + "/001.md"
 
             class Client:
@@ -730,6 +847,7 @@ class TransactionSafetyTest(unittest.TestCase):
                     self.assertTrue(result["failures"])
                     updated = next(page for page in client.pages.values() if page.path.endswith("/002" if old_page_removed else "/001"))
                     self.assertIn("55°C", updated.body)
+                    self.assertIn("60°C", updated.body)  # the capture was applied on the new source
                     if missing_revision_record:
                         known["p1"] = set()
                     if late_delete:
@@ -756,11 +874,12 @@ class TransactionSafetyTest(unittest.TestCase):
                         restored_page = client.pages[restored["page_id"]]
                         self.assertIn("60°C", restored_page.body)
                         self.assertNotIn("55°C", restored_page.body)
+                        self.assertEqual(restored_page.body.count("60°C"), 1)
                         self.assertEqual(len(client.pages), 1)
                         self.assertTrue(candidate_is_clean(live, last_good(live)))
                         self.assertEqual(restored["revision_id"], restored_page.revision_id)
 
-    def test_failed_publication_restores_old_source_with_new_human_journal(self):
+    def test_failed_publication_restores_old_source_with_the_captured_human_change(self):
         self._failed_publication()
 
     def test_unknown_human_revision_during_rollback_is_never_overwritten(self):
@@ -786,17 +905,18 @@ class TierIntegrationTest(unittest.TestCase):
             folder = project.wiki_dir(rel)
             folder.mkdir(parents=True)
             writer.write_source_stamp(folder, project.raw_file(rel), rel)
+            write_text_atomic(folder / "001.md", page)
+            apply_generated(project, rel)
             store = HumanStore(project)
-            store.generated(rel, {"001.md": page})
-            row = {"marker_id": "b1", "revision_id": "r0", "observed_revision_id": "r1"}
             path = folder.relative_to(project.wiki).as_posix() + "/001.md"
-            store.capture(rel, path, row, page, page.replace("40°C", "60°C"))
-            store.render(rel)
+            store.accept(rel, path, "b1", "r1", page, page.replace("40°C", "60°C"))
             project.raw_file(rel).write_text(tiers.OLD_SOURCE.replace("line 5\n", "line 5 changed\n"), encoding="utf-8")
             model = tiers.PatchModel(patches=[{"edit_ids": [1], "before": "line 5", "after": "line 5 changed"}])
             first = writer.write_wiki_pages(project, rel, mode="wiki", settings=tiers.SETTINGS, llm=model, embedder=None)
             self.assertEqual(first.tier, 1)
             self.assertNotIn("60°C", (state / "wiki" / "001.md").read_text())
+            self.assertEqual((folder / "001.md").read_text().count("60°C"), 1)
+            self.assertIn("line 5 changed", (folder / "001.md").read_text())
             zero = writer.write_wiki_pages(project, rel, mode="wiki", settings=tiers.SETTINGS, llm=None, embedder=None)
             self.assertEqual(zero.tier, 0)
             self.assertEqual((folder / "001.md").read_text().count("60°C"), 1)
@@ -809,6 +929,7 @@ class TierIntegrationTest(unittest.TestCase):
                 second = writer.write_wiki_pages(project, rel, mode="wiki", settings=tiers.SETTINGS, llm=tiers.PatchModel(fail=True), embedder=None)
             self.assertEqual(second.tier, 2)
             self.assertIn("60°C", (folder / "001.md").read_text())
+            self.assertIn("55°C", (folder / "001.md").read_text())
             def rebuild(**kwargs):
                 docs = Path(kwargs["out_dir"]) / "docs"
                 docs.mkdir(parents=True)
@@ -818,8 +939,33 @@ class TierIntegrationTest(unittest.TestCase):
                 third = writer.write_wiki_pages(project, rel, mode="wiki", settings=tiers.SETTINGS, llm=None, embedder=None, resume=False)
             self.assertEqual(third.tier, 3)
             self.assertEqual((folder / "001.md").read_text().count("60°C"), 1)
-            store.render(rel)
-            self.assertEqual((folder / "001.md").read_text().count("60°C"), 1)
+            self.assertIn("Fully rebuilt source.", (folder / "001.md").read_text())
+
+    def test_guidance_reaches_the_builders_and_state_does_not_exist_for_untouched_documents(self):
+        from tests import test_update_tiers as tiers
+        with tempfile.TemporaryDirectory() as tmp:
+            page = "# P1\n\nline 5\n"
+            project, rel, _state = tiers.make_project(tmp, [(1, tiers.COUNT, page)], tiers.OLD_SOURCE)
+            project.raw_file(rel).write_text(tiers.OLD_SOURCE, encoding="utf-8")
+            folder = project.wiki_dir(rel)
+            folder.mkdir(parents=True)
+            writer.write_source_stamp(folder, project.raw_file(rel), rel)
+            write_text_atomic(folder / "001.md", page)
+            apply_generated(project, rel)
+            self.assertFalse((project.metadata / "human-sync" / "doc").exists())
+            model = FakeModel(classes=[{"kind": "structure", "instruction": "Use a table"}])
+            HumanStore(project).accept(rel, f"{folder.name}/001.md", "b1", "r1", page, page + "\n", model=model)
+            seen = []
+            def build(**kwargs):
+                seen.append(kwargs["human_guidance"])
+                docs = Path(kwargs["out_dir"]) / "docs"
+                docs.mkdir(parents=True)
+                write_text_atomic(docs / "001.md", "# P1\n\nRebuilt.\n")
+                return SimpleNamespace(out_dir=Path(kwargs["out_dir"]))
+            project.raw_file(rel).write_text(tiers.OLD_SOURCE.replace("line 5\n", "line 5 second\n"), encoding="utf-8")
+            with patch.object(writer, "build_wiki_output", side_effect=build):
+                writer.write_wiki_pages(project, rel, mode="wiki", settings=tiers.SETTINGS, llm=None, embedder=None, resume=False)
+            self.assertEqual(seen, [{"001.md": ["Use a table"]}])
 
 
 class PartialPublicationTest(unittest.TestCase):
@@ -831,7 +977,7 @@ class PartialPublicationTest(unittest.TestCase):
 
     def _harness(self, tmp, *, pages=("001.md", "002.md"), ledgered=("001.md", "002.md")):
         from graph.wiki.storage import sha256_text
-        from publisher.ledger import Ledger, load_ledger, save_ledger
+        from publisher.ledger import Ledger, save_ledger
 
         live = Project(Path(tmp) / "live", Path(tmp) / "mount").ensure()
         live.mount.mkdir()
@@ -841,9 +987,10 @@ class PartialPublicationTest(unittest.TestCase):
         folder.mkdir()
         writer.write_source_stamp(folder, live.raw_file(self.raw_rel), self.raw_rel, identity_seed="source-1")
         write_json_atomic(folder / "_planning" / "linker.json", {"status": "complete"})
+        for name in pages:
+            write_text_atomic(folder / name, BASE)
+        apply_generated(live, self.raw_rel)
         store = HumanStore(live)
-        store.generated(self.raw_rel, dict.fromkeys(pages, BASE))
-        store.render(self.raw_rel)
 
         class Client:
             def __init__(self):
@@ -931,38 +1078,16 @@ class PartialPublicationTest(unittest.TestCase):
         with patch.object(pipeline, "_publisher", return_value=publisher):
             return pipeline.pull_growi_once(settings)
 
-    def _regenerate(self, folder, store, names):
-        for name in names:
-            write_text_atomic(folder / name, self.bot)
-        # Mirror the real writer: save the pure generated pages before rendering
-        # any authoritative human overlay into the effective wiki.
-        store.generated(self.raw_rel, {page.name: page.read_text(encoding="utf-8") for page in folder.glob("*.md")})
-        store.render(self.raw_rel)
-
-    def test_linker_links_are_not_recorded_as_part_of_a_human_edit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            live, folder, store, _client, _publisher, _settings, rows = self._harness(tmp)
-            path = f"{self.document}/001.md"
-            row = dict(rows[path], observed_revision_id="human-1")
-            linked = BASE.replace("Mode is AUTO.", "[Mode](002.md) is AUTO.")  # what the linker published
-            human = linked.replace("Maximum is 40°C.", "Maximum is 40°C (checked).")
-
-            def stored(unlinked):
-                fresh = HumanStore(live)
-                fresh.capture(self.raw_rel, path, dict(row), linked, human, generated_before=BASE, unlinked=unlinked)
-                edits = [e for e in fresh.document(self.raw_rel)["edits"] if e["status"] != "deleted"]
-                self.assertEqual(len(edits), 1)
-                return fresh.get(edits[0]["human_after_blob"])
-
-            # only the human's change is stored against the pure block
-            self.assertEqual(stored(BASE), "## Limits\n\nMaximum is 40°C (checked).\nMode is AUTO.\n\n")
-            store.document(self.raw_rel)["edits"].clear()
-            store.save(store.document(self.raw_rel))
+    def _regenerate(self, live, folder, pages):
+        """Mirror the real writer: export the new pages, then apply_generated."""
+        for name, text in pages.items():
+            write_text_atomic(folder / name, text)
+        apply_generated(live, self.raw_rel)
 
     def test_unrecorded_published_page_is_not_captured_as_a_human_edit(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp)
-            self._regenerate(folder, store, ("001.md", "002.md"))
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
             client.fail_update = "p1"  # 002 publishes, then 001 fails the batch.
             self.assertTrue(self._publish(publisher, settings)["failures"])
             self.assertIn("55°C", client.pages["p2"].body)
@@ -976,7 +1101,7 @@ class PartialPublicationTest(unittest.TestCase):
             # A failed publish still checkpoints durable state, so recovery is not blocked.
             self.assertTrue(candidate_is_clean(live, last_good(live)))
             self.assertFalse(self._pull(publisher, settings)["failures"])
-            self.assertEqual(store.document(self.raw_rel)["edits"], [])
+            self.assertIsNone(store.state(self.raw_rel))
             self.assertEqual(self._ledger(live).published_pages[f"{self.document}/002.md"]["revision_id"],
                              client.pages["p2"].revision_id)
             settled = store.page(marker)
@@ -986,18 +1111,18 @@ class PartialPublicationTest(unittest.TestCase):
             client.fail_update = ""
             self.assertFalse(self._publish(publisher, settings)["failures"])
             self.assertIn("55°C", client.pages["p1"].body)
-            self.assertEqual(store.document(self.raw_rel)["edits"], [])
+            self.assertIsNone(store.state(self.raw_rel))
             self.assertTrue(candidate_is_clean(live, last_good(live)))
 
     def test_lost_update_response_recovers_from_the_exact_prepared_body(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp)
-            self._regenerate(folder, store, ("001.md", "002.md"))
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
             client.lose_response = "p2"
             self.assertTrue(self._publish(publisher, settings)["failures"])
             self.assertIn("55°C", client.pages["p2"].body)
             self.assertFalse(self._pull(publisher, settings)["failures"])
-            self.assertEqual(store.document(self.raw_rel)["edits"], [])
+            self.assertIsNone(store.state(self.raw_rel))
             self.assertEqual(self._ledger(live).published_pages[f"{self.document}/002.md"]["revision_id"],
                              client.pages["p2"].revision_id)
             client.lose_response = ""
@@ -1008,7 +1133,7 @@ class PartialPublicationTest(unittest.TestCase):
     def test_created_page_with_lost_create_response_is_published_on_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp, ledgered=("001.md",))
-            self._regenerate(folder, store, ("001.md", "002.md"))
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
             client.lose_response = "create"
             self.assertTrue(self._publish(publisher, settings)["failures"])
             self.assertNotIn(f"{self.document}/002.md", self._ledger(live).published_pages)
@@ -1017,12 +1142,12 @@ class PartialPublicationTest(unittest.TestCase):
             published = self._ledger(live).published_pages[f"{self.document}/002.md"]
             self.assertEqual(published["page_id"], "p3")
             self.assertEqual(client.pages["p3"].body.count("55°C"), 1)
-            self.assertEqual(store.document(self.raw_rel)["edits"], [])
+            self.assertIsNone(store.state(self.raw_rel))
 
     def test_human_edit_on_an_unledgered_created_page_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp, ledgered=("001.md",))
-            self._regenerate(folder, store, ("001.md", "002.md"))
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
             client.lose_response = "create"
             self.assertTrue(self._publish(publisher, settings)["failures"])
             path = f"{self.document}/002.md"
@@ -1040,14 +1165,10 @@ class PartialPublicationTest(unittest.TestCase):
             live, _folder, store, _client, publisher, _settings, _rows = self._harness(tmp)
             path = f"{self.document}/002.md"
             marker = publisher.page_marker_id(live, path)
-            store.generated(self.raw_rel, {"001.md": BASE, "002.md": self.bot})
-            generated_blob = store.document(self.raw_rel)["pages"]["002.md"]["body_blob"]
             effective = self.bot.replace("Mode is AUTO.", "Mode is MANUAL.")
             store.save_page(dict(store.page(marker), prepared_path="/docs/doc/002", prepared_page_id="p2",
                                  prepared_revision="r0", prepared_remote_blob=store.put("exact prepared body"),
-                                 prepared_local_blob=store.put(effective), prepared_generated_blob=generated_blob))
-            newer = self.bot.replace("55°C", "60°C")
-            store.generated(self.raw_rel, {"001.md": BASE, "002.md": newer})
+                                 prepared_local_blob=store.put(effective)))
             ours = GrowiPage(page_id="p2", revision_id="bot-1", path="/docs/doc/002", body="exact prepared body")
             self.assertTrue(store.prepared_match(marker, ours))
             self.assertEqual(store.prepared_match(marker, ours.model_copy(update={"body": "someone changed it"})), {})
@@ -1057,25 +1178,21 @@ class PartialPublicationTest(unittest.TestCase):
             self.assertEqual(store.prepared_match(marker, stalled), {})
             self.assertEqual(store.account_prepared(dict(store.page(marker)), stalled), {})
             self.assertEqual(store.account_prepared(dict(store.page(marker)), ours), {"exact": True})
-            self.assertEqual(store.get(store.document(self.raw_rel)["pages"]["002.md"]["body_blob"]), newer)
-            self.assertEqual(store.page(marker)["generated_blob"], generated_blob)
-            self.assertNotIn("MANUAL", store.get(generated_blob))
             for key in ("prepared_path", "prepared_page_id", "prepared_revision",
-                        "prepared_remote_blob", "prepared_local_blob", "prepared_generated_blob"):
+                        "prepared_remote_blob", "prepared_local_blob"):
                 self.assertNotIn(key, store.page(marker))
             store.save_page(dict(store.page(marker), prepared_path="/docs/doc/002", prepared_page_id="p2",
                                  prepared_revision="bot-1", prepared_remote_blob=store.put("exact prepared body"),
-                                 prepared_local_blob=store.put(effective), prepared_generated_blob=generated_blob))
+                                 prepared_local_blob=store.put(effective)))
             late = GrowiPage(page_id="p2", revision_id="late-human", path="/docs/doc/002", body="someone changed it")
             rebased = store.account_prepared(dict(store.page(marker)), late)
             self.assertFalse(rebased["exact"])
-            self.assertEqual((rebased["remote"], rebased["local"], rebased["generated"]),
-                             ("exact prepared body", effective, self.bot))
+            self.assertEqual((rebased["remote"], rebased["local"]), ("exact prepared body", effective))
 
     def test_human_edit_after_a_partial_write_is_captured_and_never_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp)
-            self._regenerate(folder, store, ("001.md", "002.md"))
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
             client.fail_update = "p1"
             self.assertTrue(self._publish(publisher, settings)["failures"])
             human = client.pages["p2"].body.replace("Mode is AUTO.", "Mode is MANUAL.")
@@ -1083,14 +1200,12 @@ class PartialPublicationTest(unittest.TestCase):
             client.pages["p2"].body = human
             client.pages["p2"].revision_id = "late-human"
             self.assertFalse(self._pull(publisher, settings)["failures"])
-            edits = [edit for edit in store.document(self.raw_rel)["edits"] if edit["status"] != "deleted"]
-            self.assertTrue(edits)
             # Only the human delta is intent: the bot's 40 to 55 change is generated state.
-            self.assertIn("55°C", " ".join(store.get(edit["base_before_blob"]) for edit in edits))
-            delta = " ".join(store.get(item["replacement_blob"]) for edit in edits for item in edit["human_delta"])
-            self.assertIn("MANUAL", delta)
-            self.assertNotIn("55°C", delta)
-            self.assertNotIn("40°C", delta)
+            self.assertEqual(store.state(self.raw_rel)["appendix"], None)
+            page = (folder / "002.md").read_text(encoding="utf-8")
+            self.assertIn("Mode is MANUAL.", page)
+            self.assertEqual(page.count("55°C"), 1)
+            self.assertEqual((folder / "001.md").read_text(encoding="utf-8"), self.bot)
             self.assertEqual(client.pages["p2"].body, human)
             client.fail_update = ""
             self.assertFalse(self._publish(publisher, settings)["failures"])
@@ -1099,7 +1214,7 @@ class PartialPublicationTest(unittest.TestCase):
     def test_409_race_uses_the_old_baseline_not_the_write_that_never_landed(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp)
-            self._regenerate(folder, store, ("001.md", "002.md"))
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
             path = f"{self.document}/002.md"
             marker = publisher.page_marker_id(live, path)
             client.human_edit_on_put = "p2"
@@ -1109,18 +1224,12 @@ class PartialPublicationTest(unittest.TestCase):
             self.assertNotIn("55°C", client.pages["p2"].body)
             self.assertIn("Mode is MANUAL.", client.pages["p2"].body)
             self.assertFalse(self._pull(publisher, settings)["failures"])
-            edits = [edit for edit in store.document(self.raw_rel)["edits"] if edit["status"] != "deleted"]
-            self.assertTrue(edits)
-            # The rejected transport is not human intent: the old published
-            # baseline stays authoritative for the human delta. The legitimate
-            # current source generation remains pure state and combines later.
-            self.assertIn("40°C", " ".join(store.get(edit["base_before_blob"]) for edit in edits))
-            delta = " ".join(store.get(item["replacement_blob"]) for edit in edits for item in edit["human_delta"])
-            self.assertIn("MANUAL", delta)
-            self.assertNotIn("55°C", delta)
-            self.assertEqual(store.document(self.raw_rel)["pages"]["002.md"]["body_blob"], store.put(self.bot))
-            self.assertIn("55°C", (folder / "002.md").read_text(encoding="utf-8"))
-            self.assertIn("Mode is MANUAL.", (folder / "002.md").read_text(encoding="utf-8"))
+            # The rejected transport is not human intent: the old published baseline
+            # stays authoritative for the human delta, applied on the newer local text.
+            page = (folder / "002.md").read_text(encoding="utf-8")
+            self.assertIn("55°C", page)
+            self.assertIn("Mode is MANUAL.", page)
+            self.assertNotIn("40°C", page)
             self.assertEqual(self._ledger(live).published_pages[path]["revision_id"], "human-1")
             self.assertFalse(self._publish(publisher, settings)["failures"])
             self.assertIn("Mode is MANUAL.", client.pages["p2"].body)
@@ -1130,25 +1239,22 @@ class PartialPublicationTest(unittest.TestCase):
     def test_source_change_after_a_rebased_edit_does_not_conflict_or_override(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp)
-            self._regenerate(folder, store, ("001.md", "002.md"))
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
             client.fail_update = "p1"
             self.assertTrue(self._publish(publisher, settings)["failures"])
             client.pages["p2"].body = client.pages["p2"].body.replace("Mode is AUTO.", "Mode is MANUAL.")
             client.pages["p2"].revision_id = "late-human"
             self.assertFalse(self._pull(publisher, settings)["failures"])
             # The next build legitimately carries the published bot change.
-            store.generated(self.raw_rel, {"001.md": BASE, "002.md": self.bot.replace("Unchanged.", "Revised.")})
-            store.render(self.raw_rel)
+            for page in folder.glob("*.md"):
+                page.unlink()
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot.replace("Unchanged.", "Revised.")})
             page = (folder / "002.md").read_text(encoding="utf-8")
-            self.assertNotIn("conflict", [edit["status"] for edit in store.document(self.raw_rel)["edits"]])
             self.assertEqual(page.count("55°C"), 1)
             self.assertNotIn("40°C", page)
+            self.assertNotIn("元文書", page)
             self.assertIn("Mode is MANUAL.", page)
             self.assertIn("Revised.", page)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TransportSpellingMergeTest(unittest.TestCase):
@@ -1156,8 +1262,6 @@ class TransportSpellingMergeTest(unittest.TestCase):
     swallow a human token edit when the capture rebases it onto the local page."""
 
     def test_human_edit_inside_a_multi_line_spelling_hunk_is_captured(self):
-        from publisher.human_changes import merge
-
         remote = "- 供給温度は通常 18 °C に設定します。\n- 戻り温度が 26 °C を超えた場合は確認する。\n"
         human = "- 供給温度は通常 18 °C に設定します（夏季は 16 °C）。\n- 戻り温度が 26 °C を超えた場合は確認する。\n"
         local = "- 供給温度は通常 `18 °C` に設定します。\n- 戻り温度が `26 °C` を超えた場合は確認する。\n"
@@ -1166,9 +1270,11 @@ class TransportSpellingMergeTest(unittest.TestCase):
         self.assertEqual(merged, "- 供給温度は通常 `18 °C` に設定します（夏季は 16 °C）。\n- 戻り温度が `26 °C` を超えた場合は確認する。\n")
 
     def test_same_token_still_conflicts_inside_a_multi_line_hunk(self):
-        from publisher.human_changes import merge
-
         base = "- 高温警報: 60 °C\n- 低圧警報: 0.15 MPa\n"
         human = "- 高温警報: 65 °C\n- 低圧警報: 0.15 MPa\n"
         source = "- 高温警報: 55 °C\n- 低圧警報: 0.20 MPa\n"
         self.assertEqual(merge(base, human, source)[1], "conflict")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -124,6 +124,7 @@ class _PageInput:
     page_path: Path
     state_path: Path
     state: dict[str, Any]
+    guidance: list[str] = field(default_factory=list)  # what human editors want this page to look like
 
 
 @dataclass
@@ -470,6 +471,10 @@ def _writer_messages(
     earlier_feedback: Sequence[str] = (),
 ) -> list[Any]:
     image_tags = "、".join(slot.tag for slot in page.images) or "なし"
+    guidance = (
+        "--- 人間の編集者の要望（このページの体裁。事実は変えない） ---\n- " + "\n- ".join(page.guidance) + "\n\n"
+        if page.guidance else ""
+    )
     baseline = (
         "（現在候補と同一。まだ修復による差分なし）"
         if title == page.shell.title and body == page.masked_body
@@ -548,6 +553,7 @@ def _writer_messages(
             f"修復試行: {attempt}/{MAX_REWRITE_ATTEMPTS}\n"
             f"ページ番号: {page.number}\nファイル名（変更禁止）: {page.filename}\n"
             f"保持必須のWiki画像タグ: {image_tags}\n\n"
+            f"{guidance}"
             f"--- 所有する行番号付き原文 ---\n{page.owner_evidence}\n\n"
             f"--- 許可された参照行 ---\n{page.reference_evidence}\n\n"
             f"--- 修復開始時Wiki（全試行で固定。退行防止専用。原文にない内容は根拠にしない） ---\n"
@@ -1378,6 +1384,8 @@ class FastRepair:
         list[_PageInput],
         dict[str, tuple[str, str]],
     ]:
+        from publisher.human_changes import HumanStore
+
         state_root = Path(self.project.state_dir(raw_rel))
         snapshot = state_root / "source" / "original.md"
         raw_path = Path(self.project.raw_file(raw_rel))
@@ -1478,6 +1486,7 @@ class FastRepair:
                 page_path=page_path,
                 state_path=state_path,
                 state=state,
+                guidance=HumanStore(self.project).guidance(raw_rel).get(filename, []),
             ))
             examined += 1
         return state_root, plan, manifest, inputs, pending_title_changes
@@ -1643,7 +1652,7 @@ class FastRepair:
     def _promote(self, raw_rel: str, state_root: Path) -> list[str]:
         from graph.wiki.export import export_ingest_layout
         from graph.workspace.writer import publish_output, write_source_stamp
-        from publisher.human_changes import apply_generated
+        from publisher.human_changes import LlmHumanModel, apply_generated
 
         target = Path(self.project.wiki_dir(raw_rel))
         source_stamp = read_json(target / "_planning" / "source.json", default={})
@@ -1661,7 +1670,7 @@ class FastRepair:
         write_json_atomic(target / "_planning" / "linker.json", {
             "schema_version": 2, "status": "disabled",
         })
-        overlay = apply_generated(self.project, raw_rel)
+        overlay = apply_generated(self.project, raw_rel, model=LlmHumanModel(self.settings, self.project))
         return sorted(overlay.changed_pages)
 
     def repair_document(

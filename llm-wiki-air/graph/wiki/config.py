@@ -67,6 +67,8 @@ class WikiConfig(BaseModel):
     # server default). Python's lossless checks gate the output either way.
     text_thinking: bool = True
     output_language: str = "Japanese (日本語)"
+    # page file name -> what human editors want that page to look like (publisher/human_changes.py)
+    human_guidance: dict[str, list[str]] = Field(default_factory=dict)
     prompt_version: str = PROMPT_VERSION
     resume: bool = True
     # Tier-2 updates must resume the stored plan; never silently re-plan.

@@ -281,19 +281,15 @@ def _publisher(settings: Any) -> GrowiPublisher | None:
     )
     from graph.config import HumanSyncPolicy
 
+    from .human_changes import LlmHumanModel
+
     policy = HumanSyncPolicy.resolve(getattr(settings, "human_sync_mode", "off"))
-
-    def semantic_factory(project: Project):
-        from .human_changes import HumanStore
-        from .human_semantic import build_runtime_semantic_assistant
-
-        return build_runtime_semantic_assistant(HumanStore(project), settings)
 
     return GrowiPublisher(
         client,
         connection,
         human_sync_policy=policy,
-        semantic_assistant_factory=semantic_factory if policy.semantic_observe else None,
+        human_model_factory=lambda project: LlmHumanModel(settings, project),
     )
 
 
@@ -738,7 +734,8 @@ def _remove_sources(project: Project, ledger: Ledger, sources: dict[str, str]) -
             source = dict(ledger.sources.get(rel) or {})
             from .human_changes import HumanStore
 
-            HumanStore(project).archive(raw_rel)
+            # Deleting the document deletes its Appendix, so human text blocks the delete.
+            HumanStore(project).assert_deletable(raw_rel)
             if (project.wiki_dir(raw_rel) / "_planning" / "linker.json").exists():
                 from graph.linker import remove_document
                 touched = remove_document(project, raw_rel)
@@ -1296,9 +1293,6 @@ def move_sources(
                         "mode": str(getattr(settings, "wiki_linker_mode", "legacy")),
                         **({"resume": True} if previous_linker.get("status") == "complete" else {}),
                     })
-                from .human_changes import HumanStore
-
-                HumanStore(project).move(new_raw, old_document, new_document)
                 source.update({
                     "mount_rel": new_rel,
                     "raw_rel": new_raw,
@@ -1560,10 +1554,10 @@ def restore_publication(
     # A failed candidate may have captured human edits that were absent from
     # last-good. Restore the old source with those edits still applied; restoring
     # the old visible wiki verbatim would erase them after a partial bot write.
-    from .human_changes import HumanStore
+    from .human_changes import HumanStore, LlmHumanModel
 
     base_rels = [str(row["raw_rel"]) for document, row in base.published_documents.items() if document in affected]
-    HumanStore(live).import_captured(candidate_project, base_rels)
+    HumanStore(live).replay_captured(candidate_project, base_rels, model=LlmHumanModel(settings, live))
 
     moved_candidate_docs: set[str] = set()
     for source_id in set(base_by_id) & set(candidate_by_id):
@@ -1667,8 +1661,7 @@ def pull_growi_once(settings: Any, *, force_inventory: bool = False) -> dict[str
             save_ledger(ledger_path, ledger)
             from .human_changes import HumanStore
 
-            operator = HumanStore(project).project_summary()
-            detector["operator"] = {key: operator[key] for key in ("counts", "unresolved", "blocked")}
+            detector["operator"] = HumanStore(project).status()["counts"]
             cursor_backup: dict[str, Any] | None = None
             cursor_existed = False
             if cursor_commit is not None:
@@ -1726,6 +1719,9 @@ def build_wiki_only(settings: Any, *, only: list[str] | None = None, force: bool
                     continue
                 try:
                     from graph.linker import remove_document
+                    from .human_changes import HumanStore
+
+                    HumanStore(project).assert_deletable(raw_rel)
                     touched = remove_document(project, raw_rel)
                     shutil.rmtree(project.wiki_dir(raw_rel), ignore_errors=True)
                     shutil.rmtree(project.state_dir(raw_rel), ignore_errors=True)
