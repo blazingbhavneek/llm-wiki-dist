@@ -986,6 +986,7 @@ def make_llm(
         api_key=api_key,
         temperature=temperature,
         timeout=timeout,
+        reasoning_effort="low",
         # Temporary: disable thinking for faster summaries. Comment out to re-enable.
         # model_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
     )
@@ -999,6 +1000,16 @@ async def structured_ainvoke(
     *,
     temperature: float | None = None,
 ) -> BaseModel:
+    # New wiki model ports provide the same structured seam while also
+    # serializing fast writer calls on a shared GPU. Keep raw ChatOpenAI
+    # support below for older callers.
+    if hasattr(llm, "structured"):
+        return await llm.structured(
+            schema_cls,
+            messages,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+        )
     request_timeout = getattr(llm, "request_timeout", None)
     try:
         hard_timeout = float(request_timeout) if request_timeout is not None else None
@@ -1012,21 +1023,21 @@ async def structured_ainvoke(
         return await asyncio.wait_for(operation, timeout=hard_timeout)
 
     bind_kwargs: dict[str, Any] = {}
-    if max_output_tokens is not None:
-        bind_kwargs["max_tokens"] = max_output_tokens
+    # TEMPORARILY DISABLED: restore this cap when legacy structured responses
+    # should be bounded again.
+    # if max_output_tokens is not None:
+    #     bind_kwargs["max_tokens"] = max_output_tokens
     if temperature is not None:
         bind_kwargs["temperature"] = temperature
     call_llm = llm.bind(**bind_kwargs) if bind_kwargs else llm
 
     try:
         structured_kwargs = {
-            key: value
-            for key, value in (
-                ("max_tokens", max_output_tokens),
-                ("temperature", temperature),
-            )
-            if value is not None
-        }
+            "temperature": temperature,
+        } if temperature is not None else {}
+        # TEMPORARILY DISABLED: restore the max_tokens entry when needed.
+        # if max_output_tokens is not None:
+        #     structured_kwargs["max_tokens"] = max_output_tokens
         structured = llm.with_structured_output(schema_cls, **structured_kwargs)
         result = await invoke(structured, messages)
 

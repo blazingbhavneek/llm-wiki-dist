@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from common.context import Context
-from common.legacy import convert_mount, open_project, parse_document
+from common.legacy import convert_mount, open_project, parse_document, read_text_source
 from common.paths import DataLayout, raw_name_for
 from common.storage import read_json, write_json_atomic, write_text_atomic
 
@@ -84,7 +84,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
     settings = _settings(cfg)
     with (ctx.stage("convert", relative) if ctx is not None else _null_context()):
         if source.suffix.lower() in {".md", ".txt"}:
-            text = source.read_text(encoding="utf-8")
+            text = read_text_source(source)
         else:
             if not cfg.parser_base_url:
                 raise RuntimeError("parser_base_url is required for non-Markdown files")

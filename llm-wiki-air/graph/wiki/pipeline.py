@@ -20,17 +20,19 @@ import asyncio
 import json
 import re
 import shutil
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from common.policy import policy_of
-from .config import REWRITE_PROMPT_VERSION, SEED_PLAN_VERSION, WikiConfig
+from .config import REWRITE_PROMPT_VERSION, SEED_PLAN_COMPILE_VERSION, SEED_PLAN_VERSION, WikiConfig
 from .document_map import build_seed_plan
 from .markdown_blocks import build_block_index
 from .ids import document_id, slugify
 from .images import ImageUnit, block_units, extract_image_units, restore_images
-from .model import ChatModelPort, ModelPort
+from .model import ModelPort, judge_model
 from .page import (
     PLACEHOLDER_RE,
     REFERENCE_MARKER_RE,
@@ -38,6 +40,7 @@ from .page import (
     check_section,
     code_tokens,
     demote_h1,
+    is_small_document,
     link_titles,
     normalize_draft,
     split_sections,
@@ -53,6 +56,7 @@ from .prompts import (
 from .schemas import CompiledSeedPlan
 from .storage import (
     clean_workdir,
+    hash_of,
     normalize_source,
     read_json,
     sha256_text,
@@ -73,12 +77,24 @@ Progress = Callable[[dict[str, Any]], None] | None
 StopCheck = Callable[[], bool] | None
 
 
+PLAN_CACHE_VERSION = "wiki-planner-cache-1"
+_PLANNING: dict[str, threading.Event] = {}
+_PLANNING_LOCK = threading.Lock()
+
+
 class PipelineError(RuntimeError):
     """A deterministic seed or publication invariant failed."""
 
 
 class ResumeUnavailable(PipelineError):
     """The caller required the stored seed plan, but it no longer matches."""
+
+
+# Keep room below NAME_MAX for numbered page names and filesystem details. The
+# limit is measured in UTF-8 bytes, so a character-count limit is insufficient
+# for Japanese titles.
+_PAGE_FILENAME_MAX_BYTES = 200
+_SHORT_PAGE_NAME_MAX_CHARS = 24
 
 
 @dataclass
@@ -101,6 +117,7 @@ class RewriteResult:
     attempts: int
     judge_score: int | None = None
     missing_important_information: list[str] = field(default_factory=list)
+    defects: list[str] = field(default_factory=list)
     verbatim_sections: list[str] = field(default_factory=list)
 
 
@@ -110,6 +127,7 @@ class _SectionCandidate:
     attempt: int
     score: int | None = None
     missing: list[str] = field(default_factory=list)
+    defects: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -119,6 +137,7 @@ class _SectionResult:
     attempts: int
     score: int | None = None
     missing: list[str] = field(default_factory=list)
+    defects: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     verbatim: bool = False
 
@@ -245,6 +264,102 @@ def _plan_pages(plan: CompiledSeedPlan) -> list[SeedPage]:
             )
         )
     return pages
+
+
+def _filename_bytes(filename: str) -> int:
+    return len(filename.encode("utf-8"))
+
+
+def _truncate_filename(filename: str, *, max_bytes: int = _PAGE_FILENAME_MAX_BYTES) -> str:
+    """Trim a filename by UTF-8 bytes while preserving its extension."""
+
+    suffix = Path(filename).suffix or ".md"
+    stem = filename[: -len(suffix)] if filename.endswith(suffix) else filename
+    budget = max(1, max_bytes - len(suffix.encode("utf-8")))
+    while stem and len(stem.encode("utf-8")) > budget:
+        stem = stem[:-1]
+    return stem.rstrip("._- ") + suffix
+
+
+def _short_name_text(value: str) -> str:
+    """Extract a single model-provided name before slugifying it."""
+
+    text = str(value or "").strip()
+    text = re.sub(r"^```(?:text|markdown)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```\s*$", "", text).strip()
+    text = re.sub(r"^(?:ファイル名|ページ名|名前)\s*[:：]\s*", "", text)
+    text = text.splitlines()[0].strip(" `\"'") if text else ""
+    if text.casefold().endswith(".md"):
+        text = text[:-3]
+    return text.strip()
+
+
+async def _repair_long_page_filenames(
+    pages: Sequence[SeedPage],
+    *,
+    model: ModelPort | None,
+    on_progress: Progress,
+    stop_check: StopCheck,
+) -> None:
+    """Give overlong generated names one concise naming call before writing."""
+
+    long_pages = [page for page in pages if _filename_bytes(page.filename) > _PAGE_FILENAME_MAX_BYTES]
+    if not long_pages:
+        return
+
+    model = policy_of(config).planning_model(model)
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    for page in long_pages:
+        if stop_check and stop_check():
+            raise asyncio.CancelledError("page filename repair cancelled")
+        original = page.filename
+        candidate = ""
+        if model is not None:
+            try:
+                response = await model.text(
+                    [
+                        SystemMessage(
+                            content=(
+                                "技術Wikiのページ名を短く整える作業者です。"
+                                "説明や前置きは返さず、短い日本語名を1行だけ返してください。"
+                            )
+                        ),
+                        HumanMessage(
+                            content=(
+                                f"ページ題名: {page.title}\n"
+                                f"章: {page.chapter or 'なし'}\n"
+                                f"内容要約: {page.summary}\n\n"
+                                f"意味を保ったまま、ファイル名に使える簡潔な名前を"
+                                f"{_SHORT_PAGE_NAME_MAX_CHARS}文字以内で返してください。"
+                                "拡張子、番号、パス、記号、説明文は不要です。"
+                            )
+                        ),
+                    ],
+                    max_output_tokens=64,
+                )
+                candidate = _short_name_text(response)
+            except Exception as exc:  # noqa: BLE001 - deterministic fallback follows
+                _emit(on_progress, "seed", "filename_repair_model_error", page=page.title, error=str(exc)[:300])
+
+        if candidate:
+            stem = slugify(candidate, fallback=f"page-{page.number}")
+            repaired = f"{page.number:03d}-{stem}.md"
+        else:
+            repaired = ""
+        if not repaired or _filename_bytes(repaired) > _PAGE_FILENAME_MAX_BYTES:
+            repaired = _truncate_filename(original)
+        page.filename = repaired
+        _emit(
+            on_progress,
+            "seed",
+            "filename_repaired",
+            page=page.title,
+            original=original,
+            filename=page.filename,
+            model=bool(candidate),
+        )
 
 
 def _slice_ranges(lines: Sequence[str], ranges: Sequence[tuple[int, int]]) -> str:
@@ -777,6 +892,7 @@ def _load_seed_plan(
     source_sha256: str,
     source_line_count: int,
     prompt_version: str,
+    single_page_rewrite: bool = False,
 ) -> list[SeedPage] | None:
     """Load the completed seed plan so a stopped run resumes at rewriting."""
 
@@ -789,6 +905,8 @@ def _load_seed_plan(
         if int(raw.get("source_line_count", 0)) != source_line_count:
             return None
         if raw.get("prompt_version") != prompt_version:
+            return None
+        if bool(raw.get("single_page_rewrite", False)) != single_page_rewrite:
             return None
         pages = [
             SeedPage(
@@ -818,6 +936,209 @@ def _load_seed_plan(
         return pages
     except (KeyError, OSError, TypeError, ValueError, PipelineError):
         return None
+
+
+def _plan_cache_key(source_text: str, config: WikiConfig) -> str:
+    """Key the shared plan by every input that can change seed ownership."""
+
+    policy = policy_of(config)
+    return hash_of({
+        "version": PLAN_CACHE_VERSION,
+        "source_sha256": sha256_text(source_text),
+        "prompt_version": config.prompt_version,
+        "seed_version": policy.cache_key(SEED_PLAN_VERSION),
+        "compile_version": policy.cache_key(SEED_PLAN_COMPILE_VERSION),
+        "source_kind": config.source_kind,
+        "window_target_lines": config.window_target_lines,
+        "window_overlap_lines": config.window_overlap_lines,
+        "planner_attempts": config.planner_attempts,
+        "regional_window_count": config.regional_window_count,
+        "map_attempts": config.map_attempts,
+        "planner_max_output_tokens": config.planner_max_output_tokens,
+        "map_max_output_tokens": config.map_max_output_tokens,
+        "page_target_lines": config.page_target_lines,
+        "chat_base_url": config.chat_base_url,
+        "chat_model": config.chat_model,
+        **policy.model_cache_fields(config),
+        "reasoning_effort": "low",
+        "temperature": config.temperature,
+        "retry_temperature": config.retry_temperature,
+        "output_language": config.output_language,
+        "structure_target_lines": config.structure_target_lines,
+        "structure_min_lines": config.structure_min_lines,
+        "slide_delimiter": config.slide_delimiter,
+        "slide_title": config.slide_title,
+        "pdf_use_headings": config.pdf_use_headings,
+    })
+
+
+def _plan_cache_path(source_text: str, config: WikiConfig) -> Path | None:
+    if config.skip_excel_and_small and is_small_document(source_text):
+        return None  # this document needs no foreground or ahead planner
+    root = str(config.plan_cache_dir or "")
+    return Path(root) / f"{_plan_cache_key(source_text, config)}.json" if root else None
+
+
+def _load_plan_cache(path: Path | None, source_text: str, lines: list[str], config: WikiConfig) -> CompiledSeedPlan | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        payload = read_json(path)
+        if payload.get("schema_version") != 1 or payload.get("cache_key") != _plan_cache_key(source_text, config):
+            return None
+        plan = CompiledSeedPlan.model_validate(payload["plan"])
+        from .document_map import validate_seed_plan
+
+        checked, error = validate_seed_plan(
+            plan,
+            source_line_count=len(lines),
+            block_index=build_block_index(lines),
+            lines=lines,
+            page_target_lines=config.page_target_lines,
+        )
+        return checked if error is None else None
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+
+
+def _store_plan_cache(path: Path | None, source_text: str, lines: list[str], config: WikiConfig,
+                      plan: CompiledSeedPlan) -> None:
+    if path is None:
+        return
+    write_json_atomic(path, {
+        "schema_version": 1,
+        "cache_key": _plan_cache_key(source_text, config),
+        "source_sha256": sha256_text(source_text),
+        "source_line_count": len(lines),
+        "plan": plan,
+    })
+
+
+async def _compute_seed_plan(
+    source_text: str,
+    lines: list[str],
+    *,
+    config: WikiConfig,
+    model: ModelPort | None,
+    work_root: Path,
+    on_progress: Progress = None,
+    stop_check: StopCheck = None,
+) -> tuple[CompiledSeedPlan, bool]:
+    """Run the one canonical observation/seed planner implementation."""
+
+    model = policy_of(config).planning_model(model)
+
+    if config.skip_excel_and_small and is_small_document(source_text):
+        title = next(
+            (line[2:].strip() for line in lines if line.startswith("# ") and line[2:].strip()),
+            config.document_slug or "Document",
+        )
+        return CompiledSeedPlan(summary=title, pages=[{
+            "title": title, "summary": title, "source_start": 1, "source_end": len(lines),
+        }]), True
+
+    from ..formats import structural_seed_plan
+    from .document_map import validate_seed_plan
+
+    structural = await structural_seed_plan(
+        lines,
+        kind=config.source_kind,
+        config=config,
+        model=model,
+        on_progress=on_progress,
+        stop_check=stop_check,
+    )
+    seed_plan = None
+    if structural is not None:
+        seed_plan, error = validate_seed_plan(
+            structural,
+            source_line_count=len(lines),
+            block_index=build_block_index(lines),
+            lines=lines,
+            page_target_lines=config.page_target_lines,
+        )
+        if seed_plan is None:
+            _emit(on_progress, "seed", "structural_rejected", reason=error)
+    policy = policy_of(config)
+    if seed_plan is None:
+        if policy.offline and model is None:
+            seed_plan = policy.offline_seed_plan(lines)
+        else:
+            observations = await observe_document(
+                source_text,
+                model=model,
+                config=config,
+                document=document_id(normalize_source(source_text)),
+                checkpoint_dir=work_root / "observations" / "checkpoints",
+                live_output_dir=work_root / "observations" / "live",
+                on_progress=on_progress,
+                stop_check=stop_check,
+            )
+            seed_plan = await build_seed_plan(
+                observations,
+                lines=lines,
+                model=model,
+                config=config,
+                checkpoint_dir=work_root / "planning",
+                stop_check=stop_check,
+                on_progress=on_progress,
+            )
+    return seed_plan, structural is not None
+
+
+async def prepare_seed_plan_cache(
+    source_text: str,
+    *,
+    config: WikiConfig,
+    model: ModelPort | None,
+    on_progress: Progress = None,
+    stop_check: StopCheck = None,
+) -> bool:
+    """Fill only the content-addressed planner cache for a future serial build."""
+
+    lines = split_source_lines(normalize_source(source_text))
+    target = _plan_cache_path(source_text, config)
+    if target is None or _load_plan_cache(target, source_text, lines, config) is not None:
+        return target is not None
+    key = str(target.resolve())
+    with _PLANNING_LOCK:
+        running = _PLANNING.get(key)
+        if running is None:
+            running = threading.Event()
+            _PLANNING[key] = running
+            leader = True
+        else:
+            leader = False
+    if not leader:
+        await asyncio.to_thread(running.wait)
+        return _load_plan_cache(target, source_text, lines, config) is not None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".planner-", dir=target.parent) as folder:
+            plan, _structural = await _compute_seed_plan(
+                source_text,
+                lines,
+                config=config,
+                model=model,
+                work_root=Path(folder),
+                on_progress=on_progress,
+                stop_check=stop_check,
+            )
+        _store_plan_cache(target, source_text, lines, config, plan)
+        return True
+    finally:
+        with _PLANNING_LOCK:
+            _PLANNING.pop(key, None)
+        running.set()
+
+
+async def _wait_for_plan_ahead(path: Path | None) -> None:
+    if path is None:
+        return
+    with _PLANNING_LOCK:
+        running = _PLANNING.get(str(path.resolve()))
+    if running is not None:
+        await asyncio.to_thread(running.wait)
 
 
 def _page_state_path(state_root: Path, page: SeedPage) -> Path:
@@ -855,6 +1176,7 @@ def _write_page_state(
             "attempts": result.attempts,
             "judge_score": result.judge_score,
             "missing_important_information": result.missing_important_information,
+            "defects": result.defects,
             "verbatim_sections": result.verbatim_sections,
         },
     )
@@ -890,6 +1212,7 @@ def _resume_rewritten_page(
             attempts=int(state.get("attempts", 0)),
             judge_score=state.get("judge_score"),
             missing_important_information=list(state.get("missing_important_information", [])),
+            defects=list(state.get("defects", [])),
             verbatim_sections=list(state.get("verbatim_sections", [])),
         )
     except (OSError, TypeError, ValueError):
@@ -997,6 +1320,7 @@ async def _write_section(
                 if config.source_kind in {"csv", "xlsx"}
                 else sorted(policy.code_tokens(source_text))
             ),
+            policy_rules=policy.wiki_prompt_rules("writer"),
         )
         rendered_prompt = prompt.render()
         cached_prompt = task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md"
@@ -1020,7 +1344,12 @@ async def _write_section(
                 tokens=policy.code_tokens,
             )
             judgment = read_json(cached_judge, default={})
-            if not errors and judgment and not judgment.get("missing_important_information"):
+            if (
+                not errors
+                and judgment
+                and not judgment.get("missing_important_information")
+                and not judgment.get("defects")
+            ):
                 _emit(
                     on_progress,
                     "write",
@@ -1087,8 +1416,9 @@ async def _write_section(
                 numbered_original=judge_original,
                 candidate=draft,
                 output_language=config.output_language,
+                policy_rules=policy.wiki_prompt_rules("judge"),
             ),
-            model=model,
+            model=judge_model(model),
             output_dir=task_dir,
             stem=f"{stem}-judge-{attempt:02d}",
             attempts=config.judge_attempts,
@@ -1110,17 +1440,20 @@ async def _write_section(
                   page=page.title, section=index, attempt=attempt, error=judge_error)
             break
         missing = _judge_feedback(judgment)
+        defects = [item.strip() for item in judgment.defects if item and item.strip()]
         candidates.append(
-            _SectionCandidate(draft, attempt, score=judgment.coverage_score, missing=missing)
+            _SectionCandidate(
+                draft, attempt, score=judgment.coverage_score, missing=missing, defects=defects
+            )
         )
         _emit(
             on_progress, "write", "section_judged",
             page=page.title, section=index, attempt=attempt,
-            score=judgment.coverage_score, missing=len(missing),
+            score=judgment.coverage_score, missing=len(missing), defects=len(defects),
         )
-        if not missing:
+        if not missing and not defects:
             break
-        feedback = missing
+        feedback = missing + [f"品質: {item}" for item in defects]
 
     clean = [item for item in candidates if not item.errors]
     if clean:
@@ -1128,23 +1461,24 @@ async def _write_section(
             clean,
             key=lambda item: (
                 not item.missing,
+                not item.defects,
                 item.score if item.score is not None else 0,
                 item.attempt,
             ),
         )
-        if policy.strict_judge and best.missing:
+        if policy.strict_judge and (best.missing or best.defects):
             _emit(
                 on_progress,
                 "write",
                 "section_verbatim",
                 page=page.title,
                 section=index,
-                error="judge reported missing information",
+                error="judge reported missing information or defects",
             )
             return _SectionResult(
                 markdown=_verbatim_section(lines, start, end, section_units),
                 attempts=len(candidates),
-                errors=best.missing,
+                errors=best.missing + best.defects,
                 verbatim=True,
             )
         return _SectionResult(
@@ -1152,6 +1486,7 @@ async def _write_section(
             attempts=len(candidates),
             score=best.score,
             missing=best.missing,
+            defects=best.defects,
         )
     errors = candidates[-1].errors if candidates else list(feedback)
     _emit(on_progress, "write", "section_verbatim",
@@ -1259,15 +1594,19 @@ async def _rewrite_page(
     facts = [fact for item in evidence for fact in item.facts]
     _emit(on_progress, "writer", "page_start", page=page.title, current=0, total=len(pages))
     # ponytail: sections stay in source order; add reordering only if a smoke run needs it.
-    sections = split_sections(
-        lines, start, end,
-        target=config.section_target_lines, min_lines=config.section_min_lines,
-    )
+    if config.skip_excel_and_small and is_small_document("\n".join(lines)):
+        sections = [(start, end)]
+    else:
+        sections = split_sections(
+            lines, start, end,
+            target=config.section_target_lines, min_lines=config.section_min_lines,
+        )
     buckets = assign_facts(facts, sections)
 
     drafts: list[str] = []
     scores: list[int] = []
     missing: list[str] = []
+    defects: list[str] = []
     verbatim: list[str] = []
     attempts = 0
     for index, ((s, e), section_facts) in enumerate(zip(sections, buckets), start=1):
@@ -1282,6 +1621,7 @@ async def _rewrite_page(
         if result.score is not None:
             scores.append(result.score)
         missing.extend(f"原文 {s}-{e}行: {item}" for item in result.missing)
+        defects.extend(f"原文 {s}-{e}行: {item}" for item in result.defects)
         if result.verbatim:
             verbatim.append(f"原文 {s}-{e}行: " + "; ".join(result.errors))
 
@@ -1312,6 +1652,7 @@ async def _rewrite_page(
         attempts=attempts,
         judge_score=min(scores) if scores else None,
         missing_important_information=missing,
+        defects=defects,
         verbatim_sections=verbatim,
     )
 
@@ -1336,13 +1677,6 @@ async def _rewrite_all(
     parents: dict[str, str] | None = None,
 ) -> list[RewriteResult]:
     semaphore = asyncio.Semaphore(max(1, config.rewrite_concurrency))
-    tokens = {
-        item.number: word_tokens(
-            _prompt_safe(_slice_ranges(lines, item.owner_ranges), _page_units(item, units))
-        )
-        for item in pages
-    }
-
     results: list[RewriteResult] = []
     pending: list[SeedPage] = []
     rewrite_version = policy_of(config).cache_key(REWRITE_PROMPT_VERSION)
@@ -1368,6 +1702,36 @@ async def _rewrite_all(
             output_path.unlink(missing_ok=True)
             state_path.unlink(missing_ok=True)
             pending.append(page)
+
+    handled = await policy_of(config).rewrite_pending_pages(
+        pending=pending,
+        results=results,
+        pages=pages,
+        lines=lines,
+        units=units,
+        model=model,
+        config=config,
+        work_root=work_root,
+        wiki_root=wiki_root,
+        state_root=state_root,
+        source_path=source_path,
+        source_snapshot_path=source_snapshot_path,
+        source_sha256=source_sha256,
+        source_line_count=source_line_count,
+        rewrite_version=rewrite_version,
+        stop_check=stop_check,
+        on_progress=on_progress,
+        parents=parents,
+    )
+    if handled:
+        return sorted(results, key=lambda item: item.page.number)
+
+    tokens = {
+        item.number: word_tokens(
+            _prompt_safe(_slice_ranges(lines, item.owner_ranges), _page_units(item, units))
+        )
+        for item in pages
+    }
 
     async def one(page: SeedPage) -> RewriteResult:
         async with semaphore:
@@ -1469,6 +1833,7 @@ def _manifest(
                 "attempts": by_number[page.number].attempts,
                 "judge_score": by_number[page.number].judge_score,
                 "missing_important_information": by_number[page.number].missing_important_information,
+                "defects": by_number[page.number].defects,
                 "verbatim_sections": by_number[page.number].verbatim_sections,
             }
             for page in pages
@@ -1492,11 +1857,15 @@ async def run_pipeline(
     normalized = normalize_source(source_text)
     lines = split_source_lines(normalized)
     config = config or WikiConfig()
+    single_page_rewrite = config.skip_excel_and_small and is_small_document(source_text)
+    if single_page_rewrite and not config.document_slug:
+        config = config.model_copy(update={"document_slug": source_path.stem})
     policy = policy_of(config)
     # An offline policy may run without a model client (deterministic smoke runs);
     # every other caller keeps the historical implicit client construction.
     if not (model is None and policy.offline and not config.chat_base_url):
-        model = model or ChatModelPort(config)
+        if model is None:
+            model = policy.model_port(config)
     slug = slugify(config.document_slug or source_path.stem, fallback="document").casefold()
     _emit(on_progress, "planner", "start", source_lines=len(lines))
     run_root = (
@@ -1521,6 +1890,7 @@ async def run_pipeline(
         source_sha256=source_hash,
         source_line_count=len(lines),
         prompt_version=policy.cache_key(SEED_PLAN_VERSION),
+        single_page_rewrite=single_page_rewrite,
     ) if config.resume else None
     if pages is not None:
         block_index = build_block_index(lines)
@@ -1539,57 +1909,39 @@ async def run_pipeline(
         if wiki_root.exists():
             shutil.rmtree(wiki_root)
         wiki_root.mkdir(parents=True, exist_ok=True)
-        from ..formats import structural_seed_plan
-        from .document_map import validate_seed_plan
-
-        structural = await structural_seed_plan(
-            lines,
-            kind=config.source_kind,
-            config=config,
-            model=model,
-            on_progress=on_progress,
-            stop_check=stop_check,
-        )
-        seed_plan = None
-        if structural is not None:
-            seed_plan, error = validate_seed_plan(
-                structural,
-                source_line_count=len(lines),
-                block_index=build_block_index(lines),
-                lines=lines,
-                page_target_lines=config.page_target_lines,
+        plan_cache = _plan_cache_path(source_text, config)
+        await _wait_for_plan_ahead(plan_cache)
+        seed_plan = _load_plan_cache(plan_cache, source_text, lines, config)
+        if seed_plan is not None:
+            plan_kind = "cached"
+        else:
+            seed_plan, structural = await _compute_seed_plan(
+                source_text,
+                lines,
+                config=config,
+                model=model,
+                work_root=work_root,
+                on_progress=on_progress,
+                stop_check=stop_check,
             )
-            if seed_plan is None:
-                _emit(on_progress, "seed", "structural_rejected", reason=error)
-        if seed_plan is None:
-            if policy.offline and model is None:
-                seed_plan = policy.offline_seed_plan(lines)
-            else:
-                observations = await observe_document(
-                    source_text,
-                    model=model,
-                    config=config,
-                    document=document_id(normalized),
-                    checkpoint_dir=work_root / "observations" / "checkpoints",
-                    live_output_dir=work_root / "observations" / "live",
-                    on_progress=on_progress,
-                    stop_check=stop_check,
-                )
-                seed_plan = await build_seed_plan(
-                    observations,
-                    lines=lines,
-                    model=model,
-                    config=config,
-                    checkpoint_dir=work_root / "planning",
-                    stop_check=stop_check,
-                    on_progress=on_progress,
-                )
-        _emit(on_progress, "seed", "structural" if structural is not None and seed_plan is not None else "llm", pages=len(seed_plan.pages))
+            _store_plan_cache(plan_cache, source_text, lines, config, seed_plan)
+            plan_kind = "single_page" if single_page_rewrite else "structural" if structural else "llm"
+        _emit(on_progress, "seed", plan_kind, pages=len(seed_plan.pages))
         pages = _plan_pages(seed_plan)
         _verify_ranges(pages, len(lines))
 
     for page in pages:
         page.title = policy.title(page.title)
+
+    # A generated title can be valid as text but too large as a UTF-8
+    # filesystem component. Repair it before seeds, pages, or metadata use the
+    # filename. The visible wiki title remains unchanged.
+    await _repair_long_page_filenames(
+        pages,
+        model=model,
+        on_progress=on_progress,
+        stop_check=stop_check,
+    )
 
     from ..formats.context import summarize_hierarchy
 
@@ -1599,7 +1951,7 @@ async def run_pipeline(
         parents = await summarize_hierarchy(
             pages,
             lines,
-            model=model,
+            model=policy.planning_model(model),
             config=config,
             checkpoint=state_root / "context.json",
             stop_check=stop_check,
@@ -1652,6 +2004,8 @@ async def run_pipeline(
             for page in pages
         ],
     }
+    if single_page_rewrite:
+        plan_json["single_page_rewrite"] = True
     write_json_atomic(plan_path, plan_json)
     write_text_atomic(wiki_root / "index.md", _index_text(source_path.stem, pages))
     _emit(on_progress, "seed", "done", pages=len(pages), images=len(units))

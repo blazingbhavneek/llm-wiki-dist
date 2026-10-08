@@ -690,38 +690,81 @@ async def publish_pages(
     on_prepared: Any = None,
     on_confirmed: Any = None,
     on_reconcile: Any = None,
+    on_progress: Any = None,
 ) -> list[GrowiPage]:
     """Resolve every page ID first, then publish stable permalink bodies."""
     current: dict[str, GrowiPage | None] = {}
+
+    async def report_page(
+        step: str,
+        index: int,
+        item: dict[str, str],
+        *,
+        stage: str = "growi-publish",
+        **extra: Any,
+    ) -> None:
+        await _maybe_await(on_progress, {
+            "stage": stage,
+            "step": step,
+            "current": index,
+            "total": len(pages),
+            "page": item.get("local_path") or item.get("path") or "<page>",
+            **extra,
+        })
+
     # Inspect the whole batch before creating/updating any page. The following
     # PUT still uses this exact revision, so a later race fails with HTTP 409.
-    for item in pages:
-        path = item["path"]
-        body = item["body"]
-        assert_publish_path(path, mode=mode, write_path=write_path, root_path=root_path)
-        expected = (expected_pages or {}).get(item.get("local_path", ""))
-        existing = await client.get_page(**({"page_id": str(expected["page_id"])} if expected else {"path": path}))
-        if expected:
-            if existing is None:
-                raise RuntimeError(f"GROWI page disappeared before publication: {path}")
-            if existing.path != path or existing.page_id != expected.get("page_id"):
-                raise RuntimeError(f"GROWI page moved before publication: {path}")
-            if not expected.get("revision_id") or existing.revision_id != expected["revision_id"]:
-                raise RuntimeError(f"GROWI page changed before publication: {path}")
-            if managed_page_markdown(existing.body, str(expected.get("marker_id") or "")) is None:
-                raise RuntimeError(f"GROWI ownership marker missing before publication: {path}")
-        elif existing is not None:
-            stamps = _page_stamps(body)
-            marker = stamps[0] if len(stamps) == 1 else None
-            if marker is None or managed_page_markdown(existing.body, marker.group("id")) is None:
-                await _maybe_await(on_conflict, item, existing, "unowned_destination")
-                raise RuntimeError(f"GROWI destination is not owned by this page: {path}")
-            initial = _growi_markdown(_image_fallbacks(body))
-            if merge_marked_sections(existing.body, initial) != existing.body:
-                if not await _maybe_await(on_reconcile, item, existing):
-                    await _maybe_await(on_conflict, item, existing, "missing_published_snapshot")
-                    raise RuntimeError(f"GROWI destination has no inspected published baseline: {path}")
-        current[path] = existing
+    for index, item in enumerate(pages, 1):
+        try:
+            path = item["path"]
+            body = item["body"]
+            assert_publish_path(path, mode=mode, write_path=write_path, root_path=root_path)
+            expected = (expected_pages or {}).get(item.get("local_path", ""))
+            existing = await client.get_page(**({"page_id": str(expected["page_id"])} if expected else {"path": path}))
+            if expected:
+                if existing is None:
+                    raise RuntimeError(f"GROWI page disappeared before publication: {path}")
+                if existing.path != path or existing.page_id != expected.get("page_id"):
+                    raise RuntimeError(f"GROWI page moved before publication: {path}")
+                if not expected.get("revision_id") or existing.revision_id != expected["revision_id"]:
+                    raise RuntimeError(f"GROWI page changed before publication: {path}")
+                if managed_page_markdown(existing.body, str(expected.get("marker_id") or "")) is None:
+                    raise RuntimeError(f"GROWI ownership marker missing before publication: {path}")
+            elif existing is not None:
+                stamps = _page_stamps(body)
+                marker = stamps[0] if len(stamps) == 1 else None
+                if marker is None or managed_page_markdown(existing.body, marker.group("id")) is None:
+                    await _maybe_await(on_conflict, item, existing, "unowned_destination")
+                    raise RuntimeError(f"GROWI destination is not owned by this page: {path}")
+                initial = _growi_markdown(_image_fallbacks(body))
+                if merge_marked_sections(existing.body, initial) != existing.body:
+                    if not await _maybe_await(on_reconcile, item, existing):
+                        await _maybe_await(on_conflict, item, existing, "missing_published_snapshot")
+                        raise RuntimeError(f"GROWI destination has no inspected published baseline: {path}")
+            current[path] = existing
+            await report_page(
+                "page_checked",
+                index,
+                item,
+                stage="growi-preflight",
+                status="existing" if existing is not None else "new",
+            )
+        except Exception as exc:
+            await report_page(
+                "page_failed",
+                index,
+                item,
+                stage="growi-preflight",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+    await _maybe_await(on_progress, {
+        "stage": "growi-preflight",
+        "step": "done",
+        "current": len(pages),
+        "total": len(pages),
+        "pages": len(pages),
+    })
     for item in pages:
         path, body = item["path"], item["body"]
         existing = current[path]
@@ -742,29 +785,37 @@ async def publish_pages(
         if item.get("local_path") and current[item["path"]].page_id
     })
     results: list[GrowiPage] = []
-    for item in pages:
-        path = item["path"]
-        existing = current[path]
-        body = rewrite_page_links(item["body"], item.get("local_path", ""), page_ids)
-        body = await _publish_images(client, body, existing.page_id)
-        merged = merge_marked_sections(existing.body, _growi_markdown(body))
-        if merged == existing.body:
-            results.append(existing)
-            await _maybe_await(on_revision, existing)
-            continue
-        await _maybe_await(on_prepared, item, existing, merged)
-        try:
-            page = _complete_page(
-                await client.update_page(existing.page_id, existing.revision_id, merged), path, merged
-            )
-        except GrowiAPIError as exc:
-            if exc.status_code == 409:
-                observed = await client.get_page(page_id=existing.page_id)
-                await _maybe_await(on_conflict, item, observed, "revision_race")
-            raise
-        results.append(page)
-        await _maybe_await(on_confirmed, item, page, merged)
-        await _maybe_await(on_revision, page)
+    try:
+        for index, item in enumerate(pages, 1):
+            path = item["path"]
+            existing = current[path]
+            body = rewrite_page_links(item["body"], item.get("local_path", ""), page_ids)
+            body = await _publish_images(client, body, existing.page_id)
+            merged = merge_marked_sections(existing.body, _growi_markdown(body))
+            if merged == existing.body:
+                results.append(existing)
+                await _maybe_await(on_revision, existing)
+                await report_page("page_done", index, item, status="unchanged")
+                continue
+            await _maybe_await(on_prepared, item, existing, merged)
+            try:
+                page = _complete_page(
+                    await client.update_page(existing.page_id, existing.revision_id, merged), path, merged
+                )
+            except GrowiAPIError as exc:
+                if exc.status_code == 409:
+                    observed = await client.get_page(page_id=existing.page_id)
+                    await _maybe_await(on_conflict, item, observed, "revision_race")
+                raise
+            results.append(page)
+            await _maybe_await(on_confirmed, item, page, merged)
+            await _maybe_await(on_revision, page)
+            await report_page("page_done", index, item, status="published")
+    except Exception as exc:
+        failed_index = len(results)
+        failed_item = pages[failed_index] if failed_index < len(pages) else pages[-1]
+        await report_page("page_failed", failed_index, failed_item, error=f"{type(exc).__name__}: {exc}")
+        raise
     return results
 
 
@@ -833,6 +884,7 @@ class GrowiPublisher:
         known_pages: dict[str, dict[str, Any]] | None = None,
         only_pages: set[str] | None = None,
         cleanup_revisions: dict[str, str] | None = None,
+        on_progress: Any = None,
     ) -> dict[str, GrowiPage]:
         from publisher.human_changes import HumanStore
 
@@ -850,6 +902,15 @@ class GrowiPublisher:
             document_paths[self.doc_path(project, rel)] = {page["path"] for page in document_pages}
         if len({page["path"] for page in pages}) != len(pages):
             raise ValueError("multiple local wiki pages resolve to the same GROWI path")
+        if on_progress is not None:
+            on_progress({
+                "stage": "growi-publish",
+                "step": "start",
+                "current": 0,
+                "total": len(pages),
+                "documents": len(rels),
+                "pages": len(pages),
+            })
         scoped = {
             path: row for path, row in (known_pages or {}).items()
             if any(path.startswith(project.wiki_dir(rel).relative_to(project.wiki).as_posix() + "/") for rel in rels)
@@ -961,7 +1022,17 @@ class GrowiPublisher:
             on_prepared=record_prepared,
             on_confirmed=record_confirmed,
             on_reconcile=reconcile_prepared,
+            on_progress=on_progress,
         ))
+        if on_progress is not None:
+            on_progress({
+                "stage": "growi-publish",
+                "step": "done",
+                "current": len(results),
+                "total": len(pages),
+                "documents": len(rels),
+                "pages": len(results),
+            })
         if only_pages is None:
             for doc_path, keep in document_paths.items():
                 asyncio.run(self._trash_under(doc_path, keep=keep, expected_revisions={
@@ -1093,6 +1164,7 @@ class GrowiPublisher:
         project: Any,
         published_pages: dict[str, dict[str, Any]],
         unchanged_documents: set[str],
+        on_progress: Any = None,
     ) -> tuple[list[str], list[str], set[str]]:
         """Capture remote intent durably, then render from the pure generated base."""
         from publisher.human_changes import DASHBOARD, RETAINED, HumanStore, LegacyBaseUnavailable, editable, map_generated, merge, strip_regions, wrap_edit
@@ -1118,6 +1190,14 @@ class GrowiPublisher:
             }
 
         remote = asyncio.run(fetch())
+        if on_progress is not None:
+            on_progress({
+                "stage": "growi-preflight",
+                "step": "start",
+                "current": 0,
+                "total": len(remote),
+                "pages": len(remote),
+            })
         page_paths = {str(row["page_id"]): path for path, row in published_pages.items() if row.get("page_id")}
         pulled, conflicts, blocked = [], [], set()
         decisions = {"unchanged": 0, "observed": 0, "captured": 0, "blocked": 0, "recovered": 0}
@@ -1130,7 +1210,7 @@ class GrowiPublisher:
                 state["status"] = "pending"
                 write_json_atomic(marker, state)
 
-        for local_path, page in remote.items():
+        for index, (local_path, page) in enumerate(remote.items(), 1):
             row = published_pages[local_path]
             document = posixpath.dirname(local_path)
             row["marker_id"] = str(row.get("marker_id") or self.page_marker_id(project, local_path))
@@ -1344,6 +1424,23 @@ class GrowiPublisher:
                 blocked.add(document)
                 conflicts.append(f"{local_path}: {reason}")
                 decisions["blocked"] += 1
+            finally:
+                if on_progress is not None:
+                    on_progress({
+                        "stage": "growi-preflight",
+                        "step": "page_done",
+                        "current": index,
+                        "total": len(remote),
+                        "page": local_path,
+                    })
+        if on_progress is not None:
+            on_progress({
+                "stage": "growi-preflight",
+                "step": "done",
+                "current": len(remote),
+                "total": len(remote),
+                "pages": len(remote),
+            })
         self.human_sync_summary = {"mode": mode, **decisions}
         return list(dict.fromkeys(pulled)), conflicts, blocked
 
@@ -1353,29 +1450,49 @@ class GrowiPublisher:
             if known_pages is not None else None
         ), on_deleted=lambda page: self._remember_deleted(project, known_pages or {}, page)))
 
-    def reset(self) -> int:
+    def reset(self, *, on_progress: Any = None) -> int:
         """Trash every publisher-marked page below the configured write path."""
-        return asyncio.run(self._trash_under(growi_path(self.connection.write_path), keep=set()))
+        return asyncio.run(self._trash_under(
+            growi_path(self.connection.write_path), keep=set(), on_progress=on_progress,
+        ))
 
     async def _trash_under(self, doc_path: str, *, keep: set[str], expected_revisions: dict[str, str] | None = None,
-                           on_deleted: Any = None) -> int:
+                           on_deleted: Any = None, on_progress: Any = None) -> int:
         doomed: dict[str, str] = {}
         inspected: dict[str, GrowiPage] = {}
-        for listed in await self.client.list_all_pages(doc_path):
-            if listed.path == doc_path or listed.path in keep:
-                continue
+        listed_pages = [
+            listed for listed in await self.client.list_all_pages(doc_path)
+            if listed.path != doc_path and listed.path not in keep
+        ]
+        if on_progress is not None:
+            on_progress({
+                "stage": "reset", "step": "start", "current": 0,
+                "total": len(listed_pages), "pages": len(listed_pages),
+            })
+        for index, listed in enumerate(listed_pages, 1):
             full = await self.client.get_page(page_id=listed.page_id)
             if full and (_STAMP_RE.search(full.body) or _CHUNK_MARKER_RE.search(full.body)):
                 if expected_revisions is not None and full.revision_id != expected_revisions.get(full.page_id):
                     raise RuntimeError(f"GROWI page changed before deletion: {full.path}")
                 doomed[full.page_id] = full.revision_id
                 inspected[full.page_id] = full
+            if on_progress is not None:
+                on_progress({
+                    "stage": "reset", "step": "page_checked", "current": index,
+                    "total": len(listed_pages), "page": listed.path,
+                    "status": "owned" if full and full.page_id in doomed else "skipped",
+                })
         items = list(doomed.items())
         for start in range(0, len(items), 20):
             batch = dict(items[start:start + 20])
             await self.client.delete_pages(batch)
             for page_id in batch:
                 await _maybe_await(on_deleted, inspected[page_id])
+        if on_progress is not None:
+            on_progress({
+                "stage": "reset", "step": "done", "current": len(listed_pages),
+                "total": len(listed_pages), "deleted": len(doomed),
+            })
         return len(doomed)
 
 

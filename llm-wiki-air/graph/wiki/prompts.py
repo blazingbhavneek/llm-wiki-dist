@@ -30,6 +30,23 @@ COMMON_RULES = (
 )
 
 
+# Defects the pipeline produced by itself in past runs, turned into rules:
+# repetition loops, invented schema words, wrong-script text, and convert junk.
+QUALITY_RULES = (
+    "# 品質ルール（Wiki側が自分で作り出す欠陥はすべて不可）\n"
+    "- 同じ文・見出し・表を2回以上書かない。ただし原文が繰り返している表の行は全行そのまま写す。\n"
+    "- 原文にない表ヘッダ・列名・単位・数値・英語ラベル・略語の正式名称を作らない。"
+    "判読できない文字は推測で埋めず「判読不可」と注記する。\n"
+    "- 指定の出力言語でない文字（中国語簡体字など）や、日本語の表の英語訳・英語だけの"
+    "説明を書かない。\n"
+    "- 変換ゴミ（`<nl>`・`<fcel>`・`<lcel>`、`#REF!`、`%%` だけの行、内部型名 `text_image`）を"
+    "そのまま写さない。\n"
+    "- 「出力することができません」などの断り書き、内容のない見出し、空のコードフェンスを"
+    "書かない。\n"
+    "- この節の原文と無関係な話題（別文書の説明、一般的な解説テンプレート）を書かない。\n"
+)
+
+
 @dataclass(frozen=True)
 class Prompt:
     kind: str
@@ -329,6 +346,7 @@ def page_judge_prompt(
     numbered_original: str,
     candidate: str,
     output_language: str,
+    policy_rules: str = "",
 ) -> Prompt:
     """Check both important factual coverage and standalone Wiki usefulness."""
 
@@ -336,6 +354,7 @@ def page_judge_prompt(
 
     return Prompt(
         kind="page_judge",
+        version=REWRITE_PROMPT_VERSION,
         system=(
             "あなたは技術Wikiの情報欠落と、独立したWiki記事としての完成度を判定する査読者である。"
             "文章を書き直してはならない。"
@@ -346,8 +365,19 @@ def page_judge_prompt(
             "要約や再構成で意味が保持されていれば欠落ではない。捏造された欠落を報告しない。\n"
             "候補は原文の一部（節）だけを書き直したものである。節の範囲外の情報、"
             "より詳しい説明、一般的な解説、構成の改善を要求してはならない。"
-            "「他ページから追加した事実」が候補に含まれていなければ、それは欠落として報告する。\n\n"
-            "JSON形式:\n" + _schema_hint(PageJudgeResult)
+            "「他ページから追加した事実」が候補に含まれていなければ、それは欠落として報告する。\n"
+            "候補が自分で作り出した欠陥も defects に報告する。原文どおりの繰り返し、表の全行、"
+            "識別子の綴り、コードブロック内の内容は欠陥に数えない。報告するのは候補が"
+            "自分で書き足し・重複・破損させた分だけである:\n"
+            "- 重複: 同じ文・見出し・表のブロックを候補が複数回出力している。\n"
+            "- 創出: 原文にない表ヘッダ、列名、単位、数値、英語ラベル、略語の正式名称、"
+            "テンプレート図が混ぜられている。\n"
+            "- 言語: 出力言語でない文字や、英語だけの表ラベル・解説が混じっている。\n"
+            "- ゴミ: 原文にないHTML断片、変換記号、エラー値、果てしない文字の繰り返しが残っている。\n"
+            "- 空: 見出しの直後に内容がない。\n"
+            "- 逸脱: この節の原文と無関係な話題に書き換わっている。"
+            + (("\n\n" + policy_rules.strip() + "\n\n") if policy_rules.strip() else "\n\n")
+            + "JSON形式:\n" + _schema_hint(PageJudgeResult)
         ),
         body=(
             f"ページ: {page_title}\n"
@@ -355,7 +385,9 @@ def page_judge_prompt(
             f"判定文と欠落説明は{output_language}で書くこと。\n"
             "coverage_scoreは重要情報の保持率として0〜100で採点する。"
             "missing_important_informationには本当に重要な欠落だけを入れ、"
-            "原文の正確な開始行と終了行を付ける。\n\n"
+            "原文の正確な開始行と終了行を付ける。"
+            "defectsには直すべき点を1項目1文で書き、欠陥がなければ空にする。"
+            "coverage_scoreは欠落だけで採点し、defectsの有無で下げない。\n\n"
             f"--- 行番号付き原文 ---\n{numbered_original}\n\n"
             f"--- Wiki候補 ---\n{candidate}"
         ),
@@ -382,6 +414,7 @@ def section_write_prompt(
     feedback: Sequence[str] = (),
     context: str = "",
     code_identifiers: Sequence[str] = (),
+    policy_rules: str = "",
 ) -> Prompt:
     """Rewrite one section losslessly; everything needed is in this prompt."""
 
@@ -417,7 +450,9 @@ def section_write_prompt(
             "- 出力は今回提示された原文に存在する内容だけに限定する。以前の版の出力を保持せず、"
             "原文から削除された段落、文、表、図、箇条書きは出力から完全に削除する。\n"
             "- コードブロック、表、画像は`[[NEO-IMAGE:...]]`トークンとして与えられる。"
-            "トークンを一字も変えず、元と同じ話題の直後に1回だけ置く。トークンの中身を書き起こさない。"
+            "トークンを一字も変えず、元と同じ話題の直後に1回だけ置く。トークンの中身を書き起こさない。\n\n"
+            + QUALITY_RULES
+            + (("\n" + policy_rules.strip() + "\n") if policy_rules.strip() else "")
         ),
         body=(
             "# 対象\n"

@@ -117,7 +117,7 @@ def divisor_split(start: int, end: int, *, target: int, index: BlockIndex) -> li
             pieces.append((cursor, end))
             break
         ideal = start + round(size * part / d)
-        cut = index.nearest_safe_cut(ideal, backsearch=target // 4, forward_limit=target // 4)
+        cut = index.nearest_safe_cut(ideal, backsearch=target // 4)
         cut = max(cursor + 1, min(cut, end))
         pieces.append((cursor, cut - 1))
         cursor = cut

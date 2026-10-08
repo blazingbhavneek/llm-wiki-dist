@@ -99,6 +99,7 @@ def _apply_incremental_edits(
         scrub_base64,
     )
     from graph.wiki.incremental import source_lines
+    from common.policy import policy_of
     from graph.wiki.model import ChatModelPort
     from graph.wiki.page import check_section, code_tokens, verbatim_blocks
     from graph.wiki.prompts import incremental_page_edit_prompt
@@ -115,7 +116,15 @@ def _apply_incremental_edits(
 
     old_prompt_lines = sanitize_lines(old_lines, old_units)
     new_prompt_lines = sanitize_lines(new_lines, new_units)
-    model = llm if hasattr(llm, "structured") else ChatModelPort(wiki_config(settings, run_dir=state_root), llm=llm)
+    if hasattr(llm, "structured"):
+        # Tests and embedded callers can supply the complete model port.  Do
+        # not require the production endpoint settings in that path: besides
+        # being unnecessary, doing so broke human-overlay tier integration
+        # after the phase/configuration split.
+        model = llm
+    else:
+        config = wiki_config(settings, run_dir=state_root)
+        model = policy_of(config).model_port(config) if llm is None else ChatModelPort(config, llm=llm)
     attempts = max(5, int(getattr(settings, "wiki_write_attempts", 5)))
     semaphore = asyncio.Semaphore(
         max(1, int(getattr(settings, "wiki_rewrite_concurrency", getattr(settings, "concurrency", app_concurrency()))))
@@ -292,9 +301,16 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
     policy = policy_of(settings)
     fields = dict(
         policy=policy.name,
+        skip_excel_and_small=bool(getattr(settings, "skip_excel_and_small", False)),
         chat_base_url=settings.chat_base_url,
         chat_api_key=settings.chat_api_key,
         chat_model=settings.chat_model,
+        writer_base_url=str(getattr(settings, "writer_base_url", "") or ""),
+        writer_api_key=str(getattr(settings, "writer_api_key", "") or ""),
+        writer_model=str(getattr(settings, "writer_model_name", "") or ""),
+        judge_base_url=str(getattr(settings, "judge_base_url", "") or ""),
+        judge_api_key=str(getattr(settings, "judge_api_key", "") or ""),
+        judge_model=str(getattr(settings, "judge_model_name", "") or ""),
         temperature=0.7,
         output_language=getattr(settings, "wiki_output_language", "Japanese (日本語)"),
         section_target_lines=int(getattr(settings, "wiki_section_target_lines", 80)),
@@ -305,6 +321,11 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
         ),
         request_timeout=int(getattr(settings, "wiki_request_timeout", 300)),
         run_dir=str(run_dir),
+        plan_cache_dir=(
+            str(Path(settings.cache_dir) / "planner")
+            if str(getattr(settings, "cache_dir", "") or "")
+            else ""
+        ),
         resume=resume,
         require_resume=require_resume,
         source_kind=source_kind,
@@ -373,14 +394,34 @@ def build_wiki_output(
     if mode not in {"wiki", "chunks"}:
         raise ValueError("mode must be wiki or chunks")
     kind = source_kind or kind_of(document_name)
+    if mode == "chunks" and llm is None:
+        # Standalone phase calls may not have a prebuilt publisher model. The
+        # standard hook still returns None, preserving the legacy error path;
+        # FastPolicy supplies the gated writer/judge pair.
+        from common.policy import policy_of
+
+        config = wiki_config(
+            settings,
+            run_dir=state_dir or (out_dir / "wiki-state"),
+            resume=resume,
+            source_kind=kind,
+        )
+        llm = policy_of(config).model_if_missing(config)
     if is_tabular(kind):
         from graph.common.async_tools import run_async_blocking
         from graph.formats import csv as csv_format, xlsx as xlsx_format
+        from common.policy import policy_of
         from graph.wiki.model import ChatModelPort
 
         config = wiki_config(settings, run_dir=state_dir or (out_dir / "wiki-state"), resume=resume, source_kind=kind)
         runner = xlsx_format.run if kind == "xlsx" else csv_format.run
-        model = llm if hasattr(llm, "structured") and hasattr(llm, "text") else ChatModelPort(config, llm=llm)
+        model = (
+            llm
+            if hasattr(llm, "structured") and hasattr(llm, "text")
+            else policy_of(config).model_port(config)
+            if llm is None
+            else ChatModelPort(config, llm=llm)
+        )
         run_async_blocking(runner(source_path, run_dir=out_dir, model=model, config=config, on_progress=on_progress, stop_check=stop_check))
         return SimpleNamespace(out_dir=out_dir, file_count=len(list((out_dir / "docs").glob("*.md"))))
     if mode == "wiki":
@@ -404,12 +445,16 @@ def build_wiki_output(
 
     body = source_path.read_text(encoding="utf-8")
     from graph.wiki.legacy import run_chunk_pipeline
+    from graph.wiki.model import ModelPair
 
     return run_chunk_pipeline(
         source_text=body,
         document_name=document_name,
         out_dir=out_dir,
-        llm=getattr(llm, "llm", llm),
+        # Keep the historical raw client for standard/custom ports.  A fast
+        # ModelPair is the one case that must stay wrapped so its writer gate
+        # is not bypassed.
+        llm=llm if isinstance(llm, ModelPair) else getattr(llm, "llm", llm),
         concurrency=max(
             1,
             int(
@@ -499,11 +544,12 @@ def write_wiki_pages(
     resume: bool = True,
     identity_seed: str | None = None,
 ) -> WriteResult:
-    from graph.formats import kind_of, supports_page_updates
+    from graph.formats import is_tabular, kind_of, supports_page_updates
     from graph.formats.xlsx import decide_update as decide_workbook
     from graph.wiki.export import export_ingest_layout
     from graph.wiki.incremental import FULL_MIN_REGEN_SHARE, UpdateDecision, apply_update, decide_update, drop_pages
     from graph.wiki.pipeline import ResumeUnavailable
+    from graph.wiki.page import is_small_document
     from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
 
     kind = kind_of(rel)
@@ -515,13 +561,25 @@ def write_wiki_pages(
     stored_run = read_json(state_root / "run.json", default={})
     requested_policy = str(getattr(settings, "policy", "standard"))
     stored_policy = str(stored_run.get("policy") or "standard")
-    if resume and old_source.exists() and stored_policy != requested_policy:
+    shortcut = bool(getattr(settings, "skip_excel_and_small", False))
+    generation_mode = (
+        "sheets-only" if shortcut and is_tabular(kind)
+        else "single-page" if shortcut and mode == "wiki" and is_small_document(new_text)
+        else "normal"
+    )
+    plan_path = state_root / "state" / "plan.json"
+    stored_mode = stored_run.get("generation_mode") or (
+        "single-page" if read_json(plan_path, default={}).get("single_page_rewrite") else "normal"
+    )
+    if resume and (stored_run or plan_path.exists()) and stored_mode != generation_mode:
+        decision = UpdateDecision(tier=3, reason="generation-mode-switch")
+    elif resume and old_source.exists() and stored_policy != requested_policy:
         # A changed policy must not reuse an incompatible page draft. This is
         # lazy and document-scoped; unchanged documents never reach this code.
         decision = UpdateDecision(tier=3, reason="policy-switch")
     elif not resume:
         decision = UpdateDecision(tier=3, reason="forced")
-    elif mode == "wiki" and kind == "xlsx" and (workbook := decide_workbook(state_root, new_text, project.wiki_dir(rel))):
+    elif mode == "wiki" and kind == "xlsx" and not shortcut and (workbook := decide_workbook(state_root, new_text, project.wiki_dir(rel))):
         decision = workbook[0]
     elif mode != "wiki" or not supports_page_updates(kind):
         decision = UpdateDecision(tier=3, reason="format-full-only")
@@ -666,12 +724,15 @@ def write_wiki_pages(
             publish_output(out_dir, target)
         from common.policy import STANDARD, resolve_policy
 
-        if resolve_policy(requested_policy) is not STANDARD or "policy" in stored_run:
+        if (resolve_policy(requested_policy) is not STANDARD or "policy" in stored_run
+                or generation_mode != "normal" or "generation_mode" in stored_run):
             # Also restamp a variant-built document rebuilt as standard; a document
             # only ever built as standard gets no new file.
             run_state = read_json(state_root / "run.json", default={})
             run_state["policy"] = requested_policy
             run_state["policy_version"] = resolve_policy(requested_policy).version
+            if generation_mode != "normal" or "generation_mode" in stored_run:
+                run_state["generation_mode"] = generation_mode
             write_json_atomic(state_root / "run.json", run_state)
         write_source_stamp(target, project.raw_file(rel), rel, identity_seed=identity_seed)
         from publisher.human_changes import HumanStore, apply_generated
@@ -752,13 +813,18 @@ def run_linker(
         return []
 
     from graph.common.async_tools import run_async_blocking
+    from common.policy import policy_of
     from graph.wiki.model import ChatModelPort
 
     if hasattr(llm, "structured"):
         model = llm  # already a model port (the linker only needs structured()); no services to construct
     else:
         config = wiki_config(settings, run_dir=project.state_dir(rel))
-        model = ChatModelPort(config, llm=llm)
+        model = (
+            policy_of(config).model_port(config)
+            if llm is None
+            else ChatModelPort(config, llm=llm)
+        )
     if embedder is None:
         try:
             from graph.clients.embeddings import Embedder
@@ -792,8 +858,17 @@ def run_linkers(
         return []
     from graph.common.async_tools import run_async_blocking
     from graph.linker import link_documents
+    from common.policy import policy_of
     from graph.wiki.model import ChatModelPort
-    model = llm if hasattr(llm, "structured") else ChatModelPort(wiki_config(settings, run_dir=project.metadata / "state" / "linker"), llm=llm) if llm is not None else None
+    if hasattr(llm, "structured"):
+        model = llm
+    else:
+        config = wiki_config(settings, run_dir=project.metadata / "state" / "linker")
+        model = (
+            policy_of(config).model_if_missing(config)
+            if llm is None
+            else ChatModelPort(config, llm=llm)
+        )
     changed_pages = set(affected_pages) if affected_pages else None
     result = run_async_blocking(link_documents(
         project, rels, model=model, embedder=embedder, settings=settings,

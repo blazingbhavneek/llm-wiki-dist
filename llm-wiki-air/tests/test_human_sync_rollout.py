@@ -485,6 +485,41 @@ class OperatorAndLiveGateTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stale"):
             self.store.resolve(edit["edit_id"], action="accept-source", expected_revision="old")
 
+    def test_human_cli_checkpoints_summary_and_rejects_a_dirty_live_tree(self):
+        from publisher.history import last_good
+        from runner import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Project(Path(tmp) / "empty-project").ensure()
+            settings = SimpleNamespace()
+            args = SimpleNamespace(human_command="status")
+            with patch.object(cli, "_settings", return_value=settings), \
+                 patch.object(cli, "open_project", return_value=project), \
+                 patch("builtins.print"):
+                self.assertEqual(cli.cmd_human(args), 0)
+            head = subprocess.run(
+                ["git", "-C", str(project.root), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(last_good(project), head)
+            summary_path = project.metadata / "human-sync" / "operator-summary.json"
+            self.assertTrue(summary_path.is_file())
+
+            # Stable summaries are a no-op; a second status must not create an
+            # empty checkpoint.
+            with patch.object(cli, "_settings", return_value=settings), \
+                 patch.object(cli, "open_project", return_value=project), \
+                 patch("builtins.print"):
+                self.assertEqual(cli.cmd_human(args), 0)
+            self.assertEqual(last_good(project), head)
+
+            summary_path.write_text("dirty\n", encoding="utf-8")
+            with patch.object(cli, "_settings", return_value=settings), \
+                 patch.object(cli, "open_project", return_value=project), \
+                 self.assertRaisesRegex(RuntimeError, "dirty last-good"):
+                cli.cmd_human(args)
+            self.assertEqual(summary_path.read_text(encoding="utf-8"), "dirty\n")
+
     def test_live_report_is_local_redacted_and_requires_exact_boundary_confirmation(self):
         settings = SimpleNamespace(target_name="docs", growi_url="https://secret-token@example.test/growi",
                                    growi_mode="attach", human_sync_mode=HumanSyncMode.off)

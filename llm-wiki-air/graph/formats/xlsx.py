@@ -359,6 +359,9 @@ async def run(source_path: Path, *, run_dir: Path, model: Any, config: Any, on_p
     for item, (sheet, _body, _source_range) in zip(files, sheets):
         item.pop("source_ranges", None)
         item["source_cells"] = _cell_sources(sheet, by_title[sheet])
+    if getattr(config, "skip_excel_and_small", False):
+        _write_planning(Path(run_dir), files, source_name=source_path.name)
+        return files
     await _append_story(
         source_path,
         sheets,

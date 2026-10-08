@@ -152,9 +152,13 @@ class SyncProgress:
         "planner": "planner",
         "research": "wiki research",
         "writer": "wiki writer + judge",
+        "fast-repair": "wiki repair + judge",
         "linker-entities": "linker entities",
         "linker-edges": "linker main",
+        "growi-preflight": "publish preflight",
         "growi-publish": "publish",
+        "reset": "reset remote pages",
+        "reset-index": "reset index pages",
         "index": "index",
     }
 
@@ -231,7 +235,9 @@ class SyncProgress:
 
     @staticmethod
     def _document(event: dict[str, Any]) -> str:
-        if str(event.get("stage") or "") in {"capture", "growi-publish", "index"}:
+        if str(event.get("stage") or "") in {
+            "capture", "growi-publish", "reset", "reset-index", "index"
+        }:
             return "<batch>"
         value = event.get("document") or event.get("file") or "<batch>"
         value = str(value)
@@ -300,7 +306,7 @@ class SyncProgress:
             return
         if phase.started is None:
             phase.started = time.monotonic()
-        if phase.total is not None:
+        if status == "done" and phase.total is not None:
             phase.current = max(phase.current, phase.total)
         elapsed = time.monotonic() - phase.started
         phase.reported = True
@@ -318,9 +324,15 @@ class SyncProgress:
         phase_name = self._phase_name(event)
         if phase_name is None:
             return
+        if phase_name == "fast-repair":
+            self._on_repair_event(event)
+            return
         document = self._document(event)
         key = (document, phase_name)
         step = str(event.get("step") or "")
+        previous = self._phases.get(key)
+        if previous is not None and previous.reported and step in {"done", "complete", "batch_done"}:
+            return
         total = event.get("total")
         total = total if isinstance(total, int) and total > 0 else None
 
@@ -337,7 +349,12 @@ class SyncProgress:
             phase.current = max(phase.current, phase.completed)
             if total is not None:
                 phase.total = total
-            self._update_bar(phase, step=step)
+            detail = step
+            if event.get("page"):
+                detail += f": {shorten_name(str(event['page']), DOC_WIDTH)}"
+            if event.get("status"):
+                detail += f" ({event['status']})"
+            self._update_bar(phase, step=detail)
             if phase.total is not None and phase.completed >= phase.total:
                 self._finish(key, event)
             return
@@ -348,8 +365,56 @@ class SyncProgress:
         self._update_bar(phase, step=step)
         if step in {"done", "complete", "batch_done"}:
             self._finish(key, event)
-        elif step == "failed":
+        elif step in {"failed", "page_failed"}:
             self._finish(key, event, status="failed")
+
+    def _on_repair_event(self, event: dict[str, Any]) -> None:
+        """Map concurrent page repair events onto one completion bar per document."""
+
+        document = self._document(event)
+        key = (document, "fast-repair")
+        step = str(event.get("step") or "")
+        if step == "document_started":
+            pages = event.get("pages")
+            total = pages if isinstance(pages, int) and pages > 0 else None
+            phase = self._ensure_phase(key, total=total)
+            self._update_bar(phase, step=f"starting {pages or 0} pages")
+            return
+        if step == "document_done":
+            status = str(event.get("status") or "done")
+            self._finish(key, event, status="done" if status == "repaired" else status)
+            return
+
+        phase = self._ensure_phase(key)
+        page = shorten_name(str(event.get("page") or ""), DOC_WIDTH)
+        if step in {"page_clean", "page_repaired", "page_review"}:
+            phase.completed += 1
+            phase.current = max(phase.current, phase.completed)
+            label = step.removeprefix("page_")
+            if step == "page_review" and int(event.get("selected_attempt") or 0) > 0:
+                label += (
+                    f" (best attempt {int(event['selected_attempt'])}, "
+                    f"score {int(event.get('selected_score') or 0)})"
+                )
+            self._update_bar(phase, step=f"{label}: {page}")
+            if phase.total is not None and phase.completed >= phase.total:
+                self._finish(key, event)
+            return
+
+        attempt = event.get("attempt")
+        detail = step
+        if step == "candidate_judged":
+            detail = (
+                f"judge score {int(event.get('score') or 0)}"
+                f", issues {int(event.get('issues') or 0)}"
+            )
+        elif step == "candidate_rejected":
+            detail = f"rejected ({str(event.get('reason') or 'unknown')})"
+        if page:
+            detail += f": {page}"
+        if isinstance(attempt, int):
+            detail += f" (attempt {attempt})"
+        self._update_bar(phase, step=detail)
 
     def close(self) -> None:
         self._close_visible()

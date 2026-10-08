@@ -103,6 +103,7 @@ class PageJudgeResult(BaseModel):
 
     coverage_score: int = Field(default=0, ge=0, le=100)
     missing_important_information: list[ImportantOmission] = Field(default_factory=list)
+    defects: list[str] = Field(default_factory=list)
     notes: str = ""
 
 

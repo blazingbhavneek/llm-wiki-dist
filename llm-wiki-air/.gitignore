@@ -30,6 +30,7 @@ tests/*
 !tests/test_update_tiers.py
 !tests/test_human_changes.py
 !tests/test_human_sync_rollout.py
+!tests/test_fast_repair.py
 !tests/samples/
 !tests/samples/digital-agency-pdl.docx
 !doc-parser/tests/
@@ -40,3 +41,8 @@ growi-llm-wiki.zip
 growi-search/chaoliangUNSW
 jev/models
 logs/
+data_big/
+data_big_backup/
+data_big_backup2/
+data_big_backup3/
+data_backups/

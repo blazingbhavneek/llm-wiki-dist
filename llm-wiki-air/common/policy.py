@@ -44,6 +44,26 @@ class Policy:
         """WikiConfig field overrides (graph/workspace/writer.py:wiki_config)."""
         return {}
 
+    def model_port(self, config: Any) -> Any:
+        """Construct this policy's model seam without exposing policy names to the engine."""
+        from graph.wiki.model import ChatModelPort
+
+        return ChatModelPort(config)
+
+    def planning_model(self, model: Any) -> Any:
+        """Select the model used for document planning; standard keeps its client."""
+        return model
+
+    def model_cache_fields(self, config: Any) -> dict[str, Any]:
+        """Return model identity fields that affect this policy's planner cache."""
+        del config
+        return {}
+
+    def model_if_missing(self, config: Any) -> Any | None:
+        """Optional model for legacy callers that historically accepted None."""
+        del config
+        return None
+
     # -- wiki pipeline (graph/wiki) --------------------------------------------------
 
     def title(self, title: str) -> str:
@@ -60,6 +80,11 @@ class Policy:
 
         return code_tokens(text)
 
+    def wiki_prompt_rules(self, role: str) -> str:
+        """Variant-only additions to an existing wiki writer or judge prompt."""
+        del role
+        return ""
+
     def adjust_seed_plan(self, plan: Any, *, config: Any) -> Any:
         """The compiled model seed plan before pages are made from it."""
         return plan
@@ -75,6 +100,11 @@ class Policy:
     def mask_for_linking(self, text: str) -> tuple[str, Callable[[str], str]]:
         """Hide spans link insertion must not touch; returns the masked text and its undo."""
         return text, _same
+
+    async def rewrite_pending_pages(self, **kwargs: Any) -> bool:
+        """Optionally replace the standard page writer; True means fully handled."""
+        del kwargs
+        return False
 
     # -- linker (graph/linker) -------------------------------------------------------
 

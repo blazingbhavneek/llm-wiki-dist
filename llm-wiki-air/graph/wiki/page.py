@@ -7,13 +7,16 @@ rewrite verbatim, where cross-page facts go, and which titles get linked.
 
 from __future__ import annotations
 
+import html
 import re
+from collections import Counter
 from typing import Callable, Sequence
 import unicodedata
 
 from .markdown_blocks import atomic_windows, build_block_index
 from .wire import ReferenceFact
 from graph.common.markdown import strip_image_media
+from graph.common.images import strip_images
 
 HEADING_RE = re.compile(r"^#{1,4} \S")
 # The third alternative covers the short letter+digit constants (``T1``, ``P0``, ``30Wh``)
@@ -45,6 +48,15 @@ IMAGE_MARKER_RE = re.compile(r"<media payload omitted:[^>]*>|\[IMAGE [^\]]*\]")
 MD_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~])")
 # "GPUs"/"VEs" in English prose become "GPU"/"VE" in the rewrite; compare stems.
 PLURAL_ACRONYM_RE = re.compile(r"\b([A-Z0-9]{2,})s\b")
+
+
+def is_small_document(text: str) -> bool:
+    """Under 10k readable characters; keep descriptions, exclude media and markup."""
+
+    text = strip_image_media(text)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", text)
+    return len(html.unescape(text).strip()) < 10_000
 
 
 def _nonblank(lines: Sequence[str], start: int, end: int) -> int:
@@ -218,6 +230,187 @@ def table_row_key(line: str) -> str:
     return re.sub(r"\s*\|\s*", "|", line.strip())
 
 
+# Mechanical quality guard rails for the wording the writer authors itself.
+# Fenced blocks and image payloads are excluded: the lossless checks copy those
+# verbatim, so junk inside them is a convert-stage problem, not writer feedback.
+# Simplified-Chinese codepoints that have a distinct Japanese shinjitai codepoint,
+# so the test cannot fire on correct Japanese text (値 U+5024 vs 值 U+503C).
+CHINESE_ONLY_GLYPHS = frozenset("值压单项关变应杀酱查运总发图录")
+JUNK_MARKERS = ("<nl>", "<fcel>", "<lcel>", "<ecel>", "#REF!", "text_image", "YZYZYZ")
+REFUSAL_RE = re.compile(r"出力することができません|原文に内容が(含まれて|存在し)てい")
+LOOP_SCAN_LIMIT = 6000  # a degenerate line repeats inside its first kilobytes
+HEADING_LINE_RE = re.compile(r"^#{2,6} \S")
+
+
+def repeated_loop_fragment(line: str) -> str:
+    """Return a fragment repeated until degeneration, or ``""`` for a normal line.
+
+    Window counting instead of a backreference regex: a backreference costs
+    seconds on the 30 kB lines that OCR produces.
+    """
+
+    scan = line[:LOOP_SCAN_LIMIT]
+    if len(scan) < 60:
+        return ""
+    for window in (24, 12, 6):
+        counts = Counter(scan[i:i + window] for i in range(len(scan) - window + 1))
+        fragment, count = counts.most_common(1)[0]
+        if count >= 8 and count * window >= 0.6 * len(scan) and fragment.strip():
+            return fragment
+    return ""
+
+
+def authored_prose(text: str) -> str:
+    """Writer-authored text: image payloads removed, fenced blocks collapsed to
+    one placeholder line, and line numbers preserved."""
+
+    without_images = strip_images(text or "", keep_descriptions=False)
+    return re.sub(
+        r"```[^`]*```",
+        lambda match: "<fence>" + "\n" * max(0, match.group(0).count("\n") - 1),
+        without_images,
+        flags=re.S,
+    )
+
+
+def _worded_lines(text: str) -> list[tuple[int, str]]:
+    """Numbered authored lines that carry wording (no markup-only or table lines)."""
+
+    numbered = [
+        (index + 1, line.strip())
+        for index, line in enumerate(authored_prose(text).splitlines())
+        if line.strip()
+    ]
+    return [
+        (index, line)
+        for index, line in numbered
+        if not line.startswith(("|", "<")) and len(re.findall(r"[\w\u3040-\u30ff]", line)) >= 6
+    ]
+
+
+def _longest_runs(text: str) -> dict[str, int]:
+    """Longest consecutive run per line, so a source-faithful repeat is invisible."""
+
+    runs: dict[str, int] = {}
+    previous = None
+    length = 0
+    for _, line in _worded_lines(text):
+        length = length + 1 if line == previous else 1
+        runs[line] = max(runs.get(line, 0), length)
+        previous = line
+    return runs
+
+
+def _heading_counts(text: str) -> dict[str, int]:
+    return Counter(
+        line.strip() for line in authored_prose(text).splitlines() if HEADING_LINE_RE.match(line.strip())
+    )
+
+
+def quality_defects(text: str, *, source_text: str = "") -> list[str]:
+    """Repetition, wrong-script and self-invented junk in a written section.
+
+    Every returned string is writer feedback.  The guiding rule is that the
+    writer is never blamed for the source: a repeat, a heading or a junk token
+    that the converted source already contains is left alone, because the
+    lossless checks make the writer copy it.  Thresholds stay conservative so a
+    source-faithful repeated table row is never reported.
+    """
+
+    defects: list[str] = []
+    numbered = [
+        (index + 1, line.strip())
+        for index, line in enumerate(authored_prose(text).splitlines())
+        if line.strip()
+    ]
+    prose = _worded_lines(text)
+    source_runs = _longest_runs(source_text)
+    source_headings = _heading_counts(source_text)
+
+    position = 0
+    while position < len(prose):
+        line_number, line = prose[position]
+        last = position
+        while (
+            last + 1 < len(prose)
+            and prose[last + 1][1] == line
+            and prose[last + 1][0] == prose[last][0] + 1
+        ):
+            last += 1
+        run = last - position + 1
+        if run >= 3 and run > source_runs.get(line, 0):
+            defects.append(
+                f"{line_number}行目から同じ行を{run}回繰り返している。原文にない重複であり、"
+                "同じ文・行・表を2回以上書かないこと: " + line[:60]
+            )
+        position = last + 1
+
+    source_loops = {
+        fragment for _, line in _worded_lines(source_text) if (fragment := repeated_loop_fragment(line))
+    }
+    for line_number, line in prose:
+        fragment = repeated_loop_fragment(line)
+        if fragment and fragment not in source_loops:
+            defects.append(
+                f"{line_number}行目で「{fragment[:30]}」が繰り返して途切れている。"
+                "生成が暴走した形で原文にこんな形はない。繰り返しを取り除くこと。"
+            )
+
+    for glyph in sorted({c for _, line in numbered for c in line} & CHINESE_ONLY_GLYPHS):
+        first = next((line_number for line_number, line in numbered if glyph in line), 0)
+        defects.append(
+            f"{first}行目に中国語簡体字「{glyph}」が混じっている。出力言語で書き、"
+            "中国語混じりの語や表ヘッダ・誤字は原文の正しい表記へ直すこと。"
+        )
+
+    source_blob = source_text or ""
+    junk = [
+        marker
+        for marker in JUNK_MARKERS
+        if any(marker in line for _, line in numbered if not line.startswith("<"))
+        and marker not in source_blob
+    ]
+    if junk:
+        defects.append(
+            "本文に変換ゴミを自分で書き足している: " + "、".join(junk)
+            + "。これらの記号・内部名・エラー値を書かず、読める表か注記に直すこと。"
+        )
+    if REFUSAL_RE.search("\n".join(line for _, line in numbered)) and not REFUSAL_RE.search(source_blob):
+        defects.append(
+            "「出力できない」などの断り書きを本文に書いてはいけない。"
+            "内容が本当に無いなら見出しと1行の注記に留め、推測で埋めないこと。"
+        )
+
+    for heading, count in sorted(Counter(_heading_lines(numbered)).items(),
+                                 key=lambda item: -item[1]):
+        if count >= 3 and count > source_headings.get(heading, 0):
+            defects.append(
+                f"見出し {heading} を{count}回書いている（原文は{source_headings.get(heading, 0)}回）。"
+                "同じ見出しを繰り返さず、内容のない見出しは作らないこと。"
+            )
+
+    empty = [
+        line for position, (_, line) in enumerate(numbered[:-1])
+        if HEADING_LINE_RE.match(line)
+        and HEADING_LINE_RE.match(numbered[position + 1][1])
+        and _heading_level(numbered[position + 1][1]) <= _heading_level(line)
+    ]
+    if empty:
+        defects.append(
+            "直後に内容がない見出しがある（例: " + empty[0] + "）。"
+            "見出しを書いたら必ずその内容を書くこと。"
+        )
+    return defects
+
+
+def _heading_lines(numbered: Sequence[tuple[int, str]]) -> list[str]:
+    return [line for _, line in numbered if HEADING_LINE_RE.match(line)]
+
+
+def _heading_level(heading: str) -> int:
+    return len(heading) - len(heading.lstrip("#"))
+
+
 def check_section(
     draft: str,
     *,
@@ -272,9 +465,13 @@ def check_section(
         errors.append(
             "次の識別子・定数が本文から消えている。省略や言い換えをせず必ず書くこと: "
             + ", ".join(missing_tokens[:40])
+            + "。検証器は原文と出力から機械的に抽出したトークンを比較するため、"
+            "原文と同じ綴り・区切りを保つこと。`_` に隣接する短い識別子や数値は"
+            "前後の `_` を分離せず、原文で別トークンになっている識別子と数字を"
+            "1語へ結合しないこと。"
         )
 
-    return errors
+    return errors + quality_defects(draft, source_text=source_text)
 
 
 def assign_facts(

@@ -131,6 +131,14 @@ class Settings(BaseModel):
     chat_base_url: str = "http://10.160.144.101:51029/v1"
     chat_api_key: str = "local"
     chat_model: str = "gemma-4-31B"
+    # Optional fast-mode writer endpoint/model. The normal chat settings are
+    # the judge defaults; explicit judge variables are additive overrides.
+    writer_base_url: str = ""
+    writer_api_key: str = ""
+    writer_model_name: str = ""
+    judge_base_url: str = ""
+    judge_api_key: str = ""
+    judge_model_name: str = ""
     chat_temperature: float = 0.4
     agent_max_steps: int = 40
     agent_patience: int = 20
@@ -190,6 +198,8 @@ class Settings(BaseModel):
     # Generation policy (common/policy.py). Only `sync --fast` sets it; there is no env knob,
     # so a stray variable can never switch production sync.
     policy: Literal["standard", "fast"] = "standard"
+    # Opt-in sync shortcut: source-only tables and one-page rewrites below 10k chars.
+    skip_excel_and_small: bool = False
     # Untracked, content-addressed caches shared by sync's background workers and the
     # serial steps (publisher/ahead.py). Set by sync to the live project; empty = off.
     cache_dir: str = ""
@@ -243,8 +253,8 @@ class Settings(BaseModel):
     parser_timeout: float = 7200.0
     sync_isolated: bool = True
     # Ask the doc-parser to generate vision descriptions for extracted images.
-    # Set WIKI_PARSER_DESCRIBE_IMAGES=0 to convert without any LLM image calls
-    # (parser gets describe_images=false; unseen images keep empty descriptions).
+    # The parser uses its own vision-model configuration; wiki chat settings
+    # are never forwarded to it.
     parser_describe_images: bool = True
     growi_url: str = ""
     growi_token: str = ""
@@ -351,6 +361,12 @@ class Settings(BaseModel):
                 "WIKI_CHAT_API_KEY", env("OPENAI_API_KEY", cls.chat_api_key)
             ),
             chat_model=env("WIKI_CHAT_MODEL", env("WIKI_MODEL", cls.chat_model)),
+            writer_base_url=env("WRITER_BASE_URL", cls.writer_base_url),
+            writer_api_key=env("WRITER_API_KEY", cls.writer_api_key),
+            writer_model_name=env("WRITER_MODEL_NAME", cls.writer_model_name),
+            judge_base_url=env("JUDGE_BASE_URL", cls.judge_base_url),
+            judge_api_key=env("JUDGE_API_KEY", cls.judge_api_key),
+            judge_model_name=env("JUDGE_MODEL_NAME", cls.judge_model_name),
             chat_temperature=float(env("WIKI_TEMPERATURE", cls.chat_temperature)),
             embed_backend=env("WIKI_EMBED_BACKEND", cls.embed_backend),
             embed_base_url=env(

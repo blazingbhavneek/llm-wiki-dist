@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,6 +43,36 @@ def _image(payload: str, description: str = "") -> str:
 
 
 class ParserClientTests(unittest.TestCase):
+    def test_xlsm_upload_repairs_only_legacy_vml_and_preserves_source(self) -> None:
+        stream = io.BytesIO()
+        vml = b"<xml><font>before<br>after</font></xml>"
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.comment = b"keep comment"
+            archive.writestr("xl/drawings/vmlDrawing1.vml", vml)
+            archive.writestr("xl/vbaProject.bin", b"unchanged macro bytes")
+            archive.writestr("xl/worksheets/sheet1.xml", b"<worksheet/>")
+        original = stream.getvalue()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.xlsm"
+            path.write_bytes(original)
+            with parser_client._open_parser_upload(path) as upload, zipfile.ZipFile(upload) as archive:
+                self.assertEqual(archive.read("xl/drawings/vmlDrawing1.vml"), vml.replace(b"<br>", b"<br/>"))
+                self.assertEqual(archive.read("xl/vbaProject.bin"), b"unchanged macro bytes")
+                self.assertEqual(archive.read("xl/worksheets/sheet1.xml"), b"<worksheet/>")
+                self.assertEqual(archive.comment, b"keep comment")
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_valid_xlsm_upload_is_byte_identical(self) -> None:
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("xl/drawings/vmlDrawing1.vml", b"<xml><br>valid paired tag</br></xml>")
+        original = stream.getvalue()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.xlsm"
+            path.write_bytes(original)
+            with parser_client._open_parser_upload(path) as upload:
+                self.assertEqual(upload.read(), original)
+
     def test_uses_the_llm_wiki_route(self) -> None:
         self.assertEqual(LLM_WIKI_PARSE_PATH, "/parse/llm-wiki")
 
@@ -70,6 +101,8 @@ class ParserClientTests(unittest.TestCase):
             post.call_args.args[0],
             "http://parser/agent/doc-parser/parse/llm-wiki",
         )
+        self.assertEqual(post.call_args.kwargs["headers"], {})
+        self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "true")
 
     def test_rejects_malformed_pages(self) -> None:
         stream = io.BytesIO()
@@ -111,7 +144,7 @@ class ParserClientTests(unittest.TestCase):
 
         self.assertIn("<image-description>old description</image-description>", result)
         self.assertEqual(post.call_count, 1)
-        self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "false")
+        self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "true")
 
     def test_reuse_keeps_only_first_description_when_parser_deduplicates(self) -> None:
         previous = _image("YWJj", "first") + "\n" + _image("YWJj")
@@ -132,9 +165,9 @@ class ParserClientTests(unittest.TestCase):
         result = reuse_image_descriptions(previous, current, lambda _data_url, _alt: "unexpected")
         self.assertEqual(result, _image("YWJj", "first") + "\n" + _image("YWJj", "first"))
 
-    def test_update_describes_only_new_image_bytes(self) -> None:
+    def test_update_uses_parser_for_new_image_descriptions(self) -> None:
         previous = _image("YWJj", "keep me")
-        current = previous.replace("keep me", "") + "\n" + _image("ZGVm")
+        current = previous.replace("keep me", "") + "\n" + _image("ZGVm", "parser description")
         stream = io.BytesIO()
         Workbook().save(stream)
         with tempfile.TemporaryDirectory() as directory:
@@ -143,10 +176,7 @@ class ParserClientTests(unittest.TestCase):
             with patch.object(
                 parser_client.requests,
                 "post",
-                side_effect=[
-                    _Resp({"markdown": current}),
-                    _Resp({"choices": [{"message": {"content": "new description"}}]}),
-                ],
+                return_value=_Resp({"markdown": current}),
             ) as post:
                 result = parse_document(
                     path,
@@ -155,10 +185,11 @@ class ParserClientTests(unittest.TestCase):
                     previous_markdown=previous,
                 )
 
-        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_count, 1)
         self.assertIn("<image-description>keep me</image-description>", result)
-        self.assertIn("<image-description>new description</image-description>", result)
-        self.assertEqual(post.call_args_list[1].args[0], "http://llm/v1/chat/completions")
+        self.assertIn("<image-description>parser description</image-description>", result)
+        self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "true")
+        self.assertEqual(post.call_args.kwargs["headers"], {})
 
     def test_image_delete_needs_no_description_call(self) -> None:
         calls: list[str] = []

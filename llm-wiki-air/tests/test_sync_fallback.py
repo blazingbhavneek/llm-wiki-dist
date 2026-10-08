@@ -1,10 +1,12 @@
 """Bounded failure handling through the real queue, candidates and publisher."""
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -157,6 +159,141 @@ class ParserFallbackTest(unittest.TestCase):
             self.assertEqual(post.call_count, 1)
 
 
+class ParseAheadTest(unittest.TestCase):
+    def test_cache_hits_consume_the_two_position_window(self) -> None:
+        from graph.workspace.project import Project
+        from publisher import history
+        from publisher.ahead import ParseAhead
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = Project(root / "project", root / "mount").ensure()
+            cache = root / "cache"
+            cache.mkdir()
+            targets = [cache / f"{index}.md" for index in range(3)]
+            targets[0].write_text("cached zero", encoding="utf-8")
+            targets[1].write_text("cached one", encoding="utf-8")
+            seen = [threading.Event() for _ in targets]
+            parsed = threading.Event()
+            written = threading.Event()
+            ready: list[tuple[int, str]] = []
+            jobs = [
+                SimpleNamespace(
+                    rel=f"doc-{index}.pptx", raw_rel=f"doc-{index}_pptx.md",
+                    target_blob_oid=f"blob-{index}", target_sha256=str(index),
+                    from_rel="", classification="none",
+                )
+                for index in range(3)
+            ]
+
+            def cache_file(_settings, source_sha256, _previous, _validating):
+                index = int(source_sha256)
+                seen[index].set()
+                return targets[index]
+
+            def parse(*_args, **_kwargs):
+                parsed.set()
+                return "parsed two"
+
+            def write(path, text):
+                path.write_text(text, encoding="utf-8")
+                written.set()
+
+            with (
+                patch.object(pipeline, "parse_cache_file", side_effect=cache_file),
+                patch.object(pipeline, "_write_raw", side_effect=write),
+                patch.object(history, "read_blob", return_value=b"source"),
+                patch.object(parser_client, "parse_document", side_effect=parse),
+            ):
+                worker = ParseAhead(
+                    project,
+                    SimpleNamespace(parser_base_url="http://parser"),
+                    jobs,
+                    on_ready=lambda position, job, _markdown: ready.append((position, job.rel)),
+                )
+                self.addCleanup(worker.stop)
+
+                self.assertTrue(seen[0].wait(1))
+                self.assertTrue(seen[1].wait(1))
+                self.assertFalse(parsed.wait(0.1))
+
+                worker.advance()
+                self.assertTrue(parsed.wait(1))
+                self.assertTrue(written.wait(1))
+                self.assertEqual(targets[2].read_text(encoding="utf-8"), "parsed two")
+                self.assertEqual(ready, [(0, "doc-0.pptx"), (1, "doc-1.pptx"), (2, "doc-2.pptx")])
+
+
+class PlannerAheadTest(unittest.TestCase):
+    def test_current_document_is_skipped_and_future_documents_stay_fifo(self) -> None:
+        from publisher.ahead import PlannerAhead
+
+        with patch.object(threading.Thread, "start"):
+            worker = PlannerAhead(object(), object())
+        jobs = [SimpleNamespace(rel=f"doc-{index}.pdf") for index in range(3)]
+        worker.add(0, jobs[0], "current")
+        worker.add(1, jobs[1], "next")
+        worker.add(2, jobs[2], "after")
+
+        self.assertEqual(worker._queue.get_nowait()[0].rel, "doc-1.pdf")
+        self.assertEqual(worker._queue.get_nowait()[0].rel, "doc-2.pdf")
+
+
+class PlannerCacheTest(unittest.TestCase):
+    def test_serial_pipeline_consumes_cached_plan_without_replanning(self) -> None:
+        from graph.wiki import pipeline as wiki_pipeline
+        from graph.wiki.config import WikiConfig
+        from graph.wiki.schemas import CompiledSeedPlan
+        from graph.wiki.wire import SeedRange
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source.md"
+            source.write_text("one line\n", encoding="utf-8")
+            config = WikiConfig(
+                policy="fast",
+                chat_base_url="",
+                run_dir=str(root / "run"),
+                plan_cache_dir=str(root / "cache"),
+            )
+            text = source.read_text(encoding="utf-8")
+            lines = wiki_pipeline.split_source_lines(wiki_pipeline.normalize_source(text))
+            plan = CompiledSeedPlan(pages=[SeedRange(
+                title="Cached",
+                summary="Cached page summary.",
+                source_start=1,
+                source_end=1,
+            )])
+            wiki_pipeline._store_plan_cache(
+                wiki_pipeline._plan_cache_path(text, config), text, lines, config, plan,
+            )
+            with patch.object(wiki_pipeline, "_compute_seed_plan", side_effect=AssertionError("replanned")):
+                result = asyncio.run(wiki_pipeline.run_pipeline(source, config=config))
+
+            self.assertTrue((result / "wiki" / "001-Cached.md").exists())
+
+
+class LinkAheadTest(unittest.TestCase):
+    def test_smaller_ready_document_moves_before_larger_queued_document(self) -> None:
+        from graph.workspace.project import Project
+        from publisher.ahead import LinkAhead
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = Project(root / "project", root / "mount").ensure()
+            for rel, text in (("large.md", "x" * 100), ("small.md", "x")):
+                planning = project.wiki_dir(rel) / "_planning"
+                (planning / "pages").mkdir(parents=True)
+                (planning / "pages" / "001.md").write_text(text, encoding="utf-8")
+                (planning / "linker.json").write_text('{"status":"pending"}', encoding="utf-8")
+
+            with patch.object(threading.Thread, "start"):
+                worker = LinkAhead(project, SimpleNamespace(), model=object())
+            worker.add(project, ["large.md", "small.md"])
+
+            self.assertEqual(worker._queue.get_nowait()[2][0], "small.md")
+
+
 class Client:
     def __init__(self):
         self.pages = {}
@@ -263,6 +400,25 @@ class IsolatedSyncTest(unittest.TestCase):
              patch.object(pipeline, "link_pending_isolated", side_effect=link):
             self.assertEqual(self.run_sync(), 0)
         self.assertEqual(order, ["build:a.md", "build:b.md", "link"])
+
+    def test_parse_ahead_advances_once_for_each_slow_claim(self):
+        for rel in ("a.md", "b.md"):
+            self.add(rel)
+        advanced = []
+
+        class Parser:
+            def __init__(self, project, settings, jobs, **_kwargs):
+                pass
+
+            def advance(self):
+                advanced.append("advance")
+
+            def stop(self):
+                pass
+
+        with patch("publisher.ahead.ParseAhead", Parser):
+            self.assertEqual(self.run_sync(), 0)
+        self.assertEqual(advanced, ["advance", "advance"])
 
     def test_three_queues_link_earlier_built_documents_while_new_ones_build(self):
         """A document built by a stopped run goes to the linker queue before any new build."""

@@ -1,11 +1,14 @@
 """Background workers that keep the parser and the linker busy while sync builds.
 
 ``sync`` (runner/cli.py:_cmd_sync_isolated) builds one document at a time, and every
-write stays in that serial loop: candidates, promotion, linking, publication. These
-two threads only fill content-addressed caches that the serial steps read:
+live-state write stays in that serial loop: candidates, promotion, linking,
+publication. These threads only fill content-addressed caches that the serial steps
+read:
 
 - ``ParseAhead`` parses queued documents in claim order (publisher/queue.py:_PRIORITY)
   into the parse cache read by publisher/pipeline.py:_parse.
+- ``PlannerAhead`` consumes those parsed documents in the same order and fills the
+  validated seed-plan cache read by graph/wiki/pipeline.py:run_pipeline.
 - ``LinkAhead`` describes the chunks of each built document (and runs the Jev role
   check) into the metadata cache read by graph/linker/service.py:link_document
   (graph/linker/meta_cache.py).
@@ -30,20 +33,38 @@ log = logging.getLogger(__name__)
 
 
 class ParseAhead:
-    """Parse queued documents before the builder reaches them, one at a time."""
+    """Parse at most two queue positions beyond the current serial builder."""
 
-    def __init__(self, project: Any, settings: Any, jobs: Sequence[Any]) -> None:
+    def __init__(self, project: Any, settings: Any, jobs: Sequence[Any], *, on_ready: Any = None) -> None:
         self._stop = threading.Event()
+        self._on_ready = on_ready
+        # Before the first claim, allow X and X+1. Claiming X opens X+2. Every
+        # later claim opens one more position, preserving the three-stage train.
+        self._slots = threading.Semaphore(2)
         self._thread = threading.Thread(
             target=self._run, args=(project, settings, list(jobs)), name="parse-ahead", daemon=True,
         )
         self._thread.start()
 
+    def advance(self) -> None:
+        """Allow the worker to inspect one more queued position."""
+        self._slots.release()
+
     def stop(self) -> None:
         self._stop.set()  # a running parse finishes; nothing new starts
+        self._slots.release()  # wake an idle worker so it can observe the stop
+
+    def _ready(self, position: int, job: Any, markdown: str) -> None:
+        if self._on_ready is None or self._stop.is_set():
+            return
+        try:
+            self._on_ready(position, job, markdown)
+        except Exception as exc:  # noqa: BLE001 - planning ahead is only a cache optimization
+            log.warning("plan-ahead enqueue %s failed; the build will plan it: %s: %s",
+                        job.rel, type(exc).__name__, exc)
 
     def _run(self, project: Any, settings: Any, jobs: list[Any]) -> None:
-        from graph.workspace.parser_client import parse_document
+        from graph.workspace.parser_client import decode_text_bytes, parse_document
 
         from .history import read_blob
         from .ledger import load_ledger
@@ -52,29 +73,46 @@ class ParseAhead:
         )
 
         sources = load_ledger(project.metadata / "pipeline.json").sources
-        for job in jobs:
+        for position, job in enumerate(jobs):
+            self._slots.acquire()
             if self._stop.is_set():
                 return
             raw_path = project.raw_file(job.raw_rel)
-            if (
-                Path(job.rel).suffix.lower() in VERBATIM
-                or not job.target_blob_oid
-                # a pure move or an already parsed source is never parsed by the build
-                or (job.from_rel and job.target_sha256 == str(sources.get(job.from_rel, {}).get("source_sha256") or ""))
-                or (raw_path.exists() and job.target_sha256 == str(sources.get(job.rel, {}).get("parsed_source_sha256") or ""))
-            ):
+            if not job.target_blob_oid:
+                continue
+            if job.from_rel and job.target_sha256 == str(sources.get(job.from_rel, {}).get("source_sha256") or ""):
+                continue
+            if Path(job.rel).suffix.lower() in VERBATIM:
+                self._ready(
+                    position,
+                    job,
+                    decode_text_bytes(read_blob(project, job.target_blob_oid), source=Path(job.rel)),
+                )
+                continue
+            if raw_path.exists() and job.target_sha256 == str(sources.get(job.rel, {}).get("parsed_source_sha256") or ""):
+                self._ready(position, job, raw_path.read_text(encoding="utf-8"))
                 continue
             # Same inputs the build passes (publisher/pipeline.py:sync_once), so the key matches.
             previous = raw_path.read_text(encoding="utf-8") if raw_path.exists() else None
             validating = previous is not None and job.classification != "forced"
             target = parse_cache_file(settings, job.target_sha256, previous, validating)
-            if target is None or target.exists():
+            if target is None:
                 continue
-            running = threading.Event()
+            if target.exists():
+                self._ready(position, job, target.read_text(encoding="utf-8"))
+                continue
             with _PARSING_LOCK:
-                if target.name in _PARSING:
-                    continue
-                _PARSING[target.name] = running
+                active = _PARSING.get(target.name)
+                if active is None:
+                    running = threading.Event()
+                    _PARSING[target.name] = running
+                else:
+                    running = active
+            if active is not None:
+                running.wait()
+                if target.exists():
+                    self._ready(position, job, target.read_text(encoding="utf-8"))
+                continue
             started = time.monotonic()
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -90,6 +128,7 @@ class ParseAhead:
                         validate_markdown=(lambda text: _check_parse_size(job.rel, previous, text)) if validating else None,
                     )
                 _write_raw(target, markdown)
+                self._ready(position, job, markdown)
                 log.info("parse-ahead %s: %.1fs", job.rel, time.monotonic() - started)
             except Exception as exc:  # noqa: BLE001 - the build parses it itself
                 log.warning("parse-ahead %s failed; the build will parse it: %s: %s", job.rel, type(exc).__name__, exc)
@@ -99,11 +138,79 @@ class ParseAhead:
                 running.set()
 
 
+class PlannerAhead:
+    """Plan parsed documents in FIFO order, starting with the builder's next one."""
+
+    def __init__(self, project: Any, settings: Any) -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=lambda: asyncio.run(self._run(project, settings)), name="planner-ahead", daemon=True,
+        )
+        self._thread.start()
+
+    def add(self, position: int, job: Any, markdown: str) -> None:
+        # X is owned by the serial builder; planning starts at X+1.
+        if position > 0 and not self._stop.is_set():
+            self._queue.put((job, markdown))
+
+    def close(self, *, wait: bool = False) -> None:
+        if not wait:
+            self._stop.set()
+        self._queue.put(None)
+        if wait:
+            self._thread.join()
+
+    async def _run(self, project: Any, settings: Any) -> None:
+        from graph.formats import is_tabular, kind_of
+        from graph.workspace.writer import wiki_config
+        from graph.wiki.page import is_small_document
+        from graph.wiki.pipeline import prepare_seed_plan_cache
+
+        from .pipeline import _model
+
+        if str(getattr(settings, "ingest_mode", "wiki")) != "wiki":
+            return
+        try:
+            model = _model(settings, project)
+        except Exception as exc:  # noqa: BLE001 - the serial builder retains the normal fallback
+            log.warning("plan-ahead disabled: %s: %s", type(exc).__name__, exc)
+            return
+        while True:
+            item = await asyncio.to_thread(self._queue.get)
+            if item is None or self._stop.is_set():
+                return
+            job, markdown = item
+            kind = kind_of(job.raw_rel)
+            if is_tabular(kind):
+                continue
+            if getattr(settings, "skip_excel_and_small", False) and is_small_document(markdown):
+                continue
+            started = time.monotonic()
+            try:
+                config = wiki_config(
+                    settings,
+                    run_dir=Path(settings.cache_dir) / "planner-state",
+                    source_kind=kind,
+                )
+                await prepare_seed_plan_cache(
+                    markdown,
+                    config=config,
+                    model=model,
+                    stop_check=self._stop.is_set,
+                )
+                log.info("plan-ahead %s: %.1fs", job.rel, time.monotonic() - started)
+            except Exception as exc:  # noqa: BLE001 - the serial builder plans it itself
+                log.warning("plan-ahead %s failed; the build will plan it: %s: %s",
+                            job.rel, type(exc).__name__, exc)
+
+
 class LinkAhead:
     """Describe built documents' chunks for the linker while later documents build."""
 
     def __init__(self, project: Any, settings: Any, *, model: Any = None) -> None:
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: queue.PriorityQueue = queue.PriorityQueue()
+        self._order = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=lambda: asyncio.run(self._run(project, settings, model)), name="link-ahead", daemon=True,
@@ -122,16 +229,18 @@ class LinkAhead:
             # link_document chunks _planning/pages, or the pages it is about to snapshot there
             pages = sorted((planning / "pages").glob("*.md")) or sorted(folder.glob("*.md"))
             document = _document(project, rel)
-            self._queue.put((
+            snapshot = [(page.name, page.read_text(encoding="utf-8")) for page in pages]
+            self._queue.put((sum(len(text) for _, text in snapshot), self._order, (
                 rel, document, _team(project), _id_seed(planning, document), planning / "chunks.json",
-                [(page.name, page.read_text(encoding="utf-8")) for page in pages],
-            ))
+                snapshot,
+            )))
+            self._order += 1
 
     def close(self, *, wait: bool) -> None:
         """``wait``: finish every added document first (before sync's link phase)."""
         if not wait:
             self._stop.set()
-        self._queue.put(None)
+        self._queue.put((float("inf"), self._order, None))
         if wait:
             self._thread.join()
 
@@ -157,7 +266,7 @@ class LinkAhead:
                 log.warning("link-ahead without Jev roles: %s", exc)
         meta_version = policy.cache_key(CHUNK_META_VERSION)
         while True:
-            item = await asyncio.to_thread(self._queue.get)
+            _, _, item = await asyncio.to_thread(self._queue.get)
             if item is None or self._stop.is_set():
                 return
             try:
@@ -198,4 +307,4 @@ class LinkAhead:
         log.info("link-ahead %s: %d chunks, %d calls, %.1fs", rel, len(new), calls, time.monotonic() - started)
 
 
-__all__ = ["LinkAhead", "ParseAhead"]
+__all__ = ["LinkAhead", "ParseAhead", "PlannerAhead"]

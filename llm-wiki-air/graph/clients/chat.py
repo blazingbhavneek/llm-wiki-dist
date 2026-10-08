@@ -13,7 +13,14 @@ from pydantic import BaseModel
 
 
 def make_llm(model: str, base_url: str, api_key: str, temperature: float = 0.7, timeout: int = 300) -> ChatOpenAI:
-    return ChatOpenAI(model=model, base_url=base_url, api_key=api_key, temperature=temperature, timeout=timeout)
+    return ChatOpenAI(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=temperature,
+        timeout=timeout,
+        reasoning_effort="low",
+    )
 
 
 # Models write LaTeX into JSON strings unescaped ("\hat{m}_t"); the strict parser rejects
@@ -88,16 +95,17 @@ async def structured_ainvoke(
         return await asyncio.wait_for(operation, timeout=hard_timeout)
 
     limits: dict[str, Any] = {}
-    if max_output_tokens is not None:
-        limits["max_tokens"] = max_output_tokens
+    # TEMPORARILY DISABLED: restore this cap when large structured responses
+    # should be bounded again.
+    # if max_output_tokens is not None:
+    #     limits["max_tokens"] = max_output_tokens
     if temperature is not None:
         limits["temperature"] = temperature
     call_llm = llm.bind(**limits, extra_body={"chat_template_kwargs": {"enable_thinking": thinking}})
 
     try:
-        # with_structured_output drops kwargs bound before it, so the cap goes here;
-        # without it the first attempt had no max_tokens and could generate for 15 min.
-        # Thinking stays at the server default on this attempt, as before.
+        # Output-token limiting is temporarily disabled above. Thinking stays
+        # at the server default on this attempt, as before.
         structured = llm.with_structured_output(schema_cls, **limits)
         result = await invoke(structured, messages)
         if isinstance(result, schema_cls):

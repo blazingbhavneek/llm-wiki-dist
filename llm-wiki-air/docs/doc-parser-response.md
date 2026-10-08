@@ -29,9 +29,11 @@ Supported query parameters:
 | Parameter | Default | Meaning |
 |---|---:|---|
 | `images` | `true` | Include extracted image media in each image unit |
-| `describe_images` | `true` | Ask the configured vision model to describe images |
+| `describe_images` | `true` | Ask the parser's configured vision model to describe images |
 
-When image descriptions are enabled, llm-wiki supplies these headers:
+The llm-wiki client does not forward its wiki chat settings to the parser. The
+parser uses its own server-side configuration for image descriptions. Other
+parser clients may provide these optional headers:
 
 | Header | Meaning |
 |---|---|

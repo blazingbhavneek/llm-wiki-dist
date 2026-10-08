@@ -11,12 +11,13 @@ from graph.config import app_concurrency
 PROMPT_VERSION = "wiki-overlap-plan-ja-6"
 SEED_PLAN_VERSION = "wiki-seed-plan-ja-11"
 SEED_PLAN_COMPILE_VERSION = "wiki-seed-compile-ja-12"
-REWRITE_PROMPT_VERSION = "wiki-sections-ja-4"
+REWRITE_PROMPT_VERSION = "wiki-sections-ja-5"
 
 class WikiConfig(BaseModel):
     # Policy name (common/policy.py); its hooks key caches apart, so an existing
     # standard run is never resumed as another policy. Missing means standard.
     policy: Literal["standard", "fast"] = "standard"
+    skip_excel_and_small: bool = False
     # Overlapping source observation
     window_target_lines: int = 250
     window_overlap_lines: int = 50
@@ -50,6 +51,14 @@ class WikiConfig(BaseModel):
     chat_base_url: str = "http://10.160.144.101:51029/v1"
     chat_api_key: str = "local"
     chat_model: str = "gemma-4-31B"
+    # Fast policy roles. Empty values intentionally fall back to the normal
+    # chat client, so existing standard and fast configurations keep working.
+    writer_base_url: str = ""
+    writer_api_key: str = ""
+    writer_model: str = ""
+    judge_base_url: str = ""
+    judge_api_key: str = ""
+    judge_model: str = ""
     temperature: float = 0.7
     # Keep repairs at the same non-zero sampling temperature.
     retry_temperature: float = 0.7
@@ -66,6 +75,8 @@ class WikiConfig(BaseModel):
     document_slug: str = ""
     # Keep project runs stable so changed sources can resume incrementally.
     run_dir: str = ""
+    # Shared content-addressed seed-plan cache. Empty keeps the historical path.
+    plan_cache_dir: str = ""
 
     # Format-aware structural planning.
     source_kind: str = "md"

@@ -319,6 +319,9 @@ async def _delete_stale_indexes(
     client: GrowiClient,
     root_path: str,
     expected_paths: set[str],
+    *,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+    progress_stage: str = "index",
 ) -> list[str]:
     """Delete publisher-owned index pages below ``root_path`` that are not expected."""
 
@@ -326,6 +329,7 @@ async def _delete_stale_indexes(
     deleted_paths: list[str] = []
     index_segment = growi_segment(INDEX_NAME)
     boundary = growi_path(root_path)
+    listed_pages = []
     for listed in await client.list_all_pages(root_path):
         path = str(listed.path or "")
         if not (
@@ -336,13 +340,35 @@ async def _delete_stale_indexes(
             continue
         if path in expected_paths or path.rstrip("/").rsplit("/", 1)[-1] != index_segment:
             continue
+        listed_pages.append(listed)
+    if on_progress is not None:
+        on_progress({
+            "stage": progress_stage, "step": "start", "current": 0,
+            "total": len(listed_pages), "pages": len(listed_pages),
+        })
+    for index, listed in enumerate(listed_pages, 1):
         full = await client.get_page(page_id=listed.page_id)
         if full is None or not _is_index_page(full.body):
+            if on_progress is not None:
+                on_progress({
+                    "stage": progress_stage, "step": "page_checked", "current": index,
+                    "total": len(listed_pages), "page": listed.path, "status": "skipped",
+                })
             continue
         doomed[full.page_id] = full.revision_id
         deleted_paths.append(full.path)
+        if on_progress is not None:
+            on_progress({
+                "stage": progress_stage, "step": "page_checked", "current": index,
+                "total": len(listed_pages), "page": listed.path, "status": "owned",
+            })
     if doomed:
         await client.delete_pages(doomed)
+    if on_progress is not None:
+        on_progress({
+            "stage": progress_stage, "step": "done", "current": len(listed_pages),
+            "total": len(listed_pages), "deleted": len(doomed),
+        })
     return sorted(deleted_paths)
 
 
@@ -600,7 +626,11 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     return {"run_id": run_id, "done": done, "failures": failures}
 
 
-def delete_index_pages(settings: Any) -> dict[str, Any]:
+def delete_index_pages(
+    settings: Any,
+    *,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Remove every page carrying the index marker (called by `index --delete` and `reset`)."""
     project = open_project(settings)
     connection = _connection(settings)
@@ -612,6 +642,8 @@ def delete_index_pages(settings: Any) -> dict[str, Any]:
             publisher.client,
             growi_path(connection.write_path),
             set(),
+            on_progress=on_progress,
+            progress_stage="reset-index",
         ))
     else:  # compatibility for small test/fake clients
         documents = list(_folders(project))
@@ -620,7 +652,27 @@ def delete_index_pages(settings: Any) -> dict[str, Any]:
         paths.extend(growi_path(connection.write_path, folder, INDEX_NAME)
                      for folder in tree if folder and folder not in documents)
         paths.append(growi_path(connection.write_path, INDEX_NAME))
-        deleted = [path for path in paths if asyncio.run(_delete_if_index(publisher.client, path))]
+        if on_progress is not None:
+            on_progress({
+                "stage": "reset-index", "step": "start", "current": 0,
+                "total": len(paths), "pages": len(paths),
+            })
+        deleted = []
+        for current, path in enumerate(paths, 1):
+            removed = asyncio.run(_delete_if_index(publisher.client, path))
+            if removed:
+                deleted.append(path)
+            if on_progress is not None:
+                on_progress({
+                    "stage": "reset-index", "step": "page_done", "current": current,
+                    "total": len(paths), "page": path,
+                    "status": "deleted" if removed else "skipped",
+                })
+        if on_progress is not None:
+            on_progress({
+                "stage": "reset-index", "step": "done", "current": len(paths),
+                "total": len(paths), "deleted": len(deleted),
+            })
     return {"run_id": "idx-del-" + uuid.uuid4().hex[:16], "done": [{"deleted": deleted}], "failures": []}
 
 

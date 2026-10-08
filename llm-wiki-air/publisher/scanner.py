@@ -9,7 +9,8 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SUPPORTED = {".md", ".txt", ".docx", ".doc", ".pdf", ".pptx", ".xlsx", ".xlsm", ".xls", ".csv"}
+from common.paths import SUPPORTED_SOURCE_SUFFIXES as SUPPORTED
+
 IGNORED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORED_DIRS = {".git", ".hg", ".svn"}
 

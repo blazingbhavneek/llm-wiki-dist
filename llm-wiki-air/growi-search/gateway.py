@@ -37,9 +37,11 @@ def chat_model(settings: Settings, max_tokens: int = 0) -> ChatOpenAI:
         api_key=settings.chat_api_key or "local",
         temperature=settings.chat_temperature,
         timeout=httpx.Timeout(settings.llm_timeout, pool=None),
+        reasoning_effort="low",
         max_retries=settings.llm_max_retries,
         stream_usage=True,
-        max_tokens=max_tokens or settings.llm_max_output_tokens or None,
+        # TEMPORARILY DISABLED: restore the output cap when needed.
+        # max_tokens=max_tokens or settings.llm_max_output_tokens or None,
     )
 
 

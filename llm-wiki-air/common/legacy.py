@@ -48,6 +48,12 @@ def parse_document(source: Path, *, base_url: str, settings: Any, timeout_s: flo
     )
 
 
+def read_text_source(source: Path) -> str:
+    from graph.workspace.parser_client import read_text_source as read_legacy
+
+    return read_legacy(source)
+
+
 def build_wiki_output(*, source_path: Path, document_name: str, out_dir: Path, mode: str, settings: Any, llm: Any = None, embedder: Any = None, state_dir: Path | None = None, on_progress: Any = None, stop_check: Any = None, resume: bool = True) -> Any:
     from graph.workspace.writer import build_wiki_output as build_legacy
 

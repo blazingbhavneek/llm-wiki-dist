@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .parser_client import UnsupportedDocument, parse_document
+from common.paths import SUPPORTED_SOURCE_SUFFIXES
+
+from .parser_client import UnsupportedDocument, parse_document, read_text_source
 from .project import VERBATIM, Project, assert_unique_generated_paths, raw_name_for
 
 SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
@@ -19,6 +21,7 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
     paths = [
         path for path in sorted(project.mount.rglob("*"))
         if path.is_file() and not path.is_symlink()
+        and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES
         and path.name not in SKIP_NAMES and not path.name.startswith("~$")
     ]
     assert_unique_generated_paths(path.relative_to(project.mount).as_posix() for path in paths)
@@ -30,7 +33,7 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
         target = project.raw / Path(rel).parent / raw_name_for(Path(rel).name)
         try:
             if path.suffix.lower() in VERBATIM:
-                markdown = path.read_text(encoding="utf-8")
+                markdown = read_text_source(path)
             else:
                 if not parser_base_url:
                     raise RuntimeError("WIKI_PARSER_BASE_URL is required for non-Markdown files")
@@ -49,6 +52,8 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
         if on_progress:
             on_progress({"stage": "convert", "file": rel})
     for rel in list(seen):
+        if Path(rel).suffix.lower() not in SUPPORTED_SOURCE_SUFFIXES:
+            continue
         if rel not in present:
             target = project.raw / Path(rel).parent / raw_name_for(Path(rel).name)
             target.unlink(missing_ok=True); seen.pop(rel); removed.append(rel)

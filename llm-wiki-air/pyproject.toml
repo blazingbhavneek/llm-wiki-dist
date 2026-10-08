@@ -1,7 +1,7 @@
 [project]
-name = "llm-wiki-air-publisher"
+name = "llm-wiki"
 version = "0.1.0"
-description = "No-Git Markdown wiki publisher"
+description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -20,7 +20,6 @@ dependencies = [
   "python-docx==1.2.0",
   "python-dotenv==1.2.3",
   "python-pptx==1.0.2",
-  "qdrant-client>=1.12",
   "requests==2.34.2",
   "sqlite-vec==0.1.9",
   "annotated-types==0.8.0",
@@ -64,6 +63,7 @@ dependencies = [
   "tokenizers>=0.21",
   "torch>=2.4",
   "transformers>=5.0",
+  "tqdm>=4.70",
   "truststore==0.10.4",
   "typing-extensions==4.16.0",
   "typing-inspection==0.4.4",
@@ -73,6 +73,8 @@ dependencies = [
   "xlsxwriter==3.2.9",
   "xxhash==4.0.1",
   "zstandard==0.25.0",
+  "llm2jev>=0.6.1",
+  "clear>=2.0.0",
 ]
 
 [tool.uv]

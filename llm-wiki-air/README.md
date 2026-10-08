@@ -87,9 +87,8 @@ Consequences worth knowing:
   leave it unset and never touches the parser.
 - Parse calls are slow and long-lived, hence the 7200 s `parser_timeout`.
   `convert` prints a `waiting` heartbeat every 10 s under `-v`.
-- The chat credentials from `.env`/INI are forwarded per request as
-  `X-LLM-Base-URL` / `X-LLM-API-Key` / `X-LLM-Model` headers, so image
-  description uses the same model this project is configured for.
+- Parser requests do not receive the wiki chat URL or credentials. Image
+  descriptions use the parser service's own vision-model configuration.
 - To run or modify the parser itself, see `doc-parser/README.md` and
   `doc-parser/SETUP.md`; it is an independent service with its own tests.
 

@@ -84,6 +84,16 @@ def _anchor_cells(anchor: Any) -> str:
     return points[0] if len(points) == 1 else ":".join(points[:2]) if points else "unknown"
 
 
+def repair_legacy_vml(payload: bytes) -> bytes:
+    try:
+        ElementTree.fromstring(payload)
+    except ElementTree.ParseError:
+        # Legacy VML button labels can contain HTML-style bare <br>.
+        payload = re.sub(rb"<br\s*>", b"<br/>", payload, flags=re.IGNORECASE)
+        ElementTree.fromstring(payload)
+    return payload
+
+
 def _buttons(path: Path, workbook: Any) -> list[dict[str, str]]:
     output: list[dict[str, str]] = []
     with zipfile.ZipFile(path) as archive:
@@ -101,7 +111,10 @@ def _buttons(path: Path, workbook: Any) -> list[dict[str, str]]:
                 drawing_part = sheet_rels.get(drawing.attrib.get(_RID, ""), "")
                 if not drawing_part or drawing_part not in archive.namelist():
                     continue
-                root = ElementTree.fromstring(archive.read(drawing_part))
+                payload = archive.read(drawing_part)
+                if _local(drawing.tag) == "legacyDrawing":
+                    payload = repair_legacy_vml(payload)
+                root = ElementTree.fromstring(payload)
                 if _local(drawing.tag) == "drawing":
                     for anchor in (node for node in root.iter() if _local(node.tag) in {"oneCellAnchor", "twoCellAnchor", "absoluteAnchor"}):
                         macro = next((value for node in anchor.iter() for key, value in node.attrib.items() if _local(key) == "macro" and value), "")

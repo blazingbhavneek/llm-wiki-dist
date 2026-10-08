@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from common.policy import policy_of
@@ -40,6 +41,83 @@ config.PROJECT_ROOT = PROJECT_ROOT
 
 log = logging.getLogger(__name__)
 LOG_FORMAT = "%(levelname)s %(message)s"
+
+
+def _interrupted_fast_repair(
+    project: Any,
+) -> tuple[bool, frozenset[str], frozenset[str]]:
+    """Identify the narrow dirty tree and page checkpoints from a stopped repair.
+
+    A repair commits page outcomes into ``metadata/state`` as model calls finish,
+    then promotes/publishes the whole document. Stopping inside that window must
+    be resumable, but it must not turn ``--continue`` into a general dirty-tree
+    bypass for wiki, ledger, source, or human-sync changes.
+    """
+
+    root = Path(project.root)
+    if not (root / ".git").is_dir():
+        return False, frozenset(), frozenset()
+    durable = (
+        ".gitignore", "sources", "raw", "wiki", "metadata/state",
+        "metadata/pipeline.json", "metadata/source-identities.json",
+        "metadata/human-sync",
+    )
+    try:
+        status = subprocess.run(
+            [
+                "git", "-C", str(root), "status", "--porcelain=v1", "-z",
+                "--untracked-files=all", "--", *durable,
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return False, frozenset(), frozenset()
+    entries = [entry for entry in status.split(b"\0") if entry]
+    if not entries:
+        return False, frozenset(), frozenset()
+
+    saw_repair_artifact = False
+    page_states: list[Path] = []
+    for entry in entries:
+        if len(entry) < 4 or entry[2:3] != b" ":
+            return False, frozenset(), frozenset()
+        path = entry[3:].decode("utf-8", errors="surrogateescape")
+        if not path.startswith("metadata/state/"):
+            return False, frozenset(), frozenset()
+        if "/work/repair/" in path:
+            saw_repair_artifact = True
+            continue
+        if "/state/pages/" in path:
+            page_states.append(root / path)
+            continue
+        if "/wiki/" in path:
+            continue
+        if path.endswith((
+            "/state/plan.json", "/state/manifest.json", "/state/run.json",
+        )):
+            continue
+        return False, frozenset(), frozenset()
+    if not saw_repair_artifact:
+        return False, frozenset(), frozenset()
+
+    versions: set[str] = set()
+    checkpoints: set[str] = set()
+    for path in page_states:
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True, frozenset(), frozenset()
+        version = str(row.get("repair_version") or "") if isinstance(row, dict) else ""
+        status = str(row.get("repair_status") or "") if isinstance(row, dict) else ""
+        if not version or status not in {
+            "clean", "repaired", "review", "initial-judge-pending",
+            "rewrite-pending", "judge-pending"
+        }:
+            return True, frozenset(), frozenset()
+        versions.add(version)
+        checkpoints.add(path.relative_to(root).as_posix())
+    return True, frozenset(checkpoints), frozenset(versions)
 
 
 def _settings(args: argparse.Namespace) -> Settings:
@@ -60,6 +138,8 @@ def _settings(args: argparse.Namespace) -> Settings:
         settings.wiki_request_timeout = args.timeout
     if getattr(args, "fast", False):
         settings.policy = "fast"
+    if getattr(args, "skip_excel_and_small", False):
+        settings.skip_excel_and_small = True
     if not policy_of(settings).link:
         # every stage already honours this switch: no link phase or link-ahead, and
         # each document gets a "disabled" marker, which publication accepts
@@ -171,6 +251,38 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    fast_repair = bool(getattr(args, "fast_repair", False))
+    if getattr(args, "limit", None) is not None and not fast_repair:
+        raise SystemExit("--limit is only valid with --fast --repair")
+    if (
+        getattr(args, "fast_link", False)
+        or getattr(args, "fast_link_reset", False)
+        or fast_repair
+    ):
+        if not getattr(args, "fast", False):
+            raise SystemExit("--link, --link-reset and --repair require --fast")
+        if fast_repair:
+            return _cmd_fast_repair(args)
+        if getattr(args, "items", None):
+            raise SystemExit("--fast --link and --fast --link-reset operate on the whole generated wiki project")
+        from graph.fast.inline_linker import link_project, reset_project
+
+        settings = _settings(args)
+        result = (
+            reset_project(settings)
+            if getattr(args, "fast_link_reset", False)
+            else link_project(
+                settings,
+                force=bool(getattr(args, "force", False)),
+                continue_run=bool(getattr(args, "continue_run", False)),
+                on_progress=_progress if args.verbose else None,
+            )
+        )
+        code = _report(result)
+        if not result.get("failures"):
+            print("fast links changed locally; run `python main.py publish` when ready", file=sys.stderr)
+        return code
+
     from publisher import pipeline
     from publisher.queue import retry_failed, scan, work_once, worker_lock
     from publisher.progress import SyncProgress
@@ -243,13 +355,167 @@ def cmd_sync(args: argparse.Namespace) -> int:
         progress.close()
 
 
+def _cmd_fast_repair(args: argparse.Namespace) -> int:
+    """Repair existing fast pages, promoting and publishing one document at a time."""
+
+    from contextlib import closing
+
+    from graph.fast.repair import FastRepair
+    from publisher.pipeline import publish_only, pull_growi_once
+    from publisher.progress import SyncProgress
+    from publisher.queue import worker_lock
+
+    settings = _settings(args)
+    project = open_project(settings)
+    limit = getattr(args, "limit", None)
+    if limit is not None and int(limit) <= 0:
+        raise SystemExit("--limit must be a positive integer")
+    combined: dict[str, Any] = {"done": [], "failures": []}
+    with closing(SyncProgress()) as progress, worker_lock(project):
+        continuing = bool(getattr(args, "continue_run", False))
+        try:
+            resume_dirty, resume_page_states, resume_versions = (
+                _interrupted_fast_repair(project)
+                if continuing else (False, frozenset(), frozenset())
+            )
+        except Exception as exc:
+            log.exception("fast repair resume inspection failed")
+            combined["failures"].append(
+                f"fast repair resume inspection: {type(exc).__name__}: {exc}"
+            )
+            return _report(combined)
+        if resume_dirty and not resume_page_states:
+            combined["failures"].append(
+                "fast repair setup: interrupted repair checkpoints are unreadable; "
+                "refusing to restart completed pages"
+            )
+            return _report(combined)
+
+        def on_event(event: dict[str, Any]) -> None:
+            progress.on_event(event)
+            if args.verbose:
+                _progress(event)
+
+        try:
+            repair = FastRepair(
+                settings,
+                project=project,
+                on_progress=on_event,
+                resume_page_states=resume_page_states,
+            )
+            targets = repair.targets(getattr(args, "items", None) or None)
+        except Exception as exc:
+            combined["failures"].append(f"fast repair setup: {type(exc).__name__}: {exc}")
+            return _report(combined)
+
+        if not targets:
+            log.info("fast repair project=%s has no eligible documents", settings.target_name)
+            return _report(combined)
+
+        if limit is None:
+            progress.add_documents(targets)
+        log.info(
+            "fast repair project=%s documents=%d page_limit=%s concurrency=%d",
+            settings.target_name,
+            len(targets),
+            limit if limit is not None else "all",
+            repair.concurrency,
+        )
+        has_growi = bool(str(getattr(settings, "growi_url", "") or "").strip())
+        if has_growi:
+            if resume_dirty:
+                log.warning(
+                    "continuing interrupted fast repair versions=%s checkpoints=%d "
+                    "without a preflight GROWI pull; accepted pages will be reused",
+                    ",".join(sorted(resume_versions)),
+                    len(resume_page_states),
+                )
+            else:
+                log.info("checking GROWI edits before repair")
+                try:
+                    pulled = pull_growi_once(settings)
+                    combined["done"].extend(pulled.get("done", []))
+                    combined["failures"].extend(pulled.get("failures", []))
+                except Exception as exc:
+                    log.exception("fast repair GROWI preflight failed")
+                    combined["failures"].append(
+                        f"fast repair preflight: {type(exc).__name__}: {exc}"
+                    )
+                    return _report(combined)
+                if combined["failures"]:
+                    return _report(combined)
+
+        remaining = int(limit) if limit is not None else None
+        for raw_rel in targets:
+            if remaining is not None and remaining <= 0:
+                break
+            try:
+                progress.add_documents([raw_rel])
+                log.info("repairing document path=%s", raw_rel)
+                result = repair.repair_document(
+                    raw_rel,
+                    limit=remaining,
+                    force=bool(getattr(args, "force", False)),
+                )
+                combined["done"].append({"path": raw_rel, **result})
+                repair_failures = list(result.get("failures", []))
+                combined["failures"].extend(repair_failures)
+                if remaining is not None:
+                    remaining -= int(result.get("examined", 0))
+                if not result.get("promoted"):
+                    if not repair_failures:
+                        progress.mark_completed([raw_rel])
+                    continue
+                if has_growi:
+                    log.info("publishing repaired document path=%s", raw_rel)
+                    published = publish_only(
+                        settings,
+                        only=[raw_rel],
+                        allow_unlinked=True,
+                        link_pending=False,
+                    )
+                    combined["done"].extend(published.get("done", []))
+                    combined["failures"].extend(published.get("failures", []))
+                else:
+                    from publisher.index import build_index
+
+                    indexed = build_index(
+                        settings,
+                        only=[raw_rel],
+                        publish=False,
+                        on_progress=on_event,
+                    )
+                    combined["done"].extend(indexed.get("done", []))
+                    combined["failures"].extend(indexed.get("failures", []))
+                # Failures are accumulated for the final exit status, but a
+                # publish/index failure for one document must not prevent the
+                # remaining repair targets from being examined.
+                document_failures = (
+                    repair_failures
+                    + (published.get("failures", []) if has_growi else indexed.get("failures", []))
+                )
+                if document_failures:
+                    continue
+                progress.mark_completed([raw_rel])
+            except Exception as exc:
+                log.exception("fast repair failed for %s", raw_rel)
+                combined["failures"].append(
+                    f"{raw_rel}: {type(exc).__name__}: {exc}"
+                )
+                # Keep the failed document resumable and continue with the
+                # next target.  --continue can revisit it after the rest of
+                # the project has been processed.
+                continue
+    return _report(combined)
+
+
 def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     """One retry owner; each operation starts from the latest accepted main."""
     import traceback
     import uuid
 
     from publisher import pipeline
-    from publisher.ahead import LinkAhead, ParseAhead
+    from publisher.ahead import LinkAhead, ParseAhead, PlannerAhead
     from publisher.failure_logs import save_failure
     from publisher.queue import queued_jobs, recover, retry_failed, scan, status, work_once, worker_lock
     from publisher.progress import SyncProgress
@@ -257,6 +523,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     project = open_project(settings)
     run_id = "sync-" + uuid.uuid4().hex
     parse_ahead: ParseAhead | None = None
+    planner_ahead: PlannerAhead | None = None
     link_ahead: LinkAhead | None = None
     combined: dict[str, Any] = {"done": [], "failures": []}
     progress = SyncProgress()
@@ -285,6 +552,12 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
         })
 
     def on_event(event: dict[str, Any]) -> None:
+        if (
+            parse_ahead is not None
+            and event.get("stage") == "queue-claim"
+            and event.get("lane") == "slow"
+        ):
+            parse_ahead.advance()
         progress.on_event(event)
         if args.verbose:
             _progress(event)
@@ -331,10 +604,17 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 )
                 logs.setdefault(rel, []).append(path)
                 log.error("source discovery failed: %s; log=%s", rel, path)
-            # The parser works through the queue ahead of the builder, and built documents
-            # get their linker metadata while later ones build (publisher/ahead.py).
+            # Parse, plan and build form one bounded train; every ahead worker only
+            # fills a content-addressed cache (publisher/ahead.py).
             settings.cache_dir = getattr(settings, "cache_dir", "") or str((project.metadata / "cache").resolve())
-            parse_ahead = ParseAhead(project, settings, queued_jobs(project, only=args.items or None))
+            if str(getattr(settings, "ingest_mode", "wiki")) == "wiki":
+                planner_ahead = PlannerAhead(project, settings)
+            parse_ahead = ParseAhead(
+                project,
+                settings,
+                queued_jobs(project, only=args.items or None),
+                on_ready=planner_ahead.add if planner_ahead is not None else None,
+            )
             if getattr(settings, "wiki_linker_enabled", True):
                 link_ahead = LinkAhead(project, settings)
                 # Built earlier but not linked yet (e.g. a stopped run): these go first.
@@ -375,6 +655,8 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 if attempt == 2:
                     recovered.extend(paths)
             parse_ahead.stop()
+            if planner_ahead is not None:
+                planner_ahead.close()
             if link_ahead is not None:
                 link_ahead.close(wait=not blocked)
             if not blocked and getattr(settings, "wiki_linker_enabled", True):
@@ -422,6 +704,8 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     finally:
         if parse_ahead is not None:
             parse_ahead.stop()
+        if planner_ahead is not None:
+            planner_ahead.close()
         if link_ahead is not None:
             link_ahead.close(wait=False)
         progress.close()
@@ -443,45 +727,54 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
 def cmd_human(args: argparse.Namespace) -> int:
     from publisher.human_changes import HumanStore
+    from publisher.history import candidate_is_clean, checkpoint_live, ensure_repository
+    from publisher.pipeline import _lock
 
     settings = _settings(args)
     project = open_project(settings)
-    store = HumanStore(project)
-    if args.human_command == "status":
-        print(json.dumps(store.project_summary(), ensure_ascii=False, default=str))
-        return 0
-    if args.human_command == "resolve":
-        combined = ""
-        if args.text_file:
-            combined = Path(args.text_file).read_text(encoding="utf-8")
-        result = store.resolve(
-            args.edit_id,
-            action=args.action,
-            expected_revision=args.revision,
-            combined_text=combined,
-            document=args.document or "",
-        )
-        print(json.dumps(result, ensure_ascii=False))
-        return 0
-    if args.human_command == "recover-legacy":
-        from publisher.legacy_recovery import recover_legacy_ancestor
+    with _lock(project):
+        baseline = ensure_repository(project)
+        if not candidate_is_clean(project, baseline):
+            raise RuntimeError("cannot modify human state from a dirty last-good working tree")
+        store = HumanStore(project)
+        if args.human_command == "status":
+            result = store.project_summary()
+            code = 0
+        elif args.human_command == "resolve":
+            combined = ""
+            if args.text_file:
+                combined = Path(args.text_file).read_text(encoding="utf-8")
+            result = store.resolve(
+                args.edit_id,
+                action=args.action,
+                expected_revision=args.revision,
+                combined_text=combined,
+                document=args.document or "",
+            )
+            code = 0
+        elif args.human_command == "recover-legacy":
+            from publisher.legacy_recovery import recover_legacy_ancestor
 
-        result = recover_legacy_ancestor(store, args.document)
-        print(json.dumps(result, ensure_ascii=False, default=str))
-        return 0 if result.get("status") in {"recovered", "no_legacy_pin"} else 1
-    if args.human_command == "live-plan":
-        from publisher.live_verification import LiveVerificationReport
+            result = recover_legacy_ancestor(store, args.document)
+            code = 0 if result.get("status") in {"recovered", "no_legacy_pin"} else 1
+        elif args.human_command == "live-plan":
+            from publisher.live_verification import LiveVerificationReport
 
-        report = LiveVerificationReport.create(project, settings, args.path)
-        print(json.dumps({
-            "report": str(report.path),
-            "resolved_boundary": report.data["disposable_path"],
-            "endpoint": report.data["endpoint"],
-            "confirmation_code": report.data["confirmation_code"],
-            "status": report.data["status"],
-        }, ensure_ascii=False))
-        return 0
-    raise ValueError(f"unknown human command: {args.human_command}")
+            report = LiveVerificationReport.create(project, settings, args.path)
+            result = {
+                "report": str(report.path),
+                "resolved_boundary": report.data["disposable_path"],
+                "endpoint": report.data["endpoint"],
+                "confirmation_code": report.data["confirmation_code"],
+                "status": report.data["status"],
+            }
+            code = 0
+        else:
+            raise ValueError(f"unknown human command: {args.human_command}")
+        store.audit()
+        checkpoint_live(project, f"human {args.human_command}")
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return code
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -560,21 +853,53 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
+    from contextlib import closing
+
     allow_unlinked = bool(getattr(args, "allow_unlinked", False))
     from publisher.phase import Config, Input, run
+    from publisher.progress import SyncProgress
 
     settings = _settings(args)
     root = Path(settings.data_root) / settings.target_name
-    result = run(
-        Config(
-            action="publish",
-            publish=True,
-            settings=settings,
-            allow_unlinked=allow_unlinked,
-            link_pending=not allow_unlinked,
-        ),
-        Input(root),
-        root,
+    stats: dict[str, Any] = {}
+
+    def on_event(event: dict[str, Any]) -> None:
+        stage = str(event.get("stage") or "")
+        step = str(event.get("step") or "")
+        if stage == "growi-publish" and step in {"start", "done", "batch_done"}:
+            stats.update({key: event[key] for key in ("documents", "pages") if key in event})
+        elif stage == "index" and step in {"progress", "done"}:
+            if "total" in event:
+                stats["indexes"] = event["total"]
+            if step == "done":
+                stats["indexed"] = event.get("current", 0)
+        progress.on_event(event)
+        if args.verbose:
+            _progress(event)
+
+    if allow_unlinked:
+        log.info("publish project=%s allow_unlinked=True; linking skipped", settings.target_name)
+    else:
+        log.info("publish project=%s allow_unlinked=False; pending links will be checked", settings.target_name)
+    with closing(SyncProgress()) as progress:
+        result = run(
+            Config(
+                action="publish",
+                publish=True,
+                settings=settings,
+                allow_unlinked=allow_unlinked,
+                link_pending=not allow_unlinked,
+            ),
+            Input(root),
+            root,
+            on_progress=on_event,
+        )
+    log.info(
+        "publish completed documents=%s pages=%s indexes=%s failures=%d",
+        stats.get("documents", 0),
+        stats.get("pages", 0),
+        stats.get("indexed", stats.get("indexes", 0)),
+        len(result.failures),
     )
     return _report({"done": list(result.pages), "failures": list(result.failures)})
 
@@ -594,9 +919,20 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    from publisher.pipeline import reset_growi
+    from contextlib import closing
 
-    return _report(reset_growi(_settings(args)))
+    from publisher.pipeline import reset_growi
+    from publisher.progress import SyncProgress
+
+    settings = _settings(args)
+    with closing(SyncProgress()) as progress:
+        def on_event(event: dict[str, Any]) -> None:
+            progress.on_event(event)
+            if args.verbose:
+                _progress(event)
+
+        result = reset_growi(settings, on_progress=on_event)
+    return _report(result)
 
 
 def cmd_link(args: argparse.Namespace) -> int:
@@ -659,12 +995,31 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
     sync.add_argument("--force", action="store_true", help="regenerate selected sources even when unchanged")
     sync.add_argument("--fast", action="store_true", help="use the fast wiki and linker policies for changed sources")
+    fast_operation = sync.add_mutually_exclusive_group()
+    fast_operation.add_argument(
+        "--link", dest="fast_link", action="store_true",
+        help="with --fast, add reversible inline links to already-generated local wikis only",
+    )
+    fast_operation.add_argument(
+        "--link-reset", dest="fast_link_reset", action="store_true",
+        help="with --fast, remove only links previously added by --fast --link",
+    )
+    fast_operation.add_argument(
+        "--repair", dest="fast_repair", action="store_true",
+        help="with --fast, judge and repair existing generated wiki pages",
+    )
+    sync.add_argument(
+        "--limit", type=int,
+        help="with --fast --repair, examine at most this many pages",
+    )
+    sync.add_argument("--skip-excel-and-small", action="store_true",
+                      help="keep tabular source pages without extra analyses; rewrite documents under 10,000 readable characters as one page without planning")
     sync.add_argument(
         "--isolated", action=argparse.BooleanOptionalAction, default=None,
         help="build all sources with one final retry pass, then do the same for pending links (default: enabled; use --no-isolated for legacy batch mode)",
     )
     sync.add_argument("--continue", dest="continue_run", action="store_true",
-                      help="in batch mode, resume a kept candidate; isolated mode recovers it and starts from accepted main")
+                      help="resume saved work; with --fast --link, reuse partial page/Jev checkpoints")
     sync.set_defaults(fn=cmd_sync)
     watch = sub.add_parser("watch", help="run the metadata scanner and persistent queue worker"); pipeline_flags(watch)
     watch.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
@@ -759,6 +1114,7 @@ def main() -> int:
     # Keep client warnings out of the progress display as well; real errors
     # from these clients remain visible.
     for noisy in (
+        "asyncio",
         "httpx",
         "httpx2",
         "httpcore",

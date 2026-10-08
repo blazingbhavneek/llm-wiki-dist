@@ -19,7 +19,30 @@ class FastPolicy(Policy):
     def config_overrides(self) -> dict[str, Any]:
         # Window inventories are ~3.3K tokens of JSON and reasoning counts toward the
         # cap; at 4000 any longer reasoning truncated the JSON (three more full calls).
-        return {"write_attempts": self.repair_attempts + 1, "planner_max_output_tokens": 12000}
+        return {
+            "write_attempts": self.repair_attempts + 1,
+            "planner_max_output_tokens": 12000,
+            "judge_max_output_tokens": 16000,
+        }
+
+    def model_port(self, config: Any) -> Any:
+        from .model import model_pair
+
+        return model_pair(config)
+
+    def planning_model(self, model: Any) -> Any:
+        from graph.wiki.model import judge_model
+
+        return judge_model(model)
+
+    def model_cache_fields(self, config: Any) -> dict[str, Any]:
+        return {
+            "judge_base_url": config.judge_base_url,
+            "judge_model": config.judge_model,
+        }
+
+    def model_if_missing(self, config: Any) -> Any:
+        return self.model_port(config)
 
     def title(self, title: str) -> str:
         from .wiki import strip_heading_number
@@ -36,6 +59,11 @@ class FastPolicy(Policy):
 
         return code_tokens(text)
 
+    def wiki_prompt_rules(self, role: str) -> str:
+        from .wiki import generation_prompt_rules
+
+        return generation_prompt_rules(role)
+
     def adjust_seed_plan(self, plan: Any, *, config: Any) -> Any:
         from .wiki import merge_small_pages
 
@@ -50,6 +78,12 @@ class FastPolicy(Policy):
         from .wiki import hierarchy
 
         return hierarchy(pages, lines, checkpoint=checkpoint, version=self.version)
+
+    async def rewrite_pending_pages(self, **kwargs: Any) -> bool:
+        from .writer import rewrite_pending_pages
+
+        await rewrite_pending_pages(**kwargs)
+        return True
 
     def mask_for_linking(self, text: str) -> tuple[str, Callable[[str], str]]:
         from .wiki import mask_math
@@ -78,8 +112,8 @@ class FastPolicy(Policy):
 
 FAST = FastPolicy(
     name="fast",
-    version="fast-v4",
-    repair_attempts=1,
+    version="fast-v5",
+    repair_attempts=3,
     research=False,
     intro=False,
     strict_judge=True,

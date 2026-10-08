@@ -21,7 +21,7 @@ from typing import Any, Callable
 from graph.clients.embeddings import Embedder
 from graph.common.markdown import strip_big_tables, strip_image_media
 from graph.growi import MARKER_FORMAT, GrowiClient, GrowiPublisher, growi_path
-from graph.workspace.parser_client import UnsupportedDocument, parse_document
+from graph.workspace.parser_client import UnsupportedDocument, parse_document, read_text_source
 from graph.workspace.project import (
     VERBATIM,
     Project,
@@ -31,7 +31,7 @@ from graph.workspace.project import (
     wiki_folder_name,
 )
 from graph.workspace.writer import links_up_to_date, run_linkers, wiki_config, wiki_up_to_date, write_wiki_pages
-from graph.wiki.model import ChatModelPort
+from common.policy import policy_of
 from graph.wiki.storage import read_json, write_json_atomic
 
 from .ledger import Ledger, load_ledger, save_ledger
@@ -338,7 +338,7 @@ def _parse(
     validate_markdown: Callable[[str], None] | None = None,
 ) -> str:
     if path.suffix.lower() in VERBATIM:
-        return path.read_text(encoding="utf-8")
+        return read_text_source(path)
     base_url = str(getattr(settings, "parser_base_url", ""))
     if not base_url:
         raise RuntimeError(f"WIKI_PARSER_BASE_URL is required for {item.rel}")
@@ -366,8 +366,9 @@ def _parse(
     return markdown
 
 
-def _model(settings: Any, project: Project) -> ChatModelPort:
-    return ChatModelPort(wiki_config(settings, run_dir=project.metadata / "state" / "publisher"))
+def _model(settings: Any, project: Project) -> Any:
+    config = wiki_config(settings, run_dir=project.metadata / "state" / "publisher")
+    return policy_of(config).model_port(config)
 
 
 def _wiki_raw_rels(project: Project) -> list[str]:
@@ -395,6 +396,7 @@ def _capture_remote(
     *,
     only: set[str] | None = None,
     page_ids: set[str] | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[str], list[str], set[str]]:
     """Capture while local files still represent the previous accepted output."""
     if not hasattr(publisher, "pull_changes"):
@@ -416,7 +418,12 @@ def _capture_remote(
     }
     unchanged = {doc for doc, folder in folders.items()
                  if ledger.published_documents.get(doc, {}).get("content_sha256") == _content_hash(folder)}
-    pulled, failures, blocked = publisher.pull_changes(project, pages, unchanged)
+    pull_args: dict[str, Any] = {}
+    # Keep compatibility with the small fake publishers used by callers and tests;
+    # the real GROWI publisher owns the per-page capture events.
+    if on_progress is not None and isinstance(publisher, GrowiPublisher):
+        pull_args["on_progress"] = on_progress
+    pulled, failures, blocked = publisher.pull_changes(project, pages, unchanged, **pull_args)
     for doc in {Path(path).parent.as_posix() for path in pulled}:
         if doc in ledger.published_documents:
             ledger.published_documents[doc]["content_sha256"] = _content_hash(folders[doc])
@@ -604,7 +611,9 @@ def _publish_sweep(
     if publisher is not None:
         try:
             if not captured:
-                pulled, conflicts, blocked = _capture_remote(project, ledger, publisher, only=only)
+                pulled, conflicts, blocked = _capture_remote(
+                    project, ledger, publisher, only=only, on_progress=on_progress
+                )
                 failures.extend(conflicts)
                 if pulled:
                     if only_pages is not None:
@@ -638,20 +647,16 @@ def _publish_sweep(
         try:
             if documents and begin_publish is not None:
                 begin_publish()
-            if on_progress:
-                on_progress({
-                    "stage": "growi-publish",
-                    "step": "start",
-                    "current": 0,
-                    "total": len(documents),
-                    "documents": len(documents),
-                })
             publish_args = {
                 "known_pages": known_pages,
                 **({"only_pages": only_pages} if only_pages is not None else {}),
             }
+            if on_progress is not None and isinstance(publisher, GrowiPublisher):
+                publish_args["on_progress"] = on_progress
             pages = publisher.publish_documents(
-                project, [raw_rel for _, _, raw_rel in documents], **publish_args
+                project,
+                [raw_rel for _, _, raw_rel in documents],
+                **publish_args,
             )
             published_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             for document, folder, raw_rel in documents:
@@ -673,10 +678,9 @@ def _publish_sweep(
             if on_progress:
                 on_progress({
                     "stage": "growi-publish",
-                    "step": "done",
-                    "current": len(documents),
-                    "total": len(documents),
+                    "step": "batch_done",
                     "pages": len(pages),
+                    "documents": len(documents),
                     "elapsed_seconds": round(time.monotonic() - started, 1),
                 })
         except Exception as exc:
@@ -1926,6 +1930,7 @@ def publish_only(
     only: list[str] | None = None,
     allow_unlinked: bool = False,
     link_pending: bool = True,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Publish the current wiki tree without scanning or changing mount/raw.
 
@@ -1950,6 +1955,7 @@ def publish_only(
             settings=settings,
             allow_unlinked=allow_unlinked,
             link_pending=link_pending and not allow_unlinked,
+            on_progress=on_progress,
         )
         if not failures:
             # The tree is live on this endpoint, so its page IDs are now the ledger's.
@@ -1989,7 +1995,11 @@ def republish_if_stale(settings: Any) -> dict[str, Any] | None:
     return publish_only(settings)
 
 
-def reset_growi(settings: Any) -> dict[str, Any]:
+def reset_growi(
+    settings: Any,
+    *,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Trash publisher-marked pages below the configured target and reset state."""
     project = open_project(settings)
     publisher = _publisher(settings)
@@ -1997,9 +2007,9 @@ def reset_growi(settings: Any) -> dict[str, Any]:
         raise RuntimeError("GROWI_URL is required for reset")
     ledger_path = project.metadata / "pipeline.json"
     with _lock(project):
-        deleted = publisher.reset()
+        deleted = publisher.reset(on_progress=on_progress)
         from publisher.index import delete_index_pages
-        delete_index_pages(settings)  # index pages carry no chunk marker, reset() skips them
+        delete_index_pages(settings, on_progress=on_progress)  # index pages carry no chunk marker, reset() skips them
         ledger = load_ledger(ledger_path)
         ledger.published_documents.clear()
         ledger.published_pages.clear()

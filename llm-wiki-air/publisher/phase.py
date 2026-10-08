@@ -9,7 +9,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from common.context import Context
 from common.legacy import publish
@@ -65,7 +65,13 @@ def assemble(root: Path, documents: tuple[str, ...] = ()) -> Result:
     return Result("assemble", tuple(written))
 
 
-def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Result:
+def run(
+    cfg: Config,
+    inp: Input,
+    out: Path,
+    ctx: Context | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> Result:
     if cfg.action == "assemble":
         with (ctx.stage("publisher", "assemble") if ctx is not None else _null_context()):
             return assemble(out, inp.documents)
@@ -77,6 +83,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
             settings,
             allow_unlinked=cfg.allow_unlinked,
             link_pending=cfg.link_pending,
+            on_progress=on_progress,
         )
     return Result(cfg.action, tuple(str(row) for row in result.get("done", [])), tuple(result.get("failures", [])))
 

@@ -49,3 +49,21 @@ blocked) before a deployment.
 - bulk migrate existing project data;
 - make a phase depend on the full `Settings` object once its typed config is
   available.
+
+## Starting subagents here
+
+This session runs `gemma-4-31B` through a custom OpenAI-compatible gateway
+(`model`, `openai_base_url` in `~/.codex/config.toml`), not a stock OpenAI model.
+
+- Omit `model` on `spawn_agent` so the subagent inherits the session model. That
+  is the only working path.
+- Never set `model`. `spawn_agent` validates against a fixed list
+  (`gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`) that
+  rejects `gemma-4-31B`, and every one of those names 404s at this gateway.
+- Never set `reasoning_effort`. `gemma-4-31B` supports none (the gateway returns
+  an empty supported list), so `low`/`medium`/`xhigh` all fail the spawn. The
+  `model_reasoning_effort` value in `~/.codex/config.toml` is ignored by it.
+- Ignore what a subagent says it is running as; it guesses. Only the spawn
+  result and gateway errors are evidence.
+- Finished subagents still count against the concurrency limit; `close_agent`
+  once their result is integrated.

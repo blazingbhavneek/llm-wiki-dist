@@ -20,5 +20,5 @@ async def run(source_path: Path, *, run_dir: Path, model: Any, config: Any, on_p
     return await write_tables(
         sheets=[(title, body, (1, len(lines)))], run_dir=run_dir, model=model, config=config,
         on_progress=on_progress, stop_check=stop_check,
-        generate_analyses=policy_of(config).table_analyses,
+        generate_analyses=policy_of(config).table_analyses and not getattr(config, "skip_excel_and_small", False),
     )

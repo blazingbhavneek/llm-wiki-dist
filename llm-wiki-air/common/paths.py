@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+SUPPORTED_SOURCE_SUFFIXES = {".md", ".txt", ".docx", ".doc", ".pdf", ".pptx", ".xlsx", ".xlsm", ".xls", ".csv"}
+
 
 def wiki_folder_name(raw_name: str) -> str:
     stem = PurePosixPath(raw_name).stem

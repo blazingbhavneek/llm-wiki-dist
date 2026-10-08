@@ -9,7 +9,7 @@ from graph.common.async_tools import run_async_blocking
 from graph.config import Settings, resolve_project_path
 from graph.workspace.project import Project, open_project
 from graph.workspace.writer import wiki_config
-from graph.wiki.model import ChatModelPort
+from common.policy import policy_of
 
 from . import link_document
 from .catalog import Catalog
@@ -42,7 +42,7 @@ def _raw_rel(project: Project, document: str) -> str:
 
 def _model_and_embedder(settings: Settings, project: Project, document: str):
     cfg = wiki_config(settings, run_dir=project.metadata / "state" / document)
-    model = ChatModelPort(cfg)
+    model = policy_of(cfg).model_port(cfg)
     try:
         from graph.clients.embeddings import Embedder
         embedder = Embedder(settings)

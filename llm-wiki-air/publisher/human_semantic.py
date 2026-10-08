@@ -621,7 +621,12 @@ class SemanticAssistant:
 def build_runtime_semantic_assistant(store: HumanStore, settings: Any) -> SemanticAssistant:
     """Build lazy production adapters; construction performs no network/model call."""
 
-    from graph.wiki.model import ChatModelPort
+    from common.policy import policy_of
+    from graph.wiki.model import (
+        ChatModelPort,
+        judge_model as select_judge_model,
+        writer_model as select_writer_model,
+    )
     from graph.workspace.writer import wiki_config
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -629,9 +634,14 @@ def build_runtime_semantic_assistant(store: HumanStore, settings: Any) -> Semant
     writer_system = (prompt_root / "human_merge_system.txt").read_text(encoding="utf-8")
     judge_system = (prompt_root / "human_judge_system.txt").read_text(encoding="utf-8")
     writer_config = wiki_config(settings, run_dir=store.project.metadata / "state" / "human-semantic-writer")
-    judge_config = wiki_config(settings, run_dir=store.project.metadata / "state" / "human-semantic-judge")
-    writer_model = ChatModelPort(writer_config)
-    judge_model = ChatModelPort(judge_config)
+    if policy_of(settings).name == "fast":
+        role_pair = policy_of(writer_config).model_port(writer_config)
+        writer_model = select_writer_model(role_pair)
+        judge_model = select_judge_model(role_pair)
+    else:
+        judge_config = wiki_config(settings, run_dir=store.project.metadata / "state" / "human-semantic-judge")
+        writer_model = ChatModelPort(writer_config)
+        judge_model = ChatModelPort(judge_config)
 
     def score(rows: list[dict[str, Any]]) -> dict[str, Any]:
         from jev import JevQuestion, JevRequest, get_engine_for
