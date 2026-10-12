@@ -2,7 +2,7 @@
 name = "llm-wiki"
 version = "0.1.0"
 description = "Add your description here"
-readme = "README.md"
+readme = "DEV_README.md"
 requires-python = ">=3.13"
 dependencies = [
   "fastapi",

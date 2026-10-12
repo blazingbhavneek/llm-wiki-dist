@@ -8,23 +8,33 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from common.storage import read_json, sha256_text, write_json_atomic
+from publisher.ledger import Ledger, save_ledger
 from graph.fast.model import (
+    FAST_WRITER_MAX_OUTPUT_TOKENS,
+    FastModelPort,
     FastRoleGate,
     JUDGE_MAX_OUTPUT_TOKENS,
     model_pair,
 )
 from graph.fast.passes import bounded_map
+from graph.fast.policy import FAST
 from graph.fast.repair import (
     FastRepair,
     MAX_REWRITE_ATTEMPTS,
     RepairJudgeResult,
+    _assemble_page,
     _feedback,
     _judge_rank,
     _new_repair_session,
+    _split_page,
     _write_session_checkpoint,
 )
+from graph.fast.wiki import append_low_coverage_source, recent_writer_context
+from graph.fast.writer import _generate_page, _prepare_session, rewrite_pending_pages
 from graph.workspace.project import Project
+from graph.wiki import pipeline as wiki_pipeline
 from graph.wiki.config import WikiConfig
+from graph.wiki.images import extract_image_units
 from runner.cli import build_parser
 
 
@@ -147,6 +157,375 @@ class RepairingModel:
 
 
 class FastRepairTest(unittest.TestCase):
+    def test_reassembled_footer_renders_as_rule_after_paragraph_or_table(self):
+        try:
+            from markdown_it import MarkdownIt
+        except ImportError:
+            self.skipTest("optional markdown-it renderer is not installed")
+
+        footer = "---\n\n次のページ: [次](002.md)\n"
+        for body in ("最後の説明。", "<table><tr><td>42</td></tr></table>"):
+            with self.subTest(body=body):
+                original = f"# ページ\n\n{body}\n{footer}"
+                shell = _split_page(original)
+                assembled = _assemble_page(shell.title, shell.body, shell.footer)
+                rendered = MarkdownIt().render(assembled)
+                self.assertIn(body + "\n\n---\n", assembled)
+                self.assertEqual(rendered.count("<hr />"), 1)
+                self.assertNotIn("<h2>", rendered)
+                self.assertNotIn("<p>---</p>", rendered)
+                self.assertEqual(_split_page(assembled), shell)
+
+    def test_initially_approved_page_still_gets_footer_spacing_fixed(self):
+        class CleanModel:
+            async def structured(self, _schema, _messages, **_kwargs):
+                return RepairJudgeResult(approved=True, coverage_score=100)
+
+            async def text(self, *_args, **_kwargs):
+                raise AssertionError("footer spacing must not require the writer")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            original = "# ページ\n\n説明。\n---\n\n次のページ: [次](002.md)\n"
+            project, raw_rel, state_root = make_document(
+                root, [("ページ", original, (1, 1))], ["説明。"]
+            )
+            result = FastRepair(
+                settings(root), project=project, model=CleanModel()
+            ).repair_document(raw_rel, promote=False)
+            repaired = (state_root / "wiki" / "001-page-1.md").read_text(encoding="utf-8")
+            self.assertEqual(result["clean"], 1)
+            self.assertEqual(repaired, original.replace("説明。\n---", "説明。\n\n---"))
+            state = read_json(state_root / "state" / "pages" / "001.json")
+            self.assertEqual(state["content_sha256"], sha256_text(repaired))
+
+    def test_shared_rubric_repairs_intent_and_readability_without_structural_gate(self):
+        test = self
+
+        class IntentModel:
+            async def structured(self, _schema, messages, **_kwargs):
+                rules = messages[0].content
+                test.assertIn("質問・確認依頼・提案・仮定・未確定事項", rules)
+                test.assertIn("Markdownパイプ表は本文品質の欠陥", rules)
+                test.assertIn("導入の欠落", rules)
+                test.assertIn("体裁だけの欠陥では下げない", rules)
+                candidate = messages[-1].content.split("--- Wiki候補本文", 1)[1]
+                if "確認事項：担当部署に、この理解が正しいか確認する。" in candidate:
+                    return RepairJudgeResult(approved=True, coverage_score=100)
+                return RepairJudgeResult(
+                    approved=False,
+                    coverage_score=90,
+                    missing_important_information=["担当部署への確認依頼と未確定状態"],
+                    body_defects=["導入の欠落、Markdownパイプ表、孤立した注記"],
+                )
+
+            async def text(self, messages, **_kwargs):
+                rules = messages[0].content
+                test.assertIn("H1の直後に", rules)
+                test.assertIn("確定した仕様や決定事項へ変えない", rules)
+                test.assertIn("表注記へ自然に統合", rules)
+                test.assertIn("\\bigcirc、\\times", rules)
+                test.assertIn("担当部署への確認依頼と未確定状態", messages[-1].content)
+                return (
+                    "# 設定値の確認\n\n設定値と担当部署への確認事項を示す。\n\n"
+                    "<table><tr><th>項目</th><th>値</th></tr>"
+                    "<tr><td>設定値</td><td>42</td></tr></table>\n\n"
+                    "注記：設定値の単位は秒。\n\n"
+                    "確認事項：担当部署に、この理解が正しいか確認する。\n"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            project, raw_rel, state_root = make_document(
+                root,
+                [("設定値の確認", "# 設定値の確認\n\n## 設定\n\n"
+                  "| 設定値 | 42 |\n| --- | --- |\n\nこの理解が正しい。\n秒\n", (1, 3))],
+                ["設定値は42。", "単位は秒。", "担当部署様、この理解で相違ございませんでしょうか？"],
+            )
+            result = FastRepair(
+                settings(root), project=project, model=IntentModel()
+            ).repair_document(raw_rel, promote=False)
+            self.assertEqual(result["repaired"], 1)
+            repaired = (state_root / "wiki" / "001-page-1.md").read_text(encoding="utf-8")
+            self.assertIn("確認事項：担当部署に、この理解が正しいか確認する。", repaired)
+            self.assertIn("注記：設定値の単位は秒。", repaired)
+            self.assertIn("<table>", repaired)
+
+    def test_empty_source_is_reported_before_repair_model_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            project, raw_rel, state_root = make_document(
+                root, [("ページ", "# ページ\n", (1, 1))], []
+            )
+            for path in (project.raw_file(raw_rel), state_root / "source" / "original.md"):
+                path.write_text("", encoding="utf-8")
+            repair = FastRepair(settings(root), project=project, model=object())
+            with self.assertRaisesRegex(RuntimeError, "source is empty; check conversion/extraction"):
+                repair.repair_document(raw_rel, promote=False)
+            self.assertEqual(
+                (state_root / "wiki" / "001-page-1.md").read_text(encoding="utf-8"),
+                "# ページ\n",
+            )
+
+    def test_empty_page_source_is_reported_before_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = wiki_pipeline.SeedPage(1, "ページ", "章", "", [(1, 1)], "001.md", "page-1")
+            with self.assertRaisesRegex(wiki_pipeline.PipelineError, "source is empty"):
+                _prepare_session(
+                    page, pages=[page], lines=[" "], units=[], config=WikiConfig(policy="fast"),
+                    work_root=root / "work", wiki_root=root / "wiki", state_root=root / "state",
+                    source_path=root / "source.md",
+                )
+
+    def test_fast_writer_keeps_only_images_opaque(self):
+        lines = [
+            "| 項目 | 値 |",
+            "| --- | --- |",
+            "| A | 1 |",
+            "```text",
+            "fenced source",
+            "```",
+            IMAGE,
+        ]
+
+        units = FAST.writer_units(lines, extract_image_units(lines))
+
+        self.assertEqual(len(units), 1)
+        self.assertIn("image-unit", units[0].raw)
+
+    def test_low_coverage_keeps_raw_source_in_hidden_editor_fallback(self):
+        raw = "# 1. 原文見出し\n\n重要な値は42。"
+        rendered = append_low_coverage_source("読みやすい本文。", raw, 79)
+
+        self.assertIn("情報保持スコアが80未満", rendered)
+        self.assertIn('<span hidden style="display:none"', rendered)
+        self.assertIn("重要な値は42。", rendered)
+        self.assertIn("# 1. 原文見出し", FAST.section(rendered))
+        masked, restore = FAST.mask_for_linking(rendered)
+        self.assertNotIn("重要な値は42。", masked)
+        self.assertEqual(restore(masked), rendered)
+        self.assertEqual(
+            append_low_coverage_source("読みやすい本文。", "重要な値は42。", 80),
+            "読みやすい本文。",
+        )
+
+    def test_recent_writer_context_has_three_summaries_and_last_50_lines(self):
+        pages = [
+            SimpleNamespace(number=number, title=f"ページ{number}", summary=f"要約{number}")
+            for number in range(1, 6)
+        ]
+
+        context = recent_writer_context(
+            page=pages[-1],
+            pages=pages,
+            previous_source="\n".join(f"source-line-{number}" for number in range(1, 61)),
+        )
+
+        self.assertNotIn("ページ1 — 要約1", context)
+        self.assertIn("ページ2 — 要約2", context)
+        self.assertIn("ページ4 — 要約4", context)
+        self.assertNotIn("source-line-10\n", context)
+        self.assertIn("source-line-11\n", context)
+        self.assertIn("source-line-60", context)
+        self.assertIn("直前50行・最大12,000文字", context)
+
+        long_context = recent_writer_context(
+            page=pages[-1],
+            pages=pages,
+            previous_source="\n".join(
+                f"long-line-{number}-" + ("x" * 300) for number in range(1, 61)
+            ),
+        )
+        preceding = long_context.split(
+            "現在のページにない事実をコピーしない。\n", 1
+        )[1].rstrip("\n")
+        self.assertLessEqual(len(preceding), 12_000)
+        self.assertIn("long-line-60-", preceding)
+
+    def test_fast_generation_uses_page_repair_writer_and_judge(self):
+        class GenerationModel:
+            def __init__(self):
+                self.writer_messages = []
+                self.judge_messages = []
+
+            async def text(self, messages, **_kwargs):
+                self.writer_messages.append(messages[-1].content)
+                return (
+                    "# 読みやすいページ\n\n整理された本文。\n\n---\n\n"
+                    "前のページ: [モデル作成リンク](wrong.md)\n"
+                )
+
+            async def structured(self, schema, messages, **_kwargs):
+                self.assert_schema = schema
+                self.judge_messages.append(messages[-1].content)
+                return RepairJudgeResult(
+                    approved=False,
+                    coverage_score=70,
+                    missing_important_information=["重要な値42"],
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lines = [f"直前の流れ{number}" for number in range(1, 51)] + [
+                "現在ページの最初。",
+                "重要な値は42。",
+                "現在ページの最後。",
+            ]
+            previous = wiki_pipeline.SeedPage(
+                1, "前ページ", "章", "前ページの要約", [(1, 50)],
+                "001.md", "page-1",
+            )
+            page = wiki_pipeline.SeedPage(
+                2, "仮タイトル", "章", "現在ページ", [(51, 53)],
+                "002.md", "page-2",
+            )
+            config = WikiConfig(
+                policy="fast", write_attempts=2, human_guidance={}
+            )
+            session = _prepare_session(
+                page,
+                pages=[previous, page],
+                lines=lines,
+                units=[],
+                config=config,
+                work_root=root / "work",
+                wiki_root=root / "wiki",
+                state_root=root / "state",
+                source_path=root / "source.md",
+            )
+            model = GenerationModel()
+            outcome = asyncio.run(_generate_page(
+                session,
+                lines=lines,
+                model=model,
+                config=config,
+                stop_check=None,
+                on_progress=None,
+            ))
+
+        self.assertIs(model.assert_schema, RepairJudgeResult)
+        self.assertEqual(len(model.writer_messages), 2)
+        self.assertEqual(len(model.judge_messages), 2)
+        self.assertIn("直前の流れ1", model.writer_messages[0])
+        self.assertIn("直前の流れ50", model.writer_messages[0])
+        self.assertIn("51: 現在ページの最初。", model.writer_messages[0])
+        self.assertIn("53: 現在ページの最後。", model.writer_messages[0])
+        self.assertNotIn("直前の流れ1", model.judge_messages[0])
+        self.assertFalse(outcome.verbatim)
+        self.assertIn("整理された本文。", outcome.body)
+        self.assertNotIn("モデル作成リンク", outcome.body)
+        self.assertIn("重要な値は42。", outcome.body)
+        self.assertIn('data-llm-wiki-low-coverage="true"', outcome.body)
+
+    def test_fast_generation_replaces_model_navigation_with_one_current_footer(self):
+        class NavigationModel:
+            async def text(self, messages, **_kwargs):
+                prompt = messages[-1].content
+                title = "最終ページ一" if "ページ番号: 1" in prompt else "最終ページ二"
+                return (
+                    f"# {title}\n\n本文。\n\n---\n\n"
+                    "次のページ: [モデルの誤リンク](wrong.md)\n"
+                )
+
+            async def structured(self, _schema, _messages, **_kwargs):
+                return RepairJudgeResult(approved=True, coverage_score=100)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pages = [
+                wiki_pipeline.SeedPage(
+                    1, "仮ページ一", "章", "", [(1, 1)], "001.md", "page-1"
+                ),
+                wiki_pipeline.SeedPage(
+                    2, "仮ページ二", "章", "", [(2, 2)], "002.md", "page-2"
+                ),
+            ]
+            results = []
+            asyncio.run(rewrite_pending_pages(
+                pending=pages,
+                results=results,
+                pages=pages,
+                lines=["本文一。", "本文二。"],
+                units=[],
+                model=NavigationModel(),
+                config=WikiConfig(
+                    policy="fast", write_attempts=1, rewrite_concurrency=2
+                ),
+                work_root=root / "work",
+                wiki_root=root / "wiki",
+                state_root=root / "state",
+                source_path=root / "source.md",
+                source_snapshot_path=root / "snapshot.md",
+                source_sha256="source-hash",
+                source_line_count=2,
+                rewrite_version="test-fast-v7",
+                stop_check=None,
+                on_progress=None,
+                parents=None,
+            ))
+
+            first = (root / "wiki" / "001.md").read_text(encoding="utf-8")
+            second = (root / "wiki" / "002.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("モデルの誤リンク", first + second)
+        self.assertEqual(first.count("次のページ:"), 1)
+        self.assertIn("本文。\n\n---\n", first)
+        self.assertIn("次のページ: [最終ページ二](002.md)", first)
+        self.assertEqual(second.count("前のページ:"), 1)
+        self.assertIn("前のページ: [最終ページ一](001.md)", second)
+
+    def test_fast_generation_persists_judged_title_in_plan_and_index(self):
+        from graph.wiki.schemas import CompiledSeedPlan
+        from graph.wiki.wire import SeedRange
+
+        class TitleModel:
+            async def text(self, _messages, **_kwargs):
+                return "# 最終タイトル\n\n重要な値は42。\n"
+
+            async def structured(self, _schema, _messages, **_kwargs):
+                return RepairJudgeResult(approved=True, coverage_score=100)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.md"
+            source.write_text("重要な値は42。\n", encoding="utf-8")
+            config = WikiConfig(
+                policy="fast",
+                run_dir=str(root / "run"),
+                plan_cache_dir=str(root / "cache"),
+                rewrite_concurrency=1,
+                write_attempts=1,
+            )
+            source_text = source.read_text(encoding="utf-8")
+            source_lines = wiki_pipeline.split_source_lines(
+                wiki_pipeline.normalize_source(source_text)
+            )
+            seed = CompiledSeedPlan(pages=[SeedRange(
+                title="仮タイトル",
+                summary="要約",
+                source_start=1,
+                source_end=1,
+                path=["仮タイトル"],
+            )])
+            wiki_pipeline._store_plan_cache(
+                wiki_pipeline._plan_cache_path(source_text, config),
+                source_text,
+                source_lines,
+                config,
+                seed,
+            )
+
+            run_root = asyncio.run(wiki_pipeline.run_pipeline(
+                source, config=config, model=TitleModel()
+            ))
+            plan_page = read_json(run_root / "state" / "plan.json")["pages"][0]
+            index = (run_root / "wiki" / "index.md").read_text(encoding="utf-8")
+
+        self.assertEqual(plan_page["title"], "最終タイトル")
+        self.assertEqual(plan_page["path"], ["最終タイトル"])
+        self.assertIn("[最終タイトル]", index)
+
     def test_cli_repair_is_fast_operation_with_limit(self):
         args = build_parser().parse_args(["sync", "--fast", "--repair", "--limit", "7", "a.pdf"])
         self.assertTrue(args.fast_repair)
@@ -268,7 +647,7 @@ class FastRepairTest(unittest.TestCase):
             rejected.best_feedback = list(rejected.feedback)
             rejected.best_verdict = verdict
             rejected.best_rank = _judge_rank(
-                verdict, mechanical_issues=0, attempt=0
+                verdict, attempt=0
             )
             _write_session_checkpoint(
                 loaded_root,
@@ -344,7 +723,7 @@ class FastRepairTest(unittest.TestCase):
             self.assertEqual(len(model.writer_messages), MAX_REWRITE_ATTEMPTS)
             for attempt, message in enumerate(model.writer_messages, start=1):
                 self.assertIn(f"本文: 欠陥{attempt}", message)
-            self.assertIn("--- 直前の修復候補", model.writer_messages[1])
+            self.assertIn("--- 直前のWiki候補", model.writer_messages[1])
             self.assertIn("正常な説明。候補1", model.writer_messages[1])
             self.assertIn("それ以前の指摘", model.writer_messages[1])
             self.assertIn("本文: 欠陥1", model.writer_messages[1])
@@ -410,23 +789,22 @@ class FastRepairTest(unittest.TestCase):
             repair = FastRepair(
                 settings(root, concurrency=2), project=project, model=CleanModel()
             )
-            base_policy = repair.policy
+            from graph.fast import repair as repair_module
 
-            class SelectivePolicy:
-                name = base_policy.name
+            original = repair_module._judge_messages
 
-                def code_tokens(self, text):
-                    if "ページ1" in text:
-                        raise RuntimeError("injected page-local guard failure")
-                    return base_policy.code_tokens(text)
+            def fail_one_page(page, title, body):
+                if page.number == 1:
+                    raise RuntimeError("injected page-local judge failure")
+                return original(page, title, body)
 
-            repair.policy = SelectivePolicy()
-            result = repair.repair_document(raw_rel, promote=False)
+            with patch("graph.fast.repair._judge_messages", side_effect=fail_one_page):
+                result = repair.repair_document(raw_rel, promote=False)
 
             self.assertEqual(result["review"], 1)
             self.assertEqual(result["clean"], 1)
             self.assertEqual(len(result["failures"]), 1)
-            self.assertIn("injected page-local guard failure", result["failures"][0])
+            self.assertIn("injected page-local judge failure", result["failures"][0])
             self.assertEqual(
                 read_json(state_root / "state" / "pages" / "001.json")["repair_status"],
                 "review",
@@ -470,6 +848,39 @@ class FastRepairTest(unittest.TestCase):
             self.assertEqual(state["repair_selected_attempt"], 2)
             self.assertEqual(state["repair_selection"], "best-judged")
             self.assertEqual(state["judge_score"], 94)
+
+    def test_low_scored_best_rewrite_is_published_with_hidden_source(self):
+        class LowCoverageModel:
+            async def structured(self, _schema, messages, **_kwargs):
+                initial = "現在候補と同一" in messages[-1].content
+                return RepairJudgeResult(
+                    approved=False,
+                    coverage_score=40 if initial else 70,
+                    body_defects=["情報の復元が必要"],
+                    missing_important_information=["重要な設定値"],
+                )
+
+            async def text(self, _messages, **_kwargs):
+                return "# 読みやすいページ\n\n整理された本文。\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            project, raw_rel, state_root = make_document(
+                root,
+                [("壊れたページ", "# 壊れたページ\n\nOCR OCR OCR。\n", (1, 1))],
+                ["重要な設定値は42。"],
+            )
+
+            result = FastRepair(
+                settings(root), project=project, model=LowCoverageModel()
+            ).repair_document(raw_rel, promote=False)
+
+            self.assertEqual(result["review"], 1)
+            repaired = (state_root / "wiki" / "001-page-1.md").read_text(encoding="utf-8")
+            self.assertIn("整理された本文。", repaired)
+            self.assertIn("情報保持スコアが80未満", repaired)
+            self.assertIn('<span hidden style="display:none"', repaired)
+            self.assertIn("重要な設定値は42。", repaired)
 
     def test_four_failed_rewrites_keep_original_and_create_review(self):
         class RejectingModel:
@@ -673,6 +1084,35 @@ class FastRepairTest(unittest.TestCase):
         )
         self.assertEqual(make.call_args_list[0].kwargs["temperature"], 0.7)
 
+    def test_repair_targets_smallest_documents_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_root = root / "state"
+
+            def state_dir(raw_rel):
+                return state_root / raw_rel.replace("/", "__")
+
+            project = SimpleNamespace(metadata=root, state_dir=state_dir)
+            save_ledger(root / "pipeline.json", Ledger(
+                sources={
+                    "large": {"raw_rel": "large.md"},
+                    "small": {"raw_rel": "small.md"},
+                    "medium": {"raw_rel": "medium.md"},
+                },
+                published_documents={},
+            ))
+            for raw_rel, count in (("large.md", 9), ("small.md", 1), ("medium.md", 4)):
+                write_json_atomic(state_dir(raw_rel) / "state" / "plan.json", {
+                    "pages": [{} for _ in range(count)]
+                })
+
+            repair = FastRepair.__new__(FastRepair)
+            repair.project = project
+
+            self.assertEqual(
+                repair.targets(), ["small.md", "medium.md", "large.md"]
+            )
+
     def test_unset_writer_follows_judge(self):
         config = WikiConfig(
             chat_base_url="http://chat/v1",
@@ -689,6 +1129,27 @@ class FastRepairTest(unittest.TestCase):
             [call.kwargs["base_url"] for call in make.call_args_list],
             ["http://judge/v1", "http://judge/v1"],
         )
+
+    def test_fast_writer_caps_total_completion_without_changing_judge(self):
+        seen: list[dict[str, object]] = []
+
+        class Llm:
+            def bind(self, **kwargs):
+                seen.append(kwargs)
+                return self
+
+            async def ainvoke(self, _messages):
+                return SimpleNamespace(content="# title\n\nA complete page body.")
+
+        writer = FastModelPort(WikiConfig(), llm=Llm(), role="writer")
+        judge = FastModelPort(WikiConfig(), llm=Llm(), role="judge")
+        asyncio.run(writer.text([], max_output_tokens=FAST_WRITER_MAX_OUTPUT_TOKENS))
+        asyncio.run(judge.text([], max_output_tokens=16000))
+
+        self.assertEqual(seen[0]["max_tokens"], FAST_WRITER_MAX_OUTPUT_TOKENS)
+        self.assertNotIn("thinking_token_budget", seen[0].get("extra_body", {}))
+        self.assertNotIn("thinking_token_budget", seen[1].get("extra_body", {}))
+        self.assertNotIn("max_tokens", seen[1])
 
     def test_model_call_gate_respects_concurrency(self):
         async def run():

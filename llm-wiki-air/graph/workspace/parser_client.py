@@ -31,6 +31,7 @@ def safe_endpoint(value: str) -> str:
 # image-unit, description, and XLSM lineage behavior is preserved. The generic
 # /parse route produces ordinary Markdown and must never be used here.
 LLM_WIKI_PARSE_PATH = "/parse/llm-wiki"
+DEFAULT_PDF_CLIENT = "docling"
 
 _IMAGE_DESCRIPTION_RE = re.compile(
     r"(?P<open><image-description\b[^>]*>)(?P<body>.*?)(?P<close></image-description>)",
@@ -183,12 +184,15 @@ def parse_document(
             try:
                 log.info("stage=parser endpoint=%s attempt=%d file=%s timeout=%.0fs",
                          safe_endpoint(endpoint), index + 1, path.name, timeout_s)
+                params = {
+                    "images": "true",
+                    "describe_images": "true" if describe_images else "false",
+                }
+                if Path(path).suffix.lower() == ".pdf":
+                    params["pdf_client"] = DEFAULT_PDF_CLIENT
                 response = requests.post(
                     f"{endpoint}{LLM_WIKI_PARSE_PATH}",
-                    params={
-                        "images": "true",
-                        "describe_images": "true" if describe_images else "false",
-                    },
+                    params=params,
                     headers=headers,
                     data={"manifest": json.dumps(manifest, ensure_ascii=False)} if manifest else None,
                     files={"file": (Path(path).name, handle, _parser_content_type(Path(path)))},
@@ -237,6 +241,6 @@ def parse_document(
 
 
 __all__ = [
-    "UnsupportedDocument", "parse_document", "LLM_WIKI_PARSE_PATH",
+    "UnsupportedDocument", "parse_document", "LLM_WIKI_PARSE_PATH", "DEFAULT_PDF_CLIENT",
     "TEXT_SOURCE_SUFFIXES", "decode_text_bytes", "read_text_source",
 ]

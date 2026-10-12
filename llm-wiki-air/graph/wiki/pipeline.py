@@ -4,10 +4,9 @@
 2. Regional and document planners compile one exact sequential seed partition.
 3. Python picks references (adjacent + shared vocabulary); one structured
    compare call per page collects facts to import from all of them.
-4. Python cuts each page into sections; fences, tables and images become
-   placeholder tokens the model must place; the model rewrites one section at
-   a time as plain Markdown; Python restores the tokens and checks identifiers
-   and imported facts survived before a judge looks for semantic omissions.
+4. Python cuts each page into sections; the active policy chooses which source
+   units remain opaque (standard keeps fences/tables/images, fast keeps only
+   images); the model rewrites one section at a time before semantic review.
 5. Python writes the title, one model-written intro, links and navigation.
 
 There is no CLI agent and no tool-calling agent. Everything the model needs
@@ -31,7 +30,7 @@ from .config import REWRITE_PROMPT_VERSION, SEED_PLAN_COMPILE_VERSION, SEED_PLAN
 from .document_map import build_seed_plan
 from .markdown_blocks import build_block_index
 from .ids import document_id, slugify
-from .images import ImageUnit, block_units, extract_image_units, restore_images
+from .images import ImageUnit, extract_image_units, restore_images
 from .model import ModelPort, judge_model
 from .page import (
     PLACEHOLDER_RE,
@@ -1959,7 +1958,7 @@ async def run_pipeline(
             stop_check=stop_check,
         )
         _emit(on_progress, "context", "done")
-    units = extract_image_units(lines) + block_units(lines)
+    units = policy.writer_units(lines, extract_image_units(lines))
     seed_root = (work_root / "seeds").resolve()
     if not resumed_seed_plan:
         if seed_root.exists():
@@ -2032,6 +2031,14 @@ async def run_pipeline(
         parents=parents,
     )
     for item, page in zip(plan_json["pages"], pages):
+        previous_title = str(item.get("title") or "")
+        item["title"] = page.title
+        if (
+            isinstance(item.get("path"), list)
+            and item["path"]
+            and str(item["path"][-1]) == previous_title
+        ):
+            item["path"][-1] = page.title
         item["reference_ranges"] = _ranges_json(page.reference_ranges)
         item["provenance"] = _page_provenance(
             page,

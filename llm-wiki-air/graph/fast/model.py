@@ -15,6 +15,7 @@ from graph.wiki.model import ChatModelPort, ModelPair
 
 
 JUDGE_MAX_OUTPUT_TOKENS = 16_000
+FAST_WRITER_MAX_OUTPUT_TOKENS = 64_000
 
 
 class _OutputCappedLlm:
@@ -40,6 +41,30 @@ class _OutputCappedLlm:
 
 class FastModelPort(ChatModelPort):
     """Shared fast client behavior for writer and judge endpoint instances."""
+
+    async def text(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        """Cap the writer's total completion (reasoning plus page output)."""
+
+        writer_limit = (
+            min(
+                FAST_WRITER_MAX_OUTPUT_TOKENS,
+                max(1, int(max_output_tokens or FAST_WRITER_MAX_OUTPUT_TOKENS)),
+            )
+            if self.role == "writer"
+            else max_output_tokens
+        )
+        return await super().text(
+            messages,
+            max_output_tokens=writer_limit,
+            temperature=temperature,
+            _enforce_max_output_tokens=self.role == "writer",
+        )
 
     async def structured(
         self,

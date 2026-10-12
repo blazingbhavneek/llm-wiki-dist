@@ -104,6 +104,24 @@ class ParserClientTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["headers"], {})
         self.assertEqual(post.call_args.kwargs["params"]["describe_images"], "true")
 
+    def test_pdf_defaults_to_docling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.pdf"
+            path.write_bytes(b"%PDF-1.7\n")
+            with patch.object(
+                parser_client.requests,
+                "post",
+                return_value=_Resp({"markdown": "# x"}),
+            ) as post:
+                result = parse_document(
+                    path,
+                    base_url="http://parser",
+                    settings=_Settings(),
+                )
+
+        self.assertEqual(result, "# x")
+        self.assertEqual(post.call_args.kwargs["params"]["pdf_client"], "docling")
+
     def test_rejects_malformed_pages(self) -> None:
         stream = io.BytesIO()
         Workbook().save(stream)

@@ -12,7 +12,8 @@ from pathlib import Path
 from common.paths import SUPPORTED_SOURCE_SUFFIXES as SUPPORTED
 
 IGNORED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
-IGNORED_DIRS = {".git", ".hg", ".svn"}
+IGNORED_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "node_modules",
+                "__pycache__", "site-packages", "dist-packages"}
 
 
 @dataclass(frozen=True)

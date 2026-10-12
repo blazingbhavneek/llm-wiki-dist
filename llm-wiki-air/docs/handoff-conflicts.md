@@ -1,18 +1,24 @@
 # Human edits and conflicts: minimal page-merge design, implementation, and validation
 
-Last rewritten: 2026-10-08
+Last audited: 2026-10-09 on the work PC
 
-Status: **implemented, not verified for production.** Offline tests pass. The journal model is
-gone; `publisher/human_changes.py` holds `rebase()`, the state layer, pull, generate, rollback
-replay, and the three model calls. Live verification so far: 12 of 62 cases, all with API edits by
-the bot token and a temporary model setting, which is not production evidence.
-**`handoff-conflicts-tests.md` is the plan for testing everything**, including real GROWI edits
-by a separate user and the production pilot. The `data_std2` test project still has a live legacy
-journal (5 edits), so its document is blocked with `legacy human journal` until migrated (4.3) or
-reset.
-Deviation from 4.4: a document whose generator state still carries `human_edited` sidecars
-(pre-journal reverse sync) raises `legacy human state` in the writer instead of being pinned,
-so nothing is rebuilt away.
+Status: **implemented, not verified for production.** The journal model is gone;
+`publisher/human_changes.py` holds `rebase()`, the state layer, pull, generate,
+rollback replay, and the three model calls. The old home-PC result (12 of 62 live
+cases, all edited through the bot API with a temporary model setting) is historical
+only and does not count as work-PC or real-user evidence.
+
+The approved work-PC project is
+`/home/seigyo/llm-wiki/configs/conflicts_test.ini`. It points at the real test
+GROWI instance and an existing private test corpus. Do not enumerate, display, or
+copy its page bodies. Live cases use a new synthetic document below a unique
+subdirectory of `/conflicts_test`; a separate tester edits only those synthetic
+pages in the GROWI web editor. `handoff-conflicts-tests.md` is the executable test
+handoff and records the current work-PC audit.
+
+Deviation from 4.4: a document whose generator state still carries `human_edited`
+sidecars (pre-journal reverse sync) raises `legacy human state` in the writer
+instead of being pinned, so nothing is rebuilt away.
 
 Audience: the agent that implements the change, then a local agent/operator with
 access to the private source subset and a disposable GROWI test subtree.
@@ -29,12 +35,15 @@ Owner priorities, in order:
 
 ## 1. Hard safety rules for the local agent
 
-1. Use a new absolute INI file for the test. Do not edit, delete, rename, copy,
-   or sanitize any existing file in `configs/`. Existing configs point at real
-   projects.
-2. Use a source mount containing only the approved subset. Use a new empty
-   `data_root` and a unique one-component `target_name` that maps to a disposable
-   GROWI subtree.
+1. Use the approved test INI by its absolute path:
+   `/home/seigyo/llm-wiki/configs/conflicts_test.ini`. Do not edit, delete,
+   rename, copy, or sanitize any other file in `configs/`. Only the rollout
+   operator may change `human_sync_mode` in this test INI.
+2. The configured data root and `/conflicts_test` GROWI boundary already contain
+   a private test corpus. Do not read or enumerate its page bodies. Add one
+   synthetic source below a unique directory such as
+   `human-conflicts-e2e-YYYYMMDD/`, and limit all deliberate UI edits, fault
+   injection, body checks, and cleanup to the resulting synthetic GROWI pages.
 3. Use a GROWI credential whose permissions are limited to the test instance or
    disposable subtree. Keep the publisher credential and any human-editor test
    credential out of the repository and out of reports.
@@ -50,8 +59,10 @@ Owner priorities, in order:
    the remote page revisions for investigation.
 7. Run the focused offline tests in section 6 first. Expand only after they pass.
 8. Do not put private page bodies, source text, tokens, or authenticated URLs in
-   this handoff, a Git commit message, or a live report. Store hashes, revision
-   IDs, page IDs, reason codes, and redacted paths instead.
+   this handoff, a Git commit message, or a live report. Do not use an evidence
+   helper that lists or fetches every page below `/conflicts_test`; fetch only an
+   explicitly named synthetic test page. Store hashes, revision IDs, page IDs,
+   reason codes, and redacted paths instead.
 
 ## 2. The merge rules
 
@@ -491,8 +502,9 @@ one-time migration is needed before `apply` is used on them:
 - `98-Human-Conflicts*.md` is dropped.
 
 A document with a `legacy_pinned` edit has no pure version: keep it blocked and
-ask the owner. In this repository, only the `data_std2` test project has such
-journals.
+ask the owner. The 2026-10-09 metadata audit found no legacy document records in
+`data_big/conflicts_test`; that says nothing about other work-PC project roots,
+which still need the read-only check before rollout.
 
 ### 4.4 Delete, keep, add
 
@@ -638,12 +650,20 @@ Delete tests for removed code (journal, resolver, legacy recovery, semantic
 observe).
 
 ```bash
-timeout 60s .venv/bin/python -m compileall -q common convert wiki linker index publisher runner graph
-timeout 120s .venv/bin/python -m unittest tests.test_human_changes tests.test_human_sync_rollout -q
+PY=/home/seigyo/llm-wiki/.venv/bin/python
+$PY -m compileall -q common convert wiki linker index publisher runner graph
+timeout 240s $PY -m unittest -q tests.test_human_changes
+timeout 240s $PY -m unittest -q tests.test_human_sync_rollout
+timeout 240s $PY -m unittest -q tests.test_sync_fallback
+timeout 240s $PY -m unittest -q tests.test_update_tiers
 ```
 
-These tests use a fake model. The shadow check (4.2) uses the real model, so
-the owner sets up the model endpoint before it runs.
+These tests use fake services and are a regression gate, not live verification.
+On 2026-10-09 the first, second and fourth suites passed (67, 21 and 34 tests);
+`test_sync_fallback` timed out in
+`test_isolated_sync_finishes_builder_pass_before_linker_phase`. Resolve that
+before recording the offline gate as passed. The shadow check (4.2) uses the real
+model endpoint, and the live matrix uses the actual GROWI instance.
 
 ## 7. Publication, races, and lost responses (unchanged)
 
@@ -705,13 +725,15 @@ committed only after classification and checkpoint succeed.
 ## 10. Operator commands
 
 ```bash
-CFG=/absolute/path/to/disposable-hc.ini
-PY=.venv/bin/python
+CFG=/home/seigyo/llm-wiki/configs/conflicts_test.ini
+PY=/home/seigyo/llm-wiki/.venv/bin/python
 $PY main.py --project "$CFG" pull               # capture GROWI edits only
-$PY main.py --project "$CFG" pull --inventory   # full read-only boundary check first
-$PY main.py --project "$CFG" sync               # pulls first once 3.7 is implemented
+$PY main.py --project "$CFG" sync               # pulls first, then scans/builds
 $PY main.py --project "$CFG" human status       # blocked pages, human-change/Appendix/guidance counts
-$PY main.py --project "$CFG" human live-plan --path /UNIQUE-DISPOSABLE-TARGET
+$PY main.py --project "$CFG" human live-plan \
+  --path /conflicts_test/human-conflicts-e2e-YYYYMMDD
+# Owner approval or a fresh all-synthetic target is required before this broad read:
+$PY main.py --project "$CFG" pull --inventory
 ```
 
 Resolving a conflict means editing the page in GROWI: delete the
@@ -756,38 +778,65 @@ immediately before each mutating or deleting case.
 
 ### 12.1 Inputs
 
-Create outside the repository: an approved source subset mount, a new empty data
-root, an INI file, and optionally a private evidence directory. Include at least
-one prose document with stable headings and numbers, one document that splits
-into several pages, one with tables, code, links, and images if production has
-them, and one that gets a realistic major rewrite. Do not use symlinks into a
-production data root or source mount.
+Use the existing work-PC project; do not rebuild it from the home-PC scratchpad:
 
-### 12.2 Example INI
-
-```ini
-[project]
-source_mount=/absolute/private-test/subset-mount
-target_name=llm-wiki-hc-disposable-UNIQUE
-data_root=/absolute/private-test/data
-growi_url=https://test-growi.example.invalid
-
-[settings]
-human_sync_mode=off
-human_sync_activity_audit_seconds=3600
-human_sync_activity_overlap_seconds=60
-growi_mode=attach
+```text
+repository     /home/seigyo/llm-wiki
+config         /home/seigyo/llm-wiki/configs/conflicts_test.ini
+project root   /home/seigyo/llm-wiki/data_big/conflicts_test
+source mount   /home/seigyo/llm-wiki/data_big/conflicts_test/mount
+GROWI boundary /conflicts_test
 ```
 
-`target_name` must be one folder name; it maps to `/llm-wiki-hc-disposable-UNIQUE`.
-Use an absolute `data_root`. An INI value in `[settings]` overrides
-`WIKI_HUMAN_SYNC_MODE`, so change the mode only in this INI. Keep the token in
-`GROWI_TOKEN` rather than the file when possible, and never print or commit it.
+The 2026-10-09 metadata-only audit found 21 source/converted documents, 21
+published document records and 260 published page records. All 260 recorded
+remote paths are below `/conflicts_test`, none is marked blocked, and there are
+no page-merge `doc/` states, captures, observations, or live reports yet. The
+project directory does not yet have its own `.git` repository or
+`refs/llm-wiki/last-good`; the first operator preflight must establish that
+baseline before a remote write. No remote page body was fetched for this audit.
+
+Create a unique synthetic source directory inside the configured mount, for
+example `human-conflicts-e2e-20261009/`. Its files contain only invented facts,
+tables, links, code and marker words. Do not open an existing generated page to
+find test material. Keep private evidence outside the repository.
+
+### 12.2 Effective work-PC configuration
+
+`configs/conflicts_test.ini` supplies these values (the token is deliberately
+omitted here):
+
+| Role | Effective setting |
+|---|---|
+| GROWI | `http://10.160.152.38:3000/`, `target_name=conflicts_test` |
+| human merge/classify/verify | `http://10.160.144.101:51029/v1`, `gemma-4-31B` |
+| standard/fast writer and judge | same chat endpoint/model; no writer/judge override is configured |
+| embeddings | `http://10.160.144.101:51024/v1`, `cl-nagoya/ruri-v3-310m` |
+| reranker | `http://10.160.144.101:51025/v1`, `cl-nagoya/ruri-v3-reranker-310m` |
+| parser | `http://10.160.144.101:51027/agent/doc-parser/` |
+| linker judge | local JEV GGUF, `Q4_K_M`, batched, using the configured `jev-score` binary |
+| concurrency | `8` |
+| rollout defaults | `human_sync_mode=off`, `growi_mode=attach` |
+
+The chat model, embedding/reranker/parser endpoints, and rollout values that are
+not written in the INI come from `Settings` defaults (or environment variables).
+Before testing, make the rollout mode explicit in the approved test INI as
+`human_sync_mode = off`, and ensure no environment override changes the table.
+Thinking remains on; do not add a temporary thinking budget or endpoint override.
 
 ### 12.3 Check resolved settings without printing secrets
 
 ```bash
-.venv/bin/python - "$CFG" <<'PY'
+REPO=/home/seigyo/llm-wiki
+CFG=/home/seigyo/llm-wiki/configs/conflicts_test.ini
+PROJECT=/home/seigyo/llm-wiki/data_big/conflicts_test
+PY=/home/seigyo/llm-wiki/.venv/bin/python
+cd "$REPO"
+
+# Print relevant variable names only, never their values.
+env | cut -d= -f1 | rg '^(WIKI_(CHAT|MODEL|HUMAN|REQUEST)|OPENAI_BASE_URL|WRITER_|JUDGE_|GROWI_)'
+
+$PY - "$CFG" <<'PY'
 import sys
 from common.settings import load_settings
 s = load_settings(sys.argv[1])
@@ -796,26 +845,50 @@ print({
     "source_mount": s.mount_path,
     "growi_host_configured": bool(s.growi_url),
     "target_name": s.target_name,
+    "chat_base_url": s.chat_base_url,
+    "chat_model": s.chat_model,
+    "embed_base_url": s.embed_base_url,
+    "rerank_base_url": s.rerank_base_url,
+    "parser_base_url": s.parser_base_url,
     "growi_mode": s.growi_mode,
     "human_sync_mode": s.human_sync_mode.value,
 })
 PY
+
+$PY main.py --project "$CFG" check
 ```
 
-Do not continue if any path is a real project's data root or source mount.
+Use either `--project conflicts_test` or the absolute path above. The CLI rejects
+the relative spelling `--project configs/conflicts_test.ini`. On 2026-10-09 the
+chat, embedding, reranker, parser, and GROWI health/model checks returned HTTP
+200, the local JEV probe passed, and both the GROWI root and `/login` returned
+HTTP 200. Repeat the check on the test day. Service health does not prove that
+the tester account can edit; 12.7 has the required browser proof.
 
 ### 12.4 Preflight and first publish
 
 ```bash
-$PY main.py --project "$CFG" check        # read-only; prints endpoints, run privately
-$PY main.py --project "$CFG" human live-plan --path /llm-wiki-hc-disposable-UNIQUE
-$PY main.py --project "$CFG" sync
-$PY main.py --project "$CFG" pull --inventory
+$PY main.py --project "$CFG" check
+$PY main.py --project "$CFG" human live-plan \
+  --path /conflicts_test/human-conflicts-e2e-YYYYMMDD
 $PY main.py --project "$CFG" human status
+git -C "$PROJECT" rev-parse HEAD refs/llm-wiki/last-good
+git -C "$PROJECT" status --porcelain
 ```
 
-Run `live-plan` while the data root is still empty. Confirm that every GROWI path
-is below `/<target_name>` and that the project is clean at last-good.
+`human live-plan` is local-only. On this pre-populated project it first validates
+the generated state and, if complete, creates the project Git baseline before it
+checkpoints the report. If validation refuses the baseline, stop and perform the
+reported normal repair step before any live test. Otherwise confirm that its
+endpoint is `http://10.160.152.38:3000`, its resolved boundary is the exact
+synthetic path, the two Git hashes match, and status is clean. Do not paste the
+confirmation code into a report or command log.
+
+Do not run `sync`, `publish`, `reset`, or `pull --inventory` until the boundary,
+baseline, synthetic source, bot credential, and tester access probe have all been
+reviewed. `pull --inventory` can fetch every owned body below `/conflicts_test`;
+case 37 therefore requires explicit owner approval or a separate fresh synthetic
+`target_name` on the same real GROWI instance.
 
 ### 12.5 Real-user test on the work PC: why
 
@@ -861,11 +934,27 @@ Use two GROWI accounts. Never use one for both.
   management, invite). It must be able to edit pages below `/<target_name>`. It
   edits only in the browser and never receives the bot token.
 
-The test INI is the one from 12.2. Add the endpoint settings your working
-project uses, by typing their values into the new INI's `[settings]`:
-`chat_base_url`, `chat_model`, `parser_base_url`, `concurrency`, and any
-`wiki_linker_*` / `wiki_jev_*` keys that project sets. Do not copy or edit the
-existing INI file. Then confirm the connection, read-only:
+The work-PC UI is `http://10.160.152.38:3000/`. Before the pipeline publishes a
+canary, prove the tester account independently without opening an existing page:
+
+1. The tester signs in through `/login` in a private browser session.
+2. The tester directly creates
+   `/conflicts_test/human-conflicts-access-YYYYMMDD`, containing only a synthetic
+   marker such as `HCT-ACCESS-1`, and saves.
+3. In the same editor, the tester changes it to `HCT-ACCESS-2`, saves again, and
+   confirms that page history contains both tester-authored revisions.
+4. Record only reachability, save timestamps, page/revision IDs and the result.
+   Do not record the account name, screenshots containing other pages, or any
+   page body. If create, edit, or history access fails, stop and have a GROWI
+   administrator grant the tester write access below `/conflicts_test`.
+
+This access page is foreign to the publisher and is not a human-merge pass. The
+real pass begins only after the bot publishes the synthetic source document and
+the tester edits that bot-owned page in the UI. Keep the access page until the
+matrix is complete, then let the tester remove it from the UI.
+
+The test INI is the existing file from 12.1 and already carries the work-PC
+endpoint and linker settings. Confirm it read-only before each live session:
 
 ```bash
 $PY main.py --project "$CFG" check
@@ -879,32 +968,41 @@ below. If production uses both, run the whole procedure once for each.
 Every human edit in this procedure contains a unique marker word: `HCT-01`,
 `HCT-02`, and so on. Then every check is just "how many times does `HCT-01`
 appear", in GROWI and in the local human state, and no page text has to be read
-or reported. This read-only script counts one marker:
+or reported. Never call `list_all_pages()` for evidence on this private test
+project. This read-only script fetches one explicitly identified synthetic page
+and its matching synthetic `current/` file only:
 
 ```bash
-$PY - "$CFG" HCT-01 <<'PY'
+PAGE_ID='<recorded synthetic GROWI page ID>'
+REMOTE_TEST_PREFIX=/conflicts_test/human-conflicts-e2e-YYYYMMDD
+$PY - "$CFG" HCT-01 "$PAGE_ID" "$REMOTE_TEST_PREFIX" \
+  human-conflicts-e2e-YYYYMMDD/canary_md.md 001.md <<'PY'
 import asyncio, pathlib, sys
 from common.settings import load_settings
 from graph.growi.client import GrowiClient
+from graph.workspace.project import open_project
+from publisher.human_changes import HumanStore
 
-settings, word = load_settings(sys.argv[1]), sys.argv[2]
+settings, word, page_id, prefix, raw_rel, page_name = (
+    load_settings(sys.argv[1]), *sys.argv[2:]
+)
 
 async def remote():
     client = GrowiClient(settings.growi_url, settings.growi_token, timeout=60)
-    counts = {}
-    for listed in await client.list_all_pages("/" + settings.target_name):
-        page = await client.get_page(page_id=listed.page_id)
-        if page is not None and page.body.count(word):
-            counts[page.path] = page.body.count(word)
-    return counts
+    page = await client.get_page(page_id=page_id)
+    if page is None:
+        raise SystemExit("synthetic test page is missing")
+    root = "/" + prefix.strip("/")
+    if page.path != root and not page.path.startswith(root + "/"):
+        raise SystemExit("page ID is outside the confirmed synthetic boundary")
+    return page.body.count(word), page.revision_id
 
-growi = asyncio.run(remote())
-state = pathlib.Path(settings.data_root) / settings.target_name / "metadata" / "human-sync" / "doc"
-local = {str(p.relative_to(state)): p.read_text(encoding="utf-8").count(word)
-         for p in state.glob("*/current/*.md")}
-local = {name: n for name, n in local.items() if n}
-print({"growi_total": sum(growi.values()), "growi_pages": growi,
-       "local_total": sum(local.values()), "local_files": local})
+remote_count, revision = asyncio.run(remote())
+project = open_project(settings)
+current = HumanStore(project)._dir(raw_rel) / "current" / page_name
+local_count = current.read_text(encoding="utf-8").count(word) if current.exists() else 0
+print({"growi_total": remote_count, "local_total": local_count,
+       "revision_id": revision})
 PY
 ```
 
@@ -921,8 +1019,22 @@ $PY main.py --project "$CFG" human status
 
 ### 12.9 Procedure
 
-**Setup.** Publish the subset with `human_sync_mode=off` (12.4). `human status`
-lists no documents.
+**Setup.** After the tester access probe, add the synthetic canary source under
+the unique directory from 12.1 and publish that source with
+`human_sync_mode=off`. Do not modify an existing private source to make a case.
+Record the canary's page ID, revision ID, raw-relative path and page filename from
+the publisher metadata without printing its body. Before the first UI edit,
+`human status` has no page-merge document state for the canary.
+
+```bash
+CANARY=human-conflicts-e2e-YYYYMMDD/canary.md
+$PY main.py --project "$CFG" sync "$CANARY"
+```
+
+The canary must be multi-page and contain only invented values, repeated and
+unique anchors, a table, inline code, a link, a fenced block, and one approved
+test image/attachment target so the same synthetic document can cover the
+matrix without opening private pages.
 
 **Modes.** The tester adds a sentence containing `HCT-00` to one page and saves.
 
@@ -934,10 +1046,10 @@ lists no documents.
 3. Set `human_sync_mode=apply` and run `sync`. `HCT-00` once. Run `sync` again:
    nothing changes, and the output shows no model calls.
 
-**Human edits** (`apply`). For each row the tester edits in the browser and
-saves; the operator then runs `sync` (not `pull`: sync pulls first, which is
-what production relies on), checks, and runs `sync` once more, which must change
-nothing.
+**Human edits** (`apply`). Every row uses only the synthetic bot-owned pages. For
+each row the tester edits in the browser and saves; the operator then runs
+`sync` (not `pull`: sync pulls first, which is what production relies on),
+checks the exact page by ID, and runs `sync` once more, which must change nothing.
 
 | # | The tester, in the GROWI editor | Passes when |
 |---|---|---|
@@ -952,9 +1064,10 @@ nothing.
 | U9 | after S4 below has created `NNN-付録.md`, edits one Appendix entry (add `HCT-09`) and deletes another | `HCT-09` once; the deleted entry does not return |
 | U10 | deletes a `（元文書の更新: …）` note | the note does not come back while the source value stays the same |
 
-**Source changes with human edits present.** The operator edits the source file
-in the test mount, then runs `sync`. After each row every `HCT-` marker from
-U1–U4 is still present exactly once, unless the row says otherwise.
+**Source changes with human edits present.** The operator edits only the
+synthetic source file in the configured mount, then runs `sync`. After each row
+every `HCT-` marker from U1–U4 is still present exactly once, unless the row says
+otherwise.
 
 | # | The operator changes the source | Passes when |
 |---|---|---|
@@ -1000,10 +1113,11 @@ Every case is also checked against these invariants:
 - nothing is written over a remote revision the pipeline did not inspect;
 - a repeat run with no new change is a no-op with no model calls.
 
-"Human edit" means an edit by a separate test user in the GROWI UI, or by a
-reviewed private harness using the page's current revision. Every case that
-involves a human edit must also pass at least once through the real-user
-procedure in 12.9.
+"Human edit" means an edit saved by the separate tester account in the real
+GROWI UI. A reviewed harness may open a timing window or create a failure, but
+its API write never satisfies the human-edit step and never turns a case into a
+pass. Every case involving human intent must pass through the real-user procedure
+in 12.9.
 
 ### Group A: baseline and idempotence
 
@@ -1104,7 +1218,9 @@ run them on a shared or production subtree.
     window: deduplicated without skipping. If the feed is inaccessible, record
     constrained and prove forced inventory.
 37. **`full_inventory_equivalence`** — Activity pull and `pull --inventory` reach
-    the same state for the same revisions.
+    the same state for the same revisions. On `/conflicts_test`, run this only
+    with explicit owner approval because inventory can fetch every owned page
+    body; otherwise use a fresh synthetic target on the same GROWI instance.
 38. **`candidate_rollback`** — Inside one sync, capture a human edit, let that
     sync republish the page, then force a later failure in the same candidate:
     rollback replays the capture onto live before restoring (3.8), the restored
@@ -1186,8 +1302,8 @@ run them on a shared or production subtree.
 
 #### Contract for `LIVE_CASES`
 
-1. Append the 21 IDs above (42-62), making 62 in total. Never rename or remove
-   the existing 41.
+1. Implemented: `publisher/live_verification.py:LIVE_CASES` contains all 62 IDs,
+   including 42-62. Never rename or remove them.
 2. `finalize()` compares against `LIVE_CASES`; keys missing from an old report
    count as pending, so an old 41-case report never finalizes as complete. Do not
    rewrite old reports on open.

@@ -85,6 +85,12 @@ class Policy:
         del role
         return ""
 
+    def writer_units(self, lines: Sequence[str], images: Sequence[Any]) -> list[Any]:
+        """Opaque source units restored after writing; standard keeps blocks lossless."""
+        from graph.wiki.images import block_units
+
+        return [*images, *block_units(lines)]
+
     def adjust_seed_plan(self, plan: Any, *, config: Any) -> Any:
         """The compiled model seed plan before pages are made from it."""
         return plan

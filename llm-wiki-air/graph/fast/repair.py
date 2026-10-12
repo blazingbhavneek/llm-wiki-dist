@@ -13,7 +13,6 @@ import json
 import logging
 import re
 import tempfile
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -28,14 +27,19 @@ from graph.common.images import find_images, replace_images_preserving_lines
 from graph.common.markdown import scan_markdown_fences
 from graph.formats import is_tabular, kind_of
 from graph.wiki.storage import normalize_source, split_source_lines
+from .model import FAST_WRITER_MAX_OUTPUT_TOKENS
 from .passes import bounded_as_completed
-from .wiki import generation_prompt_rules
+from .wiki import (
+    append_low_coverage_source,
+    generation_prompt_rules,
+    mask_math,
+    recent_writer_context,
+)
 
 
 VERSION = "wiki-repair-ja-7"
 MAX_REWRITE_ATTEMPTS = 4
 JUDGE_CALL_ATTEMPTS = 2
-TITLE_MAX_CHARS = 120
 REVIEW_START = "<!-- fast-repair:start -->"
 REVIEW_END = "<!-- fast-repair:end -->"
 
@@ -43,12 +47,9 @@ _H1_RE = re.compile(r"^# (?P<title>[^\n]+)(?:\n|$)")
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
 _WIKI_IMAGE_RE = re.compile(r"\[\[WIKI_IMAGE_\d+\]\]")
 _SOURCE_IMAGE_RE = re.compile(r"\[\[SOURCE_IMAGE_\d+\]\]")
-_HEADING_RE = re.compile(r"^#{2,6} \S")
-_REFUSAL_RE = re.compile(r"出力することができません|原文に内容が(?:含まれて|存在し)てい")
-_INTERNAL_TITLE_RE = re.compile(r"要再確認|原文範囲|\b(?:source|line)\s*range\b", re.I)
-_PIPE_ATTRIBUTE_RE = re.compile(r"\|[^\n]*(?:rowspan|colspan)\s*=", re.I)
-_SIMPLIFIED_ONLY = frozenset("值压单项关变应杀酱查运总发图录")
-
+_PROTECTED_IMAGE_RE = re.compile(
+    r"\[\[(?:WIKI_IMAGE_\d+|NEO-IMAGE:[A-Za-z0-9_-]+)\]\]"
+)
 log = logging.getLogger(__name__)
 
 
@@ -67,7 +68,7 @@ class RepairJudgeResult(BaseModel):
         default=0,
         ge=0,
         le=100,
-        description="Percentage of source-backed semantic facts retained; never score document structure, numbering, or layout.",
+        description="Percentage of source-backed information retained, including question/request intent and uncertainty; never score document structure, numbering, or layout.",
     )
     title_defects: list[str] = Field(
         default_factory=list,
@@ -79,7 +80,7 @@ class RepairJudgeResult(BaseModel):
     )
     missing_important_information: list[str] = Field(
         default_factory=list,
-        description="Each source-backed fact, full technical name, qualifier, list entry, table meaning, legend, or caption missing from the current candidate.",
+        description="Each source-backed fact, question/request intent, recipient, uncertainty, full technical name, qualifier, list entry, table meaning, legend, or caption missing from the current candidate.",
     )
     notes: str = Field(
         default="",
@@ -120,11 +121,12 @@ class _PageInput:
     owner_evidence: str
     reference_evidence: str
     allowed_source: str
-    required_tokens: set[str]
+    context: str
     page_path: Path
     state_path: Path
     state: dict[str, Any]
     guidance: list[str] = field(default_factory=list)  # what human editors want this page to look like
+    has_initial_candidate: bool = True
 
 
 @dataclass
@@ -281,8 +283,17 @@ def _split_page(text: str) -> _PageShell:
 def _assemble_page(title: str, body: str, footer: str) -> str:
     page = f"# {title.strip()}\n\n{body.strip()}\n"
     if footer:
-        page = page.rstrip() + "\n" + footer
+        page = page.rstrip() + "\n\n" + footer.lstrip("\r\n")
     return page if page.endswith("\n") else page + "\n"
+
+
+def _normalize_navigation_spacing(text: str) -> str:
+    """Keep an approved body intact while separating its generated footer."""
+
+    start = _navigation_footer_start(text)
+    if start is None:
+        return text
+    return text[:start].rstrip() + "\n\n" + text[start:]
 
 
 def _clean_writer_output(raw: str) -> tuple[str, str]:
@@ -297,6 +308,13 @@ def _clean_writer_output(raw: str) -> tuple[str, str]:
     body = text[match.end():].strip()
     if any(line.startswith("# ") for line in body.splitlines()):
         raise ValueError("output contains more than one H1")
+    # Navigation is pipeline-owned. If the model ignored the instruction and
+    # emitted an exact generated-style footer, remove only that terminal block;
+    # creation builds the current footer and repair restores the one it split
+    # off before prompting.
+    footer_start = _navigation_footer_start(text)
+    if footer_start is not None:
+        body = text[match.end():footer_start].strip()
     return match.group("title").strip(), body
 
 
@@ -316,59 +334,66 @@ def _feedback(verdict: RepairJudgeResult) -> list[str]:
     feedback = _issues(verdict)
     if verdict.notes.strip():
         feedback.append("査読メモ: " + verdict.notes.strip())
+    if verdict.coverage_score < 80 and not verdict.missing_important_information:
+        feedback.append(
+            "情報保持スコアが80未満である。失われた具体的な事実を原文と照合して復元すること。"
+        )
     if not feedback and not verdict.approved:
         feedback.append("査読者が未承認にした。原文と照合し、タイトルと本文を全面的に再確認すること。")
     return feedback
 
 
 def _approved(verdict: RepairJudgeResult) -> bool:
-    return verdict.approved and not _issues(verdict)
+    return verdict.approved and verdict.coverage_score >= 80 and not _issues(verdict)
 
 
 def _judge_rank(
     verdict: RepairJudgeResult,
     *,
-    mechanical_issues: int,
     attempt: int,
 ) -> tuple[int, int, int]:
-    """Rank judged drafts without allowing a hard-invalid rewrite to win.
+    """Rank rewrites by the judge's factual coverage, then reported quality.
 
     Coverage is deliberately first because losing a source-backed fact is the
-    most damaging repair regression.  For equal coverage, prefer fewer judge
-    and mechanical findings, then the later draft (which has seen more
-    feedback).  Rewritten candidates enter the pool only after passing every
-    mechanical guard.
+    most damaging repair regression. For equal coverage, prefer fewer judge
+    findings, then the later draft (which has seen more feedback).
     """
 
     return (
         int(verdict.coverage_score),
-        -(len(_issues(verdict)) + int(mechanical_issues)),
+        -len(_issues(verdict)),
         int(attempt),
     )
 
 
 def _judge_messages(page: _PageInput, title: str, body: str) -> list[Any]:
     schema = json.dumps(RepairJudgeResult.model_json_schema(), ensure_ascii=False)
+    has_initial = bool(getattr(page, "has_initial_candidate", True))
     baseline = (
-        "（現在候補と同一。初回査読なので差分なし）"
-        if title == page.shell.title and body == page.masked_body
-        else f"# {page.shell.title}\n\n{page.masked_body}"
+        "（新規Wiki作成のため開始時候補なし）"
+        if not has_initial
+        else (
+            "（現在候補と同一。初回査読なので差分なし）"
+            if title == page.shell.title and body == page.masked_body
+            else f"# {page.shell.title}\n\n{page.masked_body}"
+        )
     )
     return [
         SystemMessage(content=(
-            "あなたは既存の日本語技術Wikiの品質を直す厳格な査読者である。文章は書き直さず、"
+            "あなたは原文から作る日本語技術Wikiの品質を確認する厳格な査読者である。文章は書き直さず、"
             "JSONだけを返す。所有範囲と明示された参照範囲以外の事実を正当化してはならない。\n"
             "行番号付き原文は事実確認のための証拠であり、候補Wikiが再現すべき文書構造ではない。"
             "原文にはOCR誤り、重複行、ページ由来のノイズ、無関係な見出しがあり得るので、"
             "それを『欠落』として要求しない。候補にない原文の見出し・節番号・図表番号・"
             "ページ番号・箇条書き番号・空のプレースホルダー・原文の順序は欠陥ではない。\n"
-            "修復開始時Wikiは、修復による退行を見つけるための比較対象であり、事実の根拠ではない。"
+            "開始時Wikiがある場合、それは修復による退行を見つける比較対象であり、事実の根拠ではない。"
             "現在候補が修復開始時Wikiにあった情報を削除・短縮・一般化・改名した場合、その情報が"
             "所有/参照原文で裏付けられるなら必ず欠落または本文欠陥にする。原文で裏付けられない"
             "開始時Wikiの捏造、重複、文字化け、拒否文、話題逸脱は保持を要求しない。"
             "つまり原文だけが事実の権威であり、開始時Wikiは『修復で正しい内容まで壊していないか』を"
             "確認する差分基準である。修復は要約ではない。短くなったことや行数が減ったことを品質向上と"
-            "みなさず、原文に裏付けられる異なる情報を一つずつ保持したかで判定する。\n"
+            "みなさず、原文に裏付けられる異なる事実を一つずつ保持したかで判定する。完全に同じ事実が"
+            "OCRで複数回現れても一つの事実として数え、重複を削除したことを欠落にしない。\n"
             "原文の各行は、次の三分類で判定すること。"
             "【必ず守る意味】処理の目的・対象・入力・出力・動作・条件・制約・例外、"
             "固有の製品名/画面名/DB名/項目名/識別子/コード、数値・単位・閾値・日時・式、"
@@ -378,12 +403,13 @@ def _judge_messages(page: _PageInput, title: str, body: str) -> list[Any]:
             "【原則として持ち込まない構造】Markdownの見出し記号、章/節/項の番号、図/表/画像の番号、"
             "PDFページ番号・原文行番号・ファイル名、目次のリンク先/ページ番号だけ、単なる箇条書き番号、"
             "ページ区切り・空見出し・空プレースホルダー、原文の表の罫線/HTML属性/行レイアウト、"
-            "SOURCE_IMAGEや画像の生HTML、OCRの重複/文字化け/%%等のノイズ、内部作業メモ・モデル名。"
+            "SOURCE_IMAGEや画像の生HTML、OCRの重複/文字化け/%%等のノイズ、モデル用の内部作業メモ・モデル名。"
+            "業務上の質問・確認依頼・提案・未確定事項はノイズではなく保持する情報である。"
             "これらの不在は欠落ではない。順番の番号を消しても、処理順という意味まで消してはいけない。"
             "【境界】『図 1-1 処理フロー』なら数字と接頭辞は不要だが『処理フロー』は意味があるため残す。"
             "『図 1-1』だけなら戻さない。『## 2.4.1 概要』は見出しと番号を戻さず、"
             "その下の仕様上の事実だけを本文にする。『①入力、②検証』は番号を箇条書きへ変えてよいが、"
-            "入力と検証の順序・条件は保つ。表は組み替えてよいが、セルの意味・値・凡例の対応は保つ。"
+            "入力と検証の順序・条件は保つ。表は有効なHTML表へ組み替えてよいが、セルの意味・値・凡例の対応は保つ。"
             "rowspan/colspan等がセルの結合関係や意味を表す場合は、同じ対応関係を保ったか確認する。\n"
             "【目次・一覧・索引の境界】リンク、ページ番号、章番号、字下げ、見出し階層そのものは構造である。"
             "しかし各項目に書かれた正式な機能名、モジュール名、処理名、入力名、出力名、画面名、DB名、"
@@ -401,7 +427,7 @@ def _judge_messages(page: _PageInput, title: str, body: str) -> list[Any]:
             "Wikiは原文の見出し・節番号・図表番号・ページ番号・箇条書き番号・順番・表レイアウトを"
             "再現する成果物ではない。それらが候補にないこと自体を欠陥や欠落として報告しない。"
             "原文の構造を移植するのではなく、候補Wikiの日本語、読みやすさ、自然なWiki構成を評価する。\n"
-            "画像はこの作業の対象外である。SOURCE_IMAGEとWIKI_IMAGEのタグは画像全体の代用品であり、"
+            "画像はこの作業の対象外である。SOURCE_IMAGE、WIKI_IMAGE、NEO-IMAGEのタグは画像全体の代用品であり、"
             "画像そのものの内容、画像内の文字、タグの個数、対応関係、図番号を評価しない。"
             "ただし画像のそばにある通常の文章・説明的キャプションは画像ではなくWikiの事実である。"
             "説明的な語を含むキャプションを削除した場合は欠落として報告する。数字だけの図表ラベルは要求しない。\n"
@@ -416,9 +442,10 @@ def _judge_messages(page: _PageInput, title: str, body: str) -> list[Any]:
             "単位、閾値、式、エラー値、記号、表の凡例や○/◎などの修飾を確認する。"
             "または/かつ、含む/除く、保存/表示などの論理や修飾情報を変更・消失させた場合は、"
             "文章が自然でも必ずbody_defectsまたはmissingへ報告する。"
-            "事実として重要な仕様、条件、動作、値、識別子の欠落だけをmissingへ報告する。"
+            "事実として重要な仕様、条件、動作、値、識別子、質問・依頼の意図や未確定状態の欠落をmissingへ報告する。"
             "原文見出し・節番号・図表番号・画像番号・ページ番号・表レイアウトの欠落は報告しない。"
-            "表の行順やMarkdown形式は問わないが、セルの意味・ラベル・値・記号の消失や取り違えは問う。"
+            "HTMLの書式やOCRの行数は問わないが、行列の対応、意味のある空セル・空行、"
+            "セルの意味・ラベル・値・記号の消失や取り違えは問う。"
             "原文にも存在する用語の必要な反復、識別子、エラー値、コード、変換記号は候補だけの欠陥にしない。"
             "見出しを追加すること自体は欠陥ではないが、原文で裏付けられない分類、"
             "ソースの一つの流れを勝手に分断する見出し、または新しい仕様を暗示する見出しは欠陥である。"
@@ -471,27 +498,35 @@ def _writer_messages(
     earlier_feedback: Sequence[str] = (),
 ) -> list[Any]:
     image_tags = "、".join(slot.tag for slot in page.images) or "なし"
+    has_initial = bool(getattr(page, "has_initial_candidate", True))
     guidance = (
         "--- 人間の編集者の要望（このページの体裁。事実は変えない） ---\n- " + "\n- ".join(page.guidance) + "\n\n"
         if page.guidance else ""
     )
     baseline = (
-        "（現在候補と同一。まだ修復による差分なし）"
-        if title == page.shell.title and body == page.masked_body
-        else f"# {page.shell.title}\n\n{page.masked_body}"
+        "（新規Wiki作成のため開始時候補なし）"
+        if not has_initial
+        else (
+            "（現在候補と同一。まだ修復による差分なし）"
+            if title == page.shell.title and body == page.masked_body
+            else f"# {page.shell.title}\n\n{page.masked_body}"
+        )
     )
+    latest_feedback = "\n- ".join(
+        item for item in feedback if item.strip()
+    ) or "（なし。原文から新規作成する）"
     return [
         SystemMessage(content=(
-            "あなたは既存の日本語技術Wikiを読みやすく修復する編集者である。出力はMarkdownだけで、必ず1行目を"
-            "`# 修復後タイトル`にし、その後へ本文を書く。JSON、前置き、全体を囲むコードフェンス、"
+            "あなたは原文から人間が読みやすい日本語技術Wikiを作成・修復する編集者である。出力はMarkdownだけで、"
+            "必ず1行目を`# Wikiタイトル`にし、その後へ本文を書く。JSON、前置き、全体を囲むコードフェンス、"
             "前後/親ナビゲーションは出力しない。\n"
             "Wikiを原文の転記や構造の複製にしない。原文の見出し、節番号、図表番号、ページ番号、箇条書き番号、"
             "順番、表レイアウトはそのまま持ち込まず、内容に合う自然な日本語Wikiの構成に整理する。"
             "節番号・図表番号・画像番号・ページ番号はWikiで不要なら省略する。画像の前後にある番号や見出しを"
             "画像タグから推測・復元しない。\n"
-            "これは要約・短縮・再生成ではなく、既存Wikiの局所的な修復である。査読で指摘された箇所だけを"
-            "必要最小限に直し、現在候補ですでに正しい文章、一覧項目、表セル、名称、条件、値、記号を凍結して"
-            "不用意に書き換えない。前の試行で直った箇所を次の試行で壊さない。短くすること、項目数や行数を"
+            "これは要約・短縮ではなく、Wikiを人間が読みやすいページへ作成・修復する作業である。現在候補の"
+            "正しい事実は保持しつつ、壊れた構造、表、重複、読みにくい並びはページ全体で再構成してよい。"
+            "前の試行で直った事実を次の試行で壊さない。短くすること、項目数や行数を"
             "減らすこと、複数項目を総称へまとめることは修復ではない。削除してよいのは、原文と照合して明らかな"
             "重複、OCRノイズ、中国語混入、拒否文、話題逸脱、無根拠な捏造だけである。削除すべきか迷う"
             "原文裏付け済み情報は保持する。\n"
@@ -501,7 +536,8 @@ def _writer_messages(
             "または/かつ・含む/除く等の論理、保存/表示等の状態、表の凡例・注記・○/◎、"
             "説明的なキャプションは必ず保持する。構造を変えても、これらの意味は変えない。"
             "一方、章/節/項番号、図/表番号、ページ番号、原文行番号、目次のリンク先やページ番号、単なる箇条書き番号、"
-            "空見出し、OCR重複/文字化け/%%、ページ区切り、内部メモ、モデル名は本文へ移植しない。"
+            "空見出し、OCR重複/文字化け/%%、ページ区切り、モデル用の内部メモ、モデル名は本文へ移植しない。"
+            "業務上の質問・確認依頼・提案・未確定事項は内部メモではなく、意図と確認先を必ず保持する。"
             "番号付き箇条書きは番号を外してよいが、処理順・条件・内容は残す。\n"
             "原文の事実、動作、条件、意味のある値や識別子は落とさない。原文にある見出しや番号を省略しても、"
             "そこに含まれる仕様上の事実は本文に自然に反映する。特に固有の用語、単位、閾値、式、"
@@ -526,12 +562,14 @@ def _writer_messages(
             "タイトルは査読で具体的な欠陥を指摘された場合だけ直す。修復開始時タイトルが原文に裏付けられ"
             "自然ならそのまま保持し、『処理機能一覧』『概要』『関連情報』等の一般的な題名を新しく考案しない。"
             "修正が必要な場合だけ、原文の内容を正確に表す短い自然な日本語へ直す。ファイル名は題名に含めない。\n"
-            "画像は理解も修正もしない。SOURCE_IMAGEタグは原文位置の目印なので出力しない。"
-            "WIKI_IMAGEタグは既存Wiki画像そのものであり、一字も変えず各1回だけ残す。"
+            "画像は理解も修正もしない。提示された保護画像タグは画像そのものであり、一字も変えず各1回だけ残す。"
+            "提示されていないSOURCE_IMAGE、WIKI_IMAGE、NEO-IMAGEタグは新しく作らない。"
             "画像の中身を説明しない。ただし画像のそばにある説明的な通常文・キャプションは、"
             "画像タグとは別のWiki本文なので、意味のある語を保つ。図/表番号だけなら省略してよい。\n"
-            "必要な表は読みやすいMarkdown表またはHTML表に再構成してよい。"
-            "rowspan/colspanの意味を壊さず、表の中の事実、識別子、実データ値を保つ。"
+            "必要な表は有効で読みやすいHTML表に再構成する。table/thead/tbody/tr/th/tdを正しく閉じ、"
+            "rowspan/colspanの意味、行列の対応、意味のある空セル・空行、表の中の事実、識別子、"
+            "実データ値を保つ。OCRが作った重複した全空行は削除してよい。Markdownのパイプ表や"
+            "表を囲むだけのコードフェンスは出力しない。"
             "原文と同じ表記・行順・行数・見出し構造を機械的に再現する必要はない。"
             "ただし原文にない見出しで一つの説明を勝手に分断したり、新しい分類・仕様を作ったりしない。"
             "見出しレベルの飛び、原文と異なる見出し階層、章番号の不一致、ネストだけを直すために本文を"
@@ -550,166 +588,48 @@ def _writer_messages(
             "\n\n" + generation_prompt_rules("writer")
         )),
         HumanMessage(content=(
-            f"修復試行: {attempt}/{MAX_REWRITE_ATTEMPTS}\n"
+            f"執筆・修復試行: {attempt}/{MAX_REWRITE_ATTEMPTS}\n"
             f"ページ番号: {page.number}\nファイル名（変更禁止）: {page.filename}\n"
-            f"保持必須のWiki画像タグ: {image_tags}\n\n"
+            f"保持必須の保護画像タグ: {image_tags}\n\n"
             f"{guidance}"
+            f"--- 直前の文書コンテキスト（流れの理解専用。ここだけにある事実は本文へコピーしない） ---\n"
+            f"{getattr(page, 'context', '') or '（なし）'}\n\n"
             f"--- 所有する行番号付き原文 ---\n{page.owner_evidence}\n\n"
             f"--- 許可された参照行 ---\n{page.reference_evidence}\n\n"
-            f"--- 修復開始時Wiki（全試行で固定。退行防止専用。原文にない内容は根拠にしない） ---\n"
+            f"--- 開始時Wiki（存在する場合のみ退行防止に使用。原文にない内容は根拠にしない） ---\n"
             f"{baseline}\n\n"
-            f"--- 直前の修復候補（この版を土台に直す） ---\n# {title}\n\n{body}\n\n"
-            "--- 直前候補に対する最新の査読・機械検査（全て直す） ---\n- "
-            + "\n- ".join(item for item in feedback if item.strip())
+            f"--- 直前のWiki候補（空なら原文から新規作成する） ---\n# {title}\n\n{body}\n\n"
+            "--- 直前候補に対する最新の査読・画像整合性（全て直す） ---\n- "
+            + latest_feedback
             + (
                 "\n\n--- それ以前の指摘（退行チェック用。現在候補ですでに直っているなら再編集しない） ---\n- "
                 + "\n- ".join(item for item in earlier_feedback if item.strip())
                 if any(item.strip() for item in earlier_feedback)
                 else ""
             )
-            + "\n\n直前の修復候補を土台に、最新の指摘へ直接関係する箇所だけを修復する。"
-            "修復開始時Wikiまたは現在候補にある原文裏付け済みの別項目を削除・統合・改名してはならない。"
+            + "\n\n直前の候補を土台に、最新の指摘を直し、ページ全体が自然に読めるよう構成を整える。"
+            "修復開始時Wikiまたは現在候補にある原文裏付け済みの別の事実を削除・統合・改名してはならない。"
         )),
     ]
 
 
-def _longest_runs(text: str) -> dict[str, int]:
-    runs: dict[str, int] = {}
-    previous = ""
-    length = 0
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("|", "[[")):
-            previous, length = "", 0
-            continue
-        length = length + 1 if line == previous else 1
-        runs[line] = max(runs.get(line, 0), length)
-        previous = line
-    return runs
+def _image_errors(page: _PageInput, title: str, body: str) -> list[str]:
+    """The only deterministic candidate gate: keep opaque image bytes addressable."""
 
-
-def _loop_fragment(line: str) -> str:
-    scan = line[:6000]
-    if len(scan) < 60:
-        return ""
-    for width in (24, 12, 6):
-        counts = Counter(scan[index:index + width] for index in range(len(scan) - width + 1))
-        fragment, count = counts.most_common(1)[0]
-        if fragment.strip() and count >= 8 and count * width >= 0.6 * len(scan):
-            return fragment
-    return ""
-
-
-def _pipe_width(line: str) -> int:
-    value = line.strip().strip("|")
-    return len(re.split(r"(?<!\\)\|", value))
-
-
-def _mechanical_errors(page: _PageInput, title: str, body: str, policy: Any) -> list[str]:
+    del title
     errors: list[str] = []
-    if not title or "\n" in title:
-        errors.append("タイトルは空でない1行にすること。")
-    if len(title) > TITLE_MAX_CHARS:
-        errors.append(f"タイトルが長過ぎる（{len(title)}文字、上限{TITLE_MAX_CHARS}文字）。")
-    if title.startswith("#") or any(mark in title for mark in ("[", "](", "```")):
-        errors.append("タイトルにMarkdown記法を含めないこと。")
-    if _INTERNAL_TITLE_RE.search(title):
-        errors.append("タイトルに要再確認・原文範囲などの内部作業名を含めないこと。")
-    if not body.strip():
-        errors.append("本文が空である。")
-    if any(line.startswith("# ") for line in body.splitlines()):
-        errors.append("本文に追加のH1を書かないこと。")
-    if _navigation_footer_start(body) is not None or re.search(r"(?:親|前のページ|次のページ):\s*\[", body):
-        errors.append("ナビゲーションは修復器が保持するため本文へ書かないこと。")
-
     expected_tags = {slot.tag for slot in page.images}
-    found_tags = set(_WIKI_IMAGE_RE.findall(body))
+    found_tags = set(_PROTECTED_IMAGE_RE.findall(body))
     if found_tags != expected_tags:
-        errors.append("既存Wiki画像タグを追加・削除・改名しないこと。")
+        errors.append("保護画像タグを追加・削除・改名しないこと。")
     for tag in expected_tags:
         if body.count(tag) != 1:
             errors.append(f"画像タグ {tag} は1回だけ置くこと。")
     if _SOURCE_IMAGE_RE.search(body):
         errors.append("SOURCE_IMAGEタグは原文の目印であり、Wiki本文へコピーしないこと。")
     if find_images(body) or re.search(r"data:image/", body, re.I):
-        errors.append("画像マークアップやbase64を新しく書かず、指定されたWIKI_IMAGEタグだけを残すこと。")
-
-    candidate = f"# {title}\n\n{body}"
-    missing_tokens = sorted(page.required_tokens - policy.code_tokens(candidate))
-    if missing_tokens:
-        errors.append("仕様上重要な識別子・定数を維持すること（節番号・図表番号は対象外）: " + ", ".join(missing_tokens[:40]))
-
-    allowed = page.allowed_source
-    extra_glyphs = sorted(set(title + "\n" + body) & _SIMPLIFIED_ONLY)
-    if extra_glyphs:
-        errors.append("日本語Wikiに中国語簡体字が混じっている: " + "、".join(extra_glyphs))
-    if _REFUSAL_RE.search(title + "\n" + body) and not _REFUSAL_RE.search(allowed):
-        errors.append("原文にない『出力できない』等の拒否文を削除すること。")
-    if _PIPE_ATTRIBUTE_RE.search(body) and not _PIPE_ATTRIBUTE_RE.search(allowed):
-        errors.append("Markdown表セルへrowspan/colspan属性を文字列として漏らさないこと。")
-
-    source_runs = _longest_runs(allowed)
-    for line, count in _longest_runs(body).items():
-        if count >= 3 and count > source_runs.get(line, 0):
-            errors.append(f"原文にない同一行の{count}回反復を削除すること: {line[:80]}")
-            break
-    source_rules = sum(line.strip() == "---" for line in allowed.splitlines())
-    candidate_rules = sum(line.strip() == "---" for line in body.splitlines())
-    if candidate_rules > source_rules:
-        errors.append("原文にない装飾用の単独`---`を削除すること。")
-    source_loops = {_loop_fragment(line) for line in allowed.splitlines()} - {""}
-    for number, line in enumerate(body.splitlines(), start=1):
-        fragment = _loop_fragment(line)
-        if fragment and fragment not in source_loops:
-            errors.append(f"本文{number}行目の無限反復を削除すること: {fragment[:40]}")
-            break
-
-    source_headings = Counter(line.strip() for line in allowed.splitlines() if _HEADING_RE.match(line.strip()))
-    candidate_headings = Counter(line.strip() for line in body.splitlines() if _HEADING_RE.match(line.strip()))
-    for heading, count in candidate_headings.items():
-        if count >= 3 and count > source_headings.get(heading, 0):
-            errors.append(f"同じ見出しを{count}回繰り返さないこと: {heading}")
-            break
-    meaningful = [line.strip() for line in body.splitlines() if line.strip()]
-    for left, right in zip(meaningful, meaningful[1:]):
-        if _HEADING_RE.match(left) and _HEADING_RE.match(right):
-            if len(right) - len(right.lstrip("#")) <= len(left) - len(left.lstrip("#")):
-                errors.append(f"内容のない見出しを作らないこと: {left}")
-                break
-
-    table_width: int | None = None
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            table_width = None
-            continue
-        if re.fullmatch(r"\|?[\s:|-]+\|?", stripped):
-            continue
-        width = _pipe_width(stripped)
-        if table_width is None:
-            table_width = width
-        elif width != table_width and stripped not in allowed:
-            errors.append(f"Markdown表のセル数が一致しない行がある: {stripped[:100]}")
-            break
+        errors.append("画像マークアップやbase64を新しく書かず、指定された保護画像タグだけを残すこと。")
     return list(dict.fromkeys(errors))
-
-
-def _required_fact_tokens(text: str, policy: Any) -> set[str]:
-    """Keep meaningful identifiers, not source document structure, mechanically."""
-    tokens: set[str] = set()
-    structural_caption = re.compile(r"^(?:図|表|画像|写真)\s*[0-9０-９]+(?:[.．-][0-9０-９]+)*")
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        caption = structural_caption.match(stripped)
-        # A figure/table number is document structure, but the descriptive
-        # suffix can contain a real identifier or functional name.  Check the
-        # suffix instead of dropping the entire caption from the fact guard.
-        semantic = stripped[caption.end():].lstrip(" \t:：-–—") if caption else stripped
-        if semantic:
-            tokens.update(policy.code_tokens(semantic))
-    return {token for token in tokens if "SOURCE_IMAGE" not in token}
 
 
 async def _judge(
@@ -763,9 +683,15 @@ async def _writer(
     artifacts.append(_Artifact(f"rewrite-{attempt:02d}-prompt.md", _render_messages(messages)))
     try:
         try:
-            raw = await model.text(messages, max_output_tokens=16000, temperature=0.7)
+            raw = await model.text(
+                messages,
+                max_output_tokens=FAST_WRITER_MAX_OUTPUT_TOKENS,
+                temperature=0.7,
+            )
         except TypeError:
-            raw = await model.text(messages, max_output_tokens=16000)
+            raw = await model.text(
+                messages, max_output_tokens=FAST_WRITER_MAX_OUTPUT_TOKENS
+            )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"[:1000]
         artifacts.append(_Artifact(f"rewrite-{attempt:02d}-error.txt", error + "\n"))
@@ -855,7 +781,6 @@ async def _round_initial_judge(
     session: _RepairSession,
     *,
     judge_model: Any,
-    policy: Any,
     on_progress: Any,
 ) -> _PageOutcome | None:
     """Judge an untouched page; None means it entered the writer queue."""
@@ -886,8 +811,7 @@ async def _round_initial_judge(
             artifacts=session.artifacts,
         )
 
-    mechanical = _mechanical_errors(page, session.title, session.body, policy)
-    if _approved(verdict) and not mechanical:
+    if _approved(verdict):
         _emit(on_progress, "page_clean", document=page.document, page=page.filename)
         return _PageOutcome(
             page,
@@ -895,17 +819,19 @@ async def _round_initial_judge(
             "clean",
             session.title,
             session.body,
-            page.original_text,
+            _normalize_navigation_spacing(page.original_text),
             0,
             verdict.coverage_score,
             artifacts=session.artifacts,
         )
 
-    session.feedback = [*_feedback(verdict), *mechanical]
+    session.feedback = _feedback(verdict)
     session.feedback_history = list(session.feedback)
     session.best_feedback = list(session.feedback)
     session.best_verdict = verdict
-    session.best_rank = _judge_rank(verdict, mechanical_issues=len(mechanical), attempt=0)
+    # The original remains the transport/model-failure fallback, but it must
+    # not beat every readable rewrite merely because it retained OCR noise.
+    session.best_rank = (-1, -10**9, -1)
     return None
 
 
@@ -913,7 +839,6 @@ async def _round_write(
     session: _RepairSession,
     *,
     writer_model: Any,
-    policy: Any,
     on_progress: Any,
 ) -> tuple[str, _PageOutcome | None]:
     """Write one queued page, without judging it in the writer phase."""
@@ -963,7 +888,7 @@ async def _round_write(
             else ("retry", None)
         )
 
-    errors = _mechanical_errors(page, candidate_title, candidate_body, policy)
+    errors = _image_errors(page, candidate_title, candidate_body)
     if errors:
         session.feedback = errors
         session.feedback_history.extend(
@@ -971,7 +896,7 @@ async def _round_write(
         )
         session.title, session.body = candidate_title, candidate_body
         session.artifacts.append(
-            _Artifact(f"rewrite-{attempt:02d}-mechanical.json", {"errors": errors})
+            _Artifact(f"rewrite-{attempt:02d}-image-integrity.json", {"errors": errors})
         )
         _emit(
             on_progress,
@@ -979,7 +904,7 @@ async def _round_write(
             document=page.document,
             page=page.filename,
             attempt=attempt,
-            reason="mechanical",
+            reason="image-integrity",
             checks=len(errors),
         )
         return (
@@ -1043,9 +968,12 @@ async def _round_candidate_judge(
         )
 
     candidate_feedback = _feedback(latest)
-    candidate_rank = _judge_rank(latest, mechanical_issues=0, attempt=session.attempts)
+    candidate_rank = _judge_rank(latest, attempt=session.attempts)
+    published_body = append_low_coverage_source(
+        candidate_body, page.allowed_source, latest.coverage_score
+    )
     candidate_final = _restore_page_images(
-        _assemble_page(candidate_title, candidate_body, page.shell.footer),
+        _assemble_page(candidate_title, published_body, page.shell.footer),
         page.images,
     )
     if candidate_rank > session.best_rank:
@@ -1233,9 +1161,14 @@ def _resume_session_checkpoint(
     session.pending_title = str(pending_title) if pending_title is not None else None
     session.pending_body = str(pending_body) if pending_body is not None else None
     if session.best_attempt > 0:
+        restored_body = append_low_coverage_source(
+            session.best_body,
+            page.allowed_source,
+            session.best_verdict.coverage_score if session.best_verdict else None,
+        )
         session.best_final = _restore_page_images(
             _assemble_page(
-                session.best_title, session.best_body, page.shell.footer
+                session.best_title, restored_body, page.shell.footer
             ),
             page.images,
         )
@@ -1250,19 +1183,20 @@ def _replace_link_title(text: str, filename: str, title: str) -> str:
     pattern = re.compile(
         r"(?<!!)\[[^\]\n]*\]\((?P<prefix>\./)?" + re.escape(filename) + r"\)"
     )
-    lines = text.splitlines(keepends=True)
+    masked, restore = mask_math(text)
+    lines = masked.splitlines(keepends=True)
     scan = scan_markdown_fences(lines)
     protected = [
         inside or (index > 0 and scan.inside_after_line[index - 1])
         for index, inside in enumerate(scan.inside_after_line)
     ]
-    return "".join(
+    return restore("".join(
         line if protected[index] else pattern.sub(
             lambda match: f"[{title}]({match.group('prefix') or ''}{filename})",
             line,
         )
         for index, line in enumerate(lines)
-    )
+    ))
 
 
 def _update_review(state_root: Path, version: str) -> bool:
@@ -1352,8 +1286,29 @@ class FastRepair:
             for mount, row in ledger.sources.items()
             if row.get("raw_rel")
         }
+
+        def ordered(raw_rels: Sequence[str]) -> list[str]:
+            """Start the global repair queue with the smallest documents."""
+
+            def page_count(raw_rel: str) -> int:
+                try:
+                    plan = read_json(
+                        Path(self.project.state_dir(raw_rel)) / "state" / "plan.json",
+                        default={},
+                    )
+                    pages = plan.get("pages", []) if isinstance(plan, dict) else []
+                    return len(pages) if isinstance(pages, list) else 10**9
+                except (OSError, TypeError, ValueError):
+                    # Keep malformed documents eligible; repair_document will
+                    # report the actual state error when this target is reached.
+                    return 10**9
+
+            return sorted(set(raw_rels), key=lambda raw_rel: (page_count(raw_rel), raw_rel))
+
         if not items:
-            return sorted({raw_rel for raw_rel in sources.values() if not _is_tabular_document(raw_rel)})
+            return ordered(
+                raw_rel for raw_rel in sources.values() if not _is_tabular_document(raw_rel)
+            )
         selected: list[str] = []
         missing: list[str] = []
         for raw_item in items:
@@ -1369,7 +1324,7 @@ class FastRepair:
             )
         if missing:
             raise ValueError("unknown repair source selection: " + ", ".join(missing))
-        return list(dict.fromkeys(selected))
+        return ordered(selected)
 
     def _load_document(
         self,
@@ -1393,6 +1348,10 @@ class FastRepair:
             raise FileNotFoundError(f"repair state/source is unavailable for {raw_rel}")
         source_text = snapshot.read_text(encoding="utf-8")
         current_raw = raw_path.read_text(encoding="utf-8")
+        if not source_text.strip():
+            raise RuntimeError(
+                f"{raw_rel}: source is empty; check conversion/extraction before repairing the wiki"
+            )
         source_hash = sha256_text(source_text)
         if sha256_text(current_raw) != source_hash:
             raise RuntimeError(f"{raw_rel}: source changed; run a normal sync before repair")
@@ -1468,7 +1427,11 @@ class FastRepair:
             owned_source = _slice_ranges(source_lines, owner)
             reference_source = _slice_ranges(source_lines, references)
             allowed_source = owned_source + ("\n\n" + reference_source if reference_source else "")
-            required_tokens = _required_fact_tokens(owned_source, self.policy)
+            context = recent_writer_context(
+                page=item,
+                pages=plan.get("pages", []),
+                previous_source="\n".join(source_lines[: owner[0][0] - 1]),
+            )
             inputs.append(_PageInput(
                 document=raw_rel,
                 number=number,
@@ -1482,7 +1445,7 @@ class FastRepair:
                 owner_evidence=_numbered_ranges(source_lines, owner),
                 reference_evidence=_numbered_ranges(source_lines, references),
                 allowed_source=allowed_source,
-                required_tokens=required_tokens,
+                context=context,
                 page_path=page_path,
                 state_path=state_path,
                 state=state,
@@ -1790,7 +1753,6 @@ class FastRepair:
                     outcome = await _round_initial_judge(
                         session,
                         judge_model=self.judge_model,
-                        policy=self.policy,
                         on_progress=self.on_progress,
                     )
                     return session, outcome, ""
@@ -1806,7 +1768,6 @@ class FastRepair:
                     action, outcome = await _round_write(
                         session,
                         writer_model=self.writer_model,
-                        policy=self.policy,
                         on_progress=self.on_progress,
                     )
                     return session, action, outcome, ""
@@ -2013,5 +1974,5 @@ class FastRepair:
 
 
 __all__ = [
-    "FastRepair", "MAX_REWRITE_ATTEMPTS", "RepairJudgeResult", "TITLE_MAX_CHARS", "VERSION",
+    "FastRepair", "MAX_REWRITE_ATTEMPTS", "RepairJudgeResult", "VERSION",
 ]

@@ -1,41 +1,48 @@
-# Handoff: test the page-merge human-edit design completely, then in production
+# Handoff: verify page-merge human edits on the work PC and real GROWI
 
 Companion to `handoff-conflicts.md` (the design, the 62 cases in section 13, and
 the real-user procedure in 12.5–12.10). This file says what has really been
-verified, what has not, and exactly how to verify the rest. Nothing here is
-committed.
+verified, what has not, and exactly how to verify the rest.
+
+Last audited: 2026-10-09 on the work PC. The approved project is
+`/home/seigyo/llm-wiki/configs/conflicts_test.ini`; all live evidence must come
+from `http://10.160.152.38:3000/`, below `/conflicts_test`, using synthetic pages
+edited in the GROWI browser by a separate tester account. Do not enumerate or
+display the existing private wiki bodies.
 
 ## 1. The honest status
 
-**The feature is not verified for production.** What exists:
+**The feature is not verified for production.** Current work-PC evidence:
 
-- Offline tests: 155 focused tests pass. The full suite has 289 tests with the 10
-  pre-existing failures listed in section 10.
-- Shadow check: 2 history pairs from one test project, 0 failing. That is too
-  little to measure anything; 2 of the 3 model merges fell back to the note.
-- Live report: **12 passed, 50 constrained (not run), 0 failed.** The 12 are
-  `normal_update`, `noop_repeat`, `human_add`, `human_delete`, `same_edit`,
-  `disjoint_edit`, `contradiction`, `tier_2`, `markdown_integrity`,
-  `fast_policy_human_overlay`, `source_catches_up`, and
-  `regeneration_without_fact_change`.
+- The configured chat, embedding, reranker, parser, and GROWI health/model
+  endpoints returned HTTP 200. The local JEV GGUF probe passed. The GROWI root
+  and `/login` both returned HTTP 200. These checks read no wiki page body.
+- Metadata-only inspection found 21 source records, 21 published documents and
+  260 published page records. Every recorded remote path is below
+  `/conflicts_test`; none is blocked. There are no page-merge document states,
+  captures, observations, or live reports, so **0 of 62 cases have work-PC live
+  evidence**.
+- The project is pre-populated but has no project-local `.git` repository or
+  `refs/llm-wiki/last-good` yet. `human live-plan` must establish and verify the
+  baseline before any remote write.
+- `compileall` passed. Individually, 67 `test_human_changes`, 21
+  `test_human_sync_rollout`, and 34 `test_update_tiers` tests passed (122 total).
+  `test_sync_fallback` timed out after 240 seconds in
+  `test_isolated_sync_finishes_builder_pass_before_linker_phase`; the eight
+  preceding tests passed, but the suite has no passing result. The full suite
+  was not claimed as passing.
 
-Even those 12 do not count as production evidence:
-
-1. Every "human" edit was made by `lv.edit()`: an API write with the **bot's own
-   token** and `origin: "view"`. No person edited anything in the GROWI editor.
-   `handoff-conflicts.md` 12.5 explains why that path differs from a real user.
-2. The model runs used a temporary thinking cap of 1024 tokens (now reverted),
-   so every model-dependent result came from a setting production does not
-   have.
-3. All of it ran on one small synthetic document (`hc-test.md`), with
-   `sync --fast` only.
-4. `runner.compat_check` has never passed on a clean baseline.
+The home-PC report remains historical only: it recorded 12 passes and 50
+constraints, but all edits used the bot token/API, all model runs used a
+temporary thinking cap, and only `sync --fast` on one small document ran. None
+of those rows counts toward the work-PC matrix. `runner.compat_check` also still
+lacks a clean-baseline pass.
 
 ## 2. What the next agent must do
 
-Test **all 62 cases** of `handoff-conflicts.md` section 13, plus the real-user
-rows U1–U10, S1–S6 and the watcher check of 12.9. Rerun the 12 cases already
-recorded as passed, with real GROWI edits.
+Test **all 62 cases** of `handoff-conflicts.md` section 13 against the configured
+real GROWI instance, plus the real-user rows U1–U10, S1–S6 and the watcher check
+of 12.9. Rerun the 12 historical cases; they start as pending, not passed.
 
 - A case passes only with its own recorded evidence: the hashes, revisions,
   counts and reason codes required by section 13 of the design handoff.
@@ -48,9 +55,10 @@ recorded as passed, with real GROWI edits.
   patch around. Thinking must stay on.
 - Run the whole matrix with the sync command production uses. If production uses
   both `sync` and `sync --fast`, run it once for each.
-- Include at least one large real document (owner-approved, copied into the
-  disposable mount) in addition to `hc-test.md`. Record run time and the
-  fallback-note rate per document.
+- Use a new synthetic source directory and bot-owned synthetic pages for all
+  deliberate edits. Do not open an existing private page to select test text.
+  A large test must also be synthetic unless the owner separately approves a
+  private document and performs the content inspection personally.
 - Stop at the first FAIL that loses human text, and report it.
 
 ## 3. Two kinds of edits, and when each is allowed
@@ -64,20 +72,29 @@ edits a page (sections 5 and 13). It can be done two ways:
 - the agent drives a real browser logged in as the tester account (for example
   a browser-automation tool), never with the bot token.
 
-**Harness edits (`lv.edit()`, API, bot token).** Allowed only for setup and for
+Before either path, the tester must complete the create/edit/history access probe
+in `handoff-conflicts.md` 12.7 at `http://10.160.152.38:3000/`. A health check or
+bot-token API call does not prove tester permissions. After the bot publishes the
+synthetic canary, the tester must also successfully edit that bot-owned page;
+only then may the matrix begin.
+
+**Harness edits (API, bot token).** Allowed only for setup and for
 timing-critical race cases that a person cannot hit by hand (Group F). Even
 then, run each race case once with a real GROWI edit inside the window the
 fault injector opens (section 4).
 
-Source edits (changing the file in the test mount) and the commands (`sync`,
-`pull`, `watch`) are always done by the agent.
+Source edits (changing only the synthetic file in the test mount) and the
+commands (`sync`, `pull`, `watch`) are done by the operator/agent. Existing
+private source and generated page bodies stay unopened.
 
 Use the marker words, the counting script, and the per-step Git checks from
 `handoff-conflicts.md` 12.8 for every case.
 
 ## 4. Fault-injection tools (no repository code changes)
 
-All of these live in the scratchpad, never in the repository.
+All of these live below a fresh `/tmp/llm-wiki-conflicts-e2e-<run>/`, never in
+the repository. They operate on the configured real GROWI instance and the
+synthetic test paths only.
 
 **GROWI proxy.** A small local reverse proxy, written with the Python standard
 library or `httpx` from the venv, between the pipeline and GROWI. It forwards
@@ -89,18 +106,24 @@ modes, each limited to one path and one request number:
 - `drop`: forward the request, then close the connection without returning
   the response (a lost response).
 
-Use a second disposable INI (`hcv-proxy.ini`) that is identical to `hcv.ini`
-except `growi_url` points at the proxy. Keep gating (`lv.gate()`) against the
-real GROWI URL: the live-plan confirmation code is tied to that URL.
+Use a second external INI (`conflicts-proxy.ini`) derived from
+`configs/conflicts_test.ini`, except `growi_url` points at the proxy. Do not add
+the proxy INI or credentials to the repository. Boundary verification still
+uses the real GROWI URL and the exact synthetic path: the live-plan confirmation
+code is tied to that URL. Verify that endpoint-change reconciliation will not
+republish private documents before starting a proxy case; otherwise use a fresh
+synthetic `target_name` on the same GROWI server for Group F.
 
 **Process kill.** Start `sync` in the background, watch its progress output for
 the stage named in the case, then `kill -9` it.
 
-**Model outage.** A third INI whose `chat_base_url` points at a closed local
-port. Do not stop the shared model server.
+**Model outage.** A third external INI derived from the approved config whose
+`chat_base_url` points at a closed local port. Do not stop or reconfigure the
+shared work-PC model server.
 
-**Natural windows.** One document takes about 5 minutes to generate, which is
-enough time for a person to save an edit in GROWI during generation.
+**Natural windows.** Measure the synthetic large document first; do not retain
+the home-PC assumption that generation takes about five minutes. If it is too
+fast for a person to save, use the path-scoped delay proxy.
 
 ## 5. How to produce each case
 
@@ -110,7 +133,7 @@ the agent edits the file in the test mount. Pass criteria are in
 
 | # | Case | How to produce it |
 |---|---|---|
-| 1 | `initial_multi_page_publish` | New `target_name` (fresh subtree) and empty data root; first `sync`. Record it this time. |
+| 1 | `initial_multi_page_publish` | Publish a new multi-page synthetic document below the confirmed unique test path. If a completely empty project root is required, use an external INI with a fresh synthetic `target_name` on the same real GROWI server. |
 | 2 | `normal_update` | Source: change one fact; `sync`. |
 | 3 | `noop_repeat` | `sync`, `pull`, `publish` again with nothing changed. |
 | 4 | `process_restart` | `kill -9` between commands and during a sync; rerun. |
@@ -143,7 +166,7 @@ the agent edits the file in the test mount. Pass criteria are in
 | 34 | `partial_publish_late_edit` | Proxy `status 500` on the second page; UI edit on the first page; rerun. |
 | 35 | `watcher_restart` | `watch --growi-interval 60`; UI edit; restart the watcher around a poll. |
 | 36 | `activity_cursor_restart` | Two UI edits within 60 s of each other; restart between polls. |
-| 37 | `full_inventory_equivalence` | Two copies of the data root: `pull` on one, `pull --inventory` on the other; compare state hashes. |
+| 37 | `full_inventory_equivalence` | Two copies of the data root: `pull` on one, `pull --inventory` on the other; compare state hashes. Because inventory can fetch all owned bodies under `/conflicts_test`, this needs explicit owner approval or a fresh synthetic `target_name` on the same real server. |
 | 38 | `candidate_rollback` | UI edit captured inside a sync that republishes it; proxy `status 500` on a later page in the same sync. |
 | 39 | `last_good_restore` | Same failure as 38; check the restore inspected revisions; add a UI edit before the restore where the proxy delay allows. |
 | 40 | `service_restart_reconcile` | Proxy `delay` after a confirmed update; `kill -9` inside that delay; rerun. |
@@ -182,11 +205,15 @@ verification log (section 10).
 (unchanged sources: 0 model calls, no changed files). It failed earlier only
 because the inputs had pending work. Do it properly on the work PC:
 
-1. Pick a real project whose last sync finished cleanly: `queue status` shows
-   nothing pending and every document's linker is `complete`.
-2. Run `python -m runner.compat_check --project configs/<project>.ini` on the
-   commit **before** this change. It must report 0 blocked model calls and no
-   changed files; otherwise the project is not a clean baseline, so pick another.
+1. Pick a project whose last sync finished cleanly: `queue status` shows nothing
+   pending and every document's linker is `complete`. The current
+   `conflicts_test` copy was created with linker work pending and is not a valid
+   clean baseline until that work has completed and been checkpointed.
+2. Run `python -m runner.compat_check --project /absolute/path/to/project.ini`
+   on the commit **before** this change. It must report 0 blocked model calls and
+   no changed files; otherwise the project is not a clean baseline, so pick
+   another. The CLI does not accept `configs/<name>.ini` as a relative project
+   argument; use a config name or an absolute INI path.
 3. Run the same command on this change's commit. It must also report 0 blocked
    model calls and no changed files. Any difference is a regression to explain.
 
@@ -227,93 +254,117 @@ from common.settings import load_settings
 from graph.workspace.project import open_project
 from publisher.history import checkpoint_live
 
-project = open_project(load_settings("/absolute/path/hcv.ini"))
+project = open_project(load_settings("/home/seigyo/llm-wiki/configs/conflicts_test.ini"))
 checkpoint_live(project, "live report")
 ```
 
-## 9. Known code issues to fix before the affected cases
+## 9. Implementation audit and open blockers
 
-Found in review and not yet fixed. Otherwise these cases will show these bugs
-instead of testing the design:
+Already implemented in this worktree:
 
-- The new GROWI pull at the start of `sync` (`runner/cli.py`,
-  `_cmd_sync_isolated`) is not wrapped. A GROWI outage or a dirty tree raises and
-  aborts the whole sync; design 3.7 says to record the failure and continue.
-  Affects 41, 53 and any test with GROWI unreachable.
-- A moved document's `doc.json` keeps its old `raw_rel` until its next write, so
-  a new file placed at the old path can be blocked by mistake. Affects 25.
-- A page whose GROWI revision changed but that has no published baseline (an old
-  ledger) now blocks in every mode; the old code pinned it in `apply`. Operator
-  path: restore the page to its published content in GROWI, `pull` (which
-  records the baseline), then make the edit again.
-- `legacy human state` (generator state with old `human_edited` sidecars) now
-  raises in the writer instead of pinning. It needs the owner's decision.
-- When two located changes overlap in the new text, the later one goes to the
-  Appendix instead of being merged into one window (design 3.2 step 3). This is
-  safe, since nothing is lost, but it is a deviation.
+- `LIVE_CASES` contains all 62 IDs.
+- An idle isolated `sync` calls `pull_growi_once()` before scanning or building;
+  `test_idle_sync_captures_a_ui_edit_before_any_scan_or_build` covers the
+  successful path.
+- `rebase()` combines windows that overlap in the new text; the old home-PC note
+  saying the later change always went to the Appendix is obsolete.
+- `_commit()` refreshes `doc.json.raw_rel` whenever human state is written.
+- The page journal replacement, guidance, Appendix, rollback replay, fast-link
+  invalidation, and legacy safety blocks described in the design handoff are
+  present.
 
-Shadow-check questions still open: why 2 of 3 model merges fell back (check the
-verify reasons in the log), and the unexplained `newer_lines_missing_count` of 2
-and 1.
+Still open or requiring a live decision before the affected case can pass:
 
-## 10. Environment (scratchpad, not the repo)
+- The initial GROWI pull in `_cmd_sync_isolated` is not caught. A GROWI outage or
+  dirty-tree error aborts the sync instead of being recorded while unrelated
+  documents continue. This affects 41 and outage variants of 53.
+- A pure source move does not write human state, so `doc.json.raw_rel` can retain
+  the old path until a later generation or capture. A different source created
+  immediately at the old path can be blocked by mistake. This affects 25.
+- A changed remote page with no inspected published baseline fails closed in all
+  modes. Restore it to the published content, run `pull` to establish the
+  baseline, then repeat the tester edit; do not adopt it blindly.
+- `legacy human state` still raises instead of pinning. The owner must decide how
+  to handle any project that contains the old `human_edited` sidecars.
+- `test_sync_fallback` currently hangs in
+  `test_isolated_sync_finishes_builder_pass_before_linker_phase`. Resolve or
+  explain that timeout before claiming the focused regression gate passes.
 
-`$SP` = `/tmp/claude-1000/-mnt-common-Code-llm-wiki-dist-llm-wiki-air/d42fe7bd-b92c-425f-afc3-14df1364827f/scratchpad`
+Shadow-check questions remain open: why 2 of 3 historical model merges fell back,
+and why the old report showed `newer_lines_missing_count` values of 2 and 1.
 
-- `$SP/shadow/env.sh`: exports the model endpoint (`http://localhost:51029/v1`,
-  `gemma-4-31B`, `WIKI_CONCURRENCY=1`, `WIKI_REQUEST_TIMEOUT=900`). Check
-  `curl -s localhost:51029/v1/models` before any model call.
-- GROWI: `http://localhost:3000`. The bot token is `growi_token` in
-  `configs/mount-docs.ini` (`[project]`); `lv.py token()` reads it. Never print
-  it. The tester account (section 3) needs its own login and never this token.
-- `$SP/live/hcv.ini`: disposable INI (`target_name = hcv-fast-1008`,
-  `data_root = $SP/live/data`, `human_sync_mode = apply`, `growi_mode = attach`).
-  `lv.set_mode()` edits the mode.
-- `$SP/live/liveplan.json`: live plan and confirmation code. Do not paste the
-  code anywhere.
-- `$SP/live/src.py <round>`: writes `hc-test.md` for round 0, 1 or 2.
-- `$SP/live/lv.py`: `gate()`, `run()`, `pages()`, `body()`, `local_pages()`,
-  `edit()` (harness edits only, section 3), `set_mode()`.
-- `tools/human_rebase_shadow.py` (repo, untracked): the shadow check. Keep its
-  full-history document discovery.
-
-Run driver calls from `$SP/live` with the repo's venv:
+## 10. Work-PC environment
 
 ```bash
-cd $SP/live && /mnt/common/Code/llm-wiki-dist/llm-wiki-air/.venv/bin/python -c 'import lv; print(lv.pages())'
+REPO=/home/seigyo/llm-wiki
+CFG=/home/seigyo/llm-wiki/configs/conflicts_test.ini
+PROJECT=/home/seigyo/llm-wiki/data_big/conflicts_test
+PY=/home/seigyo/llm-wiki/.venv/bin/python
+SP=/tmp/llm-wiki-conflicts-e2e-YYYYMMDD
+cd "$REPO"
 ```
 
-Long runs: start them in the background and poll the output file.
+- GROWI/UI: `http://10.160.152.38:3000/`; boundary `/conflicts_test`.
+- Chat/human merge/fast judge+writer: `http://10.160.144.101:51029/v1`,
+  `gemma-4-31B` (no separate writer or judge endpoint is configured).
+- Embeddings: `http://10.160.144.101:51024/v1`; reranker:
+  `http://10.160.144.101:51025/v1`; parser:
+  `http://10.160.144.101:51027/agent/doc-parser/`.
+- Link decisions use the configured local JEV GGUF scorer (`Q4_K_M`, batched).
+- The INI's omitted rollout settings currently resolve to `off` and `attach`.
+  Pin `human_sync_mode = off` explicitly before testing, then change only this
+  approved test setting through `off` -> `observe` -> `apply`.
+- The bot credential stays in the approved secret location and is never printed.
+  The tester uses a separate browser login and never receives the bot token.
+- `tools/human_rebase_shadow.py` remains the read-only shadow tool. Do not run it
+  on the private live tree; use an approved copy.
 
-Rules: GROWI writes only below `/hcv-fast-1008` (or a new disposable subtree),
-and only after `lv.gate()`. `human_sync_mode` is changed only in the disposable
-INIs. Output carries hashes, counts and reason codes, never page bodies or
-secrets. Nothing is committed unless the owner asks.
+Preflight:
 
-## 11. Verification log so far (2026-10-08)
+```bash
+$PY main.py --project "$CFG" check
+$PY main.py --project "$CFG" human live-plan \
+  --path /conflicts_test/human-conflicts-e2e-YYYYMMDD
+$PY main.py --project "$CFG" human status
+git -C "$PROJECT" rev-parse HEAD refs/llm-wiki/last-good
+git -C "$PROJECT" status --porcelain
+```
 
-- `.venv/bin/python -m unittest discover -s tests`: 289 run, 10 failures, 27
-  skipped. The pre-existing failures:
-  `test_diff_project_config_and_docx_fixture_exist`,
-  `test_incremental_linker_keeps_valid_peer_untouched_and_skips_search`,
-  `test_incremental_scope_with_many_old_edges_checks_only_visible_ones`,
-  `test_neo_incremental_linker_preserves_entity_direction_and_checks_only_visible_edges`,
-  `test_rename_plus_edit_keeps_old_digest_until_the_new_blob_is_parsed`,
-  `test_update_uses_parser_for_new_image_descriptions`,
-  `test_document_index_page_cards_unchanged`, `test_root_lists_team_names_only`,
-  `test_related_documents_cached_and_rendered_for_both_docs`,
-  `test_first_structured_attempt_gets_token_cap_and_temperature`.
-- Focused suite (`test_human_changes`, `test_human_sync_rollout`,
-  `test_sync_fallback`, `test_update_tiers`): 155 tests, OK.
-- `compileall`: passed.
-- Shadow, real model (thinking cap on): 2 pairs, 8 model calls, 0 failing; 2 of
-  3 window-5 merges fell back. Model-free rerun: 0 failing. Fast copy: no
-  eligible pairs.
-- `compat_check`: not a valid result (unclean inputs: 87 and 62 blocked model
-  calls). Redo per section 6.
-- Live round 1 (`sync --fast`, tier 1) and round 2 (tier 2): exit 0,
-  `human_edits_overwritten=[]`, repeats unchanged; transport normalization
-  matched except the expected navigation lines. All edits were harness edits
-  with the bot token, and the thinking cap was on.
-- The live report was checkpointed with `checkpoint_live` twice;
-  `HEAD == refs/llm-wiki/last-good` for the disposable project.
+Use the absolute INI path or the name `conflicts_test`; the relative argument
+`configs/conflicts_test.ini` is rejected. Long runs may be backgrounded and
+polled, but logs contain hashes, counts, IDs and reason codes only. Evidence
+helpers fetch an exact synthetic page by ID and never list all pages. No cleanup,
+reset, inventory, or proxy run begins without rechecking the real endpoint and
+synthetic boundary.
+
+## 11. Verification log
+
+Work-PC audit, 2026-10-09 (`c60392d` plus the current uncommitted feature
+changes):
+
+- `python -m compileall -q common convert wiki linker index publisher runner graph`:
+  passed.
+- `tests.test_human_changes`: 67 passed; expected injected 409/500/lost-response
+  traces were emitted.
+- `tests.test_human_sync_rollout`: 21 passed.
+- `tests.test_update_tiers`: 34 passed.
+- `tests.test_sync_fallback`: timed out at 240 seconds in
+  `test_isolated_sync_finishes_builder_pass_before_linker_phase`; eight earlier
+  tests in its verbose run passed. No focused-suite or full-suite pass is
+  recorded.
+- Health: chat 200, embedding 200, reranker 200, parser 200, GROWI health 200,
+  local JEV probe passed; GROWI root 200 and login 200. No wiki body was read.
+- Local metadata: 21 sources, 21 published documents, 260 published pages; all
+  remote paths within `/conflicts_test`, 0 blocked, 0 page-merge states/captures/
+  observations/live reports. No project-local Git baseline yet.
+- Actual GROWI live matrix: 0/62 work-PC cases run. Tester login/edit permission
+  is not yet proven; complete section 3 before changing mode or publishing a
+  canary.
+- `compat_check`: no valid clean-baseline result yet.
+
+Historical home-PC evidence (not transferable): a 289-test full run reported 10
+failures and 27 skips; the old focused run reported 155 passing tests; a two-pair
+shadow run made 8 model calls with 2 of 3 window-5 merges falling back; and 12
+live rows used bot-token harness edits plus a temporary thinking cap. Preserve
+those records as history, but do not count them as work-PC, real-user, or
+production evidence.

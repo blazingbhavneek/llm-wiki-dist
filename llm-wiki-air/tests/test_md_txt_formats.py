@@ -83,6 +83,17 @@ class MarkdownAndTextFormatTests(unittest.TestCase):
                 self.assertEqual(_parse(item, source, SimpleNamespace()), "plain text")
                 parser.assert_not_called()
 
+    def test_vendored_dependency_folders_are_not_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = Path(tmp) / "mount"
+            for rel in ("docs/real.md", "docs/node_modules/left-pad/README.md",
+                        "docs/node_modules/left-pad/docs/guide.md",
+                        ".venv/Lib/site-packages/pkg/readme.md", "venv/share/notes.txt"):
+                path = mount / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("text", encoding="utf-8")
+            self.assertEqual(set(scan_mount(mount).files), {"docs/real.md"})
+
     def test_convert_copies_txt_without_parser_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -100,13 +100,16 @@ class ChatModelPort:
         *,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
+        _enforce_max_output_tokens: bool = False,
     ) -> str:
         """One bounded plain-text completion; the caller validates the content."""
 
         async def call() -> str:
             kwargs: dict[str, Any] = {}
-            # TEMPORARILY DISABLED: restore the max_tokens binding when needed.
-            # kwargs["max_tokens"] = max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS
+            # Standard calls intentionally leave max_tokens unset; fast writer
+            # opts in through _enforce_max_output_tokens.
+            if _enforce_max_output_tokens and max_output_tokens is not None:
+                kwargs["max_tokens"] = max(1, int(max_output_tokens))
             kwargs["temperature"] = self.config.temperature if temperature is None else temperature
             kwargs["extra_body"] = {
                 "chat_template_kwargs": {"enable_thinking": self.config.text_thinking}

@@ -64,6 +64,11 @@ class FastPolicy(Policy):
 
         return generation_prompt_rules(role)
 
+    def writer_units(self, lines: Sequence[str], images: Sequence[Any]) -> list[Any]:
+        """Fast rewrites tables/fences; only image bytes remain opaque."""
+        del lines
+        return list(images)
+
     def adjust_seed_plan(self, plan: Any, *, config: Any) -> Any:
         from .wiki import merge_small_pages
 
@@ -112,7 +117,7 @@ class FastPolicy(Policy):
 
 FAST = FastPolicy(
     name="fast",
-    version="fast-v5",
+    version="fast-v7",
     repair_attempts=3,
     research=False,
     intro=False,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from html import escape
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -20,6 +21,13 @@ ATX_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 TEX_MATH_RE = re.compile(r"\$\$.*?\$\$|\$[^$\n]+\$", re.DOTALL)
 TEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+")
 SHOUTED_WORD_RE = re.compile(r"\b[A-Z]{2,}\b")
+LOW_COVERAGE_THRESHOLD = 80
+_IMAGE_TOKEN_RE = re.compile(
+    r"\[\[(?:NEO-IMAGE:[^\]]+|SOURCE_IMAGE_\d+|WIKI_IMAGE_\d+)\]\]"
+)
+_LOW_COVERAGE_BLOCK_RE = re.compile(
+    r"<!-- 情報保持スコアが80未満です。.*?</span>", re.DOTALL
+)
 
 
 FAST_GENERATION_JUDGE_RULES = """# Fast Wiki査読規則
@@ -34,6 +42,10 @@ FAST_GENERATION_JUDGE_RULES = """# Fast Wiki査読規則
 - 保存/表示、適用/除外、入力/出力、上/下、送信/受信、連係元/連係先、率/量等の区別。
 - 表の各ラベル、セルの意味、値、注記、凡例、○/◎等の記号と対応関係。
 - 図表キャプションに含まれる説明語。図表番号だけは不要だが、説明部分は情報として保持する。
+- 質問・確認依頼・提案・仮定・未確定事項という発言の意図、確認先と依頼内容、確定/未確定の区別。
+  「三菱様、この理解で相違ございませんでしょうか？」を確定した仕様の断言に変えたら、
+  確認依頼の欠落と根拠のない確定として不承認にし、coverage_scoreにも情報損失を反映する。
+  疑問符の有無ではなく、「三菱への確認事項：この理解が正しいか」のような意味の保持を確認する。
 
 ## 要約による欠落を承認しない
 修復は要約ではない。原文に裏付けられる異なる一覧項目、索引項目、表行、短い説明を一件ずつ照合する。
@@ -48,51 +60,89 @@ FAST_GENERATION_JUDGE_RULES = """# Fast Wiki査読規則
 原文と同じ行順・行数の不在は欠落ではない。ただし番号を省いても処理順の意味は残す。
 見出しレベルの飛びや原文と異なるネストだけをdefectsへ報告しない。空見出し、反復見出し、
 意味を誤分類する見出し、原文にない仕様を主張する見出しだけを報告する。
+Mermaid図の有無・構文・描画・矢印数は査読・採点の対象外とし、図の再現を要求しない。ただし原文の図に含まれる項目、値、条件、処理順、接続元/接続先と対応関係は情報であり、文章や表などで全て保持されているか照合する。
+
+## 表の判定
+候補の表は有効なHTMLの`table`、`thead`、`tbody`、`tr`、`th`、`td`で構成する。
+Markdownパイプ表は本文品質の欠陥として不承認にする。単純な丸/バツの表記用TeXは○/×へ統一する。
+数式として意味を持つTeXや変数は保持し、◎など意味の異なる記号を○へまとめない。
+Markdown表やOCRの罫線、壊れたフェンスをそのまま再現する必要はない。行列の対応、見出しと値、
+意味のある空セル・空行、セル結合が示すグループ関係を保持したかを判定する。OCRが作った重複行や、
+対応関係を持たない全空行を除去したことは欠落にしない。
 
 ## 候補が作った欠陥
-原文にない導入、説明、一般論、分類、見出し、表ヘッダ、英語展開、数値、単位、動作を一つでも
+H1の直後には、このページの対象と内容が分かる短い導入段落を置く。原文の事実を言い換えた導入は
+捏造ではない。本文の詳細を削らず、表だけのページでも原文で分かる表の対象や読み方を説明する。
+ただし原文がごく短い一文だけなら、その一文を導入と本文に重複させなくてよい。
+原文が説明文のない保護画像だけの場合は導入を要求せず、画像内容を推測しない。
+導入の欠落、説明のない表、文脈から浮いたOCR断片や不自然な文末は本文品質の欠陥として不承認にする。
+意味のある断片は適切な説明や表注記へ統合し、情報を捨てていないか確認する。
+原文で裏付けられない導入、説明、一般論、分類、見出し、表ヘッダ、英語展開、数値、単位、動作を一つでも
 追加していればdefectsへ報告する。「正規化した」「変換した」「保存する」等を文章のつなぎとして
 補っても捏造である。意味の狭窄/拡張、論理の反転、項目間の対応変更も報告する。
 中国語簡体字、意味不明な外国語、拒否文、話題逸脱、文字化け、%%、無限反復、同じ文・語・見出しの
-不自然な反復、壊れたMarkdown、装飾用の単独`---`を報告する。原文に本当にある必要な反復は欠陥にしない。
+不自然な反復、壊れたMarkdown、装飾用の単独`---`を報告する。原文にも反復があるという理由だけで
+候補の反復を許可しない。同じ事実のOCR重複は一つへ統合し、時系列値や表の対応など反復自体に意味が
+ある場合だけ保持する。
 
 原文から候補への照合と、候補から原文への逆照合を両方行う。一つでも意味ある欠落、固有名称の短縮、
 意味変更、無根拠な追加、日本語品質の欠陥があれば具体的な問題語と正しい原文内容を返す。
-coverage_scoreが高くても問題を空にしてはならない。過去の試行だけにあった問題を現在候補へ持ち越さない。"""
+coverage_scoreは意味の保持率であり、体裁だけの欠陥では下げない。導入の欠落・表記不統一・読みにくい
+断片はbody_defectsへ報告してapproved=falseにする。coverage_scoreが高くても問題を空にしてはならない。
+過去の試行だけにあった問題を現在候補へ持ち越さない。"""
 
 
 FAST_GENERATION_WRITER_RULES = """# Fast Wiki執筆・修復規則
-これは要約ではなく、提示された原文節を情報欠落なく日本語Wikiへ整える作業である。短くすること、
+これは要約ではなく、提示された原文を情報欠落なく日本語Wikiへ整える作業である。短くすること、
 項目数や行数を減らすこと、多数の項目を総称へまとめることを品質改善とみなさない。
 前回の査読がある場合は現在案の正しい部分を保ち、指摘箇所だけを必要最小限に直す。
+Wikiは文章・表・既存画像だけで簡潔に構成し、Mermaidなどの図式は作成・出力せず、原文の図式に含まれる情報は文章や表で表す。
 
 ## 保持する情報
-- 原文に裏付けられる異なる一覧項目、索引項目、表行、短い説明を一件ずつ残す。
+- 原文に裏付けられる異なる事実、一覧項目、索引項目、表の意味、短い説明を一件ずつ残す。
 - 正式な機能名、モジュール名、処理名、入力名、出力名、画面名、DB名、項目名を完全な名称で残す。
 - 複合名称を短い上位概念へ置換せず、括弧内の対象、方向、処理種別、連係元/連係先、DB区分、
   保存/表示、適用/除外、率/量など項目を区別する語を落とさない。
 - 条件、制約、例外、処理順、または/かつ、含む/除く、以上/未満、数値、単位、閾値、日時、式、
   エラー値、識別子、コードを変えない。
-- 表はMarkdown/HTMLを組み替えてよいが、全ラベル、セルの意味、値、注記、凡例、○/◎と対応関係を残す。
+- 質問・確認依頼・提案・仮定・未確定事項の意図を保持し、確定した仕様や決定事項へ変えない。
+  確認先と何を確認したいかも残す。「三菱様、この理解で相違ございませんでしょうか？」は、
+  例えば「三菱への確認事項：この理解が正しいか」と整理できるが、「この理解が正しい」と断言しない。
+  業務上の質問や確認依頼は内部作業メモやOCRノイズではない。原文にない回答を補わない。
+- 表は必ず読みやすいHTML表へ作り直す。`table`、`thead`、`tbody`、`tr`、`th`、`td`を正しく閉じ、
+  全ラベル、セルの意味、値、注記、凡例、○/◎、行列の対応、意味のある空セル・空行を残す。
+  セル結合が意味を持つ場合は`rowspan`/`colspan`で同じ関係を表す。OCR由来の壊れた罫線、
+  重複した全空行、表を囲むだけのコードフェンスはコピーしない。
+  Markdownパイプ表は使わない。単純な丸/バツを表すTeX（\\bigcirc、\\times等）は○/×へ統一する。
+  数式として意味を持つTeXや変数、意味の異なる○/◎などの区別は保持する。
 - 「図 1-1 処理フロー」の番号は省いてよいが「処理フロー」は残す。数字だけの図表ラベルは追加しない。
 
 ## 持ち込まない構造とノイズ
 章/節/項番号、図表番号、ページ番号、原文行番号、目次リンク、単なる箇条書き番号、空見出し、
-ページ区切り、OCR重複、文字化け、%%、内部メモ、モデル名はWiki本文へ移植しない。
+ページ区切り、OCR重複、文字化け、%%、モデル用の内部メモ、モデル名はWiki本文へ移植しない。
 見出しレベルや表レイアウトを原文と同じにする必要はないが、構造を変えるために事実を削除しない。
+通常の表やコードフェンスは原文として見えている。`[[NEO-IMAGE:...]]`だけが保護対象の画像である。
+表やフェンスを画像トークンとして扱わず、内容を読んでWiki向けに再構成する。
 
 ## 捏造と退行を防ぐ
-ページ要約や周辺コンテキストを原文扱いせず、今回の原文節または明示された追加事実にない導入、一般論、
+H1の直後に、今回の原文に裏付けられる短い導入段落を書き、何についてのページかを説明する。
+表が中心でも、表の対象や原文で分かる読み方を自然な文章で説明する。導入は詳細の代わりではなく、
+本文の事実や表セルを省略しない。原文がごく短い一文だけなら、その一文を重複させなくてよい。
+原文が説明文のない保護画像だけの場合は、画像内容や導入を推測して作らない。
+原文に裏付けられる既存の導入は保持・改善する。孤立したOCR断片は、意味があれば適切な段落や
+表注記へ自然に統合し、意味を復元できないノイズだけを除く。
+ページ要約や周辺コンテキストを原文扱いせず、今回の原文または明示された追加事実にない導入、一般論、
 分類名、見出し、表ヘッダ、英語展開、数値、単位、動作を作らない。「正規化した」「変換した」
 「保存する」等を滑らかな説明として補わない。原文にない長い総称を考案せず、既存語を勝手に膨らませない。
-第2節以降でページ要約を導入文として繰り返さず、その節が所有する事実だけを書く。
+導入を各節で繰り返さず、このページが所有する事実だけを書く。
 
 中国語簡体字が一字だけ混じる場合は周辺の名称・表行を削除せず、日本語の字へ直す
 （值→値、压→圧、单→単、项→項、关→関、变→変、应→応、查→査、运→運、总→総、发→発、图→図、录→録）。
 拒否文、話題逸脱、不自然な外国語、無限反復、重複見出し、壊れたMarkdown、装飾用の単独`---`を出力しない。
 
 出力前に、原文の各固有項目、複合名称、括弧内限定、論理語、条件、方向、入出力、値、単位、表凡例、
-○/◎を一つずつ照合し、欠落・統合・改名・意味変更・無根拠な追加がないことを確認する。"""
+○/◎、質問・確認依頼・提案・仮定・未確定事項を一つずつ照合し、欠落・統合・改名・意味変更・
+無根拠な追加がないことを確認する。"""
 
 
 def generation_prompt_rules(role: str) -> str:
@@ -105,6 +155,73 @@ def generation_prompt_rules(role: str) -> str:
     return ""
 
 
+def recent_writer_context(
+    *,
+    page: Any,
+    pages: Sequence[Any],
+    previous_source: str,
+    base: str = "",
+    source_limit: int = 12_000,
+    line_limit: int = 50,
+    page_limit: int = 3,
+) -> str:
+    """Orientation for fast writers: recent summaries plus preceding source text."""
+
+    def value(item: Any, name: str, default: Any = "") -> Any:
+        if isinstance(item, dict):
+            return item.get(name, default)
+        return getattr(item, name, default)
+
+    current = int(value(page, "number", 0) or 0)
+    previous_pages = sorted(
+        (item for item in pages if int(value(item, "number", 0) or 0) < current),
+        key=lambda item: int(value(item, "number", 0) or 0),
+    )[-page_limit:]
+    out = [base.rstrip()] if base.strip() else []
+    if previous_pages:
+        out.extend([
+            "## 直前のWikiページ要約（文脈専用）",
+            "以下は話の流れを理解するためだけに使い、この節の事実根拠にはしない。",
+        ])
+        for item in previous_pages:
+            title = str(value(item, "title", "")).strip() or "無題"
+            summary = str(value(item, "summary", "")).strip() or "要約なし"
+            out.append(f"- {title} — {summary[:400]}")
+    prior = "\n".join(previous_source.splitlines()[-line_limit:])
+    if len(prior) > source_limit:
+        prior = prior[-source_limit:]
+    prior = prior.strip()
+    if prior:
+        out.extend([
+            "## 直前の原文（直前50行・最大12,000文字・文脈専用）",
+            "これは現在のページより前の流れを理解するための資料である。現在のページにない事実をコピーしない。",
+            prior,
+        ])
+    return "\n".join(out).rstrip() + ("\n" if out else "")
+
+
+def append_low_coverage_source(markdown: str, source: str, score: int | None) -> str:
+    """Keep readable output while retaining raw evidence when fact coverage is low."""
+
+    if score is None or score >= LOW_COVERAGE_THRESHOLD:
+        return markdown
+    raw = _IMAGE_TOKEN_RE.sub("", source or "").strip()
+    if not raw:
+        return markdown
+    # Keep source HTML inert so it cannot escape the hidden safety container.
+    raw = escape(raw, quote=False)
+    warning = (
+        "<!-- 情報保持スコアが80未満です。以下の非表示原文を確認し、失われた事実があれば本文へ"
+        "復元してください。人間の編集者が確認後にこのspanを削除しても構いません。 -->"
+    )
+    hidden = (
+        '<span hidden style="display:none" data-llm-wiki-low-coverage="true">\n'
+        + raw
+        + "\n</span>"
+    )
+    return markdown.rstrip() + "\n\n" + warning + "\n" + hidden + "\n"
+
+
 def strip_heading_number(text: str) -> str:
     """Remove a formatting prefix from a title without touching body text."""
 
@@ -114,15 +231,16 @@ def strip_heading_number(text: str) -> str:
 def strip_heading_numbers(markdown: str) -> str:
     """strip_heading_number on every ATX heading outside code fences."""
 
+    protected, restore = mask_math(markdown)
     out: list[str] = []
     fenced = False
-    for line in markdown.split("\n"):
+    for line in protected.split("\n"):
         if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced
         elif not fenced and (match := ATX_HEADING_RE.match(line)):
             line = f"{match.group(1)} {strip_heading_number(match.group(2)) or match.group(2)}"
         out.append(line)
-    return "\n".join(out)
+    return restore("\n".join(out))
 
 
 def translatable(text: str) -> str:
@@ -216,7 +334,7 @@ MATH_RE = re.compile(r"\$\$.*?\$\$|\$[^$\n]+\$", re.DOTALL)
 
 
 def mask_math(text: str) -> tuple[str, Callable[[str], str]]:
-    """Swap $...$ and $$...$$ for tokens so link insertion never writes inside math."""
+    """Hide math and low-coverage evidence while automatic links are inserted."""
 
     spans: list[str] = []
 
@@ -224,7 +342,8 @@ def mask_math(text: str) -> tuple[str, Callable[[str], str]]:
         spans.append(match.group(0))
         return f"{len(spans) - 1}"
 
-    masked = MATH_RE.sub(hide, text)
+    masked = _LOW_COVERAGE_BLOCK_RE.sub(hide, text)
+    masked = MATH_RE.sub(hide, masked)
     if not spans:
         return text, _same
 

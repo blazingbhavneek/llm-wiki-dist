@@ -844,7 +844,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 def cmd_publish(args: argparse.Namespace) -> int:
     from contextlib import closing
 
-    allow_unlinked = bool(getattr(args, "allow_unlinked", False))
+    allow_unlinked = bool(getattr(args, "allow_unlinked", True))
     from publisher.phase import Config, Input, run
     from publisher.progress import SyncProgress
 
@@ -1015,7 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--force", action="store_true", help="queue selected sources once at startup even when unchanged")
     watch.add_argument("--continue", dest="continue_run", action="store_true",
                        help="resume the previous run's kept candidate worktree instead of discarding it")
-    watch.add_argument("--interval", type=float, default=float(os.environ.get("PUBLISHER_INTERVAL_SECONDS", "10")))
+    watch.add_argument("--interval", type=float, default=float(os.environ.get("PUBLISHER_INTERVAL_SECONDS", "86400")), help="seconds between mount scans (default 86400 = once a day)")
     watch.add_argument("--growi-interval", type=float, default=float(os.environ.get("GROWI_WATCH_INTERVAL_SECONDS", "300")), help="seconds between low-priority GROWI revision checks; 0 disables")
     watch.set_defaults(fn=cmd_watch)
 
@@ -1042,8 +1042,9 @@ def build_parser() -> argparse.ArgumentParser:
     publish = sub.add_parser("publish", help="publish the current wiki tree only"); project_flags(publish)
     publish.add_argument(
         "--allow-unlinked",
-        action="store_true",
-        help="publish built wiki pages even when linking is pending or failed; keep them pending for a later sync",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="publish built wiki pages even when linking is pending or failed (the default); keep them pending for a later sync. Use --no-allow-unlinked to link first and publish only linker-complete documents.",
     )
     publish.set_defaults(fn=cmd_publish)
     pull = sub.add_parser("pull", help="capture GROWI edits into the local human overlay"); project_flags(pull)

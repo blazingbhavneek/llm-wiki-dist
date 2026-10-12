@@ -1,4 +1,10 @@
-"""Fast-only document-wide writer pass -> judge pass scheduler."""
+"""Fast page creation using the same writer and semantic judge as repair.
+
+Creation starts with the writer while repair starts with a judge. After that,
+both paths use the shared page-level writer -> judge loop from ``repair.py``.
+Model work may run concurrently, but page files and state are committed in the
+document's serial order.
+"""
 
 from __future__ import annotations
 
@@ -10,346 +16,312 @@ from typing import Any, Sequence
 
 from common.policy import policy_of
 from graph.wiki.model import judge_model, writer_model
-from graph.wiki.page import (
-    PLACEHOLDER_RE,
-    check_section,
-    is_small_document,
-    normalize_draft,
-    split_sections,
-)
-from graph.wiki.storage import read_json, slice_text, write_text_atomic
-from graph.wiki.wire import PageJudgeResult, ReferenceFact
+from graph.wiki.page import PLACEHOLDER_RE
+from graph.wiki.storage import slice_text, write_text_atomic
+
 from .passes import bounded_map
+from .repair import (
+    MAX_REWRITE_ATTEMPTS,
+    RepairJudgeResult,
+    _Artifact,
+    _ImageSlot,
+    _PageInput,
+    _PageShell,
+    _approved,
+    _feedback,
+    _image_errors,
+    _judge,
+    _judge_rank,
+    _writer,
+    _write_artifacts,
+)
+from .wiki import append_low_coverage_source, recent_writer_context
 
 
 @dataclass
-class SectionSession:
+class _GenerationSession:
     page: Any
-    start: int
-    end: int
-    index: int
-    count: int
-    facts: list[ReferenceFact]
-    units: list[Any]
-    placeholders: list[str]
-    numbered: str
-    source_text: str
-    facts_text: str
+    prompt_page: _PageInput
+    page_units: list[Any]
     task_dir: Path
-    context: str
-    candidates: list[Any] = field(default_factory=list)
-    feedback: list[str] = field(default_factory=list)
-    attempt: int = 0
-    pending_draft: str | None = None
-    result: Any | None = None
+    raw_source: str
+    artifacts: list[_Artifact] = field(default_factory=list)
 
 
-def _prompt(session: SectionSession, *, lines: Sequence[str], config: Any, policy: Any) -> Any:
-    from graph.wiki import pipeline as wiki
-
-    return wiki.section_write_prompt(
-        page_title=session.page.title,
-        page_summary=session.page.summary,
-        index=session.index,
-        count=session.count,
-        source_start=session.start,
-        source_end=session.end,
-        numbered_section=session.numbered,
-        facts_text=session.facts_text,
-        image_context=wiki._image_context(session.units, lines),
-        output_language=config.output_language,
-        feedback=session.feedback,
-        context=session.context,
-        code_identifiers=(
-            []
-            if config.source_kind in {"csv", "xlsx"}
-            else sorted(policy.code_tokens(session.source_text))
-        ),
-        policy_rules=policy.wiki_prompt_rules("writer"),
-        guidance=config.human_guidance.get(session.page.filename, ()),
-    )
+@dataclass
+class _GenerationOutcome:
+    session: _GenerationSession
+    title: str
+    body: str
+    attempts: int
+    verdict: RepairJudgeResult | None = None
+    errors: list[str] = field(default_factory=list)
+    verbatim: bool = False
 
 
-def _finish(
-    session: SectionSession,
+def _source_body(
+    page: Any,
     *,
     lines: Sequence[str],
-    policy: Any,
-    on_progress: Any,
-) -> Any:
-    from graph.wiki import pipeline as wiki
-
-    if session.result is not None:
-        return session.result
-    clean = [item for item in session.candidates if not item.errors]
-    if clean:
-        best = max(
-            clean,
-            key=lambda item: (
-                not item.missing,
-                not item.defects,
-                item.score if item.score is not None else 0,
-                item.attempt,
-            ),
-        )
-        if policy.strict_judge and (best.missing or best.defects):
-            wiki._emit(
-                on_progress,
-                "write",
-                "section_verbatim",
-                page=session.page.title,
-                section=session.index,
-                error="judge reported missing information or defects",
-            )
-            session.result = wiki._SectionResult(
-                markdown=wiki._verbatim_section(
-                    lines, session.start, session.end, session.units
-                ),
-                attempts=len(session.candidates),
-                errors=best.missing + best.defects,
-                verbatim=True,
-            )
-        else:
-            session.result = wiki._SectionResult(
-                markdown=best.markdown,
-                attempts=len(session.candidates),
-                score=best.score,
-                missing=best.missing,
-                defects=best.defects,
-            )
-        return session.result
-
-    errors = session.candidates[-1].errors if session.candidates else list(session.feedback)
-    wiki._emit(
-        on_progress,
-        "write",
-        "section_verbatim",
-        page=session.page.title,
-        section=session.index,
-        error="; ".join(errors)[:300],
-    )
-    session.result = wiki._SectionResult(
-        markdown=wiki._verbatim_section(
-            lines, session.start, session.end, session.units
-        ),
-        attempts=len(session.candidates),
-        errors=errors,
-        verbatim=True,
-    )
-    return session.result
-
-
-async def _write_candidate(
-    session: SectionSession,
-    *,
-    lines: Sequence[str],
-    model: Any,
-    config: Any,
-    policy: Any,
-    stop_check: Any,
-    on_progress: Any,
+    units: Sequence[Any],
 ) -> str:
+    """Readable lossless fallback used only when no candidate can be judged."""
+
     from graph.wiki import pipeline as wiki
 
-    if stop_check and stop_check():
-        raise asyncio.CancelledError("page writing cancelled")
-    session.attempt += 1
-    attempt = session.attempt
-    stem = f"section-{session.index:02d}"
-    prompt = _prompt(session, lines=lines, config=config, policy=policy)
-    rendered_prompt = prompt.render()
-    cached_prompt = session.task_dir / f"{stem}-attempt-{attempt:02d}-prompt.md"
-    cached_draft = session.task_dir / f"{stem}-attempt-{attempt:02d}.md"
-    cached_judge = session.task_dir / f"{stem}-judge-{attempt:02d}.json"
-    if (
-        attempt == 1
-        and cached_prompt.exists()
-        and cached_draft.exists()
-        and cached_prompt.read_text(encoding="utf-8") == rendered_prompt
-    ):
-        draft = cached_draft.read_text(encoding="utf-8")
-        errors = check_section(
-            draft,
-            lines=lines,
-            source_text=session.source_text,
-            block_ranges=(),
-            placeholders=session.placeholders,
-            facts=session.facts,
-            check_identifiers=config.source_kind not in {"csv", "xlsx"},
-            tokens=policy.code_tokens,
-        )
-        judgment = read_json(cached_judge, default={})
-        if (
-            not errors
-            and judgment
-            and not judgment.get("missing_important_information")
-            and not judgment.get("defects")
-        ):
-            wiki._emit(
-                on_progress,
-                "write",
-                "section_resumed",
-                page=session.page.title,
-                section=session.index,
-            )
-            session.result = wiki._SectionResult(
-                markdown=draft,
-                attempts=0,
-                score=int(judgment.get("coverage_score", 0)),
-            )
-            return "done"
-
-    write_text_atomic(cached_prompt, rendered_prompt)
-    try:
-        raw = await writer_model(model).text(
-            prompt.messages(), max_output_tokens=config.write_max_output_tokens
-        )
-    except Exception as exc:
-        session.feedback = [
-            f"前回の呼び出しが失敗した: {type(exc).__name__}: {exc}"[:500]
+    chunks: list[str] = []
+    for start, end in page.owner_ranges:
+        range_units = [
+            unit
+            for unit in units
+            if start <= unit.source_start and unit.source_end <= end
         ]
-        write_text_atomic(
-            session.task_dir / f"{stem}-attempt-{attempt:02d}-error.txt",
-            session.feedback[0] + "\n",
-        )
-        if attempt >= max(1, config.write_attempts):
-            _finish(session, lines=lines, policy=policy, on_progress=on_progress)
-            return "done"
-        return "retry"
+        chunks.append(wiki._verbatim_section(lines, start, end, range_units).rstrip())
+    return "\n\n".join(chunks).rstrip() + "\n"
 
-    draft = normalize_draft(raw)
-    draft = re.sub(r"`+(\[\[NEO-IMAGE:[A-Za-z0-9_-]+\]\])`+", r"\1", draft)
-    draft = PLACEHOLDER_RE.sub(
-        lambda match: match.group(0)
-        if match.group(0) in session.placeholders
-        else "",
-        draft,
+
+def _prepare_session(
+    page: Any,
+    *,
+    pages: Sequence[Any],
+    lines: list[str],
+    units: Sequence[Any],
+    config: Any,
+    work_root: Path,
+    wiki_root: Path,
+    state_root: Path,
+    source_path: Path,
+) -> _GenerationSession:
+    from graph.wiki import pipeline as wiki
+
+    if not page.owner_ranges:
+        raise wiki.PipelineError(f"page {page.number} has no source range")
+    page_units = wiki._page_units(page, units)
+    raw_source = wiki._prompt_safe(
+        "\n\n".join(
+            slice_text(lines, start, end) for start, end in page.owner_ranges
+        ),
+        page_units,
     )
-    draft = wiki._preserve_image_placeholders(draft, session.units, lines)
-    write_text_atomic(cached_draft, draft)
-    errors = check_section(
-        draft,
-        lines=lines,
-        source_text=session.source_text,
-        block_ranges=(),
-        placeholders=session.placeholders,
-        facts=session.facts,
-        check_identifiers=config.source_kind not in {"csv", "xlsx"},
-        tokens=policy.code_tokens,
+    if not raw_source.strip():
+        raise wiki.PipelineError(
+            f"page {page.number}: source is empty; check conversion/extraction before writing the wiki"
+        )
+    first_line = min(start for start, _end in page.owner_ranges)
+    previous_start = max(0, first_line - 1 - 50)
+    context = recent_writer_context(
+        page=page,
+        pages=pages,
+        previous_source=wiki._prompt_safe(
+            "\n".join(lines[previous_start:first_line - 1]), units
+        ),
     )
-    if errors:
-        session.candidates.append(
-            wiki._SectionCandidate(draft, attempt, errors=errors)
-        )
-        session.feedback = errors
-        wiki._emit(
-            on_progress,
-            "write",
-            "section_retry",
-            page=session.page.title,
-            section=session.index,
-            attempt=attempt,
-            error="; ".join(errors)[:300],
-        )
-        if attempt >= max(1, config.write_attempts):
-            _finish(session, lines=lines, policy=policy, on_progress=on_progress)
-            return "done"
-        return "retry"
+    task_dir = work_root / f"page-{page.number:03d}"
+    prompt_page = _PageInput(
+        document=str(source_path),
+        number=page.number,
+        filename=page.filename,
+        owner_ranges=list(page.owner_ranges),
+        reference_ranges=[],
+        original_text="",
+        shell=_PageShell(page.title, "", ""),
+        masked_body="",
+        images=[_ImageSlot(unit.placeholder, unit.raw) for unit in page_units],
+        owner_evidence=wiki._numbered_source(
+            lines, page.owner_ranges, page_units
+        ),
+        reference_evidence="（なし）",
+        allowed_source=raw_source,
+        context=context,
+        page_path=wiki_root / page.filename,
+        state_path=wiki._page_state_path(state_root, page),
+        state={},
+        guidance=list(config.human_guidance.get(page.filename, ())),
+        has_initial_candidate=False,
+    )
+    return _GenerationSession(
+        page=page,
+        prompt_page=prompt_page,
+        page_units=page_units,
+        task_dir=task_dir,
+        raw_source=raw_source,
+    )
 
-    session.pending_draft = draft
-    return "candidate"
+
+def _clean_generation_images(
+    body: str,
+    session: _GenerationSession,
+    *,
+    lines: Sequence[str],
+) -> str:
+    """Keep only this page's opaque image tags, exactly once each."""
+
+    from graph.wiki import pipeline as wiki
+
+    expected = {unit.placeholder for unit in session.page_units}
+    body = re.sub(r"`+(\[\[NEO-IMAGE:[A-Za-z0-9_-]+\]\])`+", r"\1", body)
+    body = PLACEHOLDER_RE.sub(
+        lambda match: match.group(0) if match.group(0) in expected else "",
+        body,
+    )
+    return wiki._preserve_image_placeholders(body, session.page_units, lines)
 
 
-async def _judge_candidate(
-    session: SectionSession,
+async def _generate_page(
+    session: _GenerationSession,
     *,
     lines: Sequence[str],
     model: Any,
     config: Any,
-    policy: Any,
     stop_check: Any,
     on_progress: Any,
-) -> str:
+) -> _GenerationOutcome:
+    """Run writer -> judge retries and retain the best judged page candidate."""
+
     from graph.wiki import pipeline as wiki
 
-    draft = session.pending_draft
-    if draft is None:
-        raise wiki.PipelineError("writer pass completed without a section candidate")
-    session.pending_draft = None
-    original = session.numbered
-    if session.facts:
-        original += (
-            "\n\n--- 他ページから追加した事実（必ず反映） ---\n"
-            + session.facts_text
+    page = session.page
+    prompt_page = session.prompt_page
+    fallback = _source_body(page, lines=lines, units=session.page_units)
+    if model is None:
+        return _GenerationOutcome(
+            session,
+            page.title,
+            fallback,
+            0,
+            errors=["model unavailable"],
+            verbatim=True,
         )
-    judgment, _attempts, error = await wiki._structured_with_artifacts(
-        schema=PageJudgeResult,
-        prompt=wiki.page_judge_prompt(
-            page_title=f"{session.page.title}（節 {session.index}/{session.count}）",
-            owner_ranges=f"{session.start}-{session.end}",
-            numbered_original=original,
-            candidate=draft,
-            output_language=config.output_language,
-            policy_rules=policy.wiki_prompt_rules("judge"),
-        ),
-        model=judge_model(model),
-        output_dir=session.task_dir,
-        stem=f"section-{session.index:02d}-judge-{session.attempt:02d}",
-        attempts=config.judge_attempts,
-        max_output_tokens=config.judge_max_output_tokens,
-        stop_check=stop_check,
-        retry_temperature=getattr(config, "retry_temperature", 0.7),
+
+    current_title = page.title
+    current_body = ""
+    feedback: list[str] = []
+    feedback_history: list[str] = []
+    best_title = page.title
+    best_body = ""
+    best_verdict: RepairJudgeResult | None = None
+    best_rank = (-1, -10**9, -1)
+    errors: list[str] = []
+    max_attempts = min(
+        MAX_REWRITE_ATTEMPTS,
+        max(1, int(getattr(config, "write_attempts", MAX_REWRITE_ATTEMPTS))),
     )
-    if judgment is None:
-        session.candidates.append(
-            wiki._SectionCandidate(
-                draft,
-                session.attempt,
-                errors=[error or "judge unavailable"] if policy.strict_judge else [],
+
+    wiki._emit(
+        on_progress,
+        "writer",
+        "page_start",
+        page=page.title,
+        current=0,
+        total=0,
+    )
+    for attempt in range(1, max_attempts + 1):
+        if stop_check and stop_check():
+            raise asyncio.CancelledError("page writing cancelled")
+        try:
+            candidate_title, candidate_body = await _writer(
+                prompt_page,
+                current_title,
+                current_body,
+                feedback,
+                model=writer_model(model),
+                attempt=attempt,
+                earlier_feedback=[
+                    item for item in feedback_history if item not in feedback
+                ],
+                artifacts=session.artifacts,
             )
+        except Exception as exc:
+            error = f"writer unavailable: {type(exc).__name__}: {exc}"[:1000]
+            errors.append(error)
+            feedback = [error]
+            feedback_history.extend(
+                item for item in feedback if item not in feedback_history
+            )
+            continue
+
+        candidate_body = _clean_generation_images(
+            candidate_body, session, lines=lines
         )
+        image_errors = _image_errors(
+            prompt_page, candidate_title, candidate_body
+        )
+        if image_errors:
+            errors.extend(image_errors)
+            feedback = image_errors
+            feedback_history.extend(
+                item for item in feedback if item not in feedback_history
+            )
+            current_title, current_body = candidate_title, candidate_body
+            continue
+
+        verdict, judge_error = await _judge(
+            prompt_page,
+            candidate_title,
+            candidate_body,
+            model=judge_model(model),
+            stem=f"rewrite-{attempt:02d}-judge",
+            artifacts=session.artifacts,
+        )
+        current_title, current_body = candidate_title, candidate_body
+        if verdict is None:
+            error = "judge unavailable: " + (judge_error or "unknown error")
+            errors.append(error)
+            feedback = [error]
+            feedback_history.extend(
+                item for item in feedback if item not in feedback_history
+            )
+            continue
+
+        rank = _judge_rank(verdict, attempt=attempt)
+        if rank > best_rank:
+            best_title = candidate_title
+            best_body = candidate_body
+            best_verdict = verdict
+            best_rank = rank
+        wiki._emit(
+            on_progress,
+            "writer",
+            "page_judged",
+            page=page.title,
+            attempt=attempt,
+            score=verdict.coverage_score,
+            approved=_approved(verdict),
+        )
+        if _approved(verdict):
+            break
+        feedback = _feedback(verdict)
+        feedback_history.extend(
+            item for item in feedback if item not in feedback_history
+        )
+
+    if best_verdict is None:
         wiki._emit(
             on_progress,
             "write",
-            "judge_unavailable",
-            page=session.page.title,
-            section=session.index,
-            attempt=session.attempt,
-            error=error,
+            "page_verbatim",
+            page=page.title,
+            error="; ".join(errors)[-500:],
         )
-        _finish(session, lines=lines, policy=policy, on_progress=on_progress)
-        return "done"
+        return _GenerationOutcome(
+            session,
+            page.title,
+            fallback,
+            max_attempts,
+            errors=errors or ["no judged candidate"],
+            verbatim=True,
+        )
 
-    missing = wiki._judge_feedback(judgment)
-    defects = [item.strip() for item in judgment.defects if item and item.strip()]
-    session.candidates.append(
-        wiki._SectionCandidate(
-            draft,
-            session.attempt,
-            score=judgment.coverage_score,
-            missing=missing,
-            defects=defects,
-        )
+    return _GenerationOutcome(
+        session,
+        best_title,
+        append_low_coverage_source(
+            best_body, session.raw_source, best_verdict.coverage_score
+        ),
+        max_attempts if not _approved(best_verdict) else best_rank[2],
+        verdict=best_verdict,
+        errors=errors,
     )
-    wiki._emit(
-        on_progress,
-        "write",
-        "section_judged",
-        page=session.page.title,
-        section=session.index,
-        attempt=session.attempt,
-        score=judgment.coverage_score,
-        missing=len(missing),
-        defects=len(defects),
-    )
-    if not missing and not defects:
-        _finish(session, lines=lines, policy=policy, on_progress=on_progress)
-        return "done"
-    session.feedback = missing + [f"品質: {item}" for item in defects]
-    if session.attempt >= max(1, config.write_attempts):
-        _finish(session, lines=lines, policy=policy, on_progress=on_progress)
-        return "done"
-    return "retry"
 
 
 async def rewrite_pending_pages(
@@ -373,256 +345,142 @@ async def rewrite_pending_pages(
     on_progress: Any,
     parents: dict[str, str] | None,
 ) -> None:
-    """Write every pending section, then judge every candidate, until complete."""
+    """Create whole pages with the repair writer/judge, then commit serially."""
 
-    del source_line_count
-    from graph.formats.context import context_block
+    del source_line_count, parents
     from graph.wiki import pipeline as wiki
 
     policy = policy_of(config)
-    sessions_by_page: dict[int, list[SectionSession]] = {}
-    queue: list[SectionSession] = []
-    small = config.skip_excel_and_small and is_small_document("\n".join(lines))
-    for page in pending:
-        if len(page.owner_ranges) != 1:
-            raise wiki.PipelineError(
-                f"page {page.number} must own one contiguous range"
-            )
-        page_start, page_end = page.owner_ranges[0]
-        task_dir = work_root / f"page-{page.number:03d}"
-        task_dir.mkdir(parents=True, exist_ok=True)
-        ranges = (
-            [(page_start, page_end)]
-            if small
-            else split_sections(
-                lines,
-                page_start,
-                page_end,
-                target=config.section_target_lines,
-                min_lines=config.section_min_lines,
-            )
+    sessions = [
+        _prepare_session(
+            page,
+            pages=pages,
+            lines=lines,
+            units=units,
+            config=config,
+            work_root=work_root,
+            wiki_root=wiki_root,
+            state_root=state_root,
+            source_path=source_path,
         )
-        wiki._emit(
-            on_progress,
-            "writer",
-            "page_start",
-            page=page.title,
-            current=0,
-            total=len(pages),
-        )
-        page_sessions: list[SectionSession] = []
-        for index, (start, end) in enumerate(ranges, start=1):
-            section_units = [
-                unit
-                for unit in units
-                if start <= unit.source_start and unit.source_end <= end
-            ]
-            session = SectionSession(
-                page=page,
-                start=start,
-                end=end,
-                index=index,
-                count=len(ranges),
-                facts=[],
-                units=section_units,
-                placeholders=[unit.placeholder for unit in section_units],
-                numbered=wiki._numbered_source(lines, [(start, end)], section_units),
-                source_text=wiki._prompt_safe(
-                    slice_text(lines, start, end), section_units
-                ),
-                facts_text="なし",
-                task_dir=task_dir,
-                context=context_block(page, pages, parents or {}),
-            )
-            if model is None:
-                session.result = wiki._SectionResult(
-                    markdown=wiki._verbatim_section(lines, start, end, section_units),
-                    attempts=0,
-                    errors=["model unavailable"],
-                    verbatim=True,
-                )
-            else:
-                queue.append(session)
-            page_sessions.append(session)
-        sessions_by_page[page.number] = page_sessions
+        for page in pending
+    ]
 
-    committed = {item.page.number for item in results}
-
-    def commit_ready() -> None:
-        for page in pending:
-            if page.number in committed:
-                continue
-            sessions = sessions_by_page[page.number]
-            if any(session.result is None for session in sessions):
-                continue
-            section_results = [session.result for session in sessions]
-            body = "\n\n".join(
-                policy.section(item.markdown).rstrip()
-                for item in section_results
-                if item is not None
-            )
-            markdown = f"# {page.title}\n\n{body}\n"
-            masked, unmask = policy.mask_for_linking(markdown)
-            markdown = unmask(
-                wiki.link_titles(
-                    masked,
-                    [
-                        (other.title, other.filename)
-                        for other in pages
-                        if other.number != page.number
-                    ],
-                )
-            )
-            markdown += wiki._nav_footer(page, pages)
-            restored, unresolved = wiki.restore_images(
-                markdown, wiki._page_units(page, units)
-            )
-            if unresolved:
-                raise wiki.PipelineError(
-                    f"page {page.number} has unresolved image placeholders: {unresolved}"
-                )
-            page.reference_ranges = []
-            completed = [item for item in section_results if item is not None]
-            result = wiki.RewriteResult(
-                page=page,
-                markdown=wiki.strip_reader_references(restored),
-                attempts=sum(item.attempts for item in completed),
-                judge_score=min(
-                    (item.score for item in completed if item.score is not None),
-                    default=None,
-                ),
-                missing_important_information=[
-                    f"原文 {session.start}-{session.end}行: {item}"
-                    for session in sessions
-                    for item in session.result.missing
-                ],
-                defects=[
-                    f"原文 {session.start}-{session.end}行: {item}"
-                    for session in sessions
-                    for item in session.result.defects
-                ],
-                verbatim_sections=[
-                    f"原文 {session.start}-{session.end}行: "
-                    + "; ".join(session.result.errors)
-                    for session in sessions
-                    if session.result.verbatim
-                ],
-            )
-            results.append(result)
-            committed.add(page.number)
-            write_text_atomic(wiki_root / page.filename, result.markdown)
-            wiki._write_page_state(
-                wiki._page_state_path(state_root, page),
-                result,
-                rewrite_version=rewrite_version,
-                pages=pages,
-                source_path=source_path,
-                source_snapshot_path=source_snapshot_path,
-                source_sha256=source_sha256,
-            )
-            wiki._emit(
-                on_progress,
-                "writer",
-                "page_done",
-                page=page.title,
-                total=len(pages),
-            )
-            wiki._emit(
-                on_progress,
-                "rewrite",
-                "page_done",
-                current=len(results),
-                total=len(pages),
-                page=page.title,
-                attempts=result.attempts,
-                score=result.judge_score,
-                verbatim_sections=len(result.verbatim_sections),
-            )
-
-    commit_ready()
-    concurrency = max(1, int(config.rewrite_concurrency))
-    pass_number = 1
-    while queue:
-        current = queue
-        retry: list[SectionSession] = []
-        candidates: list[SectionSession] = []
-        wiki._emit(
-            on_progress,
-            "writer",
-            "writer_pass_started",
-            pass_number=pass_number,
-            sections=len(current),
-            concurrency=concurrency,
-        )
-        async def write_one(session: SectionSession) -> str:
-            return await _write_candidate(
+    async def generate(session: _GenerationSession) -> _GenerationOutcome:
+        try:
+            return await _generate_page(
                 session,
                 lines=lines,
                 model=model,
                 config=config,
-                policy=policy,
                 stop_check=stop_check,
                 on_progress=on_progress,
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            fallback = _source_body(
+                session.page, lines=lines, units=session.page_units
+            )
+            error = f"{type(exc).__name__}: {exc}"[:1000]
+            session.artifacts.append(_Artifact("generation-error.txt", error + "\n"))
+            return _GenerationOutcome(
+                session,
+                session.page.title,
+                fallback,
+                0,
+                errors=[error],
+                verbatim=True,
+            )
 
-        actions = await bounded_map(current, concurrency, write_one)
-        for session, action in zip(current, actions):
-            if action == "candidate":
-                candidates.append(session)
-            elif action == "retry":
-                retry.append(session)
+    outcomes = await bounded_map(
+        sessions,
+        max(1, int(config.rewrite_concurrency)),
+        generate,
+    )
+
+    # Final titles must be known before cross-page links and navigation are made.
+    for outcome in outcomes:
+        page = outcome.session.page
+        previous_title = page.title
+        page.title = outcome.title
+        if page.path and page.path[-1] == previous_title:
+            page.path[-1] = outcome.title
+
+    for outcome in outcomes:
+        session = outcome.session
+        page = session.page
+        _write_artifacts(session.task_dir, session.artifacts)
+        body = policy.section(outcome.body).rstrip()
+        markdown = f"# {page.title}\n\n{body}\n"
+        masked, unmask = policy.mask_for_linking(markdown)
+        markdown = unmask(
+            wiki.link_titles(
+                masked,
+                [
+                    (other.title, other.filename)
+                    for other in pages
+                    if other.number != page.number
+                ],
+            )
+        )
+        markdown += wiki._nav_footer(page, pages)
+        restored, unresolved = wiki.restore_images(markdown, session.page_units)
+        if unresolved:
+            raise wiki.PipelineError(
+                f"page {page.number} has unresolved image placeholders: {unresolved}"
+            )
+        page.reference_ranges = []
+        verdict = outcome.verdict
+        defects = []
+        missing = []
+        if verdict is not None:
+            defects = [
+                *[f"タイトル: {item}" for item in verdict.title_defects],
+                *[f"本文: {item}" for item in verdict.body_defects],
+            ]
+            missing = list(verdict.missing_important_information)
+        result = wiki.RewriteResult(
+            page=page,
+            markdown=wiki.strip_reader_references(restored),
+            attempts=outcome.attempts,
+            judge_score=(verdict.coverage_score if verdict is not None else None),
+            missing_important_information=missing,
+            defects=defects,
+            verbatim_sections=(
+                ["ページ全体: " + "; ".join(outcome.errors)]
+                if outcome.verbatim
+                else []
+            ),
+        )
+        results.append(result)
+        write_text_atomic(wiki_root / page.filename, result.markdown)
+        wiki._write_page_state(
+            wiki._page_state_path(state_root, page),
+            result,
+            rewrite_version=rewrite_version,
+            pages=pages,
+            source_path=source_path,
+            source_snapshot_path=source_snapshot_path,
+            source_sha256=source_sha256,
+        )
         wiki._emit(
             on_progress,
             "writer",
-            "writer_pass_done",
-            pass_number=pass_number,
-            sections=len(current),
-            candidates=len(candidates),
+            "page_done",
+            page=page.title,
+            total=len(pages),
         )
-
-        if candidates:
-            wiki._emit(
-                on_progress,
-                "writer",
-                "judge_pass_started",
-                pass_number=pass_number,
-                sections=len(candidates),
-                concurrency=concurrency,
-            )
-            async def judge_one(session: SectionSession) -> str:
-                return await _judge_candidate(
-                    session,
-                    lines=lines,
-                    model=model,
-                    config=config,
-                    policy=policy,
-                    stop_check=stop_check,
-                    on_progress=on_progress,
-                )
-
-            actions = await bounded_map(candidates, concurrency, judge_one)
-            retry.extend(
-                session
-                for session, action in zip(candidates, actions)
-                if action == "retry"
-            )
-            wiki._emit(
-                on_progress,
-                "writer",
-                "judge_pass_done",
-                pass_number=pass_number,
-                sections=len(candidates),
-                retry=len(retry),
-            )
-        commit_ready()
-        queue = retry
-        pass_number += 1
-
-    commit_ready()
-    unfinished = [page.filename for page in pending if page.number not in committed]
-    if unfinished:
-        raise RuntimeError(
-            "fast writer/judge passes left unfinished pages: " + ", ".join(unfinished)
+        wiki._emit(
+            on_progress,
+            "rewrite",
+            "page_done",
+            current=len(results),
+            total=len(pages),
+            page=page.title,
+            attempts=result.attempts,
+            score=result.judge_score,
+            verbatim_sections=len(result.verbatim_sections),
         )
 
 

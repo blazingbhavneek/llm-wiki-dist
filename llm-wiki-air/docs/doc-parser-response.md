@@ -30,6 +30,7 @@ Supported query parameters:
 |---|---:|---|
 | `images` | `true` | Include extracted image media in each image unit |
 | `describe_images` | `true` | Ask the parser's configured vision model to describe images |
+| `pdf_client` | `docling` | PDF extraction backend (`docling` or `mineru`) |
 
 The llm-wiki client does not forward its wiki chat settings to the parser. The
 parser uses its own server-side configuration for image descriptions. Other
@@ -154,8 +155,9 @@ so the service does not invent page divisions.
 
 ## PDF
 
-PDF is parsed by MinerU. The exact Markdown depends on the PDF's detected
-layout and can include headings, paragraphs, formulas, tables, and image units.
+PDF is parsed by Docling by default. The exact Markdown depends on the PDF's
+detected layout and can include headings, paragraphs, formulas, tables, and
+image units. This client explicitly selects Docling for every PDF request.
 
 Typical page entry:
 
@@ -169,14 +171,14 @@ Page text and tables.
 </image-unit>
 ```
 
-`pages` normally contains one entry per PDF page, derived from MinerU's
-`content_list.json` page indexes or explicit page markers. The same image-unit
-processing is applied to both `markdown` and `pages`.
+`pages` normally contains one entry per PDF page, derived from the selected
+backend's page indexes or explicit page markers. The same image-unit processing
+is applied to both `markdown` and `pages`.
 
-If MinerU produces no usable page metadata or markers, the llm-wiki endpoint
-falls back to one entry containing the complete processed Markdown. Therefore,
-consumers must not assume that `pages.length` equals the physical PDF page
-count in every response.
+If the selected backend produces no usable page metadata or markers, the
+llm-wiki endpoint falls back to one entry containing the complete processed
+Markdown. Therefore, consumers must not assume that `pages.length` equals the
+physical PDF page count in every response.
 
 ## PPTX
 
