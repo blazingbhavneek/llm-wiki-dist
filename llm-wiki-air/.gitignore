@@ -46,3 +46,7 @@ data_big_backup/
 data_big_backup2/
 data_big_backup3/
 data_backups/
+# Recreated for the localhost GROWI; mount-docs.ini holds a credential.
+configs/mount-docs.ini
+configs/mount-docs-fast.ini
+configs/mount-docs-hc.ini

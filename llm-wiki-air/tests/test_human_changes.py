@@ -145,6 +145,53 @@ class RebaseTest(unittest.TestCase):
         self.assertEqual(one(BASE, human, BASE, model=NoModel())[0], human)
         self.assertEqual(one(BASE, human, BASE.replace("Unchanged.", "Source v2."), model=NoModel())[0],
                          human.replace("Unchanged.", "Source v2."))
+        reordered = "# Page\n\nIntro.\n\n## Other\n\nUnchanged.\n\n## Limits\n\nMaximum is 40°C.\nMode is AUTO.\n"
+        self.assertEqual(one(BASE, reordered, BASE, model=NoModel())[0], reordered)
+
+    def test_a_repeated_line_never_carries_a_change_to_another_section(self):
+        old = "# A\n\n## S1\n\nMode is AUTO.\n\n## S2\n\nMode is AUTO.\n\n## S3\n\nend\n"
+        human = old.replace("## S2\n\nMode is AUTO.", "## S2\n\nMode is MANUAL.")
+        new = old.replace("## S2\n\nMode is AUTO.\n\n", "")  # the source deletes S2
+        text, entries = one(old, human, new, model=FakeModel([{"edits": [], "appendix": "Mode is MANUAL.\n"}]))
+        self.assertEqual(text, new)  # S1 keeps its own value
+        self.assertIn("Mode is MANUAL.", entries[0])
+        _text, entries = one(old, human, new, model=FakeModel([{"edits": [], "appendix": "## S2\n\nMode is MANUAL.\n"}]))
+        self.assertEqual(entries[0].count("## S2"), 1)  # the model's own heading is not doubled
+
+    def test_a_blank_line_left_by_a_human_does_not_freeze_a_source_change(self):
+        old, new = "# T\n\n- a 25\n- b\n", "# T\n\n- a 26\n- b\n"
+        human = "# T\n\n- a 25\n\n- b\n"  # what an insert-then-delete in the editor leaves behind
+        self.assertEqual(one(old, human, new, model=NoModel())[0], new)
+
+    def test_a_section_added_before_a_heading_survives_a_rewording_without_a_note(self):
+        old = "# T\n\n## A\n\nOld wording of a.\n\n## B\n\nb\n"
+        human = old.replace("## B", "## Human section\n\nHuman text 77.\n\n## B")
+        new = old.replace("Old wording of a.", "New wording of a.")
+        self.assertEqual(one(old, human, new, model=NoModel())[0], new.replace("## B", "## Human section\n\nHuman text 77.\n\n## B"))
+
+    def test_independent_windows_merge_in_parallel(self):
+        import threading
+        import time
+
+        class Parallel(FakeModel):
+            active = peak = 0
+            lock = threading.Lock()
+
+            def merge(self, *args):
+                with self.lock:
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+                time.sleep(0.2)
+                with self.lock:
+                    self.active -= 1
+                return {"edits": [{"find": "Maximum is 55°C.\n",
+                                   "replace": "Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\n"}], "appendix": ""}
+
+        model, new = Parallel(), BASE.replace("40", "55")
+        pages, _ = rebase({"a.md": BASE, "b.md": BASE}, {"a.md": HUMAN, "b.md": HUMAN}, {"a.md": new, "b.md": new},
+                          model=model, concurrency=4)
+        self.assertEqual(model.peak, 2)
+        self.assertTrue(all("Maximum is 60°C.\n（元文書の更新: Maximum is 55°C.）\n" in text for text in pages.values()))
 
     def test_source_deletes_a_changed_section_or_page_into_the_appendix_once(self):
         stats = Counter()
@@ -546,7 +593,7 @@ class IdentityAndDeleteTest(StoreCase):
 
     def _ledger(self, source_id):
         write_json_atomic(self.project.metadata / "pipeline.json",
-                          {"sources": {"doc.md": {"raw_rel": self.rel, "source_id": source_id, "id_seed": "source-1"}}})
+                          {"schema_version": 4, "sources": {"doc.md": {"raw_rel": self.rel, "source_id": source_id, "id_seed": "source-1"}}})
 
     def test_a_different_source_at_the_same_path_inherits_nothing_and_is_blocked_by_human_text(self):
         self._ledger("src-1")
@@ -567,12 +614,25 @@ class IdentityAndDeleteTest(StoreCase):
         self.generate({"001.md": BASE})
         self.assertEqual(self.text(), BASE)
 
-    def test_a_moved_document_keeps_its_state(self):
+    def test_a_moved_document_keeps_its_state_and_a_new_source_at_the_old_path_inherits_nothing(self):
         self._ledger("src-1")
         self.pull(HUMAN)
         key = self.store.identity(self.rel)[0]
-        self.assertEqual(self.store.identity(self.rel)[0], key)
-        self.assertEqual(read_json(self.store._dir(self.rel) / "doc.json")["raw_rel"], self.rel)
+        (Path(self.tmp.name) / "mount").mkdir()
+        settings = SimpleNamespace(data_root=self.tmp.name, target_name="project",
+                                   mount_path=str(Path(self.tmp.name) / "mount"), wiki_linker_enabled=False)
+        publisher = SimpleNamespace(connection=SimpleNamespace(write_path="/docs"), move_document=lambda *args: {})
+        job = SimpleNamespace(from_rel="doc.md", rel="moved.md", raw_rel="moved_md.md", target_sha256="", target_blob_oid="")
+        with patch.object(pipeline, "_publisher", return_value=publisher), \
+             patch("publisher.index.build_index", return_value={"failures": []}):
+            self.assertEqual(pipeline.move_sources(settings, [job])["failures"], [])
+        self.assertEqual(self.store.identity("moved_md.md")[0], key)
+        self.assertEqual(self.store.state("moved_md.md")["raw_rel"], "moved_md.md")
+        self.folder.mkdir()
+        self.project.raw_file(self.rel).write_text("another source\n", encoding="utf-8")
+        writer.write_source_stamp(self.folder, self.project.raw_file(self.rel), self.rel, identity_seed="src-2")
+        self.generate({"001.md": BASE})  # not blocked by the moved document's human text
+        self.assertIsNone(self.store.state(self.rel))
 
     def test_deleting_a_document_with_human_information_is_blocked_but_not_with_only_deletions(self):
         self.store.assert_deletable(self.rel)
@@ -677,6 +737,12 @@ class PublicationSafetyTest(unittest.TestCase):
                                          mode="attach", write_path="/docs", expected_pages={"doc/001.md": {"page_id": "p1", "revision_id": "r0", "marker_id": "b1"}}))
         self.assertTrue(pages[0].body.endswith(tail))
 
+    def test_publication_keeps_human_comments_and_drops_machine_comments(self):
+        from graph.growi.client import _growi_markdown
+
+        self.assertEqual(_growi_markdown('a <!-- human note --> b\n<!-- table-spec: {"x": 1} -->\n'),
+                         "a <!-- human note --> b\n\n")
+
     def test_untracked_human_revision_is_not_adopted_as_bot_output(self):
         class Client:
             async def get_page(self, **kwargs):
@@ -717,7 +783,7 @@ class PublicationSafetyTest(unittest.TestCase):
                 calls.append("generate-and-overlay")
                 return writer.WriteResult(target=Path(tmp), touched=[])
             def publish(*args, **kwargs):
-                self.assertTrue(kwargs["captured"])
+                self.assertFalse(kwargs.get("captured"))  # publication pulls again: edits made during the build
                 calls.append("publish")
                 return []
             with (patch.object(pipeline, "_publisher", return_value=object()),
@@ -1036,6 +1102,8 @@ class PartialPublicationTest(unittest.TestCase):
                         raise GrowiAPIError(409, "DELETE", "/page")
                 for page_id in revisions:
                     del self.pages[page_id]
+            async def revision_bodies(self, page_id, limit=100):
+                return [self.pages[page_id].body]  # a rejected write never became a revision
 
         client = Client()
         publisher = GrowiPublisher(client, SimpleNamespace(write_path="/docs", root_path="/docs", mode="attach"))
@@ -1083,6 +1151,28 @@ class PartialPublicationTest(unittest.TestCase):
         for name, text in pages.items():
             write_text_atomic(folder / name, text)
         apply_generated(live, self.raw_rel)
+
+    def test_moving_a_document_when_growi_moves_child_pages_with_the_document_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live, folder, _store, client, publisher, _settings, rows = self._harness(tmp)
+            old_doc = publisher.doc_path(live, self.raw_rel)
+            client.pages["root"] = GrowiPage(page_id="root", revision_id="r0", path=old_doc, body="")
+
+            async def rename_page(page_id, revision_id, path, recursively=False):
+                if any(page.path == path for page in client.pages.values()):
+                    raise GrowiAPIError(409, "PUT", "/pages/rename")
+                old = client.pages[page_id].path
+                for page in client.pages.values():  # like GROWI: the children move too
+                    if page.path == old or page.path.startswith(old + "/"):
+                        page.path = path + page.path[len(old):]
+                return client.copy(client.pages[page_id])
+
+            client.rename_page = rename_page
+            shutil.move(str(folder), str(live.wiki_dir("moved_md.md")))  # move_sources moves the folder first
+            moved = publisher.move_document(live, self.raw_rel, "moved_md.md", rows)
+            new_doc = publisher.doc_path(live, "moved_md.md")
+            self.assertEqual(sorted(page.page_id for page in moved.values()), ["p1", "p2"])
+            self.assertTrue(all(client.pages[p].path.startswith(new_doc + "/") for p in ("p1", "p2")))
 
     def test_unrecorded_published_page_is_not_captured_as_a_human_edit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1143,6 +1233,52 @@ class PartialPublicationTest(unittest.TestCase):
             self.assertEqual(published["page_id"], "p3")
             self.assertEqual(client.pages["p3"].body.count("55°C"), 1)
             self.assertIsNone(store.state(self.raw_rel))
+
+    def test_an_edit_saved_during_generation_is_captured_before_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live, _folder, _store, client, publisher, settings, _rows = self._harness(tmp)
+            (live.mount / "doc.md").write_text("changed source\n", encoding="utf-8")
+
+            def rebuild(**kwargs):
+                docs = Path(kwargs["out_dir"]) / "docs"
+                docs.mkdir(parents=True)
+                for name in ("001.md", "002.md"):
+                    write_text_atomic(docs / name, self.bot)
+                page = client.pages["p1"]  # a human saves while the document is being generated
+                page.body, page.revision_id = page.body.replace("Mode is AUTO.", "Mode is MANUAL."), "human-during-build"
+                return SimpleNamespace(out_dir=Path(kwargs["out_dir"]))
+
+            with (patch.object(pipeline, "_publisher", return_value=publisher),
+                  patch.object(pipeline, "_model", return_value=object()),
+                  patch.object(pipeline, "Embedder", return_value=object()),
+                  patch.object(pipeline, "_parse", return_value="changed source\n"),
+                  patch.object(writer, "build_wiki_output", side_effect=rebuild),
+                  patch("publisher.index.build_index", return_value={"failures": []})):
+                self.assertEqual(pipeline.sync_once(settings, only=["doc.md"])["failures"], [])
+            self.assertIn("Mode is MANUAL.", client.pages["p1"].body)
+            self.assertIn("55°C", client.pages["p1"].body)
+
+    def test_a_lost_create_recorded_without_a_revision_is_recovered_before_preflight(self):
+        from publisher.ledger import save_ledger
+
+        with tempfile.TemporaryDirectory() as tmp:
+            live, _folder, _store, client, publisher, settings, _rows = self._harness(tmp, ledgered=())
+            ledger = self._ledger(live)
+            ledger.published_documents.clear()  # a new document
+            save_ledger(live.metadata / "pipeline.json", ledger)
+            client.lose_response = "create"
+            self.assertTrue(self._publish(publisher, settings)["failures"])
+            created = next(iter(client.pages.values()))
+            path = next(p for p in (f"{self.document}/001.md", f"{self.document}/002.md")
+                        if publisher.page_marker_id(live, p) in created.body)
+            ledger = self._ledger(live)  # what inventory records for an exact prepared create
+            ledger.published_pages[path] = {"growi_path": created.path, "page_id": created.page_id, "revision_id": "",
+                                            "marker_id": publisher.page_marker_id(live, path)}
+            save_ledger(live.metadata / "pipeline.json", ledger)
+            client.lose_response = ""
+            self.assertFalse(self._publish(publisher, settings)["failures"])
+            self.assertEqual(len(client.pages), 2)  # the lost create was adopted, not duplicated
+            self.assertEqual(self._ledger(live).published_pages[path]["revision_id"], created.revision_id)
 
     def test_human_edit_on_an_unledgered_created_page_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1211,6 +1347,23 @@ class PartialPublicationTest(unittest.TestCase):
             self.assertFalse(self._publish(publisher, settings)["failures"])
             self.assertIn("Mode is MANUAL.", client.pages["p2"].body)
 
+    def test_human_edit_on_a_page_whose_publish_got_an_error_is_applied_on_the_newer_local_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live, folder, _store, client, publisher, settings, _rows = self._harness(tmp)
+            self._regenerate(live, folder, {"001.md": self.bot, "002.md": self.bot})
+            client.fail_update = "p2"  # 002 is answered with HTTP 500; the write never lands
+            self.assertTrue(self._publish(publisher, settings)["failures"])
+            client.pages["p2"].body = client.pages["p2"].body.replace("Mode is AUTO.", "Mode is MANUAL.")
+            client.pages["p2"].revision_id = "late-human"
+            self.assertFalse(self._pull(publisher, settings)["failures"])
+            page = (folder / "002.md").read_text(encoding="utf-8")
+            self.assertIn("Mode is MANUAL.", page)
+            self.assertEqual(page.count("55°C"), 1)  # the newer local generation stays
+            client.fail_update = ""
+            self.assertFalse(self._publish(publisher, settings)["failures"])
+            self.assertIn("Mode is MANUAL.", client.pages["p2"].body)
+            self.assertIn("55°C", client.pages["p2"].body)
+
     def test_409_race_uses_the_old_baseline_not_the_write_that_never_landed(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, folder, store, client, publisher, settings, _rows = self._harness(tmp)
@@ -1268,6 +1421,13 @@ class TransportSpellingMergeTest(unittest.TestCase):
         merged, status = merge(remote, human, local)
         self.assertEqual(status, "active")
         self.assertEqual(merged, "- 供給温度は通常 `18 °C` に設定します（夏季は 16 °C）。\n- 戻り温度が `26 °C` を超えた場合は確認する。\n")
+
+    def test_deleting_a_paragraph_whose_spelling_differs_only_in_transport_is_not_a_conflict(self):
+        # GROWI holds a blank line for the stripped comment and no backticks; the human deletes that section.
+        remote = "# T\n\nkeep hxctl status\n\n## Memo\n\n\n\nrun hxctl diag now\n\n## End\n"
+        local = "# T\n\nkeep `hxctl status`\n\n## Memo\n\n<!-- memo -->\n\nrun `hxctl diag` now\n\n## End\n"
+        human = "# T\n\nkeep hxctl status\n\n## End\n"
+        self.assertEqual(merge(remote, human, local), ("# T\n\nkeep `hxctl status`\n\n## End\n", "active"))
 
     def test_same_token_still_conflicts_inside_a_multi_line_hunk(self):
         base = "- 高温警報: 60 °C\n- 低圧警報: 0.15 MPa\n"

@@ -177,13 +177,18 @@ that map. *Blank* means whitespace only.
      2. `new_w == old_w`: replace `new_w` with `cur_w` (rules 1 and 5, and pure
         insertions).
      3. Every change in the window has a non-blank `B` that occurs exactly once,
-        line-aligned, in `new_w`, and those occurrences do not overlap: replace
-        each with its `A`.
+        line-aligned, in `old_w` and in `new_w`, and those occurrences do not
+        overlap: replace each with its `A`. (A `B` repeated in `old_w` could
+        match the other copy in `new_w`, so it goes to case 4 or 5.)
      4. `new_w` is blank and `old_w` is not (the source removed this part): add
         each non-blank `A` of the window's changes to the Appendix (3.6), and
         keep `new_w` as it is.
-     5. Otherwise: the merge call (3.5). If it fails, replace `new_w` with
-        `cur_w` followed by the source note (3.5).
+     5. `old_w` and `cur_w` differ only in whitespace (for example the blank
+        line an insert-then-delete in the editor leaves): no human text is
+        involved, so keep `new_w` as it is, with no model call.
+     6. Otherwise: the merge call (3.5). If it fails, replace `new_w` with
+        `cur_w` followed by the source note (3.5). Independent windows are merged
+        in parallel, up to the configured `concurrency`.
    - **No location:** a non-blank `A` goes to the Appendix. A blank `A` (the
      human deleted text that can no longer be found) needs nothing; no human
      information is involved.
@@ -201,8 +206,12 @@ ownership, revision, prepared-evidence, and mode checks stay as they are):
 
 1. **Transport rebase**, as today: `canonical = merge(editable(previous_remote),
    editable(remote), editable(previous_local))`, then `restore_page_links`. On
-   conflict, block the page as today. `previous_local` is the live page as
+   conflict, block the page as today. Local spelling inside text the human
+   deleted is ignored (nothing is left to restore), so deleting a paragraph with
+   inline code or a comment is not a conflict. `previous_local` is the live page as
    published (it is read from disk at publication and stored in the page record).
+   A blocked page is checked again on every pull, so it unblocks once the cause
+   is gone (page moved back, mode switched) even without a new revision.
 2. **Remove linker output.** `L` = the Markdown links `[text](url)` (not images,
    `![…](…)`) that appear in `editable(previous_local)` but not anywhere in the
    current page (`current/<page>.md`, or `_planning/pages/<page>.md` when the
@@ -257,7 +266,8 @@ there; pull now writes the current pages directly.
 ### 3.5 Model calls
 
 There are three calls. Use the existing `structured_ainvoke` and the standard
-chat configuration. Thinking stays on, there are no concurrency changes, and no
+chat configuration. Thinking stays on, merge windows run at most `concurrency`
+calls at once (the configured value; each thread has its own client), and no
 prompt is truncated: an input over 30,000 characters is not sent, and that call
 takes its fallback directly.
 
@@ -290,15 +300,20 @@ The instruction is:
 
 - apply the human's change (`old_w` → `cur_w`) to `new_w`, and keep every fact in
   `new_w`;
-- if the human and `new_w` disagree on the same fact, keep the human's version
-  and add the `new_w` value as `（元文書の更新: …）` (always this exact text, so
-  later merges can find it);
-- if they differ only in wording or formatting, keep the human's form and add no
-  note;
+- only what differs between `old_w` and `cur_w` is the human's change; text that
+  is the same in both is old source text, and `new_w`'s version of it wins with no
+  note (a window can hold lines only the source changed, because those cannot be
+  anchors; without this rule the model froze them behind notes);
+- if the human changed a fact and `new_w` changed the same fact differently, keep
+  the human's version and add the `new_w` value as `（元文書の更新: …）` (always
+  this exact text, so later merges can find it);
+- if the human's changed text and `new_w` differ only in wording or formatting,
+  keep the human's form and add no note;
 - if `cur_w` already has a `（元文書の更新: …）` note for the same fact, replace it
   rather than adding a second;
-- if `new_w` no longer contains the part the human changed, put the human's
-  changed text in `appendix` instead of the page.
+- text the human added goes into `new_w` where it belongs; only if `new_w` no
+  longer contains the text the human modified, put the human's changed lines (not
+  the unchanged ones) in `appendix` instead of the page.
 
 Before accepting a result:
 
@@ -311,7 +326,9 @@ Before accepting a result:
 **Verify.** Input: `old_w`, `cur_w`, `new_w`, the result, and `appendix`.
 Output: `{"human_kept": bool, "source_kept": bool}`. `human_kept`: every piece of
 information the human added or changed is in the result or `appendix`.
-`source_kept`: every fact in `new_w` is in the result, as text or inside a note.
+`source_kept`: every fact in `new_w` is in the result, as text or inside a note,
+and a fact the human did not change (the same in `old_w` and `cur_w`) appears with
+`new_w`'s value as text, not only in a note.
 
 If any check fails, run the merge once more with the failure reason. If that
 also fails, use the fallback: `cur_w` followed by the source note. The note is
@@ -381,8 +398,9 @@ prefixed with `> `. Either way both versions stay visible.
   has human information, because its Appendix is inside the folder being
   deleted. To let the delete proceed, remove or move that text in GROWI; the next
   pull captures it. This applies to bulk deletes too.
-- **Document move.** Nothing new: the state key is the source identity, which a
-  move keeps. `doc.json` `raw_rel` is updated on its next write.
+- **Document move.** The state key is the source identity, which a move keeps.
+  `move_sources` rewrites `doc.json` `raw_rel`, so the old path is free for a
+  different source.
 - **Different source at the same path.** It has a new key and inherits nothing.
   If another key's `doc.json` has the same `raw_rel` and holds human information,
   block the new document the same way as a delete.
@@ -428,7 +446,10 @@ fast inline linker writes links only into live `*.md` pages, never into
   A human edit made meanwhile is not lost: publication preflight rejects the
   changed revision, and the next pull captures it. It appears one sync later.
 - `--fast --repair` refuses to run while inline links are active; that is
-  unchanged.
+  unchanged. Its GROWI pull runs first; a page that fails it holds back only its
+  own document, and any other pull failure (GROWI unreachable) stops the repair.
+  A repaired document goes through `apply_generated`, so human changes are
+  re-applied to the repaired pages.
 
 ## 4. Implementation plan
 
@@ -659,11 +680,11 @@ timeout 240s $PY -m unittest -q tests.test_update_tiers
 ```
 
 These tests use fake services and are a regression gate, not live verification.
-On 2026-10-09 the first, second and fourth suites passed (67, 21 and 34 tests);
-`test_sync_fallback` timed out in
-`test_isolated_sync_finishes_builder_pass_before_linker_phase`. Resolve that
-before recording the offline gate as passed. The shadow check (4.2) uses the real
-model endpoint, and the live matrix uses the actual GROWI instance.
+On 2026-10-12 all five suites passed (77, 24, 33, 34 and 33 tests, the last
+`tests.test_fast_repair`); the work-PC `test_sync_fallback` timeout of 2026-10-09
+still needs a rerun there (a thread-import race in the same path was fixed). The
+shadow check (4.2) uses the real model endpoint, and the live matrix uses the
+actual GROWI instance; `handoff-conflicts-tests.md` has the results and runbooks.
 
 ## 7. Publication, races, and lost responses (unchanged)
 

@@ -142,6 +142,8 @@ class PlannerAhead:
     """Plan parsed documents in FIFO order, starting with the builder's next one."""
 
     def __init__(self, project: Any, settings: Any) -> None:
+        # Import here, not first in two threads at once (Python's module-lock deadlock).
+        import graph.formats, graph.wiki.page, graph.wiki.pipeline  # noqa: E401,F401
         self._queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -209,6 +211,8 @@ class LinkAhead:
     """Describe built documents' chunks for the linker while later documents build."""
 
     def __init__(self, project: Any, settings: Any, *, model: Any = None) -> None:
+        # Import here, not first in two threads at once (Python's module-lock deadlock).
+        import graph.linker.jev_judge, graph.linker.prompts, graph.linker.service  # noqa: E401,F401
         self._queue: queue.PriorityQueue = queue.PriorityQueue()
         self._order = 0
         self._stop = threading.Event()

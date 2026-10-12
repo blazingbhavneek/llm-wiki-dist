@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -168,6 +170,8 @@ def merge(base: str, human: str, source: str) -> tuple[str, str]:
     if source == base:
         return human, "active"
     h, g = _changes(base, human), _changes(base, source)
+    # Local spelling inside text the human deleted has nothing left to restore.
+    g = [r for r in g if not any(not l[2] and l[0] <= r[0] < l[1] and l[0] < r[1] <= l[1] for l in h)]
     if set(h) <= set(g):
         return source, "absorbed"
     atoms = _atomic_ranges(base)
@@ -236,12 +240,16 @@ _MERGE = (
     " Return {\"edits\": [{\"find\", \"replace\"}], \"appendix\": str}. The edits apply to NEW: every find"
     " occurs exactly once in NEW and edits do not overlap; text outside the edits is kept byte for byte.\n"
     "- Apply the human's change (OLD -> HUMAN) to NEW and keep every fact in NEW.\n"
-    f"- If the human and NEW disagree on the same fact, keep the human's version and add NEW's value as"
-    f" `（{NOTE}: …）` (always exactly this text) on its own line after it.\n"
-    "- If they differ only in wording or formatting, keep the human's form and add no note.\n"
+    "- Only what differs between OLD and HUMAN is the human's change. Text that is the same in OLD and HUMAN"
+    " is old source text: NEW's version of it wins, with no note.\n"
+    f"- If the human changed a fact and NEW changed the same fact differently, keep the human's version and"
+    f" add NEW's value as `（{NOTE}: …）` (always exactly this text) on its own line after it.\n"
+    "- If the human's changed text and NEW differ only in wording or formatting, keep the human's form and"
+    " add no note.\n"
     f"- If HUMAN already has a `（{NOTE}: …）` note for the same fact, replace it; never add a second.\n"
-    "- If NEW no longer contains the part the human changed, put the human's changed text in appendix"
-    " and leave the page text alone.\n"
+    "- Text the human added goes into NEW where it belongs. Only if NEW no longer contains the text the"
+    " human modified, put the human's changed lines (not the unchanged ones) in appendix and leave the page"
+    " text alone.\n"
     "- GUIDANCE says how the human wants this page to look; follow it.\n"
     "- FAILURE, when present, says why your previous answer was rejected; fix it." + _DATA
 )
@@ -249,7 +257,9 @@ _VERIFY = (
     "Check a merge. OLD -> HUMAN is a human edit, NEW is the source's version of the same passage,"
     " RESULT (plus APPENDIX) is the merge. Return {\"human_kept\": bool, \"source_kept\": bool}."
     " human_kept: every piece of information the human added or changed is in RESULT or APPENDIX."
-    f" source_kept: every fact in NEW is in RESULT, as text or inside a `（{NOTE}: …）` note. Be strict." + _DATA
+    f" source_kept: every fact in NEW is in RESULT, as text or inside a `（{NOTE}: …）` note, and a fact the"
+    " human did not change (the same in OLD and HUMAN) appears with NEW's value as text, not only in a note."
+    " Be strict." + _DATA
 )
 
 
@@ -258,6 +268,8 @@ class LlmHumanModel:
 
     def __init__(self, settings: Any, project: Any):
         self.settings, self.project, self._port = settings, project, None
+        self.concurrency = max(1, int(getattr(settings, "concurrency", 1)))  # parallel merge windows
+        self._local = threading.local()  # one client per thread: merges run in parallel
 
     def _ask(self, schema: type[BaseModel], system: str, data: dict[str, Any]) -> dict[str, Any]:
         from langchain_core.messages import HumanMessage, SystemMessage
@@ -267,14 +279,15 @@ class LlmHumanModel:
         from graph.wiki.model import judge_model
         from graph.workspace.writer import wiki_config
 
-        if self._port is None:
+        port = self._port or getattr(self._local, "port", None)
+        if port is None:
             config = wiki_config(self.settings, run_dir=Path(self.project.metadata) / "state" / "human-merge")
-            self._port = judge_model(policy_of(config).model_port(config))
+            port = self._local.port = judge_model(policy_of(config).model_port(config))
         messages = [
             SystemMessage(content=system),
             HumanMessage(content="<DATA>\n" + json.dumps(data, ensure_ascii=False) + "\n</DATA>"),
         ]
-        result = run_async_blocking(self._port.structured(schema, messages, max_output_tokens=8000, temperature=0.0))
+        result = run_async_blocking(port.structured(schema, messages, max_output_tokens=8000, temperature=0.0))
         return schema.model_validate(result).model_dump()
 
     def classify(self, pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
@@ -429,7 +442,7 @@ class _Index:
 
 def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
            model: Any = None, guidance: dict[str, list[str]] | None = None,
-           stats: Counter | None = None) -> tuple[dict[str, str], list[str]]:
+           stats: Counter | None = None, concurrency: int = 1) -> tuple[dict[str, str], list[str]]:
     """Re-apply the human's changes (old -> human) to ``new``; returns (pages, Appendix entries).
 
     Every argument maps page file names to text. A page missing from ``human`` is unchanged.
@@ -459,7 +472,8 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
             return
         stats["appendix"] += 1
         heading = next((l.lstrip("#").strip() for l in reversed(hlines[page][:j + 1]) if l.startswith("#")), "")
-        entry = f"## {heading or page}\n\n{text}\n\n> 元の文書では、この部分は削除されました（元ページ: {page}）\n"
+        head = "" if text.lstrip().startswith("#") else f"## {heading or page}\n\n"  # the text brings its own heading
+        entry = f"{head}{text}\n\n> 元の文書では、この部分は削除されました（元ページ: {page}）\n"
         if entry not in entries:
             entries.append(entry)
 
@@ -540,6 +554,7 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
     groups = [g for g in groups if g.changes]
 
     edits: list[_Edit2] = []
+    pool, merges = ThreadPoolExecutor(max_workers=max(1, concurrency)), []  # independent windows merge in parallel
     for g in groups:
         nl = nlines[g.q][g.lo:g.hi]
         old_w = "".join("".join(olines[p][s[0]:s[1]]) for p, s in sorted(g.spans.items()))
@@ -551,23 +566,36 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
         elif new_w == old_w:
             stats["window2"] += 1
             edits.append(_Edit2(g.q, g.lo, g.hi, _lines(cur_w), g.changes))
-        elif (spots := _spots(nl, g.changes)) is not None:
+        elif (spots := _spots(nl, g.changes, _lines(old_w))) is not None:
             stats["window3"] += 1
             edits.extend(_Edit2(g.q, g.lo + s, g.lo + s + len(c.old), c.human, [c]) for c, s in spots)
         elif not new_w.strip() and old_w.strip():
             stats["window4"] += 1
             for c in g.changes:
                 to_appendix("".join(c.human), c.page, c.j1)
+        elif old_w.split() == cur_w.split():  # the human only changed blank lines or spaces: no text to keep
+            stats["window_space"] += 1
+        elif len(g.spans) == 1 and all(not c.old and c.i1 in s[:2] for c in g.changes for s in g.spans.values()):
+            stats["window_edge"] += 1  # the human only added text next to an anchor: add it there, beside the new text
+            lo = next(iter(g.spans.values()))[0]
+            edits.append(_Edit2(g.q, g.lo, g.hi, [l for c in g.changes if c.i1 == lo for l in c.human] + nl
+                                + [l for c in g.changes if c.i1 != lo for l in c.human], g.changes))
         else:
             stats["window5"] += 1
-            got = _merge_window(model, old_w, cur_w, new_w, guidance.get(g.q, []), stats)
-            if got is None:
-                stats["fallback"] += 1
-                got = _fallback(cur_w, new_w), ""
-            edit = _Edit2(g.q, g.lo, g.hi, _lines(got[0]), g.changes)
-            if got[1].strip():
-                edit.entries.append((got[1], first.page, first.j1))
-            edits.append(edit)
+            calls = Counter()
+            merges.append((g, first, cur_w, new_w, calls,
+                           pool.submit(_merge_window, model, old_w, cur_w, new_w, guidance.get(g.q, []), calls)))
+    for g, first, cur_w, new_w, calls, future in merges:
+        got = future.result()
+        stats.update(calls)
+        if got is None:
+            stats["fallback"] += 1
+            got = _fallback(cur_w, new_w), ""
+        edit = _Edit2(g.q, g.lo, g.hi, _lines(got[0]), g.changes)
+        if got[1].strip():
+            edit.entries.append((got[1], first.page, first.j1))
+        edits.append(edit)
+    pool.shutdown()
     for c, (q, i) in singles:
         stats["exact"] += 1
         edits.append(_Edit2(q, i, i + len(c.old), c.human, [c]))
@@ -592,13 +620,13 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
     return result, entries
 
 
-def _spots(nl: list[str], changes: list[_Change]) -> list[tuple[_Change, int]] | None:
-    """Window case 3: each change's old lines occur once in the new window, without overlap."""
-    index = _Index({"": nl})
+def _spots(nl: list[str], changes: list[_Change], ol: list[str]) -> list[tuple[_Change, int]] | None:
+    """Window case 3: each change's old lines occur once in the old and the new window, without overlap."""
+    index, before = _Index({"": nl}), _Index({"": ol})
     spots = []
     for c in changes:
         hit = index.find(c.old) if "".join(c.old).strip() else []
-        if len(hit) != 1:
+        if len(hit) != 1 or len(before.find(c.old)) != 1:  # a repeated line could be the other copy
             return None
         spots.append((c, hit[0][1]))
     spots.sort(key=lambda s: s[1])
@@ -877,7 +905,8 @@ class HumanStore:
         self._initialize()
         doc, pure, current = self._load(raw_rel)
         fresh = not (self._dir(raw_rel) / "doc.json").exists()
-        merged, entries = rebase({page: base}, {page: human}, current, model=model, guidance=doc["guidance"])
+        merged, entries = rebase({page: base}, {page: human}, current, model=model, guidance=doc["guidance"],
+                                 concurrency=getattr(model, "concurrency", 1))
         appendix = merged.pop(doc["appendix"], "") if doc.get("appendix") in merged else ""
         pages = self._finish(doc, merged, appendix, entries)
         if record["guidance"]:
@@ -921,7 +950,8 @@ class HumanStore:
         doc, pure, before = self._load(raw_rel)
         current = dict(before)
         appendix = current.pop(doc["appendix"], "") if doc.get("appendix") else ""
-        merged, entries = rebase(pure, current, new, model=model, guidance=doc["guidance"])
+        merged, entries = rebase(pure, current, new, model=model, guidance=doc["guidance"],
+                                 concurrency=getattr(model, "concurrency", 1))
         pages = self._finish(doc, merged, appendix, entries)
         changed = self._commit(raw_rel, doc, pages, before, pure=new, sweep=True)
         self._drop_inline_rows(f"{prefix}/{name}" for name in new)

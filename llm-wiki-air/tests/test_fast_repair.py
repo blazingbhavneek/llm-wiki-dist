@@ -539,6 +539,35 @@ class FastRepairTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             build_parser().parse_args(["sync", "--fast", "--repair", "--link"])
 
+    def test_a_page_that_fails_the_pull_holds_back_only_its_own_document(self):
+        from runner import cli
+
+        repaired = []
+
+        class Repair:
+            concurrency = 1
+            def __init__(self, *args, **kwargs):
+                pass
+            def targets(self, items=None):
+                return ["a_md.md", "b_md.md"]
+            def repair_document(self, raw_rel, **kwargs):
+                repaired.append(raw_rel)
+                return {"failures": [], "promoted": False, "examined": 1}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "mount").mkdir()
+            settings = SimpleNamespace(data_root=tmp, target_name="p", mount_path=str(Path(tmp) / "mount"),
+                                       growi_url="http://growi")
+            args = build_parser().parse_args(["sync", "--fast", "--repair"])
+            for failures, expected in ((["a.md/001.md: remote_moved"], ["b_md.md"]),
+                                       (["pull: ConnectionError: down"], [])):
+                repaired.clear()
+                with patch.object(cli, "_settings", return_value=settings), \
+                     patch("graph.fast.repair.FastRepair", Repair), \
+                     patch("publisher.pipeline.pull_growi_once", return_value={"done": [], "failures": failures}):
+                    self.assertEqual(cli._cmd_fast_repair(args), 1)  # the failure is still reported
+                self.assertEqual(repaired, expected)
+
     def test_title_body_and_links_are_repaired_while_images_stay_opaque(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

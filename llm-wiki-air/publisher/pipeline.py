@@ -397,7 +397,9 @@ def _capture_remote(
     """Capture while local files still represent the previous accepted output."""
     if not hasattr(publisher, "pull_changes"):
         return [], [], set()
-    folders = {doc: project.wiki / doc for doc in ledger.published_documents if (project.wiki / doc).is_dir()}
+    # A document whose first publish died midway has page rows but no document row yet; its pages are owned too.
+    documents = set(ledger.published_documents) | {Path(path).parent.as_posix() for path in ledger.published_pages}
+    folders = {doc: project.wiki / doc for doc in documents if (project.wiki / doc).is_dir()}
     if only is not None:
         wanted = {project.wiki_dir(rel).relative_to(project.wiki).as_posix() for rel in only}
         folders = {doc: folder for doc, folder in folders.items() if doc in wanted}
@@ -604,6 +606,7 @@ def _publish_sweep(
     if scoped_documents is not None:
         folders = {document: folder for document, folder in folders.items() if document in scoped_documents}
     blocked: set[str] = set()
+    known_pages = dict(ledger.published_pages)
     if publisher is not None:
         try:
             if not captured:
@@ -624,7 +627,7 @@ def _publish_sweep(
             known_pages = dict(ledger.published_pages)
             if hasattr(publisher, "assert_known_revisions"):
                 publisher.assert_known_revisions({path: row for path, row in known_pages.items()
-                                                 if Path(path).parent.as_posix() in folders})
+                                                 if Path(path).parent.as_posix() in set(folders) - blocked})
         except Exception as exc:
             blocked = set(folders)
             log.exception("run=%s stage=preflight failed", run_id)
@@ -1110,7 +1113,6 @@ def sync_once(
                 **({"only_pages": incremental_pages} if incremental_publish else {}),
                 **({"begin_publish": begin_publish} if begin_publish is not None else {}),
                 "settings": settings,
-                "captured": True,
                 "allow_unlinked": False,
                 "link_pending": True,
             }
@@ -1347,6 +1349,12 @@ def move_sources(
                     stop_check=(lambda: not should_continue()) if should_continue is not None else None,
                 ))
             save_ledger(ledger_path, ledger)
+            from .human_changes import HumanStore
+
+            for _job, _old_raw, new_raw, _document, _pages in moves:  # human state follows the move (3.8)
+                state = HumanStore(project)._dir(new_raw) / "doc.json"
+                if state.exists():
+                    write_json_atomic(state, {**read_json(state), "raw_rel": new_raw})
             if should_continue is not None and not should_continue():
                 return {"run_id": run_id, "done": done, "failures": failures, "cancelled": True}
             if prepare_publish is not None:
@@ -1661,7 +1669,9 @@ def pull_growi_once(settings: Any, *, force_inventory: bool = False) -> dict[str
             save_ledger(ledger_path, ledger)
             from .human_changes import HumanStore
 
-            detector["operator"] = HumanStore(project).status()["counts"]
+            store = HumanStore(project)
+            store._initialize()  # the activity cursor committed below lives in the store's folder
+            detector["operator"] = store.status()["counts"]
             cursor_backup: dict[str, Any] | None = None
             cursor_existed = False
             if cursor_commit is not None:

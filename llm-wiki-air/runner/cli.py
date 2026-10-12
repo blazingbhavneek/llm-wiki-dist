@@ -442,8 +442,12 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
                         f"fast repair preflight: {type(exc).__name__}: {exc}"
                     )
                     return _report(combined)
-                if combined["failures"]:
+                # A page that failed the pull ("<document>/<page>.md: reason") holds back only its own
+                # document; anything else (GROWI unreachable, inventory problems) stops the repair.
+                if not all(f.split(": ", 1)[0].endswith(".md") for f in combined["failures"]):
                     return _report(combined)
+                held = {f.split(": ", 1)[0].rpartition("/")[0] for f in combined["failures"]}
+                targets = [t for t in targets if project.wiki_dir(t).relative_to(project.wiki).as_posix() not in held]
 
         remaining = int(limit) if limit is not None else None
         for raw_rel in targets:

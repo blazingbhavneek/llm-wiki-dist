@@ -291,6 +291,12 @@ class GrowiClient:
         )
         return self._page_from_payload(response.json())
 
+    async def revision_bodies(self, page_id: str, limit: int = 100) -> list[str] | None:
+        """Bodies of the page's latest revisions; None when the history has more than ``limit``."""
+        payload = (await self._request("GET", "/revisions/list", params={"pageId": page_id, "limit": limit})).json()
+        revisions = payload.get("revisions") or []
+        return None if int(payload.get("totalCount") or 0) > len(revisions) else [str(r.get("body") or "") for r in revisions]
+
     async def update_page(self, page_id: str, revision_id: str, body: str) -> GrowiPage:
         response = await self._request(
             "PUT",
@@ -390,7 +396,7 @@ _PERMALINK_RE = re.compile(
 )
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _IMAGE_DESCRIPTION_RE = re.compile(r"<image-description\b[^>]*>(.*?)</image-description>", re.I | re.S)
-_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_COMMENT_RE = re.compile(r"<!--\s*(?:table-spec:|chunk(?:-end)?:|llm-wiki-).*?-->", re.DOTALL)  # machine comments only
 _INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<text>[^`\n]+)`(?!`)")
 
 
@@ -1114,8 +1120,11 @@ class GrowiPublisher:
                     continue
                 current = inspected[page_id]
                 destination = f"{new_doc_path}/{growi_segment(Path(local_path).name)}"
-                page = current if current.path == destination else await self.client.rename_page(
-                    page_id, current.revision_id, destination
+                # GROWI moves child pages with the document page, even with isRecursively false.
+                fresh = await self.client.get_page(page_id=page_id) if root is not None else None
+                page = fresh if fresh is not None and fresh.path == destination else (
+                    current if current.path == destination
+                    else await self.client.rename_page(page_id, current.revision_id, destination)
                 )
                 if page.page_id != page_id:
                     raise RuntimeError(f"GROWI move did not retain page ID: {page_id}")
@@ -1198,10 +1207,8 @@ class GrowiPublisher:
                     raise ValueError("source mapping is missing")
                 baseline = store.page(row["marker_id"])
                 if baseline.get("blocked") or row.get("human_sync_blocked"):
-                    blocked_reason = str(baseline.get("blocked") or row.get("human_sync_blocked") or "")
-                    rollout_block = "human_sync_mode=apply" in blocked_reason
-                    if page.revision_id == baseline.get("observed_revision") and not (policy.captures and rollout_block):
-                        raise ValueError(str(baseline.get("blocked") or row["human_sync_blocked"]))
+                    # Rechecked on every pull: the checks decide again, so a resolved page (moved back,
+                    # mode switched) is unblocked even without a new revision, and a real problem blocks again.
                     baseline["blocked"] = ""
                     row.pop("human_sync_blocked", None)
                     store.save_page(baseline)
@@ -1209,7 +1216,17 @@ class GrowiPublisher:
                 if baseline and baseline.get("accepted_revision") == row.get("revision_id") == page.revision_id:
                     decisions["unchanged"] += 1
                     continue
-                accounted = store.account_prepared(row, page, remote=markdown)
+                try:
+                    accounted = store.account_prepared(row, page, remote=markdown)
+                except ValueError:
+                    # An unconfirmed write (for example an HTTP 500) under a later revision: the page
+                    # history decides. Only if no revision holds its exact body did it never land.
+                    prepared = store.prepared_pending(row["marker_id"], page)
+                    bodies = asyncio.run(self.client.revision_bodies(page.page_id)) if hasattr(self.client, "revision_bodies") else None
+                    if bodies is None or store.get(prepared["prepared_remote_blob"]) in bodies:
+                        raise
+                    store.settle_prepared(prepared, status="not_landed")
+                    accounted = {}
                 if accounted.get("exact"):
                     # The page holds our own unrecorded write: bot intent, not human.
                     decisions["recovered"] += 1

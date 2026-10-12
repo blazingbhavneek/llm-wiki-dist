@@ -184,6 +184,22 @@ class ModePullTest(unittest.TestCase):
                     self.assertTrue(failures)
                     self.assertEqual(blocked, {"doc"})
 
+    def test_the_same_blocked_revision_is_observed_after_switching_from_off_to_observe(self):
+        project, store, row, client, off = self.harness("off")
+        self.assertTrue(off.pull_changes(project, {"doc/001.md": row}, {"doc"})[1])
+        observer = GrowiPublisher(client, off.connection, human_sync_policy=HumanSyncPolicy.resolve("observe"))
+        failures = observer.pull_changes(project, {"doc/001.md": row}, {"doc"})[1]
+        self.assertIn("current mode: observe", failures[0])
+        self.assertEqual(len(store.observations()), 1)
+
+    def test_a_page_moved_back_is_unblocked_without_a_new_revision(self):
+        project, _store, row, client, publisher = self.harness("apply")
+        original = client.page
+        client.page = original.model_copy(update={"path": "/elsewhere"})
+        self.assertTrue(publisher.pull_changes(project, {"doc/001.md": row}, {"doc"})[1])
+        client.page = original  # moved back with the same revision
+        self.assertEqual(publisher.pull_changes(project, {"doc/001.md": row}, {"doc"})[1], [])
+
     def test_observe_to_apply_refetches_same_revision_and_apply_off_apply_is_stable(self):
         project, store, row, client, observer = self.harness("observe")
         observer.pull_changes(project, {"doc/001.md": row}, {"doc"})
@@ -209,6 +225,26 @@ class ActivityDetectorTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.project = Project(Path(self.tmp.name) / "project").ensure()
+
+    def test_the_first_pull_of_a_fresh_project_checkpoints_its_cursor(self):
+        from publisher import pipeline
+        from publisher.history import candidate_is_clean, ensure_repository, last_good
+
+        class Client:
+            async def list_activities(self, *, offset=0, limit=100):
+                return [], 0
+            async def list_all_pages(self, _boundary):
+                return []
+
+        (Path(self.tmp.name) / "mount").mkdir()
+        settings = SimpleNamespace(data_root=self.tmp.name, target_name="project",
+                                   mount_path=str(Path(self.tmp.name) / "mount"), growi_url="https://growi")
+        ensure_repository(self.project)
+        publisher = GrowiPublisher(Client(), SimpleNamespace(write_path="/docs", root_path="/docs", mode="attach"))
+        with patch.object(pipeline, "_publisher", return_value=publisher):
+            self.assertEqual(pipeline.pull_growi_once(settings)["failures"], [])
+        self.assertTrue((self.project.metadata / "human-sync" / "activity-cursor.json").exists())
+        self.assertTrue(candidate_is_clean(self.project, last_good(self.project)))
 
     def test_idle_poll_reads_no_page_bodies_and_same_timestamp_restart_is_idempotent(self):
         stamp = "2026-10-01T00:00:00+00:00"
