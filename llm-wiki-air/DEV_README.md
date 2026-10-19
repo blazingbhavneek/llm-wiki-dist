@@ -50,6 +50,11 @@ retrieval pipeline, and a lead-agent + bounded subagent researcher with
 streaming answers and citations. It has no local index, no graph, and no write
 endpoints. See [`growi-search/README.md`](growi-search/README.md).
 
+It is configured on its own: that service reads its answer endpoint, reranker
+and per-question sub-agent limits from its own environment, so this repository
+exposes no `rerank_*` or `subagent_*` settings for it any more. The builder's
+LLM is the single `OPENAI_*` set in `.env`.
+
 ## Requirements and setup
 
 - Python **3.13+** (see `pyproject.toml`; `uv.lock` is committed, `uv sync`
@@ -59,8 +64,9 @@ endpoints. See [`growi-search/README.md`](growi-search/README.md).
   and a **GROWI** instance with an API token
 
 `.env` is committed in this repo and already points at those company endpoints,
-so a fresh clone needs no setup beyond the virtualenv. `.env.example` exists
-only as a list of variable names — edit `.env` itself when an endpoint moves.
+so a fresh clone needs no setup beyond the virtualenv. There is no
+`.env.example`; `.env` itself is the list of variable names, so edit it when an
+endpoint moves.
 
 ```bash
 uv sync            # creates .venv/
@@ -101,19 +107,18 @@ Two layers: a shared `.env` at the repo root, and one INI per project under
 Settings defaults (graph/config.py)  ->  .env  ->  configs/<name>.ini  ->  CLI flags
 ```
 
-`WIKI_CONCURRENCY` sets the shared builder default. Set a stage value to tune it
+`OPENAI_CONCURRENCY` sets the shared builder default. Set a stage value to tune it
 independently. The growi-search limits are read by that service from its
 environment:
 
 | Variable                            | Default              | Controls                                     |
 | ----------------------------------- | -------------------- | -------------------------------------------- |
-| `WIKI_CONCURRENCY`                | 4                    | Builder-wide parallelism default             |
-| `WIKI_PLANNER_CONCURRENCY`        | `WIKI_CONCURRENCY` | Wiki planner LLM calls                       |
-| `WIKI_REWRITE_CONCURRENCY`        | `WIKI_CONCURRENCY` | Wiki rewrite LLM calls                       |
-| `WIKI_LINKER_CONCURRENCY`         | `WIKI_CONCURRENCY` | Linker work                                  |
-| `WIKI_INGEST_CONCURRENCY`         | `WIKI_CONCURRENCY` | Ingest work                                  |
+| `OPENAI_CONCURRENCY`                | 4                    | Builder-wide parallelism default             |
+| `WIKI_PLANNER_CONCURRENCY`        | `OPENAI_CONCURRENCY` | Wiki planner LLM calls                       |
+| `WIKI_REWRITE_CONCURRENCY`        | `OPENAI_CONCURRENCY` | Wiki rewrite LLM calls                       |
+| `WIKI_LINKER_CONCURRENCY`         | `OPENAI_CONCURRENCY` | Linker work                                  |
+| `WIKI_INGEST_CONCURRENCY`         | `OPENAI_CONCURRENCY` | Ingest work                                  |
 | `WIKI_SEARCH_LLM_MAX_CONCURRENCY` | 4                    | growi-search LLM requests across the process |
-| `WIKI_SUBAGENT_CONCURRENCY`       | 2                    | Per-question subagent concurrency default    |
 
 growi-search never runs more than `WIKI_SEARCH_LLM_MAX_CONCURRENCY` LLM requests
 at once, across all users; the settings screen can change the per-question value
@@ -171,7 +176,6 @@ chat_base_url = http://llm.example:8000/v1
 chat_api_key = local
 chat_model = gemma-4-31B
 embed_base_url = http://embed.example:8001/v1
-rerank_base_url = http://rerank.example:8002/v1
 parser_base_url = http://parser.example/agent/doc-parser/
 parser_timeout = 7200
 concurrency = 4
@@ -204,8 +208,8 @@ absolute INI path. One command invocation always operates on one project.
 `--data-root /another/path` can be added before or after a command when an
 isolated output tree is needed.
 
-Service endpoints and tuning come from `.env` (`WIKI_CHAT_*`, `WIKI_EMBED_*`,
-`WIKI_PARSER_BASE_URL`, `GROWI_URL`, `GROWI_TOKEN`, `WIKI_CONCURRENCY`, and
+Service endpoints and tuning come from `.env` (`OPENAI_*`, `WIKI_EMBED_*`,
+`WIKI_PARSER_BASE_URL`, `GROWI_URL`, `GROWI_TOKEN`, `OPENAI_CONCURRENCY`, and
 friends); `graph/config.py::Settings.from_env` is the authoritative list, and
 the optional `[settings]` INI section overrides any of those fields per project.
 
@@ -608,7 +612,7 @@ is the source of the remote parse service — prefer changing `publisher/`,
 
 ```text
 main.py                      CLI: argument parsing + one cmd_* per subcommand;
-                             also maps WIKI_CHAT_* env names onto Settings
+                             env defaults are resolved inside Settings.from_env
 
 doc-parser/                  separate service (FastAPI + MinerU/GPU, pandoc,
                              LibreOffice): its source lives here but it RUNS on

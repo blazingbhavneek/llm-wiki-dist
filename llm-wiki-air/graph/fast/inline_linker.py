@@ -10,6 +10,9 @@ The manifest lets ``sync --fast --link-reset`` undo those edits without touching
 source-authored links or the wiki writer's previous/next navigation.  The same reset drops
 the cached entity/behaviour facts, so the following ``--link`` re-runs the model pass
 instead of replaying them.
+
+Cross-document discovery includes every built document in the selected project,
+regardless of its folder; candidate counts and Jev verification still bound the links.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import posixpath
 import re
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -35,6 +38,7 @@ from graph.clients.chat import extract_json_from_text
 log = logging.getLogger(__name__)
 
 VERSION = "fast-inline-links-v2"
+DISCOVERY_VERSION = "project-wide-v1"
 PAGE_CHARS = 14_000
 FUZZY_THRESHOLD = 90.0
 JEV_CHECKPOINT_BATCH = 128
@@ -160,7 +164,15 @@ def _root(project: Any) -> Path:
 
 
 def _manifest_path(project: Any) -> Path:
-    return _root(project) / "manifest.json"
+    # Ownership and completion must travel with accepted wiki pages through Git candidates.
+    return Path(project.metadata) / "fast-links.json"
+
+
+def _manifest(project: Any) -> dict[str, Any]:
+    path = _manifest_path(project)
+    if not path.exists():
+        path = _root(project) / "manifest.json"  # read old manifests without modifying live state
+    return read_json(path, default={})
 
 
 def _run_path(project: Any) -> Path:
@@ -343,7 +355,7 @@ def _purge_extractions(project: Any) -> int:
 
 
 def _clean_existing(project: Any) -> tuple[dict[str, str], list[str]]:
-    manifest = read_json(_manifest_path(project), default={})
+    manifest = _manifest(project)
     cleaned: dict[str, str] = {}
     failures: list[str] = []
     for rel, row in sorted(dict(manifest.get("pages", {})).items()):
@@ -359,6 +371,8 @@ def _clean_existing(project: Any) -> tuple[dict[str, str], list[str]]:
 
 
 def _inventory(project: Any, cleaned: dict[str, str]) -> list[Page]:
+    from graph.config import sanitize_text
+
     pages: list[Page] = []
     wiki = Path(project.wiki)
     for originals in sorted(wiki.rglob("_planning/pages")):
@@ -371,7 +385,18 @@ def _inventory(project: Any, cleaned: dict[str, str]) -> list[Page]:
                 continue
             rel = live.relative_to(wiki).as_posix()
             text = cleaned.get(rel, live.read_text(encoding="utf-8"))
-            pages.append(Page(rel, document, folder, _title(text, live.stem), live, text, _segments(text)))
+            prompt_text = sanitize_text(text)
+            pages.append(
+                Page(
+                    rel,
+                    document,
+                    folder,
+                    _title(prompt_text, live.stem),
+                    live,
+                    text,
+                    _segments(prompt_text),
+                )
+            )
     return pages
 
 
@@ -460,9 +485,13 @@ def _validated_facts(raw: Any, page: Page, group: list[Segment]) -> FastPageFact
 async def _extract(
     project: Any, pages: list[Page], model: Any, settings: Any, *, force: bool,
     on_progress: Any = None,
+    refresh_documents: set[str] | None = None,
 ) -> Extraction:
+    from graph.wiki.model import writer_model
+
     jobs: list[tuple[Page, list[Segment], str, Path]] = []
     facts_by_job: dict[str, FastPageFacts] = {}
+    extractor = writer_model(model)
     for page in pages:
         for group in _groups(page):
             identity = VERSION + "\0" + page.document + "\0" + "\0".join(
@@ -470,7 +499,7 @@ async def _extract(
             )
             key = sha256_text(identity)
             path = _cache_path(project, key)
-            if not force:
+            if not force and page.document not in (refresh_documents or ()):
                 try:
                     cached = read_json(path)
                     facts_by_job[key] = _validated_facts(cached.get("facts", {}), page, group)
@@ -499,7 +528,7 @@ async def _extract(
             )
             try:
                 async with semaphore:
-                    raw = await model.text(
+                    raw = await extractor.text(
                         messages,
                         max_output_tokens=8000,
                         temperature=0.5,
@@ -509,6 +538,8 @@ async def _extract(
                 break
             except Exception as exc:  # noqa: BLE001 - bounded retry with model feedback
                 error = f"{type(exc).__name__}: {exc}"
+                if attempt == EXTRACTION_ATTEMPTS:
+                    log.exception("ファストリンクのメタデータ生成に失敗: %s", page.rel)
                 if attempt < EXTRACTION_ATTEMPTS and on_progress:
                     on_progress({
                         "stage": "fast-link", "step": "page_retry", "page": page.rel,
@@ -641,6 +672,7 @@ async def _score_parts(engine: Any, requests: list[list[Any]]) -> tuple[list[lis
 async def _check_roles(
     project: Any, engine: Any, entities: list[EntityOccurrence], threshold: float,
     *, force: bool, on_progress: Any = None,
+    refresh_documents: set[str] | None = None,
 ) -> tuple[int, int]:
     """Decide the role of every entity; oversized sections score part by part."""
 
@@ -650,7 +682,7 @@ async def _check_roles(
     requests: list[list[Any]] = []
     for item in entities:
         key = _role_decision_key(item)
-        if not force:
+        if not force and item.page.document not in (refresh_documents or ()):
             cached = read_json(_decision_path(project, "role", key), default={})
             if cached.get("version") == VERSION and isinstance(cached.get("p_yes"), (int, float)):
                 item.role = "defines" if float(cached["p_yes"]) >= threshold else "uses"
@@ -703,7 +735,7 @@ def _entity_candidates(entities: list[EntityOccurrence]) -> list[Candidate]:
     for use in (item for item in entities if item.usable and item.role == "uses"):
         pools = (
             [item for item in definitions if item.page.document == use.page.document and item.page.rel != use.page.rel],
-            [item for item in definitions if item.page.folder == use.page.folder and item.page.document != use.page.document],
+            [item for item in definitions if item.page.document != use.page.document],
         )
         ranked: list[tuple[float, EntityOccurrence]] = []
         for pool in pools:
@@ -729,7 +761,7 @@ def _behaviour_candidates(behaviours: list[BehaviourOccurrence]) -> list[Candida
     for source in behaviours:
         pools = (
             [item for item in behaviours if item.page.document == source.page.document and item.page.rel != source.page.rel],
-            [item for item in behaviours if item.page.folder == source.page.folder and item.page.document != source.page.document],
+            [item for item in behaviours if item.page.document != source.page.document],
         )
         ranked: list[tuple[float, BehaviourOccurrence, str]] = []
         for pool in pools:
@@ -890,7 +922,7 @@ def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], sett
         by_page.setdefault(plan.source_page.rel, []).append(plan)
 
     limit = int(getattr(settings, "wiki_linker_inline_max_neo", 3))
-    manifest = read_json(_manifest_path(project), default={})
+    manifest = _manifest(project)
     manifest_pages: dict[str, Any] = dict(manifest.get("pages", {}))
     writes = 0
     links = 0
@@ -933,6 +965,7 @@ def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], sett
             write_json_atomic(_manifest_path(project), {
                 "schema_version": 1, "version": VERSION,
                 "status": "applying", "pages": manifest_pages,
+                "documents": manifest.get("documents", {}),
             })
             write_text_atomic(page.path, text)
             writes += 1
@@ -944,6 +977,7 @@ def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], sett
             write_json_atomic(_manifest_path(project), {
                 "schema_version": 1, "version": VERSION,
                 "status": "applying", "pages": manifest_pages,
+                "documents": manifest.get("documents", {}),
             })
 
     write_json_atomic(_manifest_path(project), {
@@ -951,12 +985,14 @@ def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], sett
         "version": VERSION,
         "status": "complete",
         "pages": manifest_pages,
+        "documents": manifest.get("documents", {}),
     })
     return {"pages": writes, "links": links}
 
 
 def _checkpoint(project: Any, status: str, **details: Any) -> None:
     write_json_atomic(_run_path(project), {
+        **read_json(_run_path(project), default={}),
         "schema_version": 1,
         "version": VERSION,
         "status": status,
@@ -968,6 +1004,7 @@ def _checkpoint(project: Any, status: str, **details: Any) -> None:
 async def _link_async(
     project: Any, settings: Any, model: Any, engine: Any, *, force: bool,
     continue_run: bool = False, on_progress: Any = None,
+    output_project: Any = None, only: list[str] | None = None,
 ) -> dict[str, Any]:
     previous_run = read_json(_run_path(project), default={})
     resumed = bool(
@@ -984,9 +1021,44 @@ async def _link_async(
     if not pages:
         _checkpoint(project, "complete", continued=resumed, pages=0, links=0)
         return {"done": [{"status": "up-to-date", "pages": 0, "links": 0}], "failures": []}
-    _checkpoint(project, "extracting", continued=resumed, pages=len(pages))
-    extraction = await _extract(project, pages, model, settings, force=force, on_progress=on_progress)
+    from publisher.ledger import load_ledger
+    from publisher.pipeline import _content_hash
+
+    manifest = _manifest(project)
+    documents = {page.document for page in pages}
+    scope = documents if only is None else {
+        project.wiki_dir(rel).relative_to(project.wiki).as_posix() for rel in only
+    } & documents
+    fingerprints = {doc: _content_hash(Path(project.wiki) / doc) for doc in documents}
+    completed = dict(manifest.get("documents", {}))
+    # Adopt already-published legacy links only when their recorded bytes still match.
+    ledger = load_ledger(Path(project.metadata) / "pipeline.json")
+    legacy_docs = {str(Path(rel).parent.as_posix()) for rel in manifest.get("pages", {})}
+    if manifest.get("version") == VERSION and manifest.get("status") == "complete":
+        for doc in (legacy_docs & documents) - set(completed):
+            rows = {rel: row for rel, row in manifest["pages"].items() if str(Path(rel).parent.as_posix()) == doc}
+            if (ledger.published_documents.get(doc, {}).get("content_sha256") == fingerprints[doc]
+                    and all((Path(project.wiki) / rel).is_file()
+                            and sha256_text((Path(project.wiki) / rel).read_text(encoding="utf-8")) == row.get("linked_sha256")
+                            for rel, row in rows.items())):
+                completed[doc] = {"version": VERSION, "status": "complete", "content_sha256": fingerprints[doc]}
+    pending = {doc for doc in scope if force or completed.get(doc, {}).get("version") != VERSION
+               or completed.get(doc, {}).get("discovery_version") != DISCOVERY_VERSION
+               or completed.get(doc, {}).get("content_sha256") != fingerprints[doc]}
+    if not pending:
+        if completed != manifest.get("documents", {}):
+            write_json_atomic(_manifest_path(output_project or project), {**manifest, "documents": completed})
+        return {"done": [{"status": "up-to-date"}], "failures": [], "linked_documents": sorted(scope)}
+    refresh = pending if not continue_run else set()
+    _checkpoint(project, "extracting", continued=resumed, pages=len(pages),
+                failures=[],
+                documents={doc: {"base_sha256": fingerprints[doc], "status": "pending"} for doc in pending})
+    extraction = await _extract(project, pages, model, settings, force=force,
+                                refresh_documents=refresh, on_progress=on_progress)
     skipped_extractions = len(extraction.failures)
+    if extraction.failures:
+        _checkpoint(project, "failed", failures=extraction.failures)
+        return {"done": [], "failures": extraction.failures}
     _checkpoint(
         project, "checking_roles", continued=resumed,
         entities=len(extraction.entities), skipped_extractions=skipped_extractions,
@@ -995,33 +1067,56 @@ async def _link_async(
         project, engine, extraction.entities,
         float(getattr(settings, "wiki_linker_role_threshold", 0.5)),
         force=force, on_progress=on_progress,
+        refresh_documents=refresh,
     )
-    candidates = _entity_candidates(extraction.entities) + _behaviour_candidates(extraction.behaviours)
+    if role_failures:
+        failures = [f"ファストリンク: エンティティのチェックに失敗（{role_failures}件）"]
+        _checkpoint(project, "failed", failures=failures)
+        return {"done": [], "failures": failures}
+    candidates = [item for item in _entity_candidates(extraction.entities) + _behaviour_candidates(extraction.behaviours)
+                  if item.source_page.document in pending]
     _checkpoint(project, "checking_candidates", continued=resumed, candidates=len(candidates))
     plans, judge_failures, judge_calls = await _judge_candidates(
         project, engine, candidates,
         float(getattr(settings, "wiki_linker_verify_threshold", 0.7)),
-        force=force, on_progress=on_progress,
+        force=force or not continue_run, on_progress=on_progress,
     )
+    if judge_failures:
+        failures = [f"ファストリンク: リンク候補のチェックに失敗（{judge_failures}件）"]
+        _checkpoint(project, "failed", failures=failures)
+        return {"done": [], "failures": failures}
     _checkpoint(project, "applying", continued=resumed, planned_links=len(plans))
-    changed = _apply_links(project, pages, plans, settings)
+    output = output_project or project
+    manifest["documents"] = completed
+    write_json_atomic(_manifest_path(output), manifest)
+    output_pages = [replace(page, path=Path(output.wiki) / page.rel) for page in pages if page.document in pending]
+    changed = _apply_links(output, output_pages, plans, settings)
+    accepted = _manifest(output)
+    accepted["documents"] = {doc: row for doc, row in completed.items() if doc in documents}
+    for doc in pending:
+        accepted["documents"][doc] = {"version": VERSION, "status": "complete",
+                                      "discovery_version": DISCOVERY_VERSION,
+                                      "content_sha256": _content_hash(Path(output.wiki) / doc)}
+    write_json_atomic(_manifest_path(output), accepted)
     _checkpoint(
-        project, "complete", continued=resumed,
+        project, "prepared" if output_project is not None else "complete", continued=resumed,
         skipped_extractions=skipped_extractions, **changed,
     )
     return {
-        "done": [{"status": "fast-linked", **changed, "documents": len({page.document for page in pages}),
+        "done": [{"status": "fast-linked", **changed, "documents": len(pending),
                   "continued": resumed, "llm_calls": extraction.calls,
                   "skipped_extractions": skipped_extractions,
                   "jev_requests": role_calls + judge_calls,
                   "jev_failures": role_failures + judge_failures}],
         "failures": [],
+        "linked_documents": sorted(scope),
     }
 
 
 def link_project(
     settings: Any, *, force: bool = False, continue_run: bool = False,
     on_progress: Any = None,
+    output_project: Any = None, only: list[str] | None = None,
 ) -> dict[str, Any]:
     """Add reversible inline links to the current local wiki tree; never publish."""
 
@@ -1032,20 +1127,33 @@ def link_project(
     from jev import get_engine_for
 
     project = open_project(settings)
+    from publisher.pipeline import _content_hash
+
+    documents = {path.parent.parent.relative_to(project.wiki).as_posix()
+                 for path in project.wiki.rglob("_planning/pages")
+                 if any(path.parent.parent.glob("*.md"))}
+    if only is not None:
+        documents &= {project.wiki_dir(rel).relative_to(project.wiki).as_posix() for rel in only}
+    completed = _manifest(project).get("documents", {})
+    if not force and all(completed.get(doc, {}).get("version") == VERSION
+                         and completed[doc].get("discovery_version") == DISCOVERY_VERSION
+                         and completed[doc].get("content_sha256") == _content_hash(project.wiki / doc)
+                         for doc in documents):
+        return {"done": [{"status": "up-to-date"}], "failures": [], "linked_documents": sorted(documents)}
     config = wiki_config(settings, run_dir=_root(project) / "work").model_copy(
-        # Temporary: disable thinking for faster linking. Restore this line to re-enable.
-        # update={"text_thinking": True, "temperature": 0.5},
         update={"text_thinking": False, "temperature": 0.5},
     )
     model = policy_of(config).model_port(config)
     try:
         engine = get_engine_for(settings)
     except Exception as exc:
+        log.exception("ファストリンクのJevチェックに失敗")
         return {"done": [], "failures": [f"fast link: Jev unavailable: {type(exc).__name__}: {exc}"]}
     return run_async_blocking(
         _link_async(
             project, settings, model, engine, force=force,
             continue_run=continue_run, on_progress=on_progress,
+            output_project=output_project, only=only,
         )
     )
 
@@ -1057,9 +1165,11 @@ def reset_project(settings: Any) -> dict[str, Any]:
 
     project = open_project(settings)
     purged = _purge_extractions(project)
-    manifest = read_json(_manifest_path(project), default={})
+    manifest = _manifest(project)
     pages = dict(manifest.get("pages", {}))
     if not pages:
+        if manifest.get("documents"):
+            write_json_atomic(_manifest_path(project), {**manifest, "documents": {}})
         return {"done": [{"status": "up-to-date", "pages": 0, "links_removed": 0,
                           "extractions_removed": purged}], "failures": []}
     writes: list[tuple[Path, str]] = []

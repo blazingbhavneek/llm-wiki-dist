@@ -64,7 +64,7 @@ class ParseAhead:
                         job.rel, type(exc).__name__, exc)
 
     def _run(self, project: Any, settings: Any, jobs: list[Any]) -> None:
-        from graph.workspace.parser_client import decode_text_bytes, parse_document
+        from graph.workspace.parser_client import ParserSkip, decode_text_bytes, parse_document, parser_skip_cache
 
         from .history import read_blob
         from .ledger import load_ledger
@@ -83,11 +83,10 @@ class ParseAhead:
             if job.from_rel and job.target_sha256 == str(sources.get(job.from_rel, {}).get("source_sha256") or ""):
                 continue
             if Path(job.rel).suffix.lower() in VERBATIM:
-                self._ready(
-                    position,
-                    job,
-                    decode_text_bytes(read_blob(project, job.target_blob_oid), source=Path(job.rel)),
-                )
+                markdown = decode_text_bytes(read_blob(project, job.target_blob_oid), source=Path(job.rel))
+                if parser_skip_cache() is not None and not markdown.strip():
+                    continue  # TEMPORARY: the builder records the empty-text skip.
+                self._ready(position, job, markdown)
                 continue
             if raw_path.exists() and job.target_sha256 == str(sources.get(job.rel, {}).get("parsed_source_sha256") or ""):
                 self._ready(position, job, raw_path.read_text(encoding="utf-8"))
@@ -100,6 +99,10 @@ class ParseAhead:
                 continue
             if target.exists():
                 self._ready(position, job, target.read_text(encoding="utf-8"))
+                continue
+            skips = parser_skip_cache()
+            skip_key = (str(target), Path(job.rel).name)
+            if skips is not None and skip_key in skips:
                 continue
             with _PARSING_LOCK:
                 active = _PARSING.get(target.name)
@@ -131,7 +134,12 @@ class ParseAhead:
                 self._ready(position, job, markdown)
                 log.info("parse-ahead %s: %.1fs", job.rel, time.monotonic() - started)
             except Exception as exc:  # noqa: BLE001 - the build parses it itself
-                log.warning("parse-ahead %s failed; the build will parse it: %s: %s", job.rel, type(exc).__name__, exc)
+                if isinstance(exc, ParserSkip):
+                    if skips is not None:
+                        skips[skip_key] = str(exc)
+                    log.warning("パースをスキップ: %s: %s", job.rel, exc)
+                else:
+                    log.warning("parse-ahead %s failed; the build will parse it: %s: %s", job.rel, type(exc).__name__, exc)
             finally:
                 with _PARSING_LOCK:
                     _PARSING.pop(target.name, None)

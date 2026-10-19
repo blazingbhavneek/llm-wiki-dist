@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 import sys
@@ -114,6 +115,80 @@ class ShortNameFormatter(logging.Formatter):
         return f"{''.join(columns)}  : {info}".rstrip()
 
 
+class JapaneseFormatter(logging.Formatter):
+    """Translate application log templates, keeping paths and exception text intact."""
+
+    _MESSAGES = {
+        "fast repair project=%s has no eligible documents": "リペア対象のドキュメントはありません: プロジェクト=%s",
+        "checking GROWI edits before repair": "リペア前にGROWIの編集をチェックします",
+        "repairing document path=%s": "ドキュメントをリペアします: パス=%s",
+        "publishing repaired document path=%s": "リペア済みドキュメントをパブリッシュします: パス=%s",
+        "fast repair failed for %s": "ファストリペアに失敗: %s",
+        "fast repair resume inspection failed": "ファストリペアの再開チェックに失敗",
+        "fast repair GROWI preflight failed": "ファストリペアのGROWIチェックに失敗",
+        "fast repair project=%s documents=%d page_limit=%s concurrency=%d": "ファストリペア: プロジェクト=%s、ドキュメント=%d、ページ上限=%s、並列数=%d",
+        "continuing interrupted fast repair versions=%s checkpoints=%d without a preflight GROWI pull; accepted pages will be reused": "中断したファストリペアを再開: バージョン=%s、チェックポイント=%d。GROWIのプルをスキップし、確定ページを再利用します",
+        "fast repair progress callback failed: %s": "ファストリペアのプログレス更新に失敗: %s",
+        "fast repair checkpoint failed for %s page %s": "ファストリペアのチェックポイント保存に失敗: %s、ページ=%s",
+        "fast repair initial judge failed for page %s": "ファストリペアの初回チェックに失敗: ページ=%s",
+        "source discovery failed: %s: %s": "ソースのスキャンに失敗: %s、%s",
+        "first pass complete; final retry documents=%d discovery=%d": "初回パス完了。最終リトライ: ドキュメント=%d、スキャンエラー=%d",
+        "document attempt %d failed: %s": "ドキュメントの処理に失敗: トライ=%d、パス=%s",
+        "publish project=%s allow_unlinked=True; linking skipped": "パブリッシュ: プロジェクト=%s、リンク処理をスキップ",
+        "publish project=%s allow_unlinked=False; pending links will be checked": "パブリッシュ: プロジェクト=%s、未処理リンクをチェック",
+        "publish completed documents=%s pages=%s indexes=%s failures=%d": "パブリッシュ完了: ドキュメント=%s、ページ=%s、インデックス=%s、エラー=%d",
+        "linker first pass complete; final retry documents=%d": "リンク初回パス完了。最終リトライ: ドキュメント=%d",
+        "linker document attempt %d failed: %s: %s": "リンク処理に失敗: トライ=%d、ドキュメント=%s、エラー=%s",
+        "parse-ahead %s: %.1fs": "先行パース: %s、%.1f秒",
+        "plan-ahead %s: %.1fs": "先行プラン: %s、%.1f秒",
+        "parse-ahead %s failed; the build will parse it: %s: %s": "先行パースに失敗。ビルド時にリトライ: %s、%s: %s",
+        "plan-ahead %s failed; the build will plan it: %s: %s": "先行プランに失敗。ビルド時にリトライ: %s、%s: %s",
+        "plan-ahead enqueue %s failed; the build will plan it: %s: %s": "先行プランのキュー登録に失敗。ビルド時にリトライ: %s、%s: %s",
+        "plan-ahead disabled: %s: %s": "先行プランを停止: %s: %s",
+        "link-ahead disabled: %s: %s": "先行リンクを停止: %s: %s",
+        "link-ahead without Jev roles: %s": "先行リンクのJevロールをスキップ: %s",
+        "link-ahead %s failed; the linker will describe it: %s: %s": "先行リンクに失敗。リンク時にリトライ: %s、%s: %s",
+        "link-ahead %s: %d chunks, %d calls, %.1fs": "先行リンク: %s、チャンク=%d、コール=%d、%.1f秒",
+        "Jev related document judge failed: %s": "Jevの関連ドキュメントチェックに失敗: %s",
+        "index page for %s: %s: %s": "インデックスのエラー: %s、%s: %s",
+        "Jev role check failed for chunk %s: %s": "Jevのロールチェックに失敗: チャンク=%s、%s",
+        "LLM tie-break failed for %s: %s": "LLMの同点判定に失敗: %s、%s",
+        "Jev page curation failed for %s: %s": "Jevのページチェックに失敗: %s、%s",
+        "Jev linker engine unavailable for page curation: %s": "Jevのリンクエンジンを利用できません: %s",
+        "Jev edge judge failed for %s: %s": "Jevのリンクチェックに失敗: %s、%s",
+        "fast Jev edge judge failed for %s: %s": "ファストJevのリンクチェックに失敗: %s、%s",
+        "Jev linker engine unavailable; using LLM: %s": "Jevのリンクエンジンを利用できないため、LLMを使用します: %s",
+        "Jev alias resolution failed for %s: %s": "Jevのエイリアス解決に失敗: %s、%s",
+        "Jev primary definer failed for %s: %s": "Jevの定義元チェックに失敗: %s、%s",
+    }
+    _STAGES = {
+        "parser": "パーサー", "index": "インデックス", "generate": "ドキュメント生成",
+        "publish": "パブリッシュ", "preflight": "事前チェック", "delete": "削除",
+        "embedder": "エンベディング", "link": "リンク", "operation": "処理", "recovery": "リカバリー",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        localized = copy.copy(record)
+        template = str(record.msg)
+        if template in self._MESSAGES:
+            template = self._MESSAGES[template]
+        elif "stage=" in template:
+            for stage, label in self._STAGES.items():
+                template = template.replace(f"stage={stage}", f"ステージ={label}")
+            for key, label in (("run", "ランID"), ("operation", "オペレーションID"), ("path", "パス"),
+                               ("document", "ドキュメント"), ("file", "ファイル"), ("error", "エラー"),
+                               ("endpoint", "エンドポイント"), ("attempt", "トライ"), ("timeout", "タイムアウト"),
+                               ("elapsed", "経過時間"), ("fallback", "フォールバック"), ("characters", "文字数")):
+                template = template.replace(f"{key}=", f"{label}=")
+            template = template.replace("retry_later", "後でリトライ").replace("failed", "失敗")
+        elif template.isascii():
+            template = "ログ詳細（原文）: " + template
+        localized.msg = template
+        localized.levelname = {"INFO": "インフォ", "WARNING": "ワーニング", "ERROR": "エラー",
+                               "CRITICAL": "重大エラー", "DEBUG": "デバッグ"}.get(record.levelname, record.levelname)
+        return logging.Formatter("%(levelname)s %(message)s").format(localized)
+
+
 class TqdmStreamHandler(logging.StreamHandler):
     """Log handler that clears the bars first, so every line starts at column 0.
 
@@ -125,7 +200,8 @@ class TqdmStreamHandler(logging.StreamHandler):
         if tqdm is None:  # pragma: no cover - tqdm is an optional terminal aid
             super().emit(record)
             return
-        with tqdm.external_write_mode(file=self.stream):
+        progress_stream = getattr(self.stream, "terminal_stream", self.stream)
+        with tqdm.external_write_mode(file=progress_stream):
             super().emit(record)
 
 
@@ -147,24 +223,26 @@ class SyncProgress:
     """
 
     _LABELS = {
-        "capture": "capture",
-        "parse": "parser",
-        "planner": "planner",
-        "research": "wiki research",
-        "writer": "wiki writer + judge",
-        "fast-repair": "wiki repair + judge",
-        "linker-entities": "linker entities",
-        "linker-edges": "linker main",
-        "growi-preflight": "publish preflight",
-        "growi-publish": "publish",
-        "reset": "reset remote pages",
-        "reset-index": "reset index pages",
-        "index": "index",
+        "capture": "キャプチャー",
+        "parse": "パーサー",
+        "planner": "プランナー",
+        "research": "ウィキリサーチ",
+        "writer": "ウィキ生成・チェック",
+        "fast-repair": "ウィキリペア・チェック",
+        "linker-entities": "リンクエンティティ",
+        "linker-edges": "メインリンク",
+        "growi-preflight": "パブリッシュ事前チェック",
+        "growi-publish": "パブリッシュ",
+        "reset": "リモートページのリセット",
+        "reset-index": "インデックスのリセット",
+        "index": "インデックス",
     }
 
     def __init__(self, *, stream: Any = None) -> None:
         self.stream = stream or sys.stderr
-        self._tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._progress_stream = getattr(self.stream, "terminal_stream", self.stream)
+        self._write_transcript = getattr(self.stream, "write_transcript", None)
+        self._tty = bool(getattr(self._progress_stream, "isatty", lambda: False)())
         self._bars_enabled = tqdm is not None and self._tty
         self._documents: set[str] = set()
         self._completed: set[str] = set()
@@ -175,13 +253,13 @@ class SyncProgress:
         if tqdm is not None:
             self._doc_bar = tqdm(
                 total=0,
-                desc="Documents",
-                unit="doc",
+                desc="ドキュメント",
+                unit="件",
                 position=0,
                 leave=True,
                 dynamic_ncols=True,
                 disable=not self._bars_enabled,
-                file=self.stream,
+                file=self._progress_stream,
             )
 
     def add_documents(self, paths: Iterable[Any]) -> None:
@@ -247,9 +325,11 @@ class SyncProgress:
 
     def _write(self, message: str) -> None:
         if tqdm is not None:
-            tqdm.write(message, file=self.stream)
+            tqdm.write(message, file=self._progress_stream)
         else:
-            print(message, file=self.stream, flush=True)
+            print(message, file=self._progress_stream, flush=True)
+        if callable(self._write_transcript):
+            self._write_transcript(message + "\n")
 
     def _close_visible(self) -> None:
         if self._stage_bar is not None:
@@ -269,6 +349,10 @@ class SyncProgress:
             self._phases[key] = phase
         if phase.started is None:
             phase.started = time.monotonic()
+            if callable(self._write_transcript):
+                self._write_transcript(
+                    f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: 開始\n"
+                )
         if total is not None and total > 0:
             phase.total = total
         if self._active_key != key:
@@ -277,13 +361,13 @@ class SyncProgress:
             if tqdm is not None:
                 self._stage_bar = tqdm(
                     total=phase.total,
-                    desc=f"{key[0]} | {phase.label}",
-                    unit="item",
+                    desc=f"{key[0].replace('<batch>', '<バッチ>')} | {phase.label}",
+                    unit="件",
                     position=1,
                     leave=False,
                     dynamic_ncols=True,
                     disable=not self._bars_enabled,
-                    file=self.stream,
+                    file=self._progress_stream,
                 )
         elif self._stage_bar is not None and phase.total != self._stage_bar.total:
             self._stage_bar.total = phase.total
@@ -297,6 +381,15 @@ class SyncProgress:
         if desired > self._stage_bar.n:
             self._stage_bar.update(desired - self._stage_bar.n)
         if step:
+            label = {"start": "スタート", "page_start": "ページ開始", "page_done": "ページ完了",
+                     "document_done": "ドキュメント完了", "progress": "処理中", "document": "ドキュメント",
+                     "folder": "フォルダー", "done": "完了", "complete": "完了", "batch_done": "バッチ完了",
+                     "failed": "エラー", "page_failed": "ページエラー", "clean": "チェック済み",
+                     "repaired": "リペア済み", "review": "レビュー", "written": "保存済み",
+                     "unchanged": "変更なし", "indexed": "インデックス更新済み", "deleted": "削除済み"}
+            heading, separator, detail = step.partition(": ")
+            first, space, rest = heading.partition(" ")
+            step = label.get(first, first) + space + rest + separator + detail
             self._stage_bar.set_postfix_str(step[:80], refresh=False)
         self._stage_bar.refresh()
 
@@ -313,8 +406,8 @@ class SyncProgress:
         if self._active_key == key:
             self._update_bar(phase, step=status)
             self._close_visible()
-        suffix = "" if status == "done" else f" ({status})"
-        self._write(f"[{key[0]}] {phase.label}: {elapsed:.1f}s{suffix}")
+        label = {"done": "完了", "failed": "エラー", "review": "レビュー", "pending": "保留", "cancelled": "キャンセル"}.get(status, status)
+        self._write(f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: {elapsed:.1f}秒 ({label})")
 
     def on_event(self, event: dict[str, Any]) -> None:
         event = dict(event)
@@ -353,7 +446,10 @@ class SyncProgress:
             if event.get("page"):
                 detail += f": {shorten_name(str(event['page']), DOC_WIDTH)}"
             if event.get("status"):
-                detail += f" ({event['status']})"
+                status = str(event["status"])
+                status = {"written": "保存済み", "unchanged": "変更なし", "indexed": "インデックス更新済み",
+                          "deleted": "削除済み", "skipped": "スキップ", "failed": "エラー"}.get(status, status)
+                detail += f" ({status})"
             self._update_bar(phase, step=detail)
             if phase.total is not None and phase.completed >= phase.total:
                 self._finish(key, event)
@@ -378,7 +474,7 @@ class SyncProgress:
             pages = event.get("pages")
             total = pages if isinstance(pages, int) and pages > 0 else None
             phase = self._ensure_phase(key, total=total)
-            self._update_bar(phase, step=f"starting {pages or 0} pages")
+            self._update_bar(phase, step=f"{pages or 0}ページをスタート")
             return
         if step == "document_done":
             status = str(event.get("status") or "done")
@@ -393,8 +489,8 @@ class SyncProgress:
             label = step.removeprefix("page_")
             if step == "page_review" and int(event.get("selected_attempt") or 0) > 0:
                 label += (
-                    f" (best attempt {int(event['selected_attempt'])}, "
-                    f"score {int(event.get('selected_score') or 0)})"
+                    f" (ベストトライ {int(event['selected_attempt'])}, "
+                    f"スコア {int(event.get('selected_score') or 0)})"
                 )
             self._update_bar(phase, step=f"{label}: {page}")
             if phase.total is not None and phase.completed >= phase.total:
@@ -405,15 +501,15 @@ class SyncProgress:
         detail = step
         if step == "candidate_judged":
             detail = (
-                f"judge score {int(event.get('score') or 0)}"
-                f", issues {int(event.get('issues') or 0)}"
+                f"チェックスコア {int(event.get('score') or 0)}"
+                f"、問題 {int(event.get('issues') or 0)}件"
             )
         elif step == "candidate_rejected":
-            detail = f"rejected ({str(event.get('reason') or 'unknown')})"
+            detail = f"リジェクト ({str(event.get('reason') or '不明')})"
         if page:
             detail += f": {page}"
         if isinstance(attempt, int):
-            detail += f" (attempt {attempt})"
+            detail += f" (トライ {attempt})"
         self._update_bar(phase, step=detail)
 
     def close(self) -> None:
@@ -422,5 +518,5 @@ class SyncProgress:
             self._doc_bar.close()
         if self._documents:
             self._write(
-                f"Documents: {len(self._completed)}/{len(self._documents)} processed"
+                f"ドキュメント: {len(self._completed)}/{len(self._documents)}件を処理"
             )

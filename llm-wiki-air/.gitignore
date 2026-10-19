@@ -1,4 +1,13 @@
-data/
+# Tracked so a fresh clone has data/test/mount/ ready for the first sync; everything
+# else under data/ stays ignored.
+data/*
+!data/test/
+data/test/*
+!data/test/.gitkeep
+!data/test/mount/
+data/test/mount/*
+!data/test/mount/.gitkeep
+!data/test/mount/マニュアル/
 *.py[cod]
 __pycache__/
 .venv/
@@ -6,7 +15,7 @@ data-excel/
 .vscode/mcp.json
 growi-search/.env
 # Local project configs contain deployment credentials.
-configs/projectE_test.ini
+# configs/projectE_test.ini
 configs/projectF_test.ini
 configs/projectG_test.ini
 growi-search/frontend/node_modules/
@@ -16,6 +25,7 @@ tests/
 !tests/
 tests/*
 !tests/test_sync_fallback.py
+!tests/test_fast_link_sync.py
 !tests/test_md_txt_formats.py
 !tests/test_search_speedup.py
 !growi-search/
@@ -31,6 +41,7 @@ tests/*
 !tests/test_human_changes.py
 !tests/test_human_sync_rollout.py
 !tests/test_fast_repair.py
+!tests/test_failure_logs.py
 !tests/samples/
 !tests/samples/digital-agency-pdl.docx
 !doc-parser/tests/
@@ -46,7 +57,3 @@ data_big_backup/
 data_big_backup2/
 data_big_backup3/
 data_backups/
-# Recreated for the localhost GROWI; mount-docs.ini holds a credential.
-configs/mount-docs.ini
-configs/mount-docs-fast.ini
-configs/mount-docs-hc.ini

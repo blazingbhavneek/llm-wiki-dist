@@ -10,6 +10,7 @@ import mimetypes
 import re
 import time
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -66,6 +67,34 @@ class UnsupportedDocument(RuntimeError):
     pass
 
 
+# TEMPORARY: set False to disable ALL preflight skips and run-only rejection caching.
+# Nothing is permanently excluded; the next sync can try the files again.
+TEMPORARY_PARSER_PREFLIGHT = True
+
+
+class ParserSkip(UnsupportedDocument):
+    """A confirmed preflight rejection, or HTTP 415 from every parser endpoint."""
+
+
+_parser_skips: dict[tuple[str, str], str] | None = None
+
+
+@contextmanager
+def parser_skip_scope():
+    """Share rejections with parse-ahead only for this CLI command."""
+    global _parser_skips
+    previous = _parser_skips
+    _parser_skips = {}
+    try:
+        yield
+    finally:
+        _parser_skips = previous
+
+
+def parser_skip_cache() -> dict[tuple[str, str], str] | None:
+    return _parser_skips if TEMPORARY_PARSER_PREFLIGHT else None
+
+
 TEXT_SOURCE_SUFFIXES = {
     ".csv", ".htm", ".html", ".ini", ".json", ".log", ".md", ".rst",
     ".sql", ".svg", ".tex", ".tsv", ".txt", ".vtt", ".xml", ".yaml", ".yml",
@@ -117,7 +146,41 @@ def decode_text_bytes(raw: bytes, *, source: Path | None = None) -> str:
 
 
 def read_text_source(path: Path) -> str:
-    return decode_text_bytes(path.read_bytes(), source=path)
+    text = decode_text_bytes(path.read_bytes(), source=path)
+    if TEMPORARY_PARSER_PREFLIGHT and not text.strip():
+        raise ParserSkip("スキップ: テキストが空です")
+    return text
+
+
+def preflight_document(path: Path) -> None:
+    """TEMPORARY: reject only confirmed empty/password-protected sources."""
+    if not TEMPORARY_PARSER_PREFLIGHT:
+        return
+    if path.stat().st_size == 0:
+        raise ParserSkip("スキップ: ファイルが空です（0バイト）")
+    encrypted = False
+    try:
+        if path.suffix.lower() in {".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".pptx"}:
+            import msoffcrypto
+            import olefile
+
+            with path.open("rb") as handle:
+                if olefile.isOleFile(handle):
+                    with olefile.OleFileIO(handle) as archive:
+                        encrypted = archive.exists("EncryptionInfo") and archive.exists("EncryptedPackage")
+                    if not encrypted:
+                        handle.seek(0)
+                        encrypted = msoffcrypto.OfficeFile(handle).is_encrypted()
+        elif path.suffix.lower() == ".pdf":
+            from pypdf import PdfReader
+
+            with path.open("rb") as handle:
+                reader = PdfReader(handle)
+                encrypted = reader.is_encrypted and not reader.decrypt("")
+    except Exception:  # Inspection is advisory: unknown/corrupt formats still reach the parser.
+        log.debug("parser preflight inconclusive: %s", path.name, exc_info=True)
+    if encrypted:
+        raise ParserSkip("スキップ: 暗号化されたドキュメントです")
 
 
 def _open_parser_upload(path: Path) -> BinaryIO:
@@ -162,6 +225,7 @@ def parse_document(
     describe_images: bool | None = None,
     validate_markdown: Callable[[str], None] | None = None,
 ) -> str:
+    preflight_document(Path(path))  # TEMPORARY: runs before XLSM inspection or any upload.
     # The parser is an independent service. Wiki chat credentials must never
     # be forwarded here: doing so makes parser-side image descriptions call
     # the model used by wiki generation. If descriptions are explicitly
@@ -176,6 +240,7 @@ def parse_document(
     fallback = str(getattr(settings, "parser_fallback_base_url", "") or "").strip().rstrip("/")
     if fallback and fallback not in endpoints:
         endpoints.append(fallback)
+    unsupported_endpoints = 0
     for index, endpoint in enumerate(endpoints):
         started = time.monotonic()
         # Opening/preparing a local source is not an endpoint failure. Each
@@ -199,6 +264,7 @@ def parse_document(
                     timeout=(30, timeout_s),
                 )
                 if response.status_code == 415:
+                    unsupported_endpoints += 1
                     raise UnsupportedDocument(response.text[:200])
                 response.raise_for_status()
                 try:
@@ -218,10 +284,12 @@ def parse_document(
                     raise RuntimeError("doc-parser: manifest produced empty markdown")
                 if validate_markdown is not None:
                     validate_markdown(markdown)
-            except Exception:
+            except Exception as exc:
                 log.exception("stage=parser endpoint=%s elapsed=%.2fs fallback=%s",
                               safe_endpoint(endpoint), time.monotonic() - started, index + 1 < len(endpoints))
                 if index + 1 == len(endpoints):
+                    if TEMPORARY_PARSER_PREFLIGHT and unsupported_endpoints == len(endpoints):
+                        raise ParserSkip(f"スキップ: 全パーサーがフォーマットを認識できません: {exc}") from exc
                     raise
             else:
                 log.info("stage=parser endpoint=%s elapsed=%.2fs characters=%d",

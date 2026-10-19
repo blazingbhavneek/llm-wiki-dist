@@ -67,7 +67,7 @@ def resolve_project_path(value: str) -> Path:
 
 
 def app_concurrency() -> int:
-    return max(1, int(os.environ.get("WIKI_CONCURRENCY", "4")))
+    return max(1, int(os.environ.get("OPENAI_CONCURRENCY", "4")))
 
 
 def _normalize_growi_token(value: str) -> str:
@@ -159,9 +159,7 @@ class Settings(BaseModel):
 
     # reranker
     rerank_backend: str = "server"
-    rerank_base_url: str = "http://10.160.144.101:51025/v1"
     rerank_api_key: str = "local"
-    rerank_model: str = "cl-nagoya/ruri-v3-reranker-310m"
     hf_rerank_model: str = "cl-nagoya/ruri-v3-reranker-310m"
     rerank_device: str = "cpu"
     # A realtime answer budgets ~5 seconds end to end. A rerank call that has
@@ -192,8 +190,8 @@ class Settings(BaseModel):
     concurrency: int = app_concurrency()
     # Both ingest modes remain available; chunks is the historical default.
     ingest_mode: Literal["chunks", "wiki"] = "wiki"
-    # Generation policy (common/policy.py). Only `sync --fast` sets it; there is no env knob,
-    # so a stray variable can never switch production sync.
+    # CLI sync selects fast by default; --full explicitly selects standard.
+    # There is no env knob for the generation policy.
     policy: Literal["standard", "fast"] = "standard"
     # Opt-in sync shortcut: source-only tables and one-page rewrites below 10k chars.
     skip_excel_and_small: bool = False
@@ -213,10 +211,13 @@ class Settings(BaseModel):
     wiki_linker_mode: Literal["legacy", "neo"] = "neo"
     wiki_linker_concurrency: int = 0
     wiki_linker_judge: Literal["llm", "jev"] = "jev"
-    # Project-level JEV selection overrides the process/.env backend.  Keeping
-    # the GGUF paths here lets one project use local inference while another
-    # continues to use a hosted or llm2jev service.
-    wiki_jev_backend: Literal["torch", "gguf", "hosted", "llm2jev"] = "torch"
+    # Shisa is the fail-closed default. Project-level overrides remain supported,
+    # but production projects inherit the cloud endpoint from .env.
+    wiki_jev_backend: Literal["torch", "gguf", "hosted", "llm2jev", "shisa"] = "shisa"
+    wiki_jev_base_url: str = ""
+    wiki_jev_model: str = ""
+    wiki_jev_tokenizer: str = ""
+    wiki_jev_http_concurrency: int = Field(default=8, ge=1)
     wiki_jev_gguf_local_path: str = ""
     wiki_jev_gguf_quant: str = "F16"
     wiki_jev_gguf_many_mode: Literal["exact", "batched"] = "exact"
@@ -322,10 +323,6 @@ class Settings(BaseModel):
     evidence_rerank_pool: int = 120
     evidence_mmr_lambda: float = 0.75
     subagent_count: int = 3
-    subagent_concurrency: int = 3
-    subagent_max_steps: int = 20
-    subagent_min_reads: int = 5
-    subagent_max_reads: int = 10
 
     # API service concurrency (semaphores in ReadGraphService)
     service_max_reads: int = 16
@@ -351,13 +348,9 @@ class Settings(BaseModel):
         ) = _project_paths(project or env("WIKI_PROJECT", ""))
         concurrency = app_concurrency()
         settings = cls(
-            chat_base_url=env(
-                "WIKI_CHAT_BASE_URL", env("OPENAI_BASE_URL", cls.chat_base_url)
-            ),
-            chat_api_key=env(
-                "WIKI_CHAT_API_KEY", env("OPENAI_API_KEY", cls.chat_api_key)
-            ),
-            chat_model=env("WIKI_CHAT_MODEL", env("WIKI_MODEL", cls.chat_model)),
+            chat_base_url=env("OPENAI_BASE_URL", cls.chat_base_url),
+            chat_api_key=env("OPENAI_API_KEY", cls.chat_api_key),
+            chat_model=env("OPENAI_MODEL_NAME", cls.chat_model),
             writer_base_url=env("WRITER_BASE_URL", cls.writer_base_url),
             writer_api_key=env("WRITER_API_KEY", cls.writer_api_key),
             writer_model_name=env("WRITER_MODEL_NAME", cls.writer_model_name),
@@ -375,11 +368,7 @@ class Settings(BaseModel):
             hf_device=env("WIKI_HF_DEVICE", cls.hf_device),
             embed_dim=int(env("WIKI_EMBED_DIM", cls.embed_dim)),
             rerank_backend=env("WIKI_RERANK_BACKEND", cls.rerank_backend),
-            rerank_base_url=env(
-                "WIKI_RERANK_BASE_URL", env("WIKI_EMBED_BASE_URL", cls.rerank_base_url)
-            ),
             rerank_api_key=env("WIKI_RERANK_API_KEY", cls.rerank_api_key),
-            rerank_model=env("WIKI_RERANK_MODEL", cls.rerank_model),
             hf_rerank_model=env("WIKI_HF_RERANK_MODEL", cls.hf_rerank_model),
             rerank_device=env("WIKI_RERANK_DEVICE", cls.rerank_device),
             rerank_timeout_seconds=int(
@@ -425,6 +414,12 @@ class Settings(BaseModel):
             wiki_linker_mode=env("WIKI_LINKER_MODE", cls.wiki_linker_mode),
             wiki_linker_judge=env("WIKI_LINKER_JUDGE", cls.wiki_linker_judge),
             wiki_jev_backend=env("WIKI_JEV_BACKEND", cls.wiki_jev_backend),
+            wiki_jev_base_url=env("WIKI_JEV_BASE_URL", cls.wiki_jev_base_url),
+            wiki_jev_model=env("WIKI_JEV_MODEL", cls.wiki_jev_model),
+            wiki_jev_tokenizer=env("WIKI_JEV_TOKENIZER", cls.wiki_jev_tokenizer),
+            wiki_jev_http_concurrency=int(env(
+                "WIKI_JEV_HTTP_CONCURRENCY", cls.wiki_jev_http_concurrency,
+            )),
             wiki_jev_gguf_local_path=env("WIKI_JEV_GGUF_LOCAL_PATH", cls.wiki_jev_gguf_local_path),
             wiki_jev_gguf_quant=env("WIKI_JEV_GGUF_QUANT", cls.wiki_jev_gguf_quant),
             wiki_jev_gguf_many_mode=env("WIKI_JEV_GGUF_MANY_MODE", cls.wiki_jev_gguf_many_mode),
@@ -543,18 +538,6 @@ class Settings(BaseModel):
                 env("WIKI_EVIDENCE_MMR_LAMBDA", cls.evidence_mmr_lambda)
             ),
             subagent_count=int(env("WIKI_SUBAGENT_COUNT", cls.subagent_count)),
-            subagent_concurrency=int(
-                env("WIKI_SUBAGENT_CONCURRENCY", cls.subagent_concurrency)
-            ),
-            subagent_max_steps=int(
-                env("WIKI_SUBAGENT_MAX_STEPS", cls.subagent_max_steps)
-            ),
-            subagent_min_reads=int(
-                env("WIKI_SUBAGENT_MIN_READS", cls.subagent_min_reads)
-            ),
-            subagent_max_reads=int(
-                env("WIKI_SUBAGENT_MAX_READS", cls.subagent_max_reads)
-            ),
             service_max_reads=int(env("WIKI_SERVICE_MAX_READS", cls.service_max_reads)),
             service_max_agents=int(
                 env("WIKI_SERVICE_MAX_AGENTS", concurrency)
@@ -1689,15 +1672,31 @@ _IMAGE_KEYS = {
     "b64_json",
 }
 
+_INLINE_IMAGE_DATA_RE = re.compile(
+    r"data:(?:image/[a-z0-9.+-]+|application/octet-stream);base64,"
+    r"[a-z0-9+/]+={0,2}",
+    re.IGNORECASE,
+)
+_LONG_BASE64_RE = re.compile(
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{200,}={0,2}(?![A-Za-z0-9+/=])"
+)
+
 
 def sanitize_text(value: str) -> str:
     """Apply shared image/base64 stripping before text reaches an LLM."""
-    return strip_image_media(value)
+    sanitized = strip_image_media(value)
+    sanitized = _INLINE_IMAGE_DATA_RE.sub("[image omitted]", sanitized)
+    return _LONG_BASE64_RE.sub("[base64 omitted]", sanitized)
 
 
 def sanitize_messages(messages: list[Any]) -> list[Any]:
     """Sanitize LangChain/OpenAI-style messages before model calls."""
     return [_sanitize_message(message) for message in messages]
+
+
+def sanitize_model_input(value: Any) -> Any:
+    """Sanitize arbitrary nested input before it reaches a model backend."""
+    return _sanitize_content(value)
 
 
 def sanitize_tool_output(text: Any) -> str:
@@ -1764,22 +1763,23 @@ def _sanitize_content(content: Any) -> Any:
 
 def _sanitize_message(message: Any) -> Any:
     if isinstance(message, dict):
-        entry = dict(message)
-        if "content" in entry:
-            entry["content"] = _sanitize_content(entry.get("content"))
-        return entry
+        return _sanitize_content(message)
 
     content = getattr(message, "content", None)
     if content is None:
         return message
 
-    sanitized_content = _sanitize_content(content)
+    updates = {"content": _sanitize_content(content)}
+    additional_kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        updates["additional_kwargs"] = _sanitize_content(additional_kwargs)
     if hasattr(message, "model_copy"):
-        return message.model_copy(update={"content": sanitized_content})
+        return message.model_copy(update=updates)
 
     try:
         cloned = copy.copy(message)
-        cloned.content = sanitized_content
+        for key, value in updates.items():
+            setattr(cloned, key, value)
         return cloned
     except Exception:
         return message

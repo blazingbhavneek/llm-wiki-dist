@@ -34,7 +34,9 @@ from typing import Any
 
 from graph import config
 from graph.config import Settings, resolve_project_path
+from graph.workspace.parser_client import parser_skip_scope
 from graph.workspace.project import open_project
+from publisher.failure_logs import capture_failure_logs, capture_run_logs
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 config.PROJECT_ROOT = PROJECT_ROOT
@@ -122,7 +124,7 @@ def _interrupted_fast_repair(
 
 def _settings(args: argparse.Namespace) -> Settings:
     settings = Settings.from_env(getattr(args, "project", ""))
-    # .env (WIKI_CHAT_*/OPENAI_*/WIKI_MODEL) is the default; the project INI is
+    # .env (OPENAI_*) is the default; the project INI is
     # project-specific and already wins inside Settings.from_env.
     if getattr(args, "data_root", None):
         settings.data_root = str(resolve_project_path(args.data_root).resolve())
@@ -136,8 +138,10 @@ def _settings(args: argparse.Namespace) -> Settings:
         settings.wiki_linker_mode = linker
     if getattr(args, "timeout", None):
         settings.wiki_request_timeout = args.timeout
-    if getattr(args, "fast", False):
+    if getattr(args, "command", "") == "sync" and not getattr(args, "full", False):
         settings.policy = "fast"
+    elif getattr(args, "command", "") == "sync":
+        settings.policy = "standard"
     if getattr(args, "skip_excel_and_small", False):
         settings.skip_excel_and_small = True
     if not policy_of(settings).link:
@@ -161,12 +165,25 @@ def _progress(event: dict[str, Any]) -> None:
     log.debug(f"[{stage}] {step}{progress} {details}".rstrip())
 
 
-def _report(result: dict[str, Any]) -> int:
-    for row in result["done"]:
+def _report(result: dict[str, Any], settings: Settings | None = None) -> int:
+    for row in result.get("done", []):
         print(json.dumps(row, ensure_ascii=False))
-    for failure in result["failures"]:
-        logging.error("%s", failure)
-    return 1 if result["failures"] else 0
+    failures = result.get("failures", []) + result.get("scan_failures", [])
+    if settings is not None and getattr(settings, "target_name", ""):
+        from publisher.failure_logs import report_failure_summary
+
+        report_failure_summary(settings, failures, result.get("warnings", []))
+    else:
+        for failure in failures:
+            logging.error("ドキュメントの処理に失敗: %s", failure)
+    return 1 if failures else 0
+
+
+def _batch_failures(result: dict[str, Any]) -> list[str]:
+    """Keep mount paths when a queue operation reports only a shared exception."""
+    paths = result.get("paths", [])
+    return [failure if not paths or any(path in failure for path in paths)
+            else f"{', '.join(paths)}: {failure}" for failure in result.get("failures", [])]
 
 
 def _jev_check(settings: Settings) -> tuple[str, int]:
@@ -250,38 +267,24 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+@capture_failure_logs()
+@parser_skip_scope()  # TEMPORARY: parser rejections expire at the end of this sync.
 def cmd_sync(args: argparse.Namespace) -> int:
     fast_repair = bool(getattr(args, "fast_repair", False))
     if getattr(args, "limit", None) is not None and not fast_repair:
-        raise SystemExit("--limit is only valid with --fast --repair")
+        raise SystemExit("--limit is only valid with sync --repair")
     if (
         getattr(args, "fast_link", False)
         or getattr(args, "fast_link_reset", False)
         or fast_repair
     ):
-        if not getattr(args, "fast", False):
-            raise SystemExit("--link, --link-reset and --repair require --fast")
+        if getattr(args, "full", False):
+            raise SystemExit("--link, --link-reset and --repair cannot be combined with --full")
         if fast_repair:
             return _cmd_fast_repair(args)
         if getattr(args, "items", None):
-            raise SystemExit("--fast --link and --fast --link-reset operate on the whole generated wiki project")
-        from graph.fast.inline_linker import link_project, reset_project
-
-        settings = _settings(args)
-        result = (
-            reset_project(settings)
-            if getattr(args, "fast_link_reset", False)
-            else link_project(
-                settings,
-                force=bool(getattr(args, "force", False)),
-                continue_run=bool(getattr(args, "continue_run", False)),
-                on_progress=_progress if args.verbose else None,
-            )
-        )
-        code = _report(result)
-        if not result.get("failures"):
-            print("fast links changed locally; run `python main.py publish` when ready", file=sys.stderr)
-        return code
+            raise SystemExit("--link and --link-reset operate on the whole generated wiki project")
+        return _cmd_fast_link(args)
 
     from publisher import pipeline
     from publisher.queue import retry_failed, scan, work_once, worker_lock
@@ -297,13 +300,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if isolated:
         return _cmd_sync_isolated(args, settings)
     project = open_project(settings)
+    fast_linking = (
+        policy_of(settings).name == "fast" and getattr(settings, "wiki_linker_enabled", True)
+    )
     combined: dict[str, Any] = {"done": [], "failures": []}
     progress = SyncProgress()
 
     def on_event(event: dict[str, Any]) -> None:
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     try:
         stale = pipeline.republish_if_stale(settings)
@@ -311,6 +316,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
             print(f"growi endpoint or markers changed: full republish {stale['run_id']}", flush=True)
             combined["failures"].extend(stale["failures"])
         with worker_lock(project):
+            with pipeline._lock(project):
+                from publisher.history import checkpoint_legacy_fast_links
+
+                checkpoint_legacy_fast_links(project)
             retry_failed(project)
             first = True
             resume = bool(getattr(args, "continue_run", False))
@@ -323,8 +332,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
                     verify_content=True,
                 )
                 progress.add_scan_result(scan_result)
+                combined.setdefault("scan_failures", []).extend(
+                    f"scan {rel}: {error}" for rel, error in scan_result.get("errors", {}).items()
+                )
                 first = False
-                result = work_once(settings, on_event=on_event, continue_run=resume)
+                work_args = {"defer_linker": True} if fast_linking else {}
+                result = work_once(settings, on_event=on_event, continue_run=resume, **work_args)
                 # Only the first batch can resume a kept worktree; later batches
                 # in the same process are always fresh.
                 resume = False
@@ -333,10 +346,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 paths = result.get("paths", [])
                 progress.add_documents(paths)
                 combined["done"].extend(result.get("done", []))
-                combined["failures"].extend(result.get("failures", []))
+                combined["failures"].extend(_batch_failures(result))
+                combined.setdefault("warnings", []).extend(result.get("index", {}).get("failures", []))
                 if result.get("failures"):
                     break
                 progress.mark_completed(paths)
+            if fast_linking and not combined["failures"]:
+                linked = _run_fast_link(
+                    args, settings, worker_locked=True, on_progress=on_event,
+                    only=_sync_link_scope(project, args.items),
+                )
+                combined["done"].extend(linked.get("done", []))
+                combined["failures"].extend(linked.get("failures", []))
         if not combined["failures"]:
             # Index pages are derived output, so reconcile them against the whole wiki tree
             # here: a wiki built before its index exists catches up, and a page whose body
@@ -344,15 +365,144 @@ def cmd_sync(args: argparse.Namespace) -> int:
             from publisher.index import build_index
 
             try:
-                index_callback = on_event if args.verbose or progress.has_documents else None
-                index = build_index(settings, on_progress=index_callback)
+                index = build_index(settings, on_progress=on_event)
             except Exception as exc:  # a stale table of contents must not fail a sync
+                log.exception("インデックス処理に失敗")
                 index = {"done": [], "failures": [f"index: {type(exc).__name__}: {exc}"]}
             combined["done"].extend(index["done"])
             combined["failures"].extend(index["failures"])
-        return _report(combined)
+        return _report(combined, settings)
     finally:
         progress.close()
+
+
+def _cmd_fast_link(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    return _report(_run_fast_link(args, settings), settings)
+
+
+def _sync_link_scope(project: Any, items: list[str] | None) -> list[str] | None:
+    if not items:
+        return None
+    from publisher.ledger import load_ledger
+
+    wanted = {item.strip().lstrip("/") for item in items}
+    ledger = load_ledger(project.metadata / "pipeline.json")
+    return sorted({
+        str(row["raw_rel"])
+        for rel, row in ledger.sources.items()
+        if (rel in wanted or str(row.get("mount_rel") or "") in wanted) and row.get("raw_rel")
+    })
+
+
+def _run_fast_link(
+    args: argparse.Namespace, settings: Settings, *, worker_locked: bool = False,
+    preflight: bool = True, on_progress: Any = None, only: list[str] | None = None,
+) -> dict[str, Any]:
+    """Keep analysis resumable; accept and publish only a complete fast-link pass."""
+    import uuid
+    from contextlib import nullcontext
+
+    from graph.fast.inline_linker import (
+        _checkpoint, _manifest, _manifest_path, _purge_extractions, link_project, reset_project,
+    )
+    from graph.wiki.storage import read_json, write_json_atomic
+    from publisher import pipeline
+    from publisher.history import (
+        candidate, candidate_is_clean, checkpoint_legacy_fast_links, commit_candidate,
+        last_good, promote, restore_last_good,
+    )
+    from publisher.ledger import load_ledger
+    from publisher.queue import _candidate_settings, _finish_transaction, _transaction, recover, worker_lock
+
+    project = open_project(settings)
+    callback = on_progress if on_progress is not None else _progress
+    resetting = bool(getattr(args, "fast_link_reset", False))
+    result: dict[str, Any] = {"done": [], "failures": []}
+    accepted = False
+    try:
+        with nullcontext() if worker_locked else worker_lock(project):
+            if preflight:
+                with pipeline._lock(project):
+                    recover(project, settings)
+                    checkpoint_legacy_fast_links(project)
+            if preflight and not resetting:
+                pulled = pipeline.pull_growi_once(settings)
+                if pulled.get("failures"):
+                    return pulled
+            with pipeline._lock(project):
+                base = last_good(project)
+                if not candidate_is_clean(project, base):
+                    raise RuntimeError("ファストリンク: ローカルの未確定の変更があります")
+                operation = "fast-link-" + uuid.uuid4().hex
+                with candidate(project, operation) as staged:
+                    if resetting:
+                        write_json_atomic(_manifest_path(staged), _manifest(project))
+                        result = reset_project(_candidate_settings(settings, staged))
+                    else:
+                        result = link_project(
+                            settings, force=bool(getattr(args, "force", False)),
+                            continue_run=bool(getattr(args, "continue_run", False)),
+                            on_progress=callback, output_project=staged, only=only,
+                        )
+                    if result.get("failures"):
+                        result["done"] = []
+                        return result
+                    if not resetting:
+                        # Indexes use this ready marker; a distinct mode lets --full
+                        # recognize that its own linker still needs to run.
+                        for doc in result.get("linked_documents", []):
+                            marker = staged.wiki / doc / "_planning" / "linker.json"
+                            write_json_atomic(marker, {
+                                **read_json(marker, default={}),
+                                "schema_version": 2, "status": "complete", "mode": "fast-inline",
+                            })
+                    if not candidate_is_clean(project, base):
+                        raise RuntimeError("ファストリンク中にローカルのページが変更されました")
+                    if not candidate_is_clean(staged, base):
+                        commit = commit_candidate(staged, f"fast link {'reset' if resetting else 'complete'}",
+                                                  {"base": base, "operation": operation})
+                        _transaction(project, operation, base, "building", commit)
+                        try:
+                            promote(project, staged, commit)
+                        except BaseException:
+                            restore_last_good(project)
+                            raise
+                        _finish_transaction(project, operation)
+                accepted = True
+            if resetting:
+                _purge_extractions(project)
+                return result
+            _checkpoint(project, "complete", documents=_manifest(project).get("documents", {}), failures=[])
+            # Already-published documents are not rewritten. A failed publish can be retried
+            # without redoing the accepted linker work.
+            ledger = load_ledger(project.metadata / "pipeline.json")
+            publish_scope: list[str] = []
+            for doc in result.get("linked_documents", []):
+                if ledger.published_documents.get(doc, {}).get("content_sha256") == pipeline._content_hash(project.wiki / doc):
+                    continue
+                raw = read_json(project.wiki / doc / "_planning" / "source.json", default={}).get("raw")
+                if not raw:
+                    raise RuntimeError(f"ファストリンク: ソースのマッピングがありません: {doc}")
+                publish_scope.append(str(raw))
+            if publish_scope:
+                published = pipeline.publish_only(settings, only=publish_scope, allow_unlinked=True,
+                                                   link_pending=False, captured=True, on_progress=callback)
+                result["done"].extend(published.get("done", []))
+                result["failures"].extend(published.get("failures", []))
+                if published.get("failures"):
+                    _checkpoint(project, "publish-failed", failures=published["failures"])
+    except KeyboardInterrupt:
+        if not accepted:
+            result["done"] = []
+        _checkpoint(project, "interrupted")
+        result["failures"].append("ファストリンクを中断しました。メタデータを保存しました。sync --continue で再開できます")
+    except Exception as exc:
+        if not accepted:
+            result["done"] = []
+        log.exception("ファストリンクに失敗")
+        result["failures"].append(f"fast link: {type(exc).__name__}: {exc}")
+    return result
 
 
 def _cmd_fast_repair(args: argparse.Namespace) -> int:
@@ -383,18 +533,17 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
             combined["failures"].append(
                 f"fast repair resume inspection: {type(exc).__name__}: {exc}"
             )
-            return _report(combined)
+            return _report(combined, settings)
         if resume_dirty and not resume_page_states:
             combined["failures"].append(
                 "fast repair setup: interrupted repair checkpoints are unreadable; "
                 "refusing to restart completed pages"
             )
-            return _report(combined)
+            return _report(combined, settings)
 
         def on_event(event: dict[str, Any]) -> None:
             progress.on_event(event)
-            if args.verbose:
-                _progress(event)
+            _progress(event)
 
         try:
             repair = FastRepair(
@@ -405,12 +554,13 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
             )
             targets = repair.targets(getattr(args, "items", None) or None)
         except Exception as exc:
+            log.exception("ファストリペアのセットアップに失敗")
             combined["failures"].append(f"fast repair setup: {type(exc).__name__}: {exc}")
-            return _report(combined)
+            return _report(combined, settings)
 
         if not targets:
             log.info("fast repair project=%s has no eligible documents", settings.target_name)
-            return _report(combined)
+            return _report(combined, settings)
 
         if limit is None:
             progress.add_documents(targets)
@@ -441,11 +591,11 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
                     combined["failures"].append(
                         f"fast repair preflight: {type(exc).__name__}: {exc}"
                     )
-                    return _report(combined)
+                    return _report(combined, settings)
                 # A page that failed the pull ("<document>/<page>.md: reason") holds back only its own
                 # document; anything else (GROWI unreachable, inventory problems) stops the repair.
                 if not all(f.split(": ", 1)[0].endswith(".md") for f in combined["failures"]):
-                    return _report(combined)
+                    return _report(combined, settings)
                 held = {f.split(": ", 1)[0].rpartition("/")[0] for f in combined["failures"]}
                 targets = [t for t in targets if project.wiki_dir(t).relative_to(project.wiki).as_posix() not in held]
 
@@ -510,32 +660,27 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
                 # next target.  --continue can revisit it after the rest of
                 # the project has been processed.
                 continue
-    return _report(combined)
+    return _report(combined, settings)
 
 
 def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     """One retry owner; each operation starts from the latest accepted main."""
-    import traceback
-    import uuid
-
     from publisher import pipeline
     from publisher.ahead import LinkAhead, ParseAhead, PlannerAhead
-    from publisher.failure_logs import save_failure
     from publisher.queue import queued_jobs, recover, retry_failed, scan, status, work_once, worker_lock
     from publisher.progress import SyncProgress
 
     project = open_project(settings)
-    run_id = "sync-" + uuid.uuid4().hex
+    fast_linking = policy_of(settings).name == "fast"
     parse_ahead: ParseAhead | None = None
     planner_ahead: PlannerAhead | None = None
     link_ahead: LinkAhead | None = None
     combined: dict[str, Any] = {"done": [], "failures": []}
     progress = SyncProgress()
     wanted = {item.strip().lstrip("/") for item in args.items or ()}
-    logs: dict[str, list[str]] = {}
     discovery: dict[str, str] = {}
-    recorded: set[tuple[int, str, str]] = set()
     recovered: list[str] = []
+    skipped_versions: dict[str, int] = {}
     blocked = False
 
     def selected(row: dict[str, Any]) -> bool:
@@ -543,17 +688,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
 
     def link_scope() -> list[str] | None:
         """Raw paths of the selected sources (None: every document)."""
-        if not wanted:
-            return None
-        from publisher.ledger import load_ledger
-
-        ledger = load_ledger(project.metadata / "pipeline.json")
-        return sorted({
-            str(row.get("raw_rel") or "")
-            for rel, row in ledger.sources.items()
-            if (rel in wanted or str(row.get("mount_rel") or "") in wanted)
-            and row.get("raw_rel")
-        })
+        return _sync_link_scope(project, args.items)
 
     def on_event(event: dict[str, Any]) -> None:
         if (
@@ -563,18 +698,21 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
         ):
             parse_ahead.advance()
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     try:
         with worker_lock(project):
             # Uncertain remote state must be examined before pruning, scanning,
             # retrying jobs, or issuing any unrelated publication.
             recover(project, settings)
+            with pipeline._lock(project):
+                from publisher.history import checkpoint_legacy_fast_links
+
+                checkpoint_legacy_fast_links(project)
             stale = pipeline.republish_if_stale(settings)
             if stale is not None and stale.get("failures"):
                 combined["failures"].extend(stale["failures"])
-                return _report(combined)
+                return _report(combined, settings)
             if stale is None:
                 # Capture GROWI edits before any scan or build, so a UI-only edit is taken even
                 # when no source changed. A blocked page is reported; its document is blocked
@@ -601,19 +739,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 )
             }
             for rel, error in discovery.items():
-                key = (1, rel, error)
-                recorded.add(key)
-                path = save_failure(
-                    settings,
-                    project,
-                    run_id,
-                    1,
-                    rel,
-                    {"stage": "scan", "error": error},
-                    error,
-                )
-                logs.setdefault(rel, []).append(path)
-                log.error("source discovery failed: %s; log=%s", rel, path)
+                log.error("source discovery failed: %s: %s", rel, error)
             # Parse, plan and build form one bounded train; every ahead worker only
             # fills a content-addressed cache (publisher/ahead.py).
             settings.cache_dir = getattr(settings, "cache_dir", "") or str((project.metadata / "cache").resolve())
@@ -625,14 +751,14 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 queued_jobs(project, only=args.items or None),
                 on_ready=planner_ahead.add if planner_ahead is not None else None,
             )
-            if getattr(settings, "wiki_linker_enabled", True):
+            if getattr(settings, "wiki_linker_enabled", True) and not fast_linking:
                 link_ahead = LinkAhead(project, settings)
                 # Built earlier but not linked yet (e.g. a stopped run): these go first.
                 link_ahead.add(project, pipeline._pending_link_rels(project, settings, link_scope()))
             attempt = 1
             while True:
                 result = work_once(settings, on_event=on_event, isolated=True,
-                                   only=args.items or None, run_id=run_id, attempt=attempt,
+                                   only=args.items or None,
                                    exclude=list(discovery), defer_linker=True)
                 if result is None:
                     if attempt == 2:
@@ -640,23 +766,26 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                     # Snapshot exact current versions once. No scan or worker
                     # loop below automatically requeues failed final attempts.
                     targets = {row["rel"]: row["version"] for row in status(project)
-                               if selected(row) and row["status"] == "failed"}
+                               if selected(row) and row["status"] == "failed"
+                               and skipped_versions.get(row["rel"]) != row["version"]}
                     retry_failed(project, only=args.items or None, versions=targets)
                     attempt = 2
                     log.info("first pass complete; final retry documents=%d discovery=%d", len(targets), len(discovery))
                     continue
                 paths = result.get("paths", [])
+                skipped_paths = set(result.get("parser_skips", []))
+                skipped_versions.update({row["rel"]: row["version"] for row in result.get("job_versions", [])
+                                         if row["rel"] in skipped_paths})
                 progress.add_documents(paths)
-                evidence = result.get("failure_logs", [])
-                if evidence:
-                    for rel in paths:
-                        logs.setdefault(rel, []).extend(evidence)
                 if result.get("recovery_required") or result.get("cancelled"):
                     blocked = True
                     combined["failures"].extend(result.get("failures") or ["sync cancelled; pending jobs retained"])
                     break
                 if result.get("failures"):
-                    log.warning("document attempt %d failed: %s; logs=%s", attempt, paths, result.get("failure_logs", []))
+                    if skipped_paths and set(paths) <= skipped_paths:
+                        log.warning("ドキュメントをスキップ: %s", paths)
+                    else:
+                        log.warning("document attempt %d failed: %s", attempt, paths)
                     continue
                 combined["done"].extend(result.get("done", []))
                 progress.mark_completed(paths)
@@ -670,47 +799,59 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
             if link_ahead is not None:
                 link_ahead.close(wait=not blocked)
             if not blocked and getattr(settings, "wiki_linker_enabled", True):
-                linked = pipeline.link_pending_isolated(
-                    settings,
-                    only=link_scope(),
-                    on_progress=on_event,
-                )
+                if fast_linking:
+                    linked = _run_fast_link(
+                        args, settings, worker_locked=True, preflight=False,
+                        on_progress=on_event, only=link_scope(),
+                    )
+                else:
+                    linked = pipeline.link_pending_isolated(
+                        settings,
+                        only=link_scope(),
+                        on_progress=on_event,
+                    )
                 combined["done"].extend(linked.get("done", []))
                 combined["failures"].extend(linked.get("failures", []))
+                failed_links = list(linked.get("failed_documents", []))
+                if failed_links:
+                    # Linking is attempted first and remains pending for the next sync,
+                    # but a linker outage must not withhold successfully built content.
+                    log.info("リンク未完了のドキュメントを先に公開します: %d件", len(failed_links))
+                    published = pipeline.publish_only(
+                        settings,
+                        only=failed_links,
+                        allow_unlinked=True,
+                        link_pending=False,
+                    )
+                    combined["done"].extend(published.get("done", []))
+                    combined["failures"].extend(published.get("failures", []))
             elif not blocked and not policy_of(settings).link:
-                # A policy without linking (fast) still publishes what it built; the
-                # link phase above is where a linking sync publishes.
+                # A policy without linking still publishes what it built.
                 published = pipeline.publish_only(settings, only=link_scope(), allow_unlinked=True, link_pending=False)
                 combined["done"].extend(published.get("done", []))
                 combined["failures"].extend(published.get("failures", []))
             pending = [row for row in status(project) if selected(row)]
             for row in pending:
-                evidence = ", ".join(logs.get(row["rel"], []))
-                combined["failures"].append(
-                    f"{row['rel']}: {row.get('error') or 'pending dependent work'}"
-                    + (f"; logs: {evidence}" if evidence else "")
-                )
+                combined["failures"].append(f"{row['rel']}: {row.get('error') or 'pending dependent work'}")
             for rel, error in discovery.items():
-                combined["failures"].append(f"scan {rel}: {error.splitlines()[-1]}; logs: {', '.join(logs.get(rel, []))}")
+                combined["failures"].append(f"scan {rel}: {error}")
             if not blocked:
                 from publisher.index import build_index
 
                 try:
-                    index = build_index(settings, on_progress=on_event if args.verbose or progress.has_documents else None)
+                    index = build_index(settings, on_progress=on_event)
                     combined["done"].extend(index.get("done", []))
                     combined["failures"].extend(index.get("failures", []))
                 except Exception as exc:
+                    log.exception("インデックス処理に失敗")
                     combined["failures"].append(f"index: {type(exc).__name__}: {exc}")
         if recovered:
             print(json.dumps({"recovered_on_final_retry": recovered}, ensure_ascii=False))
-        if logs:
-            print(json.dumps({"failure_logs": logs, "run_id": run_id}, ensure_ascii=False))
-        return _report(combined)
+        return _report(combined, settings)
     except Exception as exc:
-        evidence = save_failure(settings, project, run_id, 1, "<shared>",
-                                {"stage": "sync", "error": traceback.format_exc()}, traceback.format_exc())
-        combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}; log: {evidence}")
-        return _report(combined)
+        log.exception("シンク処理に失敗")
+        combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}")
+        return _report(combined, settings)
     finally:
         if parse_ahead is not None:
             parse_ahead.stop()
@@ -721,6 +862,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
         progress.close()
 
 
+@capture_failure_logs()
 def cmd_pull(args: argparse.Namespace) -> int:
     from publisher.pipeline import pull_growi_once
 
@@ -732,7 +874,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     )
     if result.get("human_sync"):
         print(json.dumps({"human_sync": result["human_sync"]}, ensure_ascii=False, default=str))
-    return _report(result)
+    return _report(result, settings)
 
 
 def cmd_human(args: argparse.Namespace) -> int:
@@ -781,7 +923,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             interval=args.interval,
             growi_interval=args.growi_interval,
             force=args.force,
-            on_event=_progress if args.verbose else None,
+            on_event=_progress,
             continue_run=bool(getattr(args, "continue_run", False)),
         )
     except KeyboardInterrupt:
@@ -795,7 +937,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
     settings = _settings(args)
     project = open_project(settings)
     if args.queue_command == "scan":
-        print(json.dumps(scan(settings, only=args.items or None, settle_seconds=args.settle, force=args.force), ensure_ascii=False))
+        result = scan(settings, only=args.items or None, settle_seconds=args.settle, force=args.force)
+        print(json.dumps(result, ensure_ascii=False))
+        _report({"failures": [f"scan {rel}: {error}" for rel, error in result.get("errors", {}).items()]}, settings)
         return 0
     if args.queue_command == "status":
         for row in status(project):
@@ -817,20 +961,24 @@ def cmd_queue(args: argparse.Namespace) -> int:
                 print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
             if args.once:
                 index_failures = (result or {}).get("index", {}).get("failures", [])
+                _report({"failures": _batch_failures(result or {}), "warnings": index_failures}, settings)
                 return 1 if result and (result.get("failures") or index_failures) else 0
             if result is None:
                 time.sleep(0.5)
 
 
+@capture_failure_logs()
 def cmd_convert(args: argparse.Namespace) -> int:
     settings = _settings(args)
     from runner.steps import convert
 
-    result = convert(settings, on_progress=_progress if args.verbose else None)
-    print(json.dumps(result, ensure_ascii=False))
+    result = convert(settings, on_progress=_progress)
+    print(json.dumps({key: value for key, value in result.items() if key != "failures"}, ensure_ascii=False))
+    _report({"failures": result.get("failures") or result["failed"]}, settings)
     return 1 if result["failed"] else 0
 
 
+@capture_failure_logs()
 def cmd_build(args: argparse.Namespace) -> int:
     items = list(args.items)
     phase = items.pop(0) if items and items[0] in {"wiki", "link", "all"} else "all"
@@ -839,16 +987,18 @@ def cmd_build(args: argparse.Namespace) -> int:
         rels += [line.strip() for line in Path(args.from_file).read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
     from runner.steps import build
 
+    settings = _settings(args)
     return _report(build(
-        _settings(args), phase=phase, only=rels or None, force=args.force,
-        on_progress=_progress if args.verbose else None,
-    ))
+        settings, phase=phase, only=rels or None, force=args.force,
+        on_progress=_progress,
+    ), settings)
 
 
+@capture_failure_logs()
 def cmd_publish(args: argparse.Namespace) -> int:
     from contextlib import closing
 
-    allow_unlinked = bool(getattr(args, "allow_unlinked", True))
+    allow_unlinked = True
     from publisher.phase import Config, Input, run
     from publisher.progress import SyncProgress
 
@@ -867,13 +1017,9 @@ def cmd_publish(args: argparse.Namespace) -> int:
             if step == "done":
                 stats["indexed"] = event.get("current", 0)
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
-    if allow_unlinked:
-        log.info("publish project=%s allow_unlinked=True; linking skipped", settings.target_name)
-    else:
-        log.info("publish project=%s allow_unlinked=False; pending links will be checked", settings.target_name)
+    log.info("publish project=%s allow_unlinked=True; linking skipped", settings.target_name)
     with closing(SyncProgress()) as progress:
         result = run(
             Config(
@@ -894,23 +1040,25 @@ def cmd_publish(args: argparse.Namespace) -> int:
         stats.get("indexed", stats.get("indexes", 0)),
         len(result.failures),
     )
-    return _report({"done": list(result.pages), "failures": list(result.failures)})
+    return _report({"done": list(result.pages), "failures": list(result.failures)}, settings)
 
 
+@capture_failure_logs()
 def cmd_index(args: argparse.Namespace) -> int:
     settings = _settings(args)
     if args.delete:
         from publisher.index import delete_index_pages
 
-        return _report(delete_index_pages(settings))
+        return _report(delete_index_pages(settings), settings)
     from runner.steps import index
 
     return _report(index(
         settings, only=args.items or None, publish=not args.no_publish,
-        on_progress=_progress if args.verbose else None,
-    ))
+        on_progress=_progress,
+    ), settings)
 
 
+@capture_failure_logs()
 def cmd_reset(args: argparse.Namespace) -> int:
     from contextlib import closing
 
@@ -921,13 +1069,13 @@ def cmd_reset(args: argparse.Namespace) -> int:
     with closing(SyncProgress()) as progress:
         def on_event(event: dict[str, Any]) -> None:
             progress.on_event(event)
-            if args.verbose:
-                _progress(event)
+            _progress(event)
 
         result = reset_growi(settings, on_progress=on_event)
-    return _report(result)
+    return _report(result, settings)
 
 
+@capture_failure_logs()
 def cmd_link(args: argparse.Namespace) -> int:
     from graph.linker import __main__ as linker_cli
 
@@ -935,7 +1083,7 @@ def cmd_link(args: argparse.Namespace) -> int:
     project = open_project(settings)
     if args.link_command is None:
         from publisher.pipeline import link_raw
-        return _report(link_raw(settings, force=args.force, on_progress=_progress if args.verbose else None))
+        return _report(link_raw(settings, force=args.force, on_progress=_progress), settings)
     if args.link_command == "status":
         import sqlite3
 
@@ -957,10 +1105,10 @@ def cmd_link(args: argparse.Namespace) -> int:
         elif not project.raw_file(rel).exists():
             raise SystemExit(f"unknown document: {args.document} (wiki folder or raw rel path)")
         model, embedder = linker_cli._model_and_embedder(settings, project, Path(rel).parent.as_posix())
-        result = run_async_blocking(link_document(project, rel, model=model, embedder=embedder, settings=settings, on_progress=_progress if args.verbose else None))
+        result = run_async_blocking(link_document(project, rel, model=model, embedder=embedder, settings=settings, on_progress=_progress))
         print(json.dumps({"touched": result.touched_documents}, ensure_ascii=False))
         if result.touched_documents:
-            print("run `python main.py publish` to push the touched documents to GROWI", file=sys.stderr)
+            print("更新したドキュメントをGROWIへ反映するには `python main.py publish` を実行してください", file=sys.stderr)
     return 0
 
 
@@ -986,33 +1134,35 @@ def build_parser() -> argparse.ArgumentParser:
     sync = sub.add_parser("sync", help="scan and drain the configured project's durable queue"); pipeline_flags(sync)
     sync.description = "Drain the queue, then reconcile index pages for the whole wiki tree."
     sync.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
-    sync.add_argument("--force", action="store_true", help="regenerate selected sources even when unchanged")
-    sync.add_argument("--fast", action="store_true", help="use the fast wiki and linker policies for changed sources")
+    sync.add_argument("--force", action="store_true", help="regenerate unchanged sources; with --link, relink completed documents too")
+    policy_flags = sync.add_mutually_exclusive_group()
+    policy_flags.add_argument("--fast", action="store_true", help="use fast generation and linking (the default)")
+    policy_flags.add_argument("--full", action="store_true", help="explicitly run standard generation, research and linking")
     fast_operation = sync.add_mutually_exclusive_group()
     fast_operation.add_argument(
         "--link", dest="fast_link", action="store_true",
-        help="with --fast, add reversible inline links to already-generated local wikis only",
+        help="run only the same fast linker used by normal sync, then publish on completion",
     )
     fast_operation.add_argument(
         "--link-reset", dest="fast_link_reset", action="store_true",
-        help="with --fast, remove only links previously added by --fast --link",
+        help="remove recorded fast inline links locally and checkpoint the reset",
     )
     fast_operation.add_argument(
         "--repair", dest="fast_repair", action="store_true",
-        help="with --fast, judge and repair existing generated wiki pages",
+        help="judge and repair existing fast wiki pages",
     )
     sync.add_argument(
         "--limit", type=int,
-        help="with --fast --repair, examine at most this many pages",
+        help="with --repair, examine at most this many pages",
     )
     sync.add_argument("--skip-excel-and-small", action="store_true",
                       help="keep tabular source pages without extra analyses; rewrite documents under 10,000 readable characters as one page without planning")
     sync.add_argument(
         "--isolated", action=argparse.BooleanOptionalAction, default=None,
-        help="build all sources with one final retry pass, then do the same for pending links (default: enabled; use --no-isolated for legacy batch mode)",
+        help="build sources one candidate at a time with a final retry pass (default: enabled; use --no-isolated for legacy batch generation)",
     )
     sync.add_argument("--continue", dest="continue_run", action="store_true",
-                      help="resume saved work; with --fast --link, reuse partial page/Jev checkpoints")
+                      help="resume saved work, including matching fast-linker page/Jev checkpoints")
     sync.set_defaults(fn=cmd_sync)
     watch = sub.add_parser("watch", help="run the metadata scanner and persistent queue worker"); pipeline_flags(watch)
     watch.add_argument("items", nargs="*", metavar="mount-rel", help="mount-relative source paths; omit for the full project")
@@ -1046,9 +1196,9 @@ def build_parser() -> argparse.ArgumentParser:
     publish = sub.add_parser("publish", help="publish the current wiki tree only"); project_flags(publish)
     publish.add_argument(
         "--allow-unlinked",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=True,
-        help="publish built wiki pages even when linking is pending or failed (the default); keep them pending for a later sync. Use --no-allow-unlinked to link first and publish only linker-complete documents.",
+        help="compatibility flag: publish always allows unlinked wiki pages and skips linking",
     )
     publish.set_defaults(fn=cmd_publish)
     pull = sub.add_parser("pull", help="capture GROWI edits into the local human overlay"); project_flags(pull)
@@ -1086,32 +1236,45 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    from publisher.progress import ShortNameFormatter, TqdmStreamHandler
+    from publisher.progress import JapaneseFormatter, ShortNameFormatter, TqdmStreamHandler
 
-    handler = TqdmStreamHandler(sys.stderr)
-    handler.setFormatter(ShortNameFormatter(LOG_FORMAT))
-    logging.basicConfig(
-        level="DEBUG" if getattr(args, "verbose", False) else os.environ.get("LOG_LEVEL", "INFO"),
-        handlers=[handler],
-    )
-    # -v means "show our debug", not third-party HTTP/client chatter.
-    # Keep client warnings out of the progress display as well; real errors
-    # from these clients remain visible.
-    for noisy in (
-        "asyncio",
-        "httpx",
-        "httpx2",
-        "httpcore",
-        "h11",
-        "urllib3",
-        "openai",
-        "langchain",
-        "langchain_openai",
-        "langchain-openai",
-        "anthropic",
-    ):
-        logging.getLogger(noisy).setLevel(logging.ERROR)
-    return int(args.fn(args) or 0)
+    settings = _settings(args)
+    with capture_run_logs(settings) as log_dir:
+        handler = TqdmStreamHandler(sys.stderr)
+        handler.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+        handler.setFormatter(ShortNameFormatter(LOG_FORMAT) if args.verbose else JapaneseFormatter())
+        debug_handler = logging.FileHandler(log_dir / "debug.log", mode="w", encoding="utf-8")
+        debug_handler.setLevel(logging.DEBUG)
+        debug_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logging.basicConfig(level=logging.DEBUG, handlers=[handler, debug_handler], force=True)
+        # -v means "show our debug", not third-party HTTP/client chatter.
+        # Keep client warnings out of the progress display as well; real errors
+        # from these clients remain visible.
+        for noisy in (
+            "asyncio",
+            "httpx",
+            "httpx2",
+            "httpcore",
+            "h11",
+            "urllib3",
+            "openai",
+            "langchain",
+            "langchain_openai",
+            "langchain-openai",
+            "anthropic",
+        ):
+            logging.getLogger(noisy).setLevel(logging.ERROR)
+        try:
+            # Daemons have no final report; do not accumulate their diagnostics forever.
+            if args.command == "watch" or (args.command == "queue" and args.queue_command == "work" and not args.once):
+                return int(args.fn(args) or 0)
+            with capture_failure_logs():
+                return int(args.fn(args) or 0)
+        finally:
+            root = logging.getLogger()
+            for configured in (handler, debug_handler):
+                root.removeHandler(configured)
+                configured.close()
 
 
 if __name__ == "__main__":

@@ -547,6 +547,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                                                         write_path=connection.write_path, root_path=connection.root_path))
                     status = "indexed" if changed else "unchanged"
                 except Exception as exc:  # one document must not stop the others
+                    log.warning("ドキュメントのインデックス処理に失敗: %s", document, exc_info=True)
                     failures.append(f"{document}: {type(exc).__name__}: {exc}")
                     continue
             indexed += 1
@@ -563,6 +564,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                         if asyncio.run(_delete_if_index(publisher.client, _index_link(connection, folder))):
                             status = "deleted"
                     except Exception as exc:
+                        log.warning("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
                         failures.append(f"folder {folder}: {type(exc).__name__}: {exc}")
                 done.append({"folder": folder, "status": status})
                 continue
@@ -573,6 +575,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                     try:
                         asyncio.run(_delete_if_index(publisher.client, _index_link(connection, folder)))
                     except Exception as exc:
+                        log.warning("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
                         failures.append(f"folder {folder}: {type(exc).__name__}: {exc}")
                 done.append({"folder": folder, "status": status})
                 continue
@@ -590,6 +593,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                         mode=connection.mode, write_path=connection.write_path, root_path=connection.root_path))
                     status = "indexed" if changed else "unchanged"
             except Exception as exc:
+                log.warning("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
                 failures.append(f"folder {folder}: {type(exc).__name__}: {exc}")
             done.append({"folder": folder, "status": status})
             indexed += 1
@@ -686,7 +690,8 @@ def delete_document_index(publisher: Any, document: str) -> None:
         path = growi_path(publisher.connection.write_path, document, INDEX_NAME)
         asyncio.run(_delete_if_index(publisher.client, path))
     except Exception as exc:
-        log.warning("index page for %s: %s: %s", document, type(exc).__name__, exc)
+        log.warning("index page for %s: %s: %s", document, type(exc).__name__, exc,
+                    exc_info=True, extra={"failure_summary": f"index: {document}: {type(exc).__name__}: {exc}"})
 
 
 __all__ = ["FolderNode", "build_index", "data_blocks", "delete_document_index", "delete_index_pages", "document_cards", "document_records", "document_summary", "folder_summary", "folder_tree", "render_document_card", "render_document_index", "render_folder_card", "render_folder_index"]

@@ -119,9 +119,9 @@ def _overlaps(a: tuple, b: tuple) -> bool:
     if s == e and t == u:
         return s == t
     if s == e:
-        return t <= s <= u
+        return t < s < u
     if t == u:
-        return s <= t <= e
+        return s < t < e
     return max(s, t) < min(e, u)
 
 
@@ -872,12 +872,18 @@ class HumanStore:
 
     def _drop_inline_rows(self, paths: Iterable[str]) -> None:
         """Their inline links are gone from the rewritten pages; the next ``--fast --link`` relinks them."""
-        path = Path(self.project.metadata) / "cache" / "fast-inline-links" / "manifest.json"
+        paths = set(paths)
+        path = Path(self.project.metadata) / "fast-links.json"
+        if not path.exists():  # compatibility with links made before the manifest was checkpointed
+            path = Path(self.project.metadata) / "cache" / "fast-inline-links" / "manifest.json"
         manifest = read_json(path, default={})
         rows = manifest.get("pages") or {}
         gone = {p for p in paths if p in rows}
-        if gone:
+        documents = manifest.get("documents") or {}
+        changed_documents = {str(Path(p).parent.as_posix()) for p in paths}
+        if gone or changed_documents & documents.keys():
             manifest["pages"] = {k: v for k, v in rows.items() if k not in gone}
+            manifest["documents"] = {k: v for k, v in documents.items() if k not in changed_documents}
             write_json_atomic(path, manifest)
 
     # -- pull (3.3) ---------------------------------------------------------------
@@ -1232,4 +1238,18 @@ def apply_generated(project: Any, raw_rel: str, *, model: Any = None) -> Applied
     """Run after the writer exported new pages: re-apply the human's changes to them."""
     folder = project.wiki_dir(raw_rel)
     new = {page.name: page.read_text(encoding="utf-8") for page in sorted(folder.glob("*.md"))}
-    return HumanStore(project).generate(raw_rel, new, model=model)
+    store = HumanStore(project)
+    has_human_state = store.state(raw_rel) is not None
+    applied = store.generate(raw_rel, new, model=model)
+    if has_human_state and applied.changed_pages:
+        log.info(
+            "GROWIユーザー編集を新しいドキュメントへ再適用しました: ドキュメント=%s ページ数=%d",
+            raw_rel, len(applied.changed_pages),
+        )
+        log.debug(
+            "human_sync event=reapplied document=%s pages=%s",
+            raw_rel, sorted(applied.changed_pages),
+        )
+    elif has_human_state:
+        log.debug("human_sync event=reapply_unchanged document=%s", raw_rel)
+    return applied

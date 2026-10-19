@@ -23,4 +23,7 @@ def make_backend(config):
     if config.backend == "llm2jev":
         from .llm2jev import Llm2JevBackend  # custom batched /score
         return Llm2JevBackend(config)
+    if config.backend == "shisa":
+        from .shisa_jev import ShisaJevBackend
+        return ShisaJevBackend(config)
     raise ValueError(f"unknown Jev backend: {config.backend}")

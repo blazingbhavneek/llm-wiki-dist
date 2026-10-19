@@ -4,8 +4,9 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True, slots=True)
 class JevConfig:
-    backend: str = "torch"
-    model: str = "chaoliangUNSW/Jev-Style-0.8B-Decision-v3"
+    backend: str = "shisa"
+    model: str = "jev"
+    tokenizer: str = "shisa-ai/shisa-de-2-FP8-dynamic"
     model_revision: str = ""
     local_path: str = ""
     device: str = "auto"
@@ -28,12 +29,12 @@ class JevConfig:
     share_state_max_forks: int = 8
     stats_seconds: int = 60
     compile: bool = False
-    http_concurrency: int = 20  # hosted / llm2jev: states scored at the same time
+    http_concurrency: int = 20  # hosted / llm2jev / shisa requests in flight
 
     @classmethod
     def from_env(cls, env=os.environ):
         get = env.get
-        backend = (get("WIKI_JEV_BACKEND") or "torch").strip().lower()
+        backend = (get("WIKI_JEV_BACKEND") or "shisa").strip().lower()
         base, local = get("WIKI_JEV_BASE_URL", ""), get("WIKI_JEV_LOCAL_PATH", "")
         # hosted = the vanilla /v1/systemone API (stock llm2jev over sglang/vllm);
         # llm2jev = the custom batched /score scorer.
@@ -42,9 +43,16 @@ class JevConfig:
         elif backend == "local":
             backend = "torch"
         elif backend == "auto":
-            backend = "hosted" if base and not local else "torch"
+            # Auto is cloud-only. A missing Shisa endpoint must fail closed rather
+            # than silently loading the local Torch runtime.
+            backend = "shisa"
+        default_model = ("jev" if backend == "shisa"
+                         else "chaoliangUNSW/Jev-Style-0.8B-Decision-v3")
+        default_tokenizer = ("shisa-ai/shisa-de-2-FP8-dynamic"
+                             if backend == "shisa" else "")
         fields = dict(
-            backend=backend, model=get("WIKI_JEV_MODEL", "chaoliangUNSW/Jev-Style-0.8B-Decision-v3"),
+            backend=backend, model=get("WIKI_JEV_MODEL", default_model),
+            tokenizer=get("WIKI_JEV_TOKENIZER", default_tokenizer),
             model_revision=get("WIKI_JEV_MODEL_REVISION", ""), local_path=local,
             device=get("WIKI_JEV_DEVICE", "auto").lower(), dtype=get("WIKI_JEV_DTYPE", "bfloat16").lower(),
             base_url=base, api_key=get("WIKI_JEV_API_KEY", ""),
@@ -64,8 +72,8 @@ class JevConfig:
             http_concurrency=_int(get, "WIKI_JEV_HTTP_CONCURRENCY" if get("WIKI_JEV_HTTP_CONCURRENCY")
                                   else "WIKI_JEV_LLM2JEV_CONCURRENCY", 20),
         )
-        if backend not in {"torch", "gguf", "hosted", "llm2jev"}:
-            raise ValueError("WIKI_JEV_BACKEND must be torch, gguf, hosted or llm2jev")
+        if backend not in {"torch", "gguf", "hosted", "llm2jev", "shisa"}:
+            raise ValueError("WIKI_JEV_BACKEND must be torch, gguf, hosted, llm2jev or shisa")
         if fields["device"] not in {"auto", "cuda", "mps", "cpu"}:
             raise ValueError("WIKI_JEV_DEVICE must be auto, cuda, mps or cpu")
         if fields["dtype"] not in {"float32", "bfloat16", "float16"}:
@@ -87,6 +95,12 @@ class JevConfig:
         return replace(
             config,
             backend=str(getattr(settings, "wiki_jev_backend", config.backend)),
+            model=str(getattr(settings, "wiki_jev_model", "") or config.model),
+            tokenizer=str(getattr(settings, "wiki_jev_tokenizer", "") or config.tokenizer),
+            base_url=str(getattr(settings, "wiki_jev_base_url", "") or config.base_url),
+            http_concurrency=int(getattr(
+                settings, "wiki_jev_http_concurrency", config.http_concurrency,
+            )),
             gguf_local_path=str(getattr(
                 settings, "wiki_jev_gguf_local_path", config.gguf_local_path,
             )),

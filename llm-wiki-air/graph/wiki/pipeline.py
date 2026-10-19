@@ -306,8 +306,6 @@ async def _repair_long_page_filenames(
     if not long_pages:
         return
 
-    model = policy_of(config).planning_model(model)
-
     from langchain_core.messages import HumanMessage, SystemMessage
 
     for page in long_pages:
@@ -1939,7 +1937,7 @@ async def run_pipeline(
     # filename. The visible wiki title remains unchanged.
     await _repair_long_page_filenames(
         pages,
-        model=model,
+        model=policy.planning_model(model),
         on_progress=on_progress,
         stop_check=stop_check,
     )

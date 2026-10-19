@@ -22,8 +22,8 @@ class Config:
     action: str = "assemble"
     publish: bool = False
     settings: Any = None
-    allow_unlinked: bool = False
-    link_pending: bool = True
+    allow_unlinked: bool = True
+    link_pending: bool = False
 
 
 @dataclass(frozen=True)

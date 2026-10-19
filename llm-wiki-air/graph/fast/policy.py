@@ -123,7 +123,7 @@ FAST = FastPolicy(
     intro=False,
     strict_judge=True,
     offline=True,
-    link=False,  # parse -> plan -> write -> publish; a fast linker comes later
+    link=True,  # sync uses the resumable inline linker after accepting the wiki
     model_table_structure=False,
     table_analyses=False,
 )

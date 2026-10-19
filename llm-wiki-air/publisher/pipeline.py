@@ -21,7 +21,7 @@ from typing import Any, Callable
 from graph.clients.embeddings import Embedder
 from graph.common.markdown import strip_big_tables, strip_image_media
 from graph.growi import MARKER_FORMAT, GrowiClient, GrowiPublisher, growi_path
-from graph.workspace.parser_client import UnsupportedDocument, parse_document, read_text_source
+from graph.workspace.parser_client import ParserSkip, UnsupportedDocument, parse_document, parser_skip_cache, read_text_source
 from graph.workspace.project import (
     VERBATIM,
     Project,
@@ -349,14 +349,24 @@ def _parse(
             if validate_markdown is not None:
                 validate_markdown(markdown)
             return markdown
-    markdown = parse_document(
-        path,
-        base_url=base_url,
-        settings=settings,
-        timeout_s=float(getattr(settings, "parser_timeout", PARSER_TIMEOUT)),
-        previous_markdown=previous_markdown,
-        validate_markdown=validate_markdown,
-    )
+    # TEMPORARY: reuse a rejection from parse-ahead for these exact cached inputs.
+    skips = parser_skip_cache()
+    skip_key = (str(cached), path.name) if cached is not None else None
+    if skips is not None and skip_key in skips:
+        raise ParserSkip(skips[skip_key])
+    try:
+        markdown = parse_document(
+            path,
+            base_url=base_url,
+            settings=settings,
+            timeout_s=float(getattr(settings, "parser_timeout", PARSER_TIMEOUT)),
+            previous_markdown=previous_markdown,
+            validate_markdown=validate_markdown,
+        )
+    except ParserSkip as exc:
+        if skips is not None and skip_key is not None:
+            skips[skip_key] = str(exc)
+        raise
     if cached is not None:
         _write_raw(cached, markdown)
     return markdown
@@ -722,9 +732,11 @@ def _publish_sweep(
                 ledger=ledger,
                 on_progress=on_progress,
             )["failures"]:
-                log.warning("run=%s stage=index error=%s", run_id, problem)
+                log.warning("run=%s stage=index error=%s", run_id, problem,
+                            extra={"failure_summary": f"index: {problem}"})
         except Exception as exc:
-            log.warning("run=%s stage=index error=%s: %s", run_id, type(exc).__name__, exc)
+            log.warning("run=%s stage=index error=%s: %s", run_id, type(exc).__name__, exc,
+                        exc_info=True, extra={"failure_summary": f"index: {type(exc).__name__}: {exc}"})
     return failures
 
 
@@ -772,6 +784,7 @@ def _remove_sources(project: Project, ledger: Ledger, sources: dict[str, str]) -
                 "rebuild": "full",
             })
         except Exception as exc:
+            log.exception("ドキュメントの削除に失敗: %s", rel)
             failures.append(f"{rel}: {type(exc).__name__}: {exc}")
     return done, touched_raw, failures
 
@@ -824,6 +837,7 @@ def sync_once(
     run_id = "prun-" + uuid.uuid4().hex[:16]
     done: list[dict[str, Any]] = []
     failures: list[str] = []
+    parser_skips: list[str] = []
     cancelled = False
     with _lock(project):
         if history_enabled:
@@ -1048,20 +1062,25 @@ def sync_once(
                 if should_continue is not None and not should_continue():
                     cancelled = True
                     break
-                log.exception("run=%s path=%s stage=generate failed", run_id, rel)
+                if isinstance(exc, ParserSkip):
+                    parser_skips.append(rel)
+                    log.warning("ドキュメントをスキップ: %s: %s", rel, exc, exc_info=True)
+                else:
+                    log.exception("run=%s path=%s stage=generate failed", run_id, rel)
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 ledger.sources[rel] = _source_row(
                     item, raw_rel, error, details=details, previous=previous_source,
                     parsed_source_sha256=parsed_sha256,
                 )
                 save_ledger(ledger_path, ledger)
-                if retry_documents and rel not in retried:
+                if retry_documents and rel not in retried and not isinstance(exc, ParserSkip):
                     retried.add(rel)
                     changed.append(rel)
                     log.warning("run=%s path=%s stage=generate retry_later error=%s: %s", run_id, rel, type(exc).__name__, exc)
                     continue
                 failures.append(f"{rel}: {error}")
-                log.error("run=%s path=%s stage=generate error=%s: %s", run_id, rel, type(exc).__name__, exc)
+                if not isinstance(exc, ParserSkip):
+                    log.error("run=%s path=%s stage=generate error=%s: %s", run_id, rel, type(exc).__name__, exc)
         pending_links = _pending_link_rels(project, settings, scoped_candidates)
         if should_continue is not None and not should_continue():
             cancelled = True
@@ -1132,6 +1151,7 @@ def sync_once(
         "failures": failures,
         "cancelled": cancelled,
         "index_paths": index_paths,
+        **({"parser_skips": parser_skips} if parser_skips else {}),
         "human_sync": dict(getattr(publisher, "human_sync_summary", {})),
     }
 
@@ -1392,11 +1412,14 @@ def move_sources(
                         ledger=ledger,
                         on_progress=on_progress,
                     )["failures"]:
-                        log.warning("run=%s stage=index error=%s", run_id, problem)
+                        log.warning("run=%s stage=index error=%s", run_id, problem,
+                                    extra={"failure_summary": f"index: {problem}"})
                 except Exception as exc:
-                    log.warning("run=%s stage=index error=%s: %s", run_id, type(exc).__name__, exc)
+                    log.warning("run=%s stage=index error=%s: %s", run_id, type(exc).__name__, exc,
+                                exc_info=True, extra={"failure_summary": f"index: {type(exc).__name__}: {exc}"})
             save_ledger(ledger_path, ledger)
         except Exception as exc:
+            log.exception("ドキュメントの移動に失敗: %s", [(job.from_rel, job.rel) for job in jobs])
             failures.append(f"move: {type(exc).__name__}: {exc}")
     return {
         "run_id": run_id,
@@ -1653,7 +1676,7 @@ def pull_growi_once(settings: Any, *, force_inventory: bool = False) -> dict[str
     if history_enabled:
         from .history import candidate_is_clean, last_good
 
-        if not candidate_is_clean(project, last_good(project)):
+        if not candidate_is_clean(project, last_good(project), allow_initial_human_schema=True):
             raise RuntimeError("cannot pull GROWI changes into a dirty last-good working tree")
     publisher = _publisher(settings)
     if publisher is None:
@@ -1696,11 +1719,26 @@ def pull_growi_once(settings: Any, *, force_inventory: bool = False) -> dict[str
             pulled = []
             failures = [f"pull: {type(exc).__name__}: {exc}"]
             detector = {"fallback_reason": "pull_exception"}
+    human_sync = dict(getattr(publisher, "human_sync_summary", {}))
+    if not failures:
+        checked = int(detector.get("authoritative_pages_fetched", 0) or 0)
+        log.info(
+            "GROWIユーザー編集チェック完了: モード=%s 対象ページ=%d 取り込み=%d ブロック=%d 復旧=%d",
+            human_sync.get("mode", getattr(settings, "human_sync_mode", "off")),
+            checked,
+            int(human_sync.get("captured", 0) or 0),
+            int(human_sync.get("blocked", 0) or 0),
+            int(human_sync.get("recovered", 0) or 0),
+        )
+        log.debug(
+            "human_sync event=pull_complete run=%s checked=%d decisions=%s fallback=%s",
+            run_id, checked, human_sync, detector.get("fallback_reason", ""),
+        )
     return {
         "run_id": run_id,
         "done": [{"status": "pulled", "path": path} for path in pulled],
         "failures": failures,
-        "human_sync": {**detector, **dict(getattr(publisher, "human_sync_summary", {}))},
+        "human_sync": {**detector, **human_sync},
     }
 
 
@@ -1737,6 +1775,7 @@ def build_wiki_only(settings: Any, *, only: list[str] | None = None, force: bool
                     shutil.rmtree(project.state_dir(raw_rel), ignore_errors=True)
                     done.append({"path": raw_rel, "status": "deleted", "touched": touched})
                 except Exception as exc:
+                    log.exception("ドキュメントの削除に失敗: %s", raw_rel)
                     failures.append(f"{raw_rel}: {type(exc).__name__}: {exc}")
         model = _model(settings, project) if pending else None
         for rel in rels:
@@ -1747,6 +1786,7 @@ def build_wiki_only(settings: Any, *, only: list[str] | None = None, force: bool
                 result = write_wiki_pages(project, rel, mode=str(settings.ingest_mode), settings=settings, llm=model, embedder=None, on_progress=on_progress, resume=not force)
                 done.append({"path": rel, "status": "built", "touched": result.touched})
             except Exception as exc:
+                log.exception("ドキュメントのビルドに失敗: %s", rel)
                 failures.append(f"{rel}: {type(exc).__name__}: {exc}")
     return {"run_id": run_id, "done": done, "failures": failures}
 
@@ -1780,6 +1820,7 @@ def link_raw(settings: Any, *, only: list[str] | None = None, force: bool = Fals
             touched = run_linkers(project, pending, settings=settings, llm=model, embedder=embedder, on_progress=on_progress)
             done.append({"status": "linked", "documents": pending, "touched": touched})
         except Exception as exc:
+            log.exception("ドキュメントのリンク処理に失敗: %s", pending)
             failures.append(f"link: {type(exc).__name__}: {exc}")
     return {"run_id": run_id, "done": done, "failures": failures}
 
@@ -1888,7 +1929,7 @@ def link_pending_isolated(
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:1000]
                 errors[rel] = error
-                log.warning("linker document attempt %d failed: %s: %s", attempt, rel, error)
+                log.warning("linker document attempt %d failed: %s: %s", attempt, rel, error, exc_info=True)
                 if on_progress:
                     on_progress({
                         "stage": "linker",
@@ -1918,7 +1959,12 @@ def link_pending_isolated(
             "total": len(pending),
             "failures": len(errors),
         })
-    return {"run_id": run_id, "done": done, "failures": failures}
+    return {
+        "run_id": run_id,
+        "done": done,
+        "failures": failures,
+        "failed_documents": sorted(errors),
+    }
 
 
 def build_raw(settings: Any, *, only: list[str] | None = None, force: bool = False, on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
@@ -1934,15 +1980,17 @@ def publish_only(
     settings: Any,
     *,
     only: list[str] | None = None,
-    allow_unlinked: bool = False,
-    link_pending: bool = True,
+    allow_unlinked: bool = True,
+    link_pending: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    captured: bool = False,
 ) -> dict[str, Any]:
     """Publish the current wiki tree without scanning or changing mount/raw.
 
-    ``allow_unlinked`` is an explicit escape hatch for publishing successfully
-    generated pages while their linker marker is still pending or failed.  The
-    marker is preserved so a later isolated sync can link and republish them.
+    Built pages publish unlinked by default. Link completion is checked only
+    when explicitly requested. ``captured`` retains the caller's inspected
+    revisions, so a late remote edit blocks publication instead of changing
+    freshly linked output during the publish pass.
     """
     project = open_project(settings)
     publisher = _publisher(settings)
@@ -1962,6 +2010,7 @@ def publish_only(
             allow_unlinked=allow_unlinked,
             link_pending=link_pending and not allow_unlinked,
             on_progress=on_progress,
+            captured=captured,
         )
         if not failures:
             # The tree is live on this endpoint, so its page IDs are now the ledger's.

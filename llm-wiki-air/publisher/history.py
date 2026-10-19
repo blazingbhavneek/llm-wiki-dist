@@ -389,14 +389,32 @@ def amend_candidate(candidate_project: Project) -> str:
     return str(_git(candidate_project, "rev-parse", "HEAD"))
 
 
-def candidate_is_clean(candidate_project: Project, commit: str) -> bool:
+def candidate_is_clean(candidate_project: Project, commit: str, *, allow_initial_human_schema: bool = False) -> bool:
     if str(_git(candidate_project, "rev-parse", "HEAD")) != commit:
         return False
     paths = [
         ".gitignore", "sources", "raw", "wiki", "metadata/state",
         "metadata/pipeline.json", "metadata/source-identities.json", "metadata/human-sync",
+        "metadata/fast-links.json",
     ]
-    return not str(_git(candidate_project, "status", "--porcelain", "--untracked-files=all", "--", *paths))
+    status = str(_git(candidate_project, "status", "--porcelain", "--untracked-files=all", "--", *paths))
+    if not status:
+        return True
+    # Pull can finish checkpointing an otherwise empty, newly initialized store.
+    if allow_initial_human_schema and status == "?? metadata/human-sync/schema.json":
+        from .human_changes import VERSION
+
+        root = candidate_project.metadata / "human-sync"
+        schema = root / "schema.json"
+        try:
+            if (root.is_symlink() or schema.is_symlink() or not schema.is_file()
+                    or set(root.iterdir()) != {schema}):
+                return False
+            data = read_json(schema)
+            return data == {"schema_version": VERSION} and type(data["schema_version"]) is int
+        except (OSError, ValueError):
+            return False
+    return False
 
 
 def checkpoint_live(project: Project, message: str) -> str:
@@ -408,6 +426,7 @@ def checkpoint_live(project: Project, message: str) -> str:
     paths = [
         ".gitignore", "sources", "raw", "wiki", "metadata/state",
         "metadata/pipeline.json", "metadata/source-identities.json", "metadata/human-sync",
+        "metadata/fast-links.json",
     ]
     if not str(_git(project, "status", "--porcelain", "--untracked-files=all", "--", *paths)):
         return previous
@@ -417,10 +436,23 @@ def checkpoint_live(project: Project, message: str) -> str:
     return commit
 
 
+def checkpoint_legacy_fast_links(project: Project) -> None:
+    """Adopt old ownership metadata before candidates need to invalidate its rows."""
+    legacy = project.metadata / "cache" / "fast-inline-links" / "manifest.json"
+    target = project.metadata / "fast-links.json"
+    if target.exists() or not legacy.exists():
+        return
+    if not candidate_is_clean(project, last_good(project), allow_initial_human_schema=True):
+        return  # Existing dirty-tree checks still decide whether the command may proceed.
+    write_json_atomic(target, read_json(legacy))
+    checkpoint_live(project, "checkpoint fast link ownership")
+
+
 def _stage_durable(project: Project) -> None:
     paths = [
         ".gitignore", "sources", "raw", "wiki", "metadata/state",
         "metadata/pipeline.json", "metadata/source-identities.json", "metadata/human-sync",
+        "metadata/fast-links.json",
     ]
     selected = [
         path for path in paths

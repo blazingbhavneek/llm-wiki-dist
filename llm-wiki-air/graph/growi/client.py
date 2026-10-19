@@ -7,6 +7,7 @@ import base64
 import binascii
 import hashlib
 import html
+import logging
 import mimetypes
 import posixpath
 import re
@@ -23,6 +24,8 @@ from graph.common.images import DATA_IMAGE_RE, find_images
 from graph.common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
 from graph.wiki.page import strip_reader_references
 from graph.wiki.storage import read_json
+
+log = logging.getLogger(__name__)
 
 
 class GrowiAPIError(RuntimeError):
@@ -1154,7 +1157,7 @@ class GrowiPublisher:
         on_progress: Any = None,
     ) -> tuple[list[str], list[str], set[str]]:
         """Accept human revisions: each changed page is re-based onto the document's current pages."""
-        from publisher.human_changes import HumanStore, editable, merge
+        from publisher.human_changes import HumanStore, editable, merge, rebase
 
         store = HumanStore(project)
         store.audit()
@@ -1215,6 +1218,10 @@ class GrowiPublisher:
                 store.retire_unlanded(row["marker_id"], page)
                 if baseline and baseline.get("accepted_revision") == row.get("revision_id") == page.revision_id:
                     decisions["unchanged"] += 1
+                    log.debug(
+                        "human_sync event=unchanged document=%s page=%s revision=%s",
+                        document, local_path, page.revision_id,
+                    )
                     continue
                 try:
                     accounted = store.account_prepared(row, page, remote=markdown)
@@ -1230,6 +1237,14 @@ class GrowiPublisher:
                 if accounted.get("exact"):
                     # The page holds our own unrecorded write: bot intent, not human.
                     decisions["recovered"] += 1
+                    log.info(
+                        "GROWIパブリッシュ状態を復旧しました: ドキュメント=%s ページ=%s",
+                        document, local_path,
+                    )
+                    log.debug(
+                        "human_sync event=recovered_exact document=%s page=%s revision=%s",
+                        document, local_path, page.revision_id,
+                    )
                     continue
                 local = target.read_text(encoding="utf-8") if not baseline else store.get(baseline["local_blob"])
                 if not baseline:
@@ -1258,10 +1273,18 @@ class GrowiPublisher:
                         raise ValueError("missing verified baseline; the remote page differs from the local page")
                     row["revision_id"] = page.revision_id
                     store.remember_page(local_path, row, markdown, local, published=False)
+                    log.debug(
+                        "human_sync event=baseline_registered document=%s page=%s revision=%s",
+                        raw_rel, local_path, page.revision_id,
+                    )
                     continue
                 if baseline["accepted_revision"] != row.get("revision_id"):
                     raise ValueError("published revision and human baseline disagree")
                 if page.revision_id == row.get("revision_id"):
+                    log.debug(
+                        "human_sync event=revision_unchanged document=%s page=%s revision=%s",
+                        raw_rel, local_path, page.revision_id,
+                    )
                     continue
                 previous_remote = store.get(baseline["remote_blob"])
                 previous_local = store.get(baseline["local_blob"])
@@ -1277,7 +1300,30 @@ class GrowiPublisher:
                 # This restores permalink/image spelling without inventing text.
                 canonical, status = merge(editable(previous_remote), editable(markdown), editable(previous_local))
                 if status == "conflict":
-                    raise ValueError("remote transport changes cannot be canonicalized safely")
+                    page_name = Path(local_path).name
+                    log.info(
+                        "GROWIユーザー編集の複雑な差分をマージしています: ドキュメント=%s ページ=%s",
+                        raw_rel, local_path,
+                    )
+                    merged, entries = rebase(
+                        {page_name: editable(previous_remote)},
+                        {page_name: editable(markdown)},
+                        {page_name: editable(previous_local)},
+                        model=model if policy.captures else None,
+                        concurrency=getattr(model, "concurrency", 1),
+                    )
+                    canonical = merged[page_name]
+                    for entry in entries:
+                        if entry.strip() and entry not in canonical:
+                            canonical = canonical.rstrip() + "\n\n" + entry.strip() + "\n"
+                    log.info(
+                        "GROWIユーザー編集の複雑な差分をマージしました: ドキュメント=%s ページ=%s",
+                        raw_rel, local_path,
+                    )
+                    log.debug(
+                        "human_sync event=transport_rebased document=%s page=%s revision=%s appendix_entries=%d",
+                        raw_rel, local_path, page.revision_id, len(entries),
+                    )
                 canonical = restore_page_links(canonical, local_path, page_paths)
                 # Linker output and transport spelling are not human changes, in every mode.
                 base, human = store.separate(raw_rel, local_path, previous_local, canonical)
@@ -1286,6 +1332,10 @@ class GrowiPublisher:
                         "delete" if not editable(canonical).strip()
                         else "add" if not editable(previous_local).strip()
                         else "replace"
+                    )
+                    log.debug(
+                        "human_sync event=user_edit_detected document=%s page=%s revision=%s operation=%s mode=%s",
+                        raw_rel, local_path, page.revision_id, proposed_operation, mode,
                     )
                     if policy.observes:
                         store.record_observation(
@@ -1315,10 +1365,29 @@ class GrowiPublisher:
                         )
                 row["observed_revision_id"] = page.revision_id
                 if base != human:
-                    pulled.extend(sorted(store.accept(
+                    rewritten = sorted(store.accept(
                         raw_rel, local_path, row["marker_id"], page.revision_id, base, human, model=model,
-                    )))
+                    ))
+                    pulled.extend(rewritten)
                     decisions["captured"] += 1
+                    operation_ja = {"add": "追加", "delete": "削除", "replace": "更新"}[proposed_operation]
+                    log.info(
+                        "GROWIユーザー編集を取り込みました: ドキュメント=%s ページ=%s 操作=%s",
+                        raw_rel, local_path, operation_ja,
+                    )
+                    log.debug(
+                        "human_sync event=captured document=%s page=%s revision=%s operation=%s rewritten=%s",
+                        raw_rel, local_path, page.revision_id, proposed_operation, rewritten,
+                    )
+                else:
+                    log.info(
+                        "GROWIページ更新を確認しました（ユーザー編集なし）: ドキュメント=%s ページ=%s",
+                        raw_rel, local_path,
+                    )
+                    log.debug(
+                        "human_sync event=accepted_without_user_edit document=%s page=%s revision=%s",
+                        raw_rel, local_path, page.revision_id,
+                    )
                 row["revision_id"] = page.revision_id
                 row["marker_seed"] = self.page_marker_seed(project, local_path)
                 store.remember_page(local_path, row, markdown, canonical, published=False)
@@ -1327,6 +1396,7 @@ class GrowiPublisher:
                     if settled.get("prepared_attempt_id") == accounted["attempt_id"]:
                         store.settle_prepared(settled, status="captured_late_human")
             except (OSError, KeyError, TypeError, ValueError) as exc:
+                log.exception("GROWIのプルに失敗: %s", local_path)
                 reason = str(exc)
                 store.block_page(local_path, row, reason, page)
                 blocked.add(document)
