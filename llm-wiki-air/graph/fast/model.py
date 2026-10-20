@@ -54,6 +54,7 @@ class FastModelPort(ChatModelPort):
         writer_limit = (
             min(
                 FAST_WRITER_MAX_OUTPUT_TOKENS,
+                max(1, int(self.config.write_max_output_tokens)),
                 max(1, int(max_output_tokens or FAST_WRITER_MAX_OUTPUT_TOKENS)),
             )
             if self.role == "writer"

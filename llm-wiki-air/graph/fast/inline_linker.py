@@ -869,7 +869,7 @@ async def _judge_candidates(
     return plans, failures, calls
 
 
-_MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]+\]\([^)]+\)")
+_MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]+\]\((?:[^()\n]|\([^()\n]*\))*\)")
 _INLINE_CODE = re.compile(r"`[^`]*`")
 
 
@@ -887,9 +887,11 @@ def _wrap_once(text: str, anchor: str, url: str) -> tuple[str, dict[str, Any] | 
         stripped = line.lstrip()
         if (
             flags[number]
-            or stripped.startswith(("#", "|", "<", "[[NEO-IMAGE", "!["))
+            or stripped.startswith(("#", ">", "|", "<", "[[NEO-IMAGE", "!["))
             or "前のページ:" in line
             or "次のページ:" in line
+            or "元ページ:" in line
+            or "元文書の更新" in line
         ):
             continue
         blocked = [match.span() for regex in (_MARKDOWN_LINK, _INLINE_CODE) for match in regex.finditer(line)]

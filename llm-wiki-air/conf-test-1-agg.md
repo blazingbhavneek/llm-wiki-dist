@@ -1,7 +1,7 @@
 # Aggressive human-sync test — Doc A (conf-test-1-agg.md)
 
 growi_url = http://10.160.152.38:3000/
-growi_token = LA13j572FoTfv6wiSuT50l9apnao2UI4xbH2dQScUCQ=
+growi_token = (set `GROWI_TOKEN` in `.env`)
 
 
 Same five behaviours as `conf-test-1.md`, pushed to the awkward end: more edits at once, uglier

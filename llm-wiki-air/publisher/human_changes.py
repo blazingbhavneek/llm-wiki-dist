@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -34,8 +35,8 @@ NOTE = "元文書の更新"
 APPENDIX = "付録"
 _HEX = re.compile(r"[0-9a-f]{64}")
 _LINE = re.compile(r"[^\n]*\n|[^\n]+")
-_LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\([^)\n]*\)")
-_DIGITS = re.compile(r"\d+")
+_LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\((?:[^()\n]|\([^()\n]*\))*\)")
+_NOTE_END = re.compile(rf"（{re.escape(NOTE)}: (.*)）((?:[ \t]*</t[dhr]>)*)[ \t]*$", re.I)
 
 
 def now() -> str:
@@ -239,6 +240,8 @@ _MERGE = (
     "A human edited a generated wiki passage (OLD -> HUMAN) while the source document turned it into NEW."
     " Return {\"edits\": [{\"find\", \"replace\"}], \"appendix\": str}. The edits apply to NEW: every find"
     " occurs exactly once in NEW and edits do not overlap; text outside the edits is kept byte for byte.\n"
+    "- appendix must always be an empty string. Human text always stays in the result, where it was, even when"
+    " NEW deleted the text around it; add no note for that deletion.\n"
     "- Apply the human's change (OLD -> HUMAN) to NEW and keep every fact in NEW.\n"
     "- Only what differs between OLD and HUMAN is the human's change. Text that is the same in OLD and HUMAN"
     " is old source text: NEW's version of it wins, with no note.\n"
@@ -249,10 +252,7 @@ _MERGE = (
     "- If the human's changed text and NEW differ only in wording or formatting, keep the human's form and"
     " add no note.\n"
     f"- If HUMAN already has a {NOTE} note for the same fact (either form), replace it; never add a second.\n"
-    "- Text the human added goes into NEW where it belongs. If the source deleted a block containing human-added"
-    " or modified text, put only the human's changed lines in appendix; do not restore the block or add a note"
-    " for its deletion. A separator or footer remaining in NEW does not mean the block survived; reworded or"
-    " moved content does.\n"
+    "- Text the human added goes into NEW where it belongs.\n"
     "- Keep human deletions deleted; NEW's differing version belongs only in a source-update note. If both"
     " sides deleted the content, leave it absent with no note or appendix entry.\n"
     "- GUIDANCE says how the human wants this page to look; follow it.\n"
@@ -260,10 +260,10 @@ _MERGE = (
 )
 _VERIFY = (
     "Check a merge. OLD -> HUMAN is a human edit, NEW is the source's version of the same passage,"
-    " RESULT (plus APPENDIX) is the merge. Return {\"human_kept\": bool, \"source_kept\": bool}."
-    " human_kept: every piece of information the human added or changed is in RESULT or APPENDIX."
+    " RESULT is the merge. Return {\"human_kept\": bool, \"source_kept\": bool}."
+    " human_kept: every piece of information the human added or changed is in RESULT."
     " Return human_kept=false if a human deletion was restored outside a source-update note, or if the source"
-    " deleted a block containing human-added/modified text and those changed lines are not in APPENDIX."
+    " deleted a block containing human-added/modified text and those changed lines are not in RESULT."
     " A remaining separator/footer does not count as the block surviving; reworded or moved content does."
     f" source_kept: every fact in NEW is in RESULT, as text or inside a {NOTE} note (parentheses or blockquote), and a fact the"
     " human did not change (the same in OLD and HUMAN) appears with NEW's value as text, not only in a note."
@@ -317,12 +317,114 @@ class _TooLarge(Exception):
     pass
 
 
+def _key(line: str) -> str:
+    """Normalise a line for matching only; inserted text always stays byte-exact."""
+    text = unicodedata.normalize(
+        "NFKC", _LINK.sub(lambda match: match.group(0)[1:match.group(0).index("](")], line)
+    )
+    return " ".join(text.lstrip("#> \t").split())
+
+
+def _current_notes(text: str, source: str) -> str:
+    """Drop source-update notes whose quoted text is absent from the current source."""
+    source_keys = "\n".join(_key(line) for line in _lines(source))
+
+    def stale(payload: str) -> bool:
+        keys = [_key(line) for line in _lines(payload)]
+        return not any(key.strip("-*_=~|# ") for key in keys) or any(
+            key and key not in source_keys for key in keys
+        )
+
+    lines, output, index = _lines(text), [], 0
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == f"> **{NOTE}:**":
+            end = index + 1
+            while end < len(lines) and lines[end].startswith(">"):
+                end += 1
+            if not stale("".join(item[1:] for item in lines[index + 1:end])):
+                output.extend(lines[index:end])
+            index = end
+            continue
+        newline = "\n" if line.endswith("\n") else ""
+        content = line[:-1] if newline else line
+        match = _NOTE_END.search(content)
+        if match and stale(match.group(1)):
+            line = content[:match.start()] + match.group(2) + newline
+            if not line.strip():
+                index += 1
+                continue
+        output.append(line)
+        index += 1
+    return "".join(output)
+
+
+def _added(before: str, after: str) -> list[str]:
+    """Normalised 2+ character lines added or changed, diffed line-first."""
+    a, b = before.splitlines(), after.splitlines()
+    added: list[str] = []
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag not in ("replace", "insert"):
+            continue
+        for line in b[j1:j2]:
+            value = " ".join(unicodedata.normalize("NFKC", line).split())
+            if len(value) >= 2:
+                added.append(value)
+    return added
+
+
+def _note_in_table(text: str) -> int:
+    depth = 0
+    count = 0
+    for line in _lines(text):
+        lowered = line.lower()
+        inside = depth > 0 or "<table" in lowered or line.lstrip().startswith("|")
+        if inside and NOTE in line:
+            count += 1
+        depth += len(re.findall(r"<table\b", lowered)) - len(re.findall(r"</table\s*>", lowered))
+    return count
+
+
+def _notes_after_tables(text: str) -> str:
+    """Move machine notes out of HTML tables without moving human cell text."""
+    lines, output, pending = _lines(text), [], []
+    depth = index = 0
+    while index < len(lines):
+        line = lines[index]
+        modified = False
+        inside = depth > 0 or "<table" in line.lower()
+        if inside and line.strip() == f"> **{NOTE}:**":
+            end = index + 1
+            while end < len(lines) and lines[end].startswith(">"):
+                end += 1
+            pending.extend(lines[index:end])
+            index = end
+            continue
+        if inside and (match := _NOTE_END.search(line.rstrip("\n"))):
+            pending.append(f"（{NOTE}: {match.group(1)}）\n")
+            line = line[:match.start()] + match.group(2) + ("\n" if line.endswith("\n") else "")
+            modified = True
+        if line.strip() or not modified:
+            output.append(line)
+        lowered = line.lower()
+        depth += len(re.findall(r"<table\b", lowered)) - len(re.findall(r"</table\s*>", lowered))
+        if depth <= 0 and pending:
+            if output and output[-1].strip():
+                output.append("\n")
+            output.extend(pending)
+            pending = []
+            depth = 0
+        index += 1
+    output.extend(pending)
+    return "".join(output)
+
+
 def _attempt(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list[str], failure: str,
              stats: Counter) -> tuple[str, str]:
     """One merge call, checked; returns (window text, appendix) or raises ValueError(reason)."""
     stats["model_calls"] += 1
     out = model.merge(old_w, cur_w, new_w, guidance, failure)
-    appendix = str(out.get("appendix") or "")
+    appendix = ""
     spans = []
     for edit in out.get("edits") or []:
         find, replace = str(edit["find"]), str(edit["replace"])
@@ -338,9 +440,19 @@ def _attempt(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list[str]
         result = result[:start] + replace + result[end:]
     if result and not result.endswith("\n"):
         result += "\n"
-    missing = set(_DIGITS.findall(cur_w)) - set(_DIGITS.findall(old_w)) - set(_DIGITS.findall(result + "\n" + appendix))
-    if missing:
-        raise ValueError(f"numbers the human wrote are missing: {sorted(missing)}")
+    body = _current_notes(result, "")
+    keys = lambda value: {_key(line) for line in _lines(value) if _key(line)}
+    flat_result = " ".join(unicodedata.normalize("NFKC", result).split())
+    gone = [value for value in _added(old_w, cur_w) + _added(old_w, new_w) if value not in flat_result]
+    gone += sorted((keys(old_w) & keys(cur_w) & keys(new_w)) - keys(body))
+    if gone:
+        raise ValueError(f"text the human or the source wrote is missing from the result: {gone[:5]}")
+    if keys(body) & (keys(old_w) - keys(new_w)):
+        raise ValueError("the result keeps source text the source has changed or removed; use NEW's version")
+    if _current_notes(result, new_w + "\n" + cur_w) != result:
+        raise ValueError("a source-update note must quote NEW's current text, never empty or markup")
+    if _note_in_table(result) > _note_in_table(cur_w):
+        raise ValueError("put the source-update note after the table, never inside a table or row")
     if sum(map(len, (old_w, cur_w, new_w, result, appendix))) > LIMIT:
         raise _TooLarge
     stats["model_calls"] += 1
@@ -362,23 +474,76 @@ def _merge_window(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list
             return None
         except Exception as exc:  # a failed call is a rejected attempt
             failure = f"{type(exc).__name__}: {exc}"
-            log.debug("human_sync event=merge_rejected attempt=%d reason=%s", attempt, failure)
+            log.info("human_sync event=merge_rejected attempt=%d reason=%s", attempt, failure)
             continue
         stats[f"merge_ok_{attempt}"] += 1
         return got
     return None
 
 
-def _fallback(cur_w: str, new_w: str) -> str:
-    """The human's text, then the source's version as a note: both stay visible."""
-    if not new_w.strip():
-        return cur_w
-    head = cur_w if not cur_w or cur_w.endswith("\n") else cur_w + "\n"
-    body = new_w.strip("\n")
+def _clean_merge(old_w: str, cur_w: str, new_w: str) -> str | None:
+    """Accept the existing diff3 only when the two sides changed different text."""
+    human, source = _changes(old_w, cur_w), _changes(old_w, new_w)
+    if any(
+        not deletion[2]
+        and deletion[0] <= edit[0] < deletion[1]
+        and deletion[0] < edit[1] <= deletion[1]
+        for deletion in human
+        for edit in source
+    ):
+        return None
+    output, status = merge(old_w, cur_w, new_w)
+    return output if status in ("active", "absorbed") else None
+
+
+def _fallback(old_w: str, cur_w: str, new_w: str) -> str:
+    """Keep human edits, discard stale source text, and quote only missing source lines."""
+    old, current = _lines(old_w), _lines(cur_w)
+    new_keys = {_key(line) for line in _lines(new_w)}
+    opcodes = list(SequenceMatcher(None, old, current, autojunk=False).get_opcodes())
+    table_lines: set[int] = set()
+    depth = 0
+    start = None
+    for index, line in enumerate(current):
+        opened = len(re.findall(r"<table\b", line, re.I))
+        closed = len(re.findall(r"</table\s*>", line, re.I))
+        if opened and depth == 0:
+            start = index
+        depth += opened - closed
+        if start is not None and depth <= 0:
+            if any(
+                tag != "equal"
+                and (
+                    max(start, j1) < min(index + 1, j2)
+                    or (j1 == j2 and start < j1 < index + 1)
+                )
+                for tag, _i1, _i2, j1, j2 in opcodes
+            ):
+                table_lines.update(range(start, index + 1))
+            start = None
+            depth = 0
+    head = [
+        line
+        for tag, _i1, _i2, j1, j2 in opcodes
+        for index, line in enumerate(current[j1:j2], j1)
+        if index in table_lines or tag != "equal" or not _key(line) or _key(line) in new_keys
+    ]
+    have = {_key(line) for line in head}
+    missing = [line for line in _lines(new_w) if _key(line) and _key(line) not in have]
+    if not missing:
+        return "".join(head)
+    if any(line.lstrip().startswith(("<t", "</t", "|")) for line in missing):
+        missing = _lines(new_w)
+    head_text = "".join(head)
+    head_text = head_text if not head_text or head_text.endswith("\n") else head_text + "\n"
+    open_tables = head_text.lower().count("<table") - head_text.lower().count("</table>")
+    if open_tables > 0:
+        head_text += "</table>\n" * open_tables
+    body = "".join(missing).strip("\n")
     if "\n" not in body and len(body) < 200:
-        return f"{head}（{NOTE}: {body}）\n"
+        return f"{head_text}（{NOTE}: {body}）\n"
     quote = f"> **{NOTE}:**\n" + "".join("> " + (line if line.endswith("\n") else line + "\n") for line in _lines(body))
-    return head + ("\n" if head.strip() and not head.endswith("\n\n") else "") + quote
+    return head_text + ("\n" if head_text.strip() and not head_text.endswith("\n\n") else "") + quote
 
 
 def classify(model: Any, pairs: list[tuple[str, str]]) -> list[str]:
@@ -388,7 +553,7 @@ def classify(model: Any, pairs: list[tuple[str, str]]) -> list[str]:
     try:
         items = model.classify(pairs)
     except Exception as exc:
-        log.debug("human_sync event=classify_failed reason=%s: %s", type(exc).__name__, exc)
+        log.warning("human_sync event=classify_failed reason=%s: %s", type(exc).__name__, exc)
         return []
     return [str(i["instruction"]).strip() for i in items if i.get("kind") == "structure" and str(i.get("instruction") or "").strip()]
 
@@ -429,7 +594,6 @@ class _Edit2:
     hi: int
     lines: list[str]
     owners: list[_Change]
-    entries: list[tuple[str, str, int]] = field(default_factory=list)  # (text, page, human line)
 
 
 class _Index:
@@ -450,9 +614,39 @@ class _Index:
         return bool(line.strip()) and len(self.at.get(line, ())) == 1
 
 
+def _page_remap(old: dict[str, str], new: dict[str, str]) -> dict[str, str]:
+    """Map vanished pages only when their generated content identifies one successor."""
+    remap = {page: page for page in old if page in new}
+    new_stems: dict[str, list[str]] = {}
+    for page in new:
+        new_stems.setdefault(re.sub(r"^\d+-", "", Path(page).stem), []).append(page)
+    new_keys = {
+        page: Counter(_key(line) for line in _lines(text) if _key(line))
+        for page, text in new.items()
+    }
+    for page, text in old.items():
+        if page in remap:
+            continue
+        same_stem = new_stems.get(re.sub(r"^\d+-", "", Path(page).stem), [])
+        if len(same_stem) == 1:
+            remap[page] = same_stem[0]
+            continue
+        old_keys = Counter(_key(line) for line in _lines(text) if _key(line))
+        scores = sorted(
+            ((sum((old_keys & keys).values()), candidate) for candidate, keys in new_keys.items()),
+            reverse=True,
+        )
+        if old_keys and scores and scores[0][0] >= 0.3 * sum(old_keys.values()) and (
+            len(scores) == 1 or scores[0][0] != scores[1][0]
+        ):
+            remap[page] = scores[0][1]
+    return remap
+
+
 def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
            model: Any = None, guidance: dict[str, list[str]] | None = None,
-           stats: Counter | None = None, concurrency: int = 1) -> tuple[dict[str, str], list[str]]:
+           stats: Counter | None = None, concurrency: int = 1,
+           notes: bool = True) -> tuple[dict[str, str], list[str]]:
     """Re-apply the human's changes (old -> human) to ``new``; returns (pages, Appendix entries).
 
     Every argument maps page file names to text. A page missing from ``human`` is unchanged.
@@ -462,6 +656,7 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
     olines = {p: _lines(t) for p, t in old.items()}
     hlines = {p: _lines(human[p]) if p in human else olines[p] for p in old}
     nlines = {p: _lines(t) for p, t in new.items()}
+    remap = _page_remap(old, new)
     same: dict[str, dict[int, int]] = {}
     changes: list[_Change] = []
     for p, a in olines.items():
@@ -476,16 +671,59 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
     oi, ni = _Index(olines), _Index(nlines)
     entries: list[str] = []
 
-    def to_appendix(text: str, page: str, j: int) -> None:
-        text = text.strip("\n")
+    def to_appendix(text: str, page: str, j: int, *, deleted: bool) -> None:
+        text = _current_notes(text, "").strip("\n")
         if not text.strip():
             return
+        if re.search(r"</?t[dhr]\b", text, re.I) and not re.search(r"<table\b", text, re.I):
+            text = f"<table>\n{text}\n</table>"
         stats["appendix"] += 1
         heading = next((l.lstrip("#").strip() for l in reversed(hlines[page][:j + 1]) if l.startswith("#")), "")
         head = "" if text.lstrip().startswith("#") else f"## {heading or page}\n\n"  # the text brings its own heading
-        entry = f"{head}{text}\n\n> 元の文書では、この部分は削除されました（元ページ: {page}）\n"
+        reason = (
+            "元の文書では、この部分は削除されました"
+            if deleted
+            else "新しい版ではこの編集の位置を特定できませんでした"
+        )
+        entry = f"{head}{text}\n\n> {reason}（元ページ: {page}）\n"
         if entry not in entries:
             entries.append(entry)
+
+    def local_exact(c: _Change) -> tuple[str, int] | None:
+        own = remap.get(c.page)
+        if own is None or not c.old:
+            return None
+        wanted = [_key(line) for line in c.old]
+        old_hits = sum(
+            [_key(line) for line in olines[c.page][index:index + len(wanted)]] == wanted
+            for index in range(len(olines[c.page]) - len(wanted) + 1)
+        )
+        if old_hits != 1:
+            return None
+        hits = [
+            index
+            for index in range(len(nlines[own]) - len(wanted) + 1)
+            if [_key(line) for line in nlines[own][index:index + len(wanted)]] == wanted
+        ]
+        return (own, hits[0]) if len(hits) == 1 else None
+
+    def cross_page_exact_ok(c: _Change, hit: tuple[str, int]) -> bool:
+        page, index = hit
+        if page == remap.get(c.page) or c.page not in nlines:
+            return True
+        if sum(bool(line.strip()) for line in c.old) >= 3 or len("".join(c.old).strip()) >= 60:
+            return True
+        source, target = olines[c.page], nlines[page]
+        before = next((k for k in range(c.i1 - 1, -1, -1) if source[k].strip()), None)
+        after = next((k for k in range(c.i2, len(source)) if source[k].strip()), None)
+        return (
+            before is not None
+            and index >= c.i1 - before
+            and target[index - (c.i1 - before):index] == source[before:c.i1]
+        ) or (
+            after is not None
+            and target[index + len(c.old):index + len(c.old) + after - c.i2 + 1] == source[c.i2:after + 1]
+        )
 
     def window(c: _Change) -> _Win | None:
         a, eq = olines[c.page], same[c.page]
@@ -496,17 +734,29 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
         b, f = anchor(range(c.i1 - 1, -1, -1)), anchor(range(c.i2, len(a)))
         pb = ni.find([a[b]])[0] if b is not None else None
         pf = ni.find([a[f]])[0] if f is not None else None
-        if b is not None and f is not None:
-            if pb[0] != pf[0] or pb[1] >= pf[1]:
-                return None
+        if b is not None and f is not None and pb[0] == pf[0] and pb[1] < pf[1]:
             q, lo, hi = pb[0], pb[1] + 1, pf[1]
-        else:
-            lone = pb or pf
-            if c.page not in nlines or (lone and lone[0] != c.page):
-                return None
-            q = c.page
-            lo = pb[1] + 1 if pb else 0
-            hi = pf[1] if pf else len(nlines[q])
+            span = (b + 1, f, eq[b] + 1, eq[f])
+            return _Win(q, lo, hi, {c.page: span}, [c])
+
+        q = remap.get(c.page)
+        if q is None:
+            return None
+        target = nlines[q]
+        old_counts, new_counts = Counter(map(_key, a)), Counter(map(_key, target))
+        at = {_key(line): index for index, line in enumerate(target)}
+
+        def good(index: int) -> bool:
+            key = _key(a[index])
+            return index in eq and bool(key) and old_counts[key] == 1 and new_counts[key] == 1
+
+        b = next((k for k in range(c.i1 - 1, -1, -1) if good(k)), None)
+        f = next((k for k in range(c.i2, len(a)) if good(k)), None)
+        lo = at[_key(a[b])] + 1 if b is not None else 0
+        hi = at[_key(a[f])] if f is not None else len(target)
+        if lo > hi:
+            b = f = None
+            lo, hi = 0, len(target)
         span = (b + 1 if b is not None else 0, f if f is not None else len(a),
                 eq[b] + 1 if b is not None else 0, eq[f] if f is not None else len(hlines[c.page]))
         return _Win(q, lo, hi, {c.page: span}, [c])
@@ -514,8 +764,15 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
     others: list[tuple[_Change, tuple[str, int] | None]] = []  # exact location, or None: no location
     wins: list[_Win] = []
     for c in changes:
-        if "".join(c.old).strip() and len(oi.find(c.old)) == 1 and len(hit := ni.find(c.old)) == 1:
+        if (
+            "".join(c.old).strip()
+            and len(oi.find(c.old)) == 1
+            and len(hit := ni.find(c.old)) == 1
+            and cross_page_exact_ok(c, hit[0])
+        ):
             others.append((c, hit[0]))
+        elif (at := local_exact(c)) is not None:
+            others.append((c, at))
         elif (w := window(c)) is not None:
             wins.append(w)
         else:
@@ -570,11 +827,15 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
         old_w = "".join("".join(olines[p][s[0]:s[1]]) for p, s in sorted(g.spans.items()))
         cur_w = "".join("".join(hlines[p][s[2]:s[3]]) for p, s in sorted(g.spans.items()))
         new_w = "".join(nl)
-        first = min(g.changes, key=lambda c: (c.page, c.i1))
         if new_w == cur_w:
             stats["window1"] += 1
         elif new_w == old_w:
             stats["window2"] += 1
+            edits.append(_Edit2(g.q, g.lo, g.hi, _lines(cur_w), g.changes))
+        elif [key for key in map(_key, _lines(new_w)) if key] == [
+            key for key in map(_key, _lines(old_w)) if key
+        ]:
+            stats["window_format"] += 1
             edits.append(_Edit2(g.q, g.lo, g.hi, _lines(cur_w), g.changes))
         elif (spots := _spots(nl, g.changes, _lines(old_w))) is not None:
             stats["window3"] += 1
@@ -582,7 +843,7 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
         elif not new_w.strip() and old_w.strip():
             stats["window4"] += 1
             for c in g.changes:
-                to_appendix("".join(c.human), c.page, c.j1)
+                to_appendix("".join(c.human), c.page, c.j1, deleted=True)
         elif old_w.split() == cur_w.split():  # the human only changed blank lines or spaces: no text to keep
             stats["window_space"] += 1
         elif len(g.spans) == 1 and all(not c.old and c.i1 in s[:2] for c in g.changes for s in g.spans.values()):
@@ -590,20 +851,21 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
             lo = next(iter(g.spans.values()))[0]
             edits.append(_Edit2(g.q, g.lo, g.hi, [l for c in g.changes if c.i1 == lo for l in c.human] + nl
                                 + [l for c in g.changes if c.i1 != lo for l in c.human], g.changes))
+        elif (clean := _clean_merge(old_w, cur_w, new_w)) is not None:
+            stats["window_merge"] += 1
+            edits.append(_Edit2(g.q, g.lo, g.hi, _lines(clean), g.changes))
         else:
             stats["window5"] += 1
             calls = Counter()
-            merges.append((g, first, cur_w, new_w, calls,
+            merges.append((g, old_w, cur_w, new_w, calls,
                            pool.submit(_merge_window, model, old_w, cur_w, new_w, guidance.get(g.q, []), calls)))
-    for g, first, cur_w, new_w, calls, future in merges:
+    for g, old_w, cur_w, new_w, calls, future in merges:
         got = future.result()
         stats.update(calls)
         if got is None:
             stats["fallback"] += 1
-            got = _fallback(cur_w, new_w), ""
+            got = (_fallback(old_w, cur_w, new_w) if notes else cur_w), ""
         edit = _Edit2(g.q, g.lo, g.hi, _lines(got[0]), g.changes)
-        if got[1].strip():
-            edit.entries.append((got[1], first.page, first.j1))
         edits.append(edit)
     pool.shutdown()
     for c, (q, i) in singles:
@@ -611,22 +873,21 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
         edits.append(_Edit2(q, i, i + len(c.old), c.human, [c]))
     for c in lost:
         stats["no_location"] += 1
-        to_appendix("".join(c.human), c.page, c.j1)
+        to_appendix("".join(c.human), c.page, c.j1, deleted=False)
 
     kept: list[_Edit2] = []
     for e in sorted(edits, key=lambda e: (e.page, e.lo, -e.hi)):
         if kept and kept[-1].page == e.page and e.lo < kept[-1].hi:
             for c in e.owners:  # overlaps an earlier replacement: the human's text goes to the Appendix
-                to_appendix("".join(c.human), c.page, c.j1)
+                to_appendix("".join(c.human), c.page, c.j1, deleted=False)
             continue
         kept.append(e)
-        for text, page, j in e.entries:
-            to_appendix(text, page, j)
     result = dict(new)
     for e in reversed(kept):
         nlines[e.page][e.lo:e.hi] = e.lines
     for e in kept:
         result[e.page] = "".join(nlines[e.page])
+    result = {page: _notes_after_tables(text) if NOTE in text else text for page, text in result.items()}
     return result, entries
 
 
@@ -669,7 +930,13 @@ def _appendix_name(pages: Iterable[str]) -> str:
 
 
 def _entries(text: str) -> int:
-    return text.count("> 元の文書では、この部分は削除されました")
+    return sum(
+        text.count(marker)
+        for marker in (
+            "> 元の文書では、この部分は削除されました",
+            "> 新しい版ではこの編集の位置を特定できませんでした",
+        )
+    )
 
 
 class HumanStore:
@@ -772,7 +1039,7 @@ class HumanStore:
         if doc.get("appendix") and current.get(doc["appendix"], "").replace("# " + APPENDIX, "", 1).strip():
             return True
         for page, text in pure.items():
-            a, b = _lines(text), _lines(current.get(page, text))
+            a, b = _lines(text), _lines(_current_notes(current.get(page, text), ""))
             if any(tag != "equal" and "".join(b[j1:j2]).strip()
                    for tag, _i1, _i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes()):
                 return True
@@ -817,7 +1084,9 @@ class HumanStore:
         text = appendix if appendix.strip() else ("# " + APPENDIX + "\n\n" if fresh else "")
         for entry in fresh:
             text = text.rstrip("\n") + "\n\n" + entry
-        name = _appendix_name(pages)
+        name = doc.get("appendix")
+        if not name or name in pages:
+            name = _appendix_name(pages)
         doc["appendix"] = name
         return {**pages, name: text}
 
@@ -966,8 +1235,25 @@ class HumanStore:
         doc, pure, before = self._load(raw_rel)
         current = dict(before)
         appendix = current.pop(doc["appendix"], "") if doc.get("appendix") else ""
-        merged, entries = rebase(pure, current, new, model=model, guidance=doc["guidance"],
-                                 concurrency=getattr(model, "concurrency", 1))
+        current = {page: _current_notes(text, new.get(page, "")) for page, text in current.items()}
+        for old_page, new_page in _page_remap(pure, new).items():
+            if old_page == new_page or old_page not in doc["guidance"]:
+                continue
+            moved = doc["guidance"].pop(old_page)
+            target = doc["guidance"].setdefault(new_page, [])
+            target.extend(item for item in moved if item not in target)
+            del target[:-GUIDANCE_KEPT]
+        stats = Counter()
+        merged, entries = rebase(
+            pure,
+            current,
+            new,
+            model=model,
+            guidance=doc["guidance"],
+            concurrency=getattr(model, "concurrency", 1),
+            stats=stats,
+        )
+        log.info("human_sync event=rebase document=%s stats=%s", raw_rel, dict(stats))
         pages = self._finish(doc, merged, appendix, entries)
         changed = self._commit(raw_rel, doc, pages, before, pure=new, sweep=True)
         self._drop_inline_rows(f"{prefix}/{name}" for name in new)

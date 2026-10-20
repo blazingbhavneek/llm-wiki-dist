@@ -12,6 +12,7 @@ import mimetypes
 import posixpath
 import re
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1301,6 +1302,7 @@ class GrowiPublisher:
                 canonical, status = merge(editable(previous_remote), editable(markdown), editable(previous_local))
                 if status == "conflict":
                     page_name = Path(local_path).name
+                    stats = Counter()
                     log.info(
                         "GROWIユーザー編集の複雑な差分をマージしています: ドキュメント=%s ページ=%s",
                         raw_rel, local_path,
@@ -1309,9 +1311,12 @@ class GrowiPublisher:
                         {page_name: editable(previous_remote)},
                         {page_name: editable(markdown)},
                         {page_name: editable(previous_local)},
-                        model=model if policy.captures else None,
+                        model=None,
                         concurrency=getattr(model, "concurrency", 1),
+                        stats=stats,
+                        notes=False,
                     )
+                    log.info("human_sync event=rebase document=%s stats=%s", raw_rel, dict(stats))
                     canonical = merged[page_name]
                     for entry in entries:
                         if entry.strip() and entry not in canonical:

@@ -2243,7 +2243,7 @@ Tell me when you've made the edits and I'll run the sync and the checks.
 ## User
 
 growi_url = http://10.160.152.38:3000/
-growi_token = LA13j572FoTfv6wiSuT50l9apnao2UI4xbH2dQScUCQ=
+growi_token = (set `GROWI_TOKEN` in `.env`)
 
 make these changes for me, i will run sync myself
 
