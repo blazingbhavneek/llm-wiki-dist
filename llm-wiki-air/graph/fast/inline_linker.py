@@ -1049,12 +1049,13 @@ async def _link_async(
         if completed != manifest.get("documents", {}):
             write_json_atomic(_manifest_path(output_project or project), {**manifest, "documents": completed})
         return {"done": [{"status": "up-to-date"}], "failures": [], "linked_documents": sorted(scope)}
-    refresh = pending if not continue_run else set()
+    # Cache keys include the passage text, so normal runs only analyse changed inputs.
+    # Explicit --force still refreshes extraction, roles, and link decisions.
     _checkpoint(project, "extracting", continued=resumed, pages=len(pages),
                 failures=[],
                 documents={doc: {"base_sha256": fingerprints[doc], "status": "pending"} for doc in pending})
     extraction = await _extract(project, pages, model, settings, force=force,
-                                refresh_documents=refresh, on_progress=on_progress)
+                                on_progress=on_progress)
     skipped_extractions = len(extraction.failures)
     if extraction.failures:
         _checkpoint(project, "failed", failures=extraction.failures)
@@ -1067,7 +1068,6 @@ async def _link_async(
         project, engine, extraction.entities,
         float(getattr(settings, "wiki_linker_role_threshold", 0.5)),
         force=force, on_progress=on_progress,
-        refresh_documents=refresh,
     )
     if role_failures:
         failures = [f"ファストリンク: エンティティのチェックに失敗（{role_failures}件）"]
@@ -1079,7 +1079,7 @@ async def _link_async(
     plans, judge_failures, judge_calls = await _judge_candidates(
         project, engine, candidates,
         float(getattr(settings, "wiki_linker_verify_threshold", 0.7)),
-        force=force or not continue_run, on_progress=on_progress,
+        force=force, on_progress=on_progress,
     )
     if judge_failures:
         failures = [f"ファストリンク: リンク候補のチェックに失敗（{judge_failures}件）"]
