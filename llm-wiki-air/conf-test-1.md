@@ -1,129 +1,106 @@
-# Human-sync test guide — Doc A
+## Changes safe to do on the Mount side
 
-## Setup (once)
+The current version can safely process normal source-document updates when the existing page and heading structure remains recognizable:
 
-- You get a config with **Doc A** already published to the GROWI test tree.
-- Two things can change: the **UI** (you edit + save a page in the browser, tester account, never the bot account) and the **mount** (a new `.docx` goes into the mount folder under the same filename).
-- For the both-sides cases: **UI edit first, save, then** swap in the new `.docx`, then run one sync. That makes your change and the source change meet in the same run.
-- One sync at a time. Roughly an hour. A quiet log is not a dead run — never start a second one.
-- Put a marker in everything you add, e.g. `（QA-a1）`, so we can count it later without reading the page.
-- Count instead of reading: `grep -rc 'QA-a1' data/test/wiki/<Doc A folder>/`. Expect 1 (2 if your text is inside a table row — that's normal).
+- Rewrite or extend paragraphs under an existing heading.
+- Change multiple facts, values, names, dates, descriptions, or recommendations.
+- Add or remove ordinary paragraphs.
+- Add, edit, reorder, or remove list items.
+- Update table-cell values or add rows when the same table is not being edited in GROWI simultaneously.
+- Make several independent changes across different sections or pages.
+- Move a short, otherwise unedited block within the same page.
+- Reword content without changing its meaning or structural location.
 
----
+These changes may be combined in one source update. Unique surrounding text helps the synchronizer place changes correctly.
 
-## Case 1 — UI only, no mount change
+## Changes safe to do on the GROWI UI side
 
-**What it tests:** that your edits are captured and survive regeneration, that an untouched save is not mistaken for a change, and that a re-run with nothing changed stays silent.
+The current version can safely preserve normal human edits when the source is not simultaneously restructuring the same content:
 
-**Try these changes**
-- add a sentence to a paragraph (page 004): `運用メモ：夜間確認（QA-a1）`
-- change a table cell verdict (page 002): `○` → `△`
-- add one row at the bottom of the first table (page 001)
-- delete one bullet you don't want (page 028)
-- bold a term or fix a full-width/half-width character (page 019)
-- insert a bullet in the middle of an existing list
-- open one page and press save with no edit at all (control)
+- Rewrite or extend an existing paragraph.
+- Correct multiple facts or replace an explanation with a human-reviewed version.
+- Add or remove ordinary paragraphs under an existing heading.
+- Add, edit, reorder, or remove individual list items.
+- Update table-cell values or add a row when the mount is not restructuring that table.
+- Make independent edits across multiple sections or pages.
+- Apply small formatting corrections while keeping the underlying content recognizable.
+- Save an unchanged page without it being treated as a human edit.
 
-**What you should see**
-- every marker still present after sync, once each, in the place you left it
-- no `（元文書の更新: …）` note anywhere — nothing conflicted
-- the deleted bullet stays deleted
-- the no-edit save produces no capture and no visible change
-- a second sync with nothing changed changes nothing: no duplicated text, no new note
+Human edits should be made inside existing pages and headings. Page titles, heading boundaries, ownership markers, and large structural regions should remain unchanged in this version.
 
----
+## Expected results for the five change combinations
 
-## Case 2 — Mount only, no UI change
+### Case 1 — Mount changes only
 
-**What it tests:** that source edits flow into the wiki silently, in the right place, without inventing notes or touching pages nobody edited.
+The mount may contain several paragraph rewrites, fact changes, list updates, and table-value changes in the same run.
 
-**Try these changes**
-- change one cell verdict in a table (page 002): `×` → `○`
-- change a value written in prose (page 019): `10秒` → `20秒`
-- append a sentence to a definition paragraph (page 004)
-- add a new row to the first table (page 001)
-- add a bullet or numbered item to a list
-- delete a bullet nobody commented on (page 028)
-- reword one sentence, keeping the same meaning (page 007)
-- move a short block or sub-item to another position on the same page
+Expected result:
 
-**What you should see**
-- new source text visible in the right paragraph/cell, once
-- deleted content simply gone — no note, no 付録 page
-- a reworded sentence shows the new wording and **no** note (wording difference is not a conflict)
-- tables still render, numbering and row grouping still sane
+- The updated source content appears in the corresponding wiki locations.
+- Superseded source content disappears.
+- Existing structure remains valid.
+- No human-conflict note is created.
+- Unrelated pages and previously preserved human content remain unchanged.
 
----
+### Case 2 — GROWI changes only
 
-## Case 3 — Both sides changed the **same** value
+A user may rewrite paragraphs, correct facts, update lists, and make ordinary table edits without changing the mount.
 
-**What it tests:** the core promise — a real conflict is resolved in your favour, and the source's different value is recorded next to it instead of overwriting you.
+Expected result:
 
-**Try these changes**
-- you set a timeout to `30秒` on page 019, mount sets the same one to `20秒`
-- you change a verdict cell to `△` on page 002, mount changes that same cell to `○`
-- you change a value and mount changes it to **exactly your value** (catch-up)
-- after a note appears, run a second sync with nothing changed
-- while a note is showing, edit a different line on the same page
+- GROWI edits are captured and preserved in the local wiki state.
+- The edits remain visible after synchronization and publishing.
+- Each addition appears once in its original section.
+- A save without an actual edit produces no content change.
+- No source-update note is created.
 
-**What you should see**
-- your value stays live, with one short note beside it: `…30秒（元文書の更新: 20秒）…`
-- catch-up case: your value appears once and **no note at all**
-- repeat sync: still exactly one note — old notes must never stack or double
-- your note survives an unrelated edit on the same page, unchanged
-- never your value silently replaced by the source's
+### Case 3 — Mount and GROWI make the same change
 
----
+Both sides independently arrive at the same final wording, fact, list item, or deletion.
 
-## Case 4 — Both sides changed **different** places
+Expected result:
 
-**What it tests:** that non-colliding edits coexist — nobody's work is absorbed, dropped, or moved, and coexistence produces no note.
+- The shared result appears once.
+- No duplicate content is created.
+- No conflict note is necessary because the two sides agree.
+- A deletion made by both sides remains deleted.
 
-**Try these changes**
-- you add a row to the page 001 table, mount adds a different row to the same table
-- you add a sentence to the page 004 paragraph, mount adds a different sentence to a nearby paragraph
-- you edit page 002, mount edits a similar-looking line on page 003 (neighbour probe)
-- you and the mount add **identical** text in the same place
-- you add a new section in the middle of a page, then a later mount patch touches that page
+### Case 4 — Mount and GROWI change different content
 
-**What you should see**
-- both rows present once each, table structurally valid
-- both sentences present once each, yours not merged into the source's paragraph
-- no `（元文書の更新: …）` note anywhere — nothing collided
-- your text never shows up on the neighbouring page
-- identical text appears **once**, not twice
-- your added section is still there after the later patch
+Both sides change the same document, but they edit separate, uniquely identifiable paragraphs, sections, lists, or pages.
 
----
+Expected result:
 
-## Case 5 — Deletions and moved blocks
+- Both sets of changes coexist in the resulting wiki.
+- Each change remains under its intended heading and on its intended page.
+- Human content is not absorbed into the source-edited paragraph.
+- Source content is not moved into the human-edited paragraph.
+- No conflict note is created because the changes do not overlap.
 
-**What it tests:** that a human decision to remove something sticks, that both sides removing the same thing is not treated as a loss, and that your text follows content when the source reshuffles it.
+### Case 5 — Mount and GROWI change the same content differently
 
-**Try these changes**
-- you delete a bullet on page 028, and the mount deletes the same bullet
-- you delete a short explanation on page 007, and the mount only rewords it
-- you add a line inside a block (`（QA-a5）`) and the mount moves that block elsewhere on the page
-- you add text inside a table row and the mount adds more rows to that table
-- you delete a paragraph **you** added in an earlier case, then run two more syncs
+Both sides rewrite the same identifiable paragraph, fact, recommendation, list item, or other content unit with different results.
 
-**What you should see**
-- same-deletion case: gone everywhere, no note, no 付録 entry
-- you-deleted / mount-reworded: your deletion wins; the source's new wording appears only inside a note, never as resurrected body text
-- moved block: your line travels with the block, not with the old surrounding text
-- your row text stays in your row, nothing shifts into a neighbouring row
-- your own deletion does not come back on any later sync
+Expected result:
 
----
+- The GROWI version remains the active human-approved content.
+- The different mount version is retained next to it as a source-update note.
+- Independent non-conflicting changes from the same run are still applied normally.
+- Neither version is silently lost or copied to another page.
 
-## Leave these alone
+# Known failed cases — fixing in the next PR
 
-Don't rename a page's own title line, don't change heading levels, don't delete a whole section that contains your text, and never create a 付録 page yourself. Those paths are known-broken and would look like your mistake.
+During wider conflict testing, I found cases that are not safe enough in the current version:
 
-## Report format
+- Large document restructures that reorder, split, or combine multiple sections.
+- Page-title changes or heading-level changes.
+- Deleting or replacing a complete section containing human-edited content.
+- Editing a block in GROWI while the mount moves that block elsewhere.
+- Simultaneously adding, deleting, or reorganizing rows on both sides of the same table.
+- Conflicts involving repeated or nearly identical paragraphs where the correct anchor is ambiguous.
+- A human deletion conflicting with a substantial source rewrite of the deleted content.
+- Repeated synchronization causing conflict notes to become duplicated or stale.
+- Full model rewrites that omit existing facts, values, or table content.
+- Remote page moves, deletions, or ownership-marker changes being treated as ordinary content edits.
 
-Per case, one line: page number, your marker, marker count (1, or 2 inside a table row), whether a note appeared, pass or fail. No page text, no screenshots of source content.
-
-## Escalate instead of fixing
-
-Your marker count is 0 or unexpectedly high · your value replaced without a note · a note whose inside is empty or garbled · deleted text reappearing as body text · a 付録 page you didn't create · links vanishing from a page you edited.
+I will address these conflict-pipeline cases in the next PR. That work will add safer placement, deletion handling, structural-content preservation, fact validation, and dedicated regression coverage for aggressive mount and GROWI rewrites.
